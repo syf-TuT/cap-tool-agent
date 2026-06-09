@@ -1,8 +1,7 @@
-"""Low-level Robosuite Franka environment compatible with FrankaControlApi.
+"""Low-level OmniGibson Behavior-1K R1Pro environment.
 
-This module provides a thin wrapper around Robosuite's Stack environment
-that implements the same interface as FrankaPickPlaceLowLevel, making it
-hot-swappable for code execution environments.
+This module wraps an OmniGibson Behavior-1K environment and exposes the
+R1ProControlApi-compatible low-level interface used by code execution tasks.
 """
 
 from __future__ import annotations

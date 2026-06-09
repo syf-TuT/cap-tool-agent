@@ -6,13 +6,13 @@
 
 CaP-X 是一个用于评测和改进机器人操作类 Code-as-Policy 智能体的框架。常用运行入口如下：
 
-| 入口 | 用途 |
-| --- | --- |
-| `capx/envs/launch.py` | 运行机器人任务评测或启动交互式 Web UI |
-| `capx/serving/openrouter_server.py` | 启动 OpenAI 兼容的本地 LLM 代理 |
-| `capx/serving/launch_servers.py` | 预启动感知和控制 API 服务 |
-| `scripts/regression_test.sh` | 运行回归和烟雾测试 |
-| `web-ui/` | React/Vite 前端源码 |
+| 入口                                | 用途                                  |
+| ----------------------------------- | ------------------------------------- |
+| `capx/envs/launch.py`               | 运行机器人任务评测或启动交互式 Web UI |
+| `capx/serving/openrouter_server.py` | 启动 OpenAI 兼容的本地 LLM 代理       |
+| `capx/serving/launch_servers.py`    | 预启动感知和控制 API 服务             |
+| `scripts/regression_test.sh`        | 运行回归和烟雾测试                    |
+| `web-ui/`                           | React/Vite 前端源码                   |
 
 主要任务配置放在 `env_configs/`，例如：
 
@@ -175,11 +175,11 @@ uv run --no-sync --active capx/serving/launch_servers.py --profile default
 
 可用 profile：
 
-| profile | 服务 | 适用场景 |
-| --- | --- | --- |
-| `minimal` | PyRoKi | oracle 或 privileged 自检 |
-| `default` | SAM3、ContactGraspNet、PyRoKi | 常规 Robosuite 视觉任务 |
-| `full` | default 加 OWL-ViT、SAM2 | 更完整的视觉服务 |
+| profile   | 服务                          | 适用场景                  |
+| --------- | ----------------------------- | ------------------------- |
+| `minimal` | PyRoKi                        | oracle 或 privileged 自检 |
+| `default` | SAM3、ContactGraspNet、PyRoKi | 常规 Robosuite 视觉任务   |
+| `full`    | default 加 OWL-ViT、SAM2      | 更完整的视觉服务          |
 
 SAM3 权重需要 HuggingFace 访问权限。首次使用前需要申请访问并登录：
 
@@ -261,18 +261,18 @@ uv run --no-sync --active capx/envs/launch.py \
 
 常用参数：
 
-| 参数 | 含义 |
-| --- | --- |
-| `--config-path` | 必填，任务 YAML 路径 |
-| `--model` | 模型名称，传给本地 LLM 代理 |
-| `--server-url` | LLM 代理地址，默认 `http://127.0.0.1:8110/chat/completions` |
-| `--temperature` | 采样温度 |
-| `--total-trials` | 覆盖 YAML 中的试验次数 |
-| `--num-workers` | 并行 worker 数 |
-| `--record-video` | 是否保存视频 |
-| `--output-dir` | 输出目录 |
-| `--use-oracle-code` | 使用环境内置参考代码，不请求模型生成 |
-| `--web-ui` | 启动交互式 Web UI |
+| 参数                | 含义                                                        |
+| ------------------- | ----------------------------------------------------------- |
+| `--config-path`     | 必填，任务 YAML 路径                                        |
+| `--model`           | 模型名称，传给本地 LLM 代理                                 |
+| `--server-url`      | LLM 代理地址，默认 `http://127.0.0.1:8110/chat/completions` |
+| `--temperature`     | 采样温度                                                    |
+| `--total-trials`    | 覆盖 YAML 中的试验次数                                      |
+| `--num-workers`     | 并行 worker 数                                              |
+| `--record-video`    | 是否保存视频                                                |
+| `--output-dir`      | 输出目录                                                    |
+| `--use-oracle-code` | 使用环境内置参考代码，不请求模型生成                        |
+| `--web-ui`          | 启动交互式 Web UI                                           |
 
 ## 10. 运行 LIBERO-PRO 评测
 
@@ -489,4 +489,3 @@ export OMNIGIBSON_HEADLESS=1
 7. 跑 `cube_stack` 的 10-trial 小评测。
 8. 需要交互观察时再启动 `--web-ui True`。
 9. Robosuite 跑通后，再配置 LIBERO 或 BEHAVIOR。
-
