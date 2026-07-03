@@ -28,7 +28,7 @@ from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
 from capx.tools.planner import LlmToolPlanner, ScriptedToolPlanner
 from capx.tools.prompts import build_tool_planner_prompt
-from capx.tools.schema import ToolResult
+from capx.tools.schema import ToolCall, ToolResult
 from capx.tools.verifiers import StepVerifier
 
 from capx.llm.client import (
@@ -676,18 +676,33 @@ def _run_tool_trial(
             history=history,
         )
         prompts.append(prompt)
-        if isinstance(planner, ScriptedToolPlanner):
-            tool_call = planner.next_call(history, env.tool_state_summary())
-        else:
-            tool_call = planner.next_call(prompt=prompt)
-        tool_call.step_id = step_id
-
         before = env.snapshot_state()
-        if tool_call.tool == "finish" and tool_call.tool not in tool_names:
-            result = ToolResult(tool="finish", status="success")
+        try:
+            if isinstance(planner, ScriptedToolPlanner):
+                tool_call = planner.next_call(history, env.tool_state_summary())
+            else:
+                tool_call = planner.next_call(prompt=prompt)
+            tool_call.step_id = step_id
+        except ValueError as exc:
+            tool_call = ToolCall(
+                tool="__invalid_tool_call__",
+                args={},
+                thought="Planner response could not be parsed as a tool call.",
+                step_id=step_id,
+            )
+            result = ToolResult.failed(
+                tool=tool_call.tool,
+                failure_type="invalid_tool_call_response",
+                message=str(exc),
+                exception_type=type(exc).__name__,
+            )
+            after = before
         else:
-            result = env.call_tool(tool_call)
-        after = env.snapshot_state()
+            if tool_call.tool == "finish" and tool_call.tool not in tool_names:
+                result = ToolResult(tool="finish", status="success")
+            else:
+                result = env.call_tool(tool_call)
+            after = env.snapshot_state()
         final_snapshot = after
 
         feedback = verifier.verify(

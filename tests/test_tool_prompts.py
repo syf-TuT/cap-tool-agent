@@ -9,6 +9,14 @@ def test_parse_tool_call_response_accepts_json_object():
     assert call.tool == "get_observation"
 
 
+def test_parse_tool_call_response_extracts_json_object_from_text():
+    call = parse_tool_call_response(
+        'Here is the next call:\n{"thought": "done", "tool": "finish", "args": {}}\nThanks.'
+    )
+
+    assert call.tool == "finish"
+
+
 def test_parse_tool_call_response_rejects_python_code():
     try:
         parse_tool_call_response("```python\nmove_to_joints(joints)\n```")

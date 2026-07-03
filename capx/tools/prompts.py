@@ -20,10 +20,26 @@ def parse_tool_call_response(content: str) -> ToolCall:
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ValueError("Tool call response must be valid JSON") from exc
+        data = _extract_json_object(text)
+        if data is None:
+            raise ValueError("Tool call response must be valid JSON") from exc
     if not isinstance(data, dict):
         raise ValueError("Tool call response JSON must be an object")
     return ToolCall.from_mapping(data)
+
+
+def _extract_json_object(text: str) -> Any | None:
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            data, _ = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
 
 
 def build_tool_planner_prompt(
