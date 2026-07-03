@@ -204,6 +204,20 @@ class CodeExecutionEnvBase(Env):
                 g[fn_name] = fn
         self._exec_globals = g
 
+    def _build_capsule_globals(self) -> dict[str, Any]:
+        """Build a fresh namespace for region-based capsule execution."""
+        g: dict[str, Any] = {
+            "__name__": "__main__",
+            "env": self.low_level_env,
+            "APIS": self._apis,
+            "INPUTS": {},
+            "RESULT": None,
+        }
+        for api in self._apis.values():
+            for fn_name, fn in api.functions().items():
+                g[fn_name] = fn
+        return g
+
     def _build_low_level(
         self, src: Env | str, privileged: bool = False, enable_render: bool = True, viser_debug: bool = False
     ) -> BaseEnv:
