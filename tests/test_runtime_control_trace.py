@@ -28,3 +28,12 @@ def test_trace_wrapper_records_exception():
         pass
 
     assert trace.events[0]["status"] == "failed"
+
+
+def test_trace_window_returns_events_since_mark():
+    trace = RuntimeTrace()
+    start = trace.mark()
+    trace.log({"name": "first"})
+    trace.log({"name": "second"})
+
+    assert [event["name"] for event in trace.events_since(start)] == ["first", "second"]

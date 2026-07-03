@@ -13,6 +13,12 @@ class RuntimeTrace:
     def log(self, event: dict[str, Any]) -> None:
         self.events.append(event)
 
+    def mark(self) -> int:
+        return len(self.events)
+
+    def events_since(self, index: int) -> list[dict[str, Any]]:
+        return list(self.events[index:])
+
     def summary(self) -> dict[str, Any]:
         return {"events": list(self.events)}
 
