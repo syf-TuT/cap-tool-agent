@@ -14,6 +14,7 @@ from capx.envs.configs.instantiate import instantiate as cfg_instantiate
 from capx.envs.configs.loader import DictLoader
 from capx.integrations.base_api import ApiBase, get_api
 from capx.tools.executor import ToolExecutor
+from capx.tools.franka_metadata import FRANKA_TOOL_METADATA
 from capx.tools.registry import build_registry_from_apis
 from capx.tools.schema import ToolCall, ToolResult, ToolSpec
 from capx.tools.state import ToolState
@@ -101,7 +102,10 @@ class CodeExecutionEnvBase(Env):
         # Create APIs once; maximize sharing inside a worker via lru_cache in get_api
         self._apis: dict[str, ApiBase] = {n: get_api(n)(self.low_level_env) for n in cfg.apis}
         self._tool_state = ToolState()
-        self._tool_registry = build_registry_from_apis(self._apis)
+        self._tool_registry = build_registry_from_apis(
+            self._apis,
+            metadata=FRANKA_TOOL_METADATA,
+        )
         self._tool_executor = ToolExecutor(self._tool_registry, self._tool_state)
         # for api in self._apis.values():
         #     api.set_env(self.low_level_env)
