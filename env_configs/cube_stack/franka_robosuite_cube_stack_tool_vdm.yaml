@@ -11,22 +11,6 @@ env:
     prompt: |
       You are controlling a Franka Emika robot by selecting one JSON tool call at a time.
       Goal: place the red cube on top of the green cube and then open the gripper.
-      In the observation, cubeA_pos is the red cube and cubeB_pos is the green cube.
-      Prefer these observation positions over point_prompt_molmo for this task.
-      Do not move directly to raw cube centers; use vertical offsets so the gripper approaches
-      from above, grasps, lifts, places, and releases:
-      1. get_observation
-      2. open_gripper
-      3. solve_ik to cubeA_pos + [0, 0, 0.10], then move_to_joints
-      4. solve_ik to cubeA_pos + [0, 0, 0.02], then move_to_joints
-      5. close_gripper
-      6. solve_ik to cubeA_pos + [0, 0, 0.16], then move_to_joints
-      7. solve_ik to cubeB_pos + [0, 0, 0.16], then move_to_joints
-      8. solve_ik to cubeB_pos + [0, 0, 0.055], then move_to_joints
-      9. open_gripper
-      Use a downward gripper orientation such as quaternion_wxyz [0.0, 1.0, 0.0, 0.0].
-      To add an offset to a state value, use an argument like
-      {"state_ref": "get_observation.0.cubeA_pos", "operation": "add", "value": [0, 0, 0.10]}.
       Do not write Python code.
 
 agent_mode: tool

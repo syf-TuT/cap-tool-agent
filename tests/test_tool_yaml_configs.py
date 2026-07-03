@@ -16,14 +16,3 @@ def test_tool_yaml_configs_define_tool_mode():
         assert data["agent_mode"] == "tool"
         assert data["max_tool_steps"] > 0
         assert data["env"]["cfg"]["apis"] == ["FrankaControlApiReducedSkillLibrary"]
-
-
-def test_cube_stack_tool_prompt_includes_height_offset_recipe():
-    data = yaml.safe_load(
-        Path("env_configs/cube_stack/franka_robosuite_cube_stack_tool_vdm.yaml").read_text()
-    )
-    prompt = data["env"]["cfg"]["prompt"]
-
-    assert "cubeA_pos is the red cube" in prompt
-    assert "Do not move directly to raw cube centers" in prompt
-    assert '"operation": "add"' in prompt
