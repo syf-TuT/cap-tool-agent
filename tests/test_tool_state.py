@@ -59,6 +59,16 @@ def test_state_resolves_common_model_ref_aliases():
     assert resolved["string_ref"] is joints
 
 
+def test_state_resolves_plain_dotted_ref_strings():
+    state = ToolState()
+    rgb = np.zeros((2, 2, 3), dtype=np.uint8)
+    state.put("get_observation", {"robot0_robotview": {"images": {"rgb": rgb}}})
+
+    resolved = state.resolve_refs("get_observation.0.robot0_robotview.images.rgb")
+
+    assert resolved is rgb
+
+
 def test_state_resolves_first_output_when_model_uses_one_based_index():
     state = ToolState()
     first = np.array([1, 2, 3])

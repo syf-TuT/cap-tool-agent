@@ -53,6 +53,10 @@ class ToolState:
             resolved_ref = self._canonical_ref(value[1:])
             if resolved_ref is not None:
                 return self._values[resolved_ref]
+        if isinstance(value, str) and "." in value:
+            resolved_ref = self._canonical_ref(value)
+            if resolved_ref is not None:
+                return self._values[resolved_ref]
         return value
 
     def _canonical_ref(self, ref: str) -> str | None:
