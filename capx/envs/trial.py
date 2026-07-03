@@ -30,7 +30,9 @@ from capx.runtime_control import (
     CapsuleExecutor,
     RuntimeAction,
     RuntimeEvent,
+    RuntimeTrace,
     build_capsule_prompt,
+    build_runtime_feedback,
     parse_runtime_action_response,
     replace_region_source,
     segment_python_code,
@@ -674,7 +676,11 @@ def _run_capsule_trial(
 
     regions = segment_python_code(source)
     region_by_id = {region.region_id: region for region in regions}
-    executor = CapsuleExecutor(base_globals=env._build_capsule_globals())
+    trace = RuntimeTrace()
+    executor = CapsuleExecutor(
+        base_globals=env._build_capsule_globals(trace=trace),
+        trace=trace,
+    )
     max_steps = int(config.get("max_capsule_steps", 12))
     script = scripted_actions if scripted_actions is not None else config.get("scripted_actions")
     script_idx = 0
@@ -685,6 +691,8 @@ def _run_capsule_trial(
 
     for step_id in range(1, max_steps + 1):
         action: RuntimeAction | None = None
+        before_state = _capsule_state_snapshot(env)
+        region_for_feedback = None
         prompt = build_capsule_prompt(
             task=_task_text_from_obs(obs),
             regions=regions,
@@ -713,23 +721,47 @@ def _run_capsule_trial(
             )
             failed = True
         else:
+            region_id = str(action.args.get("region_id", ""))
+            region_for_feedback = region_by_id.get(region_id)
             event = _execute_runtime_action(action, executor, source, region_by_id)
             if event.status in {"failed", "invalid"}:
                 failed = True
-            if action.action == "patch_region" and event.status == "success":
-                source = str(event.evidence["source"])
-                regions = segment_python_code(source)
-                region_by_id = {region.region_id: region for region in regions}
             if action.action == "run_region":
                 executed_regions += 1
+
+        after_state = _capsule_state_snapshot(env)
+        trace_events = event.evidence.get("trace_events", [])
+        feedback_action = action if action is not None else RuntimeAction(action="invalid", args={})
+        feedback = build_runtime_feedback(
+            step_id=step_id,
+            action=feedback_action,
+            event=event,
+            region=region_for_feedback,
+            trace_events=trace_events,
+            before_state=before_state,
+            after_state=after_state,
+        )
 
         history.append(
             {
                 "step_id": step_id,
                 "action": action.to_dict() if action is not None else {"action": "invalid"},
                 "event": event.to_dict(),
+                "feedback": feedback.to_dict(),
+                "trace_events": trace_events,
+                "state_before": before_state,
+                "state_after": after_state,
             }
         )
+
+        if (
+            action is not None
+            and action.action == "patch_region"
+            and event.status == "success"
+        ):
+            source = str(event.evidence["source"])
+            regions = segment_python_code(source)
+            region_by_id = {region.region_id: region for region in regions}
 
         if event.action == "finish" or (action.action == "finish" if action is not None else False):
             break
@@ -851,6 +883,10 @@ def _safe_compute_reward(env: CodeExecutionEnvBase) -> float:
         return float(env.compute_reward())
     except Exception:
         return 0.0
+
+
+def _capsule_state_snapshot(env: CodeExecutionEnvBase) -> dict[str, Any]:
+    return {"reward": _safe_compute_reward(env), "task_completed": _safe_task_completed(env)}
 
 
 def _safe_task_completed(env: CodeExecutionEnvBase) -> bool | None:
