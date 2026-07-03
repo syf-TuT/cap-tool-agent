@@ -50,6 +50,22 @@ def test_executor_stores_mapping_outputs_for_nested_ref_resolution():
     assert image_result.output_summary == (2, 2, 3)
 
 
+def test_executor_coerces_list_arguments_for_ndarray_parameters():
+    registry = ToolRegistry()
+
+    def read_matrix_entry(matrix: np.ndarray) -> int:
+        return int(matrix[0, 1])
+
+    registry.register(ToolSpec(name="read_matrix_entry"), read_matrix_entry)
+
+    result = ToolExecutor(registry, ToolState()).run(
+        ToolCall(tool="read_matrix_entry", args={"matrix": [[1, 2], [3, 4]]})
+    )
+
+    assert result.status == "success"
+    assert result.output_summary == 2
+
+
 def test_executor_rejects_unknown_tool():
     result = ToolExecutor(ToolRegistry(), ToolState()).run(ToolCall(tool="missing"))
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import time
 from collections.abc import Mapping
 from typing import Any
+
+import numpy as np
 
 from capx.tools.registry import ToolRegistry
 from capx.tools.schema import ToolCall, ToolResult
@@ -31,7 +34,7 @@ class ToolExecutor:
         stderr = io.StringIO()
         start = time.perf_counter()
         try:
-            args = self.state.resolve_refs(tool_call.args)
+            args = self._coerce_args(fn, self.state.resolve_refs(tool_call.args))
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 output = fn(**args)
         except BaseException as exc:
@@ -59,3 +62,24 @@ class ToolExecutor:
             ref = self.state.put(tool, output)
             return ref, self.state.summary()[ref]
         return None, output
+
+    def _coerce_args(self, fn: Any, args: dict[str, Any]) -> dict[str, Any]:
+        signature = inspect.signature(fn)
+        coerced = dict(args)
+        for name, value in args.items():
+            param = signature.parameters.get(name)
+            if param is None:
+                continue
+            if self._is_ndarray_annotation(param.annotation) and isinstance(value, (list, tuple)):
+                coerced[name] = np.asarray(value)
+        return coerced
+
+    def _is_ndarray_annotation(self, annotation: Any) -> bool:
+        if annotation is inspect.Parameter.empty:
+            return False
+        if annotation is np.ndarray:
+            return True
+        name = getattr(annotation, "__name__", None)
+        if name == "ndarray":
+            return True
+        return str(annotation) in {"numpy.ndarray", "np.ndarray", "ndarray"}
