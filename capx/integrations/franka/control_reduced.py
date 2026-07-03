@@ -665,3 +665,45 @@ class FrankaControlApiReduced(ApiBase):
             self.ik_solve_fn, quat_wxyz_arm1, offset_pos, self.cfg
         )
         return extract_arm_joints(self.cfg)
+
+
+class FrankaStateControlApi(FrankaControlApiReduced):
+    """State-first Franka tools that avoid vision and grasp model initialization."""
+
+    def __init__(
+        self,
+        env: BaseEnv,
+        tcp_offset: list[float] | None = [0.0, 0.0, -0.107],
+        real: bool = False,
+    ) -> None:
+        ApiBase.__init__(self, env)
+        self._TCP_OFFSET = np.array(tcp_offset, dtype=np.float64)
+        self.ik_solve_fn = init_pyroki()
+        self.cfg = None
+        self.real = real
+        self.use_sam3 = False
+        self.is_spill_wipe = False
+        self.is_peg_assembly = False
+        self.is_handover = False
+        self.bimanual = False
+
+    def functions(self) -> dict[str, Any]:
+        return {
+            "get_observation": self.get_observation,
+            "solve_ik": self.solve_ik,
+            "move_to_joints": self.move_to_joints,
+            "open_gripper": self.open_gripper,
+            "close_gripper": self.close_gripper,
+        }
+
+    def get_observation(self) -> dict[str, Any]:
+        """Get the simulator observation, including true state keys when available.
+
+        Returns:
+            observation:
+                A dictionary containing camera data, robot state, and task state
+                values exposed by the simulator. Cube-stack observations include
+                true object pose keys such as ``cubeA_pos``, ``cubeA_quat``,
+                ``cubeB_pos``, and ``cubeB_quat``.
+        """
+        return super().get_observation()

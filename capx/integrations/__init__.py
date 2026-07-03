@@ -1,7 +1,7 @@
 from .base_api import list_apis, register_api
 from .franka.control import FrankaControlApi
 from .franka.control_privileged import FrankaControlPrivilegedApi
-from .franka.control_reduced import FrankaControlApiReduced
+from .franka.control_reduced import FrankaControlApiReduced, FrankaStateControlApi
 from .franka.control_reduced_skill_library import FrankaControlApiReducedSkillLibrary
 from .franka.control_reduced_exampleless import FrankaControlApiReducedExampleless
 from .franka.nut_assembly_privileged import FrankaControlNutAssemblyPrivilegedApi
@@ -27,6 +27,7 @@ except ImportError:
 register_api("FrankaControlPrivilegedApi", FrankaControlPrivilegedApi)
 register_api("FrankaControlApi", lambda env: FrankaControlApi(env, use_sam3=True))
 register_api("FrankaControlApiReduced", FrankaControlApiReduced)
+register_api("FrankaStateControlApi", FrankaStateControlApi)
 register_api(
     "FrankaControlApiReducedBimanual", lambda env: FrankaControlApiReduced(env, bimanual=True)
 )
