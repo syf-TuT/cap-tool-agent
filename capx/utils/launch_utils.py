@@ -158,6 +158,13 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         else configs_dict.get("web_ui_port", 8200),
         "save_multiturn_prompts": configs_dict.get("save_multiturn_prompts", False),
         "agent_mode": configs_dict.get("agent_mode", "code"),
+        "max_capsule_steps": configs_dict.get("max_capsule_steps", 12),
+        "checkpoint_policy": configs_dict.get("checkpoint_policy", "region"),
+        "rollback_policy": configs_dict.get("rollback_policy", "best_effort"),
+        "capsule_feedback_level": configs_dict.get(
+            "capsule_feedback_level", "source_region_repair_hint"
+        ),
+        "scripted_actions": configs_dict.get("scripted_actions", None),
     }
 
     return env_factory, merged_config, api_servers

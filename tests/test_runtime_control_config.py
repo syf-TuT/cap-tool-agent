@@ -1,0 +1,47 @@
+from pathlib import Path
+from types import SimpleNamespace
+
+import yaml
+
+from capx.utils.launch_utils import _load_config
+
+
+def test_capsule_yaml_uses_code_primitives_not_robot_tools():
+    data = yaml.safe_load(
+        Path("env_configs/cube_stack/franka_robosuite_cube_stack_capsule_vdm.yaml").read_text()
+    )
+
+    assert data["agent_mode"] == "capsule"
+    assert data["max_capsule_steps"] > 0
+    assert "Write Python code" in data["env"]["cfg"]["prompt"]
+    assert "selecting one JSON tool call" not in data["env"]["cfg"]["prompt"]
+
+
+def test_load_config_reads_capsule_fields():
+    args = SimpleNamespace(
+        config_path="env_configs/cube_stack/franka_robosuite_cube_stack_capsule_vdm.yaml",
+        total_trials=None,
+        num_workers=None,
+        record_video=None,
+        output_dir=None,
+        use_oracle_code=None,
+        use_visual_feedback=None,
+        use_img_differencing=None,
+        use_video_differencing=None,
+        use_wrist_camera=None,
+        use_parallel_ensemble=None,
+        use_multimodel=None,
+        web_ui=None,
+        web_ui_port=None,
+        server_url="http://127.0.0.1:8110/chat/completions",
+        visual_differencing_model="google/gemini-3.1-pro-preview",
+        visual_differencing_model_server_url="http://127.0.0.1:8110/chat/completions",
+        visual_differencing_model_api_key=None,
+    )
+
+    _, config, _ = _load_config(args)
+
+    assert config["agent_mode"] == "capsule"
+    assert config["max_capsule_steps"] == 12
+    assert config["checkpoint_policy"] == "region"
+    assert config["rollback_policy"] == "best_effort"
