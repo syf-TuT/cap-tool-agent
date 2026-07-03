@@ -26,6 +26,15 @@ from PIL import Image
 
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
+from capx.runtime_control import (
+    CapsuleExecutor,
+    RuntimeAction,
+    RuntimeEvent,
+    build_capsule_prompt,
+    parse_runtime_action_response,
+    replace_region_source,
+    segment_python_code,
+)
 
 from capx.llm.client import (
     VLM_MODELS,
@@ -638,6 +647,229 @@ def _task_text_from_obs(obs: dict[str, Any]) -> str:
     return str(content)
 
 
+def _run_capsule_trial(
+    env: CodeExecutionEnvBase,
+    trial: int,
+    args: LaunchArgs,
+    config: dict[str, Any],
+    *,
+    initial_code: str | None = None,
+    scripted_actions: list[dict[str, Any]] | None = None,
+) -> TrialSummary:
+    obs, _ = env.reset(options={"trial": trial}, seed=trial)
+    output_dir = config.get("output_dir")
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    raw_code: str
+    if initial_code is not None:
+        raw_code = initial_code
+        source = initial_code
+    elif config.get("use_oracle_code", False):
+        raw_code = env.oracle_code
+        source = env.oracle_code
+    else:
+        raw_code, _, _ = _query_initial_code(args, config, obs)
+        source = "\n\n".join(_extract_code(raw_code))
+
+    regions = segment_python_code(source)
+    region_by_id = {region.region_id: region for region in regions}
+    executor = CapsuleExecutor(base_globals=env._build_capsule_globals())
+    max_steps = int(config.get("max_capsule_steps", 12))
+    script = scripted_actions if scripted_actions is not None else config.get("scripted_actions")
+    script_idx = 0
+    history: list[dict[str, Any]] = []
+    prompts: list[list[dict[str, Any]]] = []
+    failed = False
+    executed_regions = 0
+
+    for step_id in range(1, max_steps + 1):
+        action: RuntimeAction | None = None
+        prompt = build_capsule_prompt(
+            task=_task_text_from_obs(obs),
+            regions=regions,
+            history=history,
+            trace_summary=executor.trace.summary() if executor.trace is not None else {},
+        )
+        prompts.append(prompt)
+
+        try:
+            if script is not None:
+                if script_idx >= len(script):
+                    action = RuntimeAction(action="finish", args={})
+                else:
+                    action = RuntimeAction.from_mapping(script[script_idx])
+                    script_idx += 1
+            else:
+                response = _query_model(args, prompt)
+                action = parse_runtime_action_response(response["content"])
+            action.step_id = step_id
+        except ValueError as exc:
+            event = RuntimeEvent(
+                action="invalid",
+                status="invalid",
+                message=str(exc),
+                evidence={"exception_type": type(exc).__name__},
+            )
+            failed = True
+        else:
+            event = _execute_runtime_action(action, executor, source, region_by_id)
+            if event.status in {"failed", "invalid"}:
+                failed = True
+            if action.action == "patch_region" and event.status == "success":
+                source = str(event.evidence["source"])
+                regions = segment_python_code(source)
+                region_by_id = {region.region_id: region for region in regions}
+            if action.action == "run_region":
+                executed_regions += 1
+
+        history.append(
+            {
+                "step_id": step_id,
+                "action": action.to_dict() if action is not None else {"action": "invalid"},
+                "event": event.to_dict(),
+            }
+        )
+
+        if event.action == "finish" or (action.action == "finish" if action is not None else False):
+            break
+
+    reward = _safe_compute_reward(env)
+    task_completed = _safe_task_completed(env)
+    sandbox_rc = 1 if failed else 0
+    code_path = None
+    if output_dir:
+        code_path = os.path.join(output_dir, f"capsule_code_trial_{trial:02d}.py")
+        with open(code_path, "w") as f:
+            f.write(source)
+        with open(os.path.join(output_dir, f"capsule_trace_trial_{trial:02d}.json"), "w") as f:
+            json.dump(history, f, indent=2, default=str)
+        with open(os.path.join(output_dir, f"capsule_prompts_trial_{trial:02d}.json"), "w") as f:
+            json.dump(prompts, f, indent=2, default=str)
+
+    log = (
+        f"Capsule actions: {len(history)}\n"
+        f"Executed regions: {executed_regions}\n"
+        f"Reward: {reward}\n"
+        f"Task Completed: {task_completed}"
+    )
+    return TrialSummary(
+        trial=trial,
+        success=sandbox_rc == 0,
+        reward=reward,
+        terminated=bool(task_completed) or reward == 1.0,
+        truncated=False,
+        sandbox_rc=sandbox_rc,
+        log=log,
+        task_completed=task_completed,
+        code_path=code_path,
+        num_regenerations=0,
+        num_finishes=1 if sandbox_rc == 0 else 0,
+        num_code_blocks=executed_regions,
+    )
+
+
+def _execute_runtime_action(
+    action: RuntimeAction,
+    executor: CapsuleExecutor,
+    source: str,
+    region_by_id: dict[str, Any],
+) -> RuntimeEvent:
+    if action.action == "finish":
+        return RuntimeEvent(action="finish", status="success")
+
+    if action.action == "run_region":
+        region_id = str(action.args.get("region_id", ""))
+        region = region_by_id.get(region_id)
+        if region is None:
+            return RuntimeEvent(
+                action=action.action,
+                status="invalid",
+                region_id=region_id,
+                message=f"Unknown region: {region_id}",
+            )
+        return executor.run_region(region)
+
+    if action.action == "inspect_trace":
+        return RuntimeEvent(
+            action=action.action,
+            status="success",
+            evidence=executor.trace.summary() if executor.trace is not None else {"events": []},
+        )
+
+    if action.action == "inspect_variables":
+        names = action.args.get("names", [])
+        evidence = {
+            str(name): _summarize_runtime_value(executor.globals.get(str(name)))
+            for name in names
+        }
+        return RuntimeEvent(action=action.action, status="success", evidence=evidence)
+
+    if action.action == "patch_region":
+        region_id = str(action.args.get("region_id", ""))
+        replacement = action.args.get("source")
+        region = region_by_id.get(region_id)
+        if region is None or not isinstance(replacement, str):
+            return RuntimeEvent(
+                action=action.action,
+                status="invalid",
+                region_id=region_id,
+                message="patch_region requires a valid region_id and source string",
+            )
+        patched = replace_region_source(source, region, replacement)
+        return RuntimeEvent(
+            action=action.action,
+            status="success",
+            region_id=region_id,
+            evidence={"source": patched},
+        )
+
+    if action.action == "rollback_to_checkpoint":
+        return RuntimeEvent(
+            action=action.action,
+            status="skipped",
+            message="Simulator checkpoint rollback is not enabled in the MVP capsule loop.",
+        )
+
+    if action.action == "resume_from_region":
+        region_id = str(action.args.get("region_id", ""))
+        region = region_by_id.get(region_id)
+        if region is None:
+            return RuntimeEvent(
+                action=action.action,
+                status="invalid",
+                region_id=region_id,
+                message=f"Unknown region: {region_id}",
+            )
+        return executor.run_region(region)
+
+    return RuntimeEvent(action=action.action, status="invalid", message="Unsupported runtime action")
+
+
+def _safe_compute_reward(env: CodeExecutionEnvBase) -> float:
+    try:
+        return float(env.compute_reward())
+    except Exception:
+        return 0.0
+
+
+def _safe_task_completed(env: CodeExecutionEnvBase) -> bool | None:
+    low_level_env = getattr(env, "low_level_env", None)
+    if low_level_env is not None and hasattr(low_level_env, "task_completed"):
+        try:
+            return bool(low_level_env.task_completed())
+        except Exception:
+            return None
+    return None
+
+
+def _summarize_runtime_value(value: Any) -> dict[str, Any]:
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return {"type": type(value).__name__, "shape": list(shape)}
+    return {"type": type(value).__name__, "repr": repr(value)[:200]}
+
+
 def _run_single_trial(
     env: CodeExecutionEnvBase,
     trial: int,
@@ -655,6 +887,9 @@ def _run_single_trial(
         4. Execute code blocks one-by-one, with optional multi-turn regeneration.
         5. Save artifacts (code, logs, per-turn videos, combined video) and return a TrialSummary.
     """
+    if config.get("agent_mode", "code") == "capsule":
+        return _run_capsule_trial(env, trial, args, config)
+
     trial_start_time = time.time()
 
     use_video_diff = config.get("use_video_differencing", False)
