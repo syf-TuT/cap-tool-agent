@@ -25,6 +25,22 @@ def test_state_resolves_nested_refs():
     assert resolved["scale"] == 2
 
 
+def test_state_applies_add_operation_to_ref_value():
+    state = ToolState()
+    cube_pos = np.array([0.1, 0.2, 0.3])
+    state.put("get_observation", {"cubeA_pos": cube_pos})
+
+    resolved = state.resolve_refs(
+        {
+            "state_ref": "get_observation.0.cubeA_pos",
+            "operation": "add",
+            "value": [0, 0, 0.1],
+        }
+    )
+
+    np.testing.assert_allclose(resolved, np.array([0.1, 0.2, 0.4]))
+
+
 def test_state_resolves_common_model_ref_aliases():
     state = ToolState()
     joints = np.array([1, 2, 3])

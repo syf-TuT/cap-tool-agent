@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from collections import defaultdict
 from typing import Any
 
+import numpy as np
+
 
 class ToolState:
     def __init__(self) -> None:
@@ -38,6 +40,12 @@ class ToolState:
                 return self.get(str(value["state_ref"]))
             if set(value) == {"$ref"}:
                 return self.get(str(value["$ref"]))
+            if "operation" in value and ("state_ref" in value or "$ref" in value):
+                ref_key = "state_ref" if "state_ref" in value else "$ref"
+                base = self.get(str(value[ref_key]))
+                operation = str(value["operation"])
+                operand = self.resolve_refs(value.get("value"))
+                return self._apply_operation(base, operation, operand)
             return {k: self.resolve_refs(v) for k, v in value.items()}
         if isinstance(value, list):
             return [self.resolve_refs(v) for v in value]
@@ -108,3 +116,18 @@ class ToolState:
         if isinstance(value, Mapping):
             return {"type": "dict", "keys": [str(key) for key in value.keys()]}
         return {"type": type(value).__name__, "repr": repr(value)[:200]}
+
+    def _apply_operation(self, base: Any, operation: str, operand: Any) -> Any:
+        base_array = np.asarray(base)
+        operand_array = np.asarray(operand)
+
+        if operation == "add":
+            return base_array + operand_array
+        if operation == "subtract":
+            return base_array - operand_array
+        if operation == "multiply":
+            return base_array * operand_array
+        if operation == "divide":
+            return base_array / operand_array
+
+        raise ValueError(f"Unsupported state ref operation: {operation}")
