@@ -6,13 +6,20 @@
 
 **Architecture:** Add a `capx.tools` package for schemas, registry, state refs, execution, verification, prompts, and planning. Extend `CodeExecutionEnvBase` with a tool-facing interface that reuses existing `ApiBase.functions()` callables. Route `agent_mode: tool` configs through a new `_run_tool_trial()` loop in `capx/envs/trial.py`.
 
-**Tech Stack:** Python dataclasses, `inspect`, `json`, `numpy`, existing CaP-X `ApiBase`, `CodeExecutionEnvBase`, pytest. Run all Python tests and Robosuite smoke commands from the prepared WSL project copy, not from the Windows checkout.
+**Tech Stack:** Python dataclasses, `inspect`, `json`, `numpy`, existing CaP-X `ApiBase`, `CodeExecutionEnvBase`, pytest. Local verification is code-level only: unit tests, imports, YAML parsing, and Ruff. Do not start model servers, API servers, Robosuite simulators, Vite servers, or any long-running services on the local machine.
 
 ---
 
 ## Working Rules
 
 Use the Windows checkout only for editing. Before running tests in WSL, sync touched files into `/home/capx/code/cap-x`.
+
+Local verification policy:
+
+- Allowed locally: focused pytest tests that use fakes/mocks, import checks, config parsing checks, and Ruff.
+- Forbidden locally: `capx/envs/launch.py`, Robosuite rollouts, model-server calls, VDM calls, SAM/GraspNet/Pyroki API server startup, frontend dev servers, dependency installs, and `uv sync`.
+- Keep simulator/service smoke checks as optional remote or high-capacity-environment checks only.
+- If a task would require a real simulator or service to verify behavior, stop at code-level verification and record the skipped runtime check explicitly.
 
 Suggested sync pattern for each task:
 
@@ -1533,54 +1540,86 @@ Skip this commit if there were no changes after Task 13.
 
 ---
 
-### Task 15: Robosuite Smoke Verification
+### Task 15: Local Code-Level Verification Only
 
 **Files:**
-- No source changes expected unless smoke reveals a bug.
+- No source changes expected unless code-level verification reveals a bug.
 
-**Step 1: Run existing oracle smoke test to confirm no regression**
+**Step 1: Confirm no local service or simulator command is required**
+
+Do not run:
+
+- `capx/envs/launch.py`
+- Any config with `api_servers` through the launcher
+- Robosuite rollouts
+- Model, SAM, GraspNet, Pyroki, VDM, or frontend servers
+
+The YAML files may still contain `api_servers` for future runtime experiments; local
+verification must only parse them.
+
+**Step 2: Run focused unit tests**
 
 Run:
+
+```powershell
+wsl.exe -d Ubuntu-22.04 -- bash --noprofile --norc -lc 'export PATH=/home/capx/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; cd /home/capx/code/cap-x; uv run --no-sync pytest tests/test_tool_schema.py tests/test_tool_state.py tests/test_tool_registry.py tests/test_tool_executor.py tests/test_tool_verifiers.py tests/test_tool_prompts.py tests/test_tool_planner.py tests/test_tool_env_interface.py tests/test_tool_trial_loop.py tests/test_tool_config_loading.py tests/test_franka_tool_metadata.py tests/test_tool_yaml_configs.py tests/test_tool_artifacts.py -q'
+```
+
+Expected: all PASS.
+
+**Step 3: Run Ruff on touched Python files**
+
+Run:
+
+```powershell
+wsl.exe -d Ubuntu-22.04 -- bash --noprofile --norc -lc 'export PATH=/home/capx/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; cd /home/capx/code/cap-x; uv run --no-sync ruff check capx/tools capx/envs/tasks/base.py capx/envs/trial.py capx/utils/launch_utils.py'
+```
+
+Expected: PASS.
+
+**Step 4: Run import and config parsing smoke without instantiating environments**
+
+This command must not call `instantiate`, `launch.py`, or any API server startup.
+
+Run:
+
+```powershell
+wsl.exe -d Ubuntu-22.04 -- bash --noprofile --norc -lc 'export PATH=/home/capx/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; cd /home/capx/code/cap-x; uv run --no-sync python - <<'"'"'PY'"'"'\nfrom capx.envs.configs.loader import DictLoader\nfrom capx.tools import ToolCall, ToolSpec, ToolState\npaths = [\n    "env_configs/cube_stack/franka_robosuite_cube_stack_tool_vdm.yaml",\n    "env_configs/cube_lifting/franka_robosuite_cube_lifting_tool_vdm.yaml",\n    "env_configs/cube_restack/franka_robosuite_cube_restack_tool_vdm.yaml",\n]\nfor path in paths:\n    cfg = DictLoader.load(path)\n    assert cfg["agent_mode"] == "tool", path\n    assert cfg["max_tool_steps"] > 0, path\nassert ToolCall(tool="finish").tool == "finish"\nassert ToolSpec(name="get_observation").name == "get_observation"\nstate = ToolState()\nref = state.put("value", 1, summary={"value": 1})\nassert state.get(ref) == 1\nprint("code-level smoke ok")\nPY'
+```
+
+Expected: `code-level smoke ok`.
+
+**Step 5: Record skipped runtime checks**
+
+In the final implementation summary, explicitly state that the following were not run
+locally because they require services or simulator resources:
+
+- Existing Robosuite oracle rollout.
+- LLM-backed tool-mode rollout.
+- VDM/image/video differencing.
+- SAM/GraspNet/Pyroki server-backed tools.
+
+**Step 6: Commit bug fixes if needed**
+
+```bash
+git add <fixed files>
+git commit -m "Fix tool-mode code-level verification issues"
+```
+
+Skip if no changes were needed.
+
+### Optional Remote/High-Capacity Runtime Checks
+
+Do not run these on the local machine. Use only on a machine with the required
+Robosuite, GPU, model server, and API server resources.
 
 ```powershell
 wsl.exe -d Ubuntu-22.04 -- bash --noprofile --norc -lc 'export PATH=/home/capx/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; cd /home/capx/code/cap-x; export MUJOCO_GL=egl; uv run --no-sync capx/envs/launch.py --config-path env_configs/cube_stack/franka_robosuite_cube_stack_privileged.yaml --use-oracle-code True --total-trials 1 --num-workers 1 --record-video False'
 ```
 
-Expected: success rate `1.000/1.000/1`, reward `1.0`, task completed `True`.
-
-**Step 2: Run tool-mode import/config smoke**
-
-Run:
-
-```powershell
-wsl.exe -d Ubuntu-22.04 -- bash --noprofile --norc -lc 'export PATH=/home/capx/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; cd /home/capx/code/cap-x; uv run --no-sync python - <<'"'"'PY'"'"'\nfrom types import SimpleNamespace\nfrom capx.utils.launch_utils import _load_config\nargs = SimpleNamespace(config_path="env_configs/cube_stack/franka_robosuite_cube_stack_tool_vdm.yaml", total_trials=1, num_workers=1, record_video=False, output_dir=None, use_oracle_code=None, use_visual_feedback=None, use_img_differencing=None, use_video_differencing=None, use_wrist_camera=None, use_parallel_ensemble=None, use_multimodel=None, web_ui=False, web_ui_port=None, server_url="http://127.0.0.1:8110/chat/completions", visual_differencing_model="google/gemini-3.1-pro-preview", visual_differencing_model_server_url="http://127.0.0.1:8110/chat/completions", visual_differencing_model_api_key=None)\n_, config, _ = _load_config(args)\nassert config["agent_mode"] == "tool"\nassert config["max_tool_steps"] > 0\nprint("tool config ok")\nPY'
-```
-
-Expected: `tool config ok`.
-
-**Step 3: Optional LLM-backed tool-mode trial**
-
-Only run this when the model server and required API servers are available.
-
-Run:
-
 ```powershell
 wsl.exe -d Ubuntu-22.04 -- bash --noprofile --norc -lc 'export PATH=/home/capx/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; cd /home/capx/code/cap-x; export MUJOCO_GL=egl; uv run --no-sync capx/envs/launch.py --config-path env_configs/cube_stack/franka_robosuite_cube_stack_tool_vdm.yaml --total-trials 1 --num-workers 1 --record-video False'
 ```
-
-Expected for first pass: trial starts, emits `tool_trace_trial_01.json`, and executes
-tool calls without Python-code execution. Task success is desirable but not required
-for merging the framework; success-rate optimization belongs to follow-up prompt and
-verifier tuning.
-
-**Step 4: Commit bug fixes if needed**
-
-```bash
-git add <fixed files>
-git commit -m "Fix tool-mode smoke issues"
-```
-
-Skip if no changes were needed.
 
 ---
 
@@ -1594,6 +1633,8 @@ Before marking implementation complete:
 - Exceptions in tools become `ToolResult(status="failed")`.
 - Large arrays use state refs instead of prompt serialization.
 - `tool_trace_trial_XX.json` records call, result, feedback, and state snapshots.
-- Focused pytest suite passes in WSL.
-- Existing Robosuite oracle smoke still passes in WSL.
-
+- Focused pytest suite passes in WSL without service or simulator startup.
+- Ruff passes on touched Python files.
+- Import and YAML parsing smoke passes without instantiating environments.
+- Runtime rollouts are explicitly skipped locally unless a remote/high-capacity
+  environment is provided.
