@@ -13,6 +13,11 @@ from capx.envs.base import BaseEnv, ObsType, get_env
 from capx.envs.configs.instantiate import instantiate as cfg_instantiate
 from capx.envs.configs.loader import DictLoader
 from capx.integrations.base_api import ApiBase, get_api
+from capx.tools.executor import ToolExecutor
+from capx.tools.franka_metadata import FRANKA_TOOL_METADATA
+from capx.tools.registry import build_registry_from_apis
+from capx.tools.schema import ToolCall, ToolResult, ToolSpec
+from capx.tools.state import ToolState
 
 
 class Tee(io.TextIOBase):
@@ -96,6 +101,12 @@ class CodeExecutionEnvBase(Env):
         )  # type: ignore[assignment]
         # Create APIs once; maximize sharing inside a worker via lru_cache in get_api
         self._apis: dict[str, ApiBase] = {n: get_api(n)(self.low_level_env) for n in cfg.apis}
+        self._tool_state = ToolState()
+        self._tool_registry = build_registry_from_apis(
+            self._apis,
+            metadata=FRANKA_TOOL_METADATA,
+        )
+        self._tool_executor = ToolExecutor(self._tool_registry, self._tool_state)
         # for api in self._apis.values():
         #     api.set_env(self.low_level_env)
         self._executor = SimpleExecutor(self.low_level_env, self._apis)
@@ -204,6 +215,10 @@ class CodeExecutionEnvBase(Env):
                 g[fn_name] = fn
         self._exec_globals = g
 
+    def _init_tool_runtime(self) -> None:
+        self._tool_state = ToolState()
+        self._tool_executor = ToolExecutor(self._tool_registry, self._tool_state)
+
     def _build_low_level(
         self, src: Env | str, privileged: bool = False, enable_render: bool = True, viser_debug: bool = False
     ) -> BaseEnv:
@@ -256,9 +271,33 @@ class CodeExecutionEnvBase(Env):
         obs.update(self._get_observation())
         # Reinitialize globals for a fresh episode and prime INPUTS with the reset observation
         self._init_exec_globals()
+        self._init_tool_runtime()
         self._exec_globals["INPUTS"] = obs
         info.update({"task_prompt": self._task_prompt})
         return obs, info
+
+    def tool_specs(self) -> list[ToolSpec]:
+        return self._tool_registry.specs()
+
+    def call_tool(self, tool_call: ToolCall) -> ToolResult:
+        return self._tool_executor.run(tool_call)
+
+    def tool_state_summary(self) -> dict[str, Any]:
+        return self._tool_state.summary()
+
+    def snapshot_state(self) -> dict[str, Any]:
+        reward = float(self.compute_reward())
+        if hasattr(self.low_level_env, "task_completed"):
+            task_completed = self.low_level_env.task_completed()
+        else:
+            task_completed = None
+        observation = self.low_level_env.get_observation()
+        return {
+            "reward": reward,
+            "task_completed": task_completed,
+            "step_count": self._step_count,
+            "observation_keys": list(observation.keys()),
+        }
 
     def step(self, action: str) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
         """

@@ -26,6 +26,10 @@ from PIL import Image
 
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
+from capx.tools.planner import LlmToolPlanner, ScriptedToolPlanner
+from capx.tools.prompts import build_tool_planner_prompt
+from capx.tools.schema import ToolResult
+from capx.tools.verifiers import StepVerifier
 
 from capx.llm.client import (
     VLM_MODELS,
@@ -626,6 +630,131 @@ def _handle_multi_turn_step(
 # Core single-trial execution
 # ---------------------------------------------------------------------------
 
+def _task_text_from_obs(obs: dict[str, Any]) -> str:
+    try:
+        content = obs["full_prompt"][-1]["content"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+    return str(content)
+
+
+def _run_tool_trial(
+    env: CodeExecutionEnvBase,
+    trial: int,
+    args: LaunchArgs,
+    config: dict[str, Any],
+    *,
+    scripted_tool_calls: list[dict[str, Any]] | None = None,
+) -> TrialSummary:
+    obs, _ = env.reset(options={"trial": trial}, seed=trial)
+    max_steps = int(config.get("max_tool_steps", 20))
+    tool_specs = env.tool_specs()
+    tool_names = {spec.name for spec in tool_specs}
+    verifier = StepVerifier()
+
+    script = scripted_tool_calls if scripted_tool_calls is not None else config.get("scripted_tool_calls")
+    planner = (
+        ScriptedToolPlanner(script)
+        if script is not None
+        else LlmToolPlanner(query_model=_query_model, args=args)
+    )
+
+    history: list[dict[str, Any]] = []
+    prompts: list[list[dict[str, Any]]] = []
+    invalid_or_failed = False
+    final_snapshot = env.snapshot_state()
+
+    for step_id in range(1, max_steps + 1):
+        prompt = build_tool_planner_prompt(
+            task=_task_text_from_obs(obs),
+            tool_specs=tool_specs,
+            state_summary=env.tool_state_summary(),
+            history=history,
+        )
+        prompts.append(prompt)
+        if isinstance(planner, ScriptedToolPlanner):
+            tool_call = planner.next_call(history, env.tool_state_summary())
+        else:
+            tool_call = planner.next_call(prompt=prompt)
+        tool_call.step_id = step_id
+
+        before = env.snapshot_state()
+        if tool_call.tool == "finish" and tool_call.tool not in tool_names:
+            result = ToolResult(tool="finish", status="success")
+        else:
+            result = env.call_tool(tool_call)
+        after = env.snapshot_state()
+        final_snapshot = after
+
+        feedback = verifier.verify(
+            step_id=step_id,
+            tool_call=tool_call,
+            result=result,
+            before=before,
+            after=after,
+        )
+        if feedback.status in {"failed", "invalid"}:
+            invalid_or_failed = True
+
+        history.append({
+            "step_id": step_id,
+            "call": tool_call.to_dict(),
+            "result": result.to_dict(),
+            "feedback": feedback.to_dict(),
+            "state_before": before,
+            "state_after": after,
+        })
+
+        if tool_call.tool == "finish" or after.get("task_completed") or after.get("reward") == 1.0:
+            break
+
+    if config.get("output_dir"):
+        os.makedirs(config["output_dir"], exist_ok=True)
+        with open(os.path.join(config["output_dir"], f"tool_trace_trial_{trial:02d}.json"), "w") as f:
+            json.dump(history, f, indent=2, default=str)
+        with open(os.path.join(config["output_dir"], f"tool_prompts_trial_{trial:02d}.json"), "w") as f:
+            json.dump(prompts, f, indent=2, default=str)
+
+    reward = float(final_snapshot.get("reward", 0.0))
+    task_completed = final_snapshot.get("task_completed")
+    success = bool(task_completed) or reward == 1.0
+    first_failure_step = next(
+        (
+            entry["step_id"]
+            for entry in history
+            if entry["feedback"]["status"] in {"failed", "invalid", "warning"}
+        ),
+        None,
+    )
+    feedback_latency = 0 if first_failure_step is not None else None
+    log = (
+        f"Tool calls: {len(history)}\n"
+        f"Invalid or failed: {int(invalid_or_failed)}\n"
+        f"First failure step: {first_failure_step}\n"
+        f"Feedback latency: {feedback_latency}\n"
+        f"Reward: {reward}\n"
+        f"Task Completed: {task_completed}"
+    )
+    return TrialSummary(
+        trial=trial,
+        success=success,
+        reward=reward,
+        terminated=success,
+        truncated=False,
+        sandbox_rc=1 if invalid_or_failed else 0,
+        log=log,
+        task_completed=task_completed,
+        code_path=None,
+        num_regenerations=0,
+        num_finishes=1 if success else 0,
+        num_code_blocks=len(history),
+    )
+
+
 def _run_single_trial(
     env: CodeExecutionEnvBase,
     trial: int,
@@ -643,6 +772,9 @@ def _run_single_trial(
         4. Execute code blocks one-by-one, with optional multi-turn regeneration.
         5. Save artifacts (code, logs, per-turn videos, combined video) and return a TrialSummary.
     """
+    if config.get("agent_mode", "code") == "tool":
+        return _run_tool_trial(env, trial, args, config)
+
     trial_start_time = time.time()
 
     use_video_diff = config.get("use_video_differencing", False)

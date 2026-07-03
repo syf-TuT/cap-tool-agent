@@ -157,6 +157,10 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         if getattr(args, "web_ui_port", None) is not None
         else configs_dict.get("web_ui_port", 8200),
         "save_multiturn_prompts": configs_dict.get("save_multiturn_prompts", False),
+        "agent_mode": configs_dict.get("agent_mode", "code"),
+        "max_tool_steps": configs_dict.get("max_tool_steps", 20),
+        "tool_feedback_level": configs_dict.get("tool_feedback_level", "repair_hint"),
+        "scripted_tool_calls": configs_dict.get("scripted_tool_calls", None),
     }
 
     return env_factory, merged_config, api_servers
