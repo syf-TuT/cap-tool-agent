@@ -59,6 +59,51 @@ def test_state_resolves_first_output_when_model_uses_one_based_index():
     assert state.resolve_refs("$solve_ik.2") is second
 
 
+def test_state_indexes_nested_mapping_outputs_by_path():
+    state = ToolState()
+    rgb = np.zeros((2, 2, 3), dtype=np.uint8)
+    depth = np.ones((2, 2), dtype=np.float32)
+    observation = {
+        "robot0_robotview": {
+            "images": {
+                "rgb": rgb,
+                "depth": depth,
+            }
+        },
+        "robot0_robotview_image": rgb,
+    }
+
+    ref = state.put("get_observation", observation)
+
+    assert state.get(ref) is observation
+    assert state.get("get_observation.0.robot0_robotview.images.rgb") is rgb
+    assert state.get("robot0_robotview.images.rgb") is rgb
+    assert state.get("robot0_robotview_image") is rgb
+    assert state.resolve_refs({"state_ref": "robot0_robotview.images.rgb"}) is rgb
+
+    summary = state.summary()
+    assert "get_observation.0.robot0_robotview.images.rgb" in summary
+    assert summary["get_observation.0"]["nested_refs"]["robot0_robotview.images.rgb"] == {
+        "ref": "get_observation.0.robot0_robotview.images.rgb",
+        "type": "ndarray",
+        "shape": [2, 2, 3],
+        "dtype": "uint8",
+    }
+
+
+def test_state_updates_unversioned_nested_aliases_to_latest_mapping_output():
+    state = ToolState()
+    first_rgb = np.zeros((2, 2, 3), dtype=np.uint8)
+    second_rgb = np.ones((2, 2, 3), dtype=np.uint8)
+
+    state.put("get_observation", {"robot0_robotview": {"images": {"rgb": first_rgb}}})
+    state.put("get_observation", {"robot0_robotview": {"images": {"rgb": second_rgb}}})
+
+    assert state.get("get_observation.0.robot0_robotview.images.rgb") is first_rgb
+    assert state.get("get_observation.1.robot0_robotview.images.rgb") is second_rgb
+    assert state.get("robot0_robotview.images.rgb") is second_rgb
+
+
 def test_state_rejects_missing_ref():
     state = ToolState()
 

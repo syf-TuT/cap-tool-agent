@@ -20,6 +20,36 @@ def test_executor_calls_registered_tool_with_resolved_refs():
     assert result.output_summary == 3
 
 
+def test_executor_stores_mapping_outputs_for_nested_ref_resolution():
+    rgb = np.zeros((2, 2, 3), dtype=np.uint8)
+    state = ToolState()
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(name="get_observation"),
+        lambda: {"robot0_robotview": {"images": {"rgb": rgb}}},
+    )
+    registry.register(ToolSpec(name="use_image"), lambda image: image.shape)
+    executor = ToolExecutor(registry, state)
+
+    obs_result = executor.run(ToolCall(tool="get_observation"))
+    image_result = executor.run(
+        ToolCall(
+            tool="use_image",
+            args={"image": {"state_ref": "get_observation.0.robot0_robotview.images.rgb"}},
+        )
+    )
+
+    assert obs_result.status == "success"
+    assert obs_result.output_ref == "get_observation.0"
+    assert obs_result.output_summary["nested_refs"]["robot0_robotview.images.rgb"]["shape"] == [
+        2,
+        2,
+        3,
+    ]
+    assert image_result.status == "success"
+    assert image_result.output_summary == (2, 2, 3)
+
+
 def test_executor_rejects_unknown_tool():
     result = ToolExecutor(ToolRegistry(), ToolState()).run(ToolCall(tool="missing"))
 

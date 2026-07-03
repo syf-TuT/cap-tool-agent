@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import time
+from collections.abc import Mapping
 from typing import Any
 
 from capx.tools.registry import ToolRegistry
@@ -54,7 +55,7 @@ class ToolExecutor:
         )
 
     def _store_or_summarize(self, tool: str, output: Any) -> tuple[str | None, Any]:
-        if hasattr(output, "shape"):
+        if hasattr(output, "shape") or isinstance(output, Mapping):
             ref = self.state.put(tool, output)
             return ref, self.state.summary()[ref]
         return None, output

@@ -48,3 +48,26 @@ def test_prompt_explains_how_to_reference_prior_outputs():
 
     assert '{"state_ref": "solve_ik.0"}' in text
     assert "Use output_ref values exactly as shown" in text
+
+
+def test_prompt_explains_nested_observation_refs():
+    prompt = build_tool_planner_prompt(
+        task="segment red cube",
+        tool_specs=[ToolSpec(name="segment_sam3_text_prompt", description="Segment")],
+        state_summary={
+            "get_observation.0": {
+                "type": "dict",
+                "nested_refs": {
+                    "robot0_robotview.images.rgb": {
+                        "ref": "get_observation.0.robot0_robotview.images.rgb"
+                    }
+                },
+            }
+        },
+        history=[],
+    )
+
+    text = prompt[-1]["content"][0]["text"]
+
+    assert '{"state_ref": "get_observation.0.robot0_robotview.images.rgb"}' in text
+    assert "nested_refs" in text

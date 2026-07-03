@@ -43,6 +43,8 @@ def build_tool_planner_prompt(
         f"{json.dumps(state_summary, indent=2, default=str)}\n\n"
         "To pass a prior tool output into another tool, wrap its output_ref exactly, "
         'for example {"state_ref": "solve_ik.0"}. '
+        "For nested outputs listed under nested_refs, pass the full nested ref, "
+        'for example {"state_ref": "get_observation.0.robot0_robotview.images.rgb"}. '
         "Use output_ref values exactly as shown; do not renumber them, prefix them with $, "
         "or put them in plain strings.\n\n"
         "Recent tool history:\n"
