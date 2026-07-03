@@ -10,6 +10,7 @@ PERCEPTION_TOOLS = {
     "segment_sam3_text_prompt",
     "segment_sam3_point_prompt",
     "segment_sam2",
+    "point_prompt_molmo",
 }
 EXECUTION_TOOLS = {
     "move_to_joints",
@@ -73,6 +74,23 @@ class StepVerifier:
         summary = result.output_summary
         if not isinstance(summary, dict):
             return None
+        if tool_call.tool == "point_prompt_molmo":
+            missing_points = [
+                ref
+                for ref, nested_summary in (summary.get("nested_refs") or {}).items()
+                if isinstance(nested_summary, dict) and "None" in str(nested_summary.get("repr", ""))
+            ]
+            if missing_points:
+                return StepFeedback(
+                    step_id=step_id,
+                    tool=tool_call.tool,
+                    status="warning",
+                    failure_stage="perception",
+                    failure_type="point_not_found",
+                    evidence={"missing_points": missing_points},
+                    repair_hints=["retry point prompting with a clearer prompt or use segmentation"],
+                    recommended_next_tools=[tool_call.tool, "segment_sam3_text_prompt"],
+                )
         score = summary.get("best_score")
         area = summary.get("mask_area")
         if (score is not None and score < MIN_MASK_SCORE) or (
