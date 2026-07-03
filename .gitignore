@@ -65,6 +65,7 @@ curobo_debug/
 core.*
 wandb/
 .webui_secret_key
+.worktrees/
 
 *.jpg
 *.png
