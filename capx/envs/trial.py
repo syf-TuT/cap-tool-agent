@@ -722,9 +722,20 @@ def _run_tool_trial(
     reward = float(final_snapshot.get("reward", 0.0))
     task_completed = final_snapshot.get("task_completed")
     success = bool(task_completed) or reward == 1.0
+    first_failure_step = next(
+        (
+            entry["step_id"]
+            for entry in history
+            if entry["feedback"]["status"] in {"failed", "invalid", "warning"}
+        ),
+        None,
+    )
+    feedback_latency = 0 if first_failure_step is not None else None
     log = (
         f"Tool calls: {len(history)}\n"
         f"Invalid or failed: {int(invalid_or_failed)}\n"
+        f"First failure step: {first_failure_step}\n"
+        f"Feedback latency: {feedback_latency}\n"
         f"Reward: {reward}\n"
         f"Task Completed: {task_completed}"
     )
