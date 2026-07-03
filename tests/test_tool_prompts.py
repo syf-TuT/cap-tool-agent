@@ -31,3 +31,20 @@ def test_prompt_contains_tools_and_last_feedback():
     assert "Do not write Python code" in text
     assert "get_observation" in text
     assert "low_confidence_mask" in text
+
+
+def test_prompt_explains_how_to_reference_prior_outputs():
+    prompt = build_tool_planner_prompt(
+        task="move using prior IK",
+        tool_specs=[
+            ToolSpec(name="solve_ik", description="Solve IK"),
+            ToolSpec(name="move_to_joints", description="Move"),
+        ],
+        state_summary={"solve_ik.0": {"type": "ndarray", "shape": [7]}},
+        history=[],
+    )
+
+    text = prompt[-1]["content"][0]["text"]
+
+    assert '{"state_ref": "solve_ik.0"}' in text
+    assert "Use output_ref values exactly as shown" in text
