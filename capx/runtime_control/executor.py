@@ -24,12 +24,14 @@ class CapsuleExecutor:
         stdout = io.StringIO()
         stderr = io.StringIO()
         start = time.perf_counter()
+        trace_start = self.trace.mark() if self.trace is not None else None
         try:
             code = compile(region.source, f"<{region.region_id}>", "exec")
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 exec(code, self.globals, self.globals)
         except BaseException as exc:
             traceback.print_exc(file=stderr)
+            trace_events = self.trace.events_since(trace_start) if trace_start is not None else []
             return RuntimeEvent(
                 action="run_region",
                 status="failed",
@@ -41,12 +43,14 @@ class CapsuleExecutor:
                         "start_line": region.start_line,
                         "end_line": region.end_line,
                     },
+                    "trace_events": trace_events,
                 },
                 stdout=stdout.getvalue(),
                 stderr=stderr.getvalue(),
                 duration_s=time.perf_counter() - start,
             )
 
+        trace_events = self.trace.events_since(trace_start) if trace_start is not None else []
         return RuntimeEvent(
             action="run_region",
             status="success",
@@ -56,6 +60,7 @@ class CapsuleExecutor:
                     "start_line": region.start_line,
                     "end_line": region.end_line,
                 },
+                "trace_events": trace_events,
             },
             stdout=stdout.getvalue(),
             stderr=stderr.getvalue(),
