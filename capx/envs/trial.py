@@ -36,6 +36,7 @@ from capx.runtime_control import (
     parse_runtime_action_response,
     replace_region_source,
     segment_python_code,
+    segment_python_code_groups,
 )
 
 from capx.llm.client import (
@@ -680,8 +681,22 @@ def _run_capsule_trial(
         raw_code, _, _ = _query_initial_code(args, config, obs)
         source = "\n\n".join(_extract_code(raw_code))
 
+    max_regions_per_group = int(config.get("capsule_max_regions_per_group", 6))
+    use_semantic_groups = (
+        config.get("capsule_execution_granularity", "semantic_group") == "semantic_group"
+    )
     regions = segment_python_code(source)
+    groups = (
+        segment_python_code_groups(
+            source,
+            regions,
+            max_regions_per_group=max_regions_per_group,
+        )
+        if use_semantic_groups
+        else []
+    )
     region_by_id = {region.region_id: region for region in regions}
+    group_by_id = {group.group_id: group for group in groups}
     trace = RuntimeTrace()
     executor = CapsuleExecutor(
         base_globals=env._build_capsule_globals(trace=trace),
@@ -699,10 +714,11 @@ def _run_capsule_trial(
     for step_id in range(1, max_steps + 1):
         action: RuntimeAction | None = None
         before_state = _capsule_state_snapshot(env)
-        region_for_feedback = None
+        source_unit_for_feedback = None
         prompt = build_capsule_prompt(
             task=_task_text_from_obs(obs),
             regions=regions,
+            groups=groups if use_semantic_groups else None,
             history=history,
             trace_summary=executor.trace.summary() if executor.trace is not None else {},
         )
@@ -729,12 +745,22 @@ def _run_capsule_trial(
             failed = True
         else:
             region_id = str(action.args.get("region_id", ""))
-            region_for_feedback = region_by_id.get(region_id)
-            event = _execute_runtime_action(action, executor, source, region_by_id)
+            group_id = str(action.args.get("group_id", ""))
+            source_unit_for_feedback = region_by_id.get(region_id) or group_by_id.get(group_id)
+            event = _execute_runtime_action(
+                action,
+                executor,
+                source,
+                region_by_id,
+                group_by_id,
+            )
             if event.status in {"failed", "invalid"}:
                 failed = True
             if action.action == "run_region":
                 executed_regions += 1
+            elif action.action == "run_group":
+                group = group_by_id.get(group_id)
+                executed_regions += len(group.region_ids) if group is not None else 0
 
         after_state = _capsule_state_snapshot(env)
         trace_events = event.evidence.get("trace_events", [])
@@ -743,7 +769,7 @@ def _run_capsule_trial(
             step_id=step_id,
             action=feedback_action,
             event=event,
-            region=region_for_feedback,
+            region=source_unit_for_feedback,
             trace_events=trace_events,
             before_state=before_state,
             after_state=after_state,
@@ -763,12 +789,22 @@ def _run_capsule_trial(
 
         if (
             action is not None
-            and action.action == "patch_region"
+            and action.action in {"patch_region", "patch_group"}
             and event.status == "success"
         ):
             source = str(event.evidence["source"])
             regions = segment_python_code(source)
+            groups = (
+                segment_python_code_groups(
+                    source,
+                    regions,
+                    max_regions_per_group=max_regions_per_group,
+                )
+                if use_semantic_groups
+                else []
+            )
             region_by_id = {region.region_id: region for region in regions}
+            group_by_id = {group.group_id: group for group in groups}
 
         if event.action == "finish" or (action.action == "finish" if action is not None else False):
             finished = True
@@ -830,7 +866,9 @@ def _execute_runtime_action(
     executor: CapsuleExecutor,
     source: str,
     region_by_id: dict[str, Any],
+    group_by_id: dict[str, Any] | None = None,
 ) -> RuntimeEvent:
+    group_by_id = group_by_id or {}
     if action.action == "finish":
         return RuntimeEvent(action="finish", status="success")
 
@@ -845,6 +883,20 @@ def _execute_runtime_action(
                 message=f"Unknown region: {region_id}",
             )
         return executor.run_region(region)
+
+    if action.action == "run_group":
+        group_id = str(action.args.get("group_id", ""))
+        group = group_by_id.get(group_id)
+        if group is None:
+            return RuntimeEvent(
+                action=action.action,
+                status="invalid",
+                region_id=group_id,
+                message=f"Unknown group: {group_id}",
+            )
+        event = executor.run_region(group)
+        event.action = "run_group"
+        return event
 
     if action.action == "inspect_trace":
         return RuntimeEvent(
@@ -890,6 +942,28 @@ def _execute_runtime_action(
             action=action.action,
             status="success",
             region_id=region_id,
+            evidence={"source": patched},
+        )
+
+    if action.action == "patch_group":
+        group_id = str(action.args.get("group_id", ""))
+        replacement = _runtime_patch_replacement(action.args)
+        group = group_by_id.get(group_id)
+        if group is None or not isinstance(replacement, str):
+            return RuntimeEvent(
+                action=action.action,
+                status="invalid",
+                region_id=group_id,
+                message=(
+                    "patch_group requires args.group_id and args.source as strings; "
+                    "new_source and patch are accepted as compatibility aliases"
+                ),
+            )
+        patched = replace_region_source(source, group, replacement)
+        return RuntimeEvent(
+            action=action.action,
+            status="success",
+            region_id=group_id,
             evidence={"source": patched},
         )
 

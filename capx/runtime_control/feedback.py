@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from capx.runtime_control.schema import (
@@ -39,6 +40,8 @@ def build_runtime_feedback(
             "start_line": region.start_line,
             "end_line": region.end_line,
         }
+        if hasattr(region, "has_robot_side_effect"):
+            evidence["has_robot_side_effect"] = bool(region.has_robot_side_effect)
 
     status = _feedback_status(event, region, before_state, after_state)
     region_id = event.region_id or (region.region_id if region is not None else None)
@@ -63,6 +66,8 @@ def _feedback_status(
     if event.status in {"failed", "invalid", "warning", "skipped"}:
         return event.status
     if region is not None and not _made_task_progress(before_state, after_state):
+        if getattr(region, "has_robot_side_effect", True) is False:
+            return "success"
         return "warning"
     return "success"
 
@@ -109,10 +114,32 @@ def _repair_hints(
     event: RuntimeEvent,
     action: RuntimeAction,
 ) -> list[str]:
+    missing_name = _missing_name_from_event(event)
     if status == "failed":
-        return ["Patch only the failed region unless the trace shows an upstream state error."]
+        hints = []
+        if missing_name:
+            hints.append(
+                f"Missing variable '{missing_name}'. Patch the failed source group or "
+                "rerun the prerequisite group that defines it."
+            )
+        if action.action.endswith("_group"):
+            hints.append("Patch the failed group unless the trace shows an upstream state error.")
+        else:
+            hints.append("Patch only the failed region unless the trace shows an upstream state error.")
+        return hints
     if status == "invalid":
         return [f"Check the {action.action} arguments and available region ids."]
     if status == "warning" and event.action == "run_region":
         return ["Inspect primitive call trace and patch this region if it should advance the task."]
+    if status == "warning" and event.action == "run_group":
+        return ["Inspect primitive call trace and patch this group if it should advance the task."]
     return []
+
+
+def _missing_name_from_event(event: RuntimeEvent) -> str | None:
+    if event.evidence.get("exception_type") != "NameError":
+        return None
+    match = re.search(r"name '([^']+)' is not defined", event.message)
+    if match:
+        return match.group(1)
+    return None

@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from capx.envs.trial import _execute_runtime_action, _run_capsule_trial, _run_single_trial
@@ -119,6 +120,69 @@ def test_capsule_trial_runs_scripted_regions(tmp_path):
     assert summary.sandbox_rc == 0
     assert summary.num_code_blocks == 2
     assert summary.num_finishes == 1
+
+
+def test_capsule_trial_runs_scripted_group(tmp_path):
+    env = FakeCapsuleEnv()
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='pose = get_pose("cube")\nmove_to(pose)\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+    assert env.api.moved is True
+    assert summary.sandbox_rc == 0
+    assert summary.num_code_blocks == 2
+    assert trace[0]["event"]["action"] == "run_group"
+    assert trace[0]["feedback"]["region_id"] == "group_1"
+    assert trace[0]["event"]["evidence"]["source_span"] == {"start_line": 1, "end_line": 2}
+
+
+def test_capsule_trial_patches_group_and_regroups(tmp_path):
+    summary = _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='pose = get_pose("cube")\nmove_to(pose)\nRESULT = "old"\n',
+        scripted_actions=[
+            {
+                "action": "patch_group",
+                "args": {
+                    "group_id": "group_1",
+                    "source": 'pose = get_pose("cube")\nRESULT = "patched"\nmove_to(pose)',
+                },
+            },
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+    patched_source = Path(summary.code_path).read_text()
+
+    assert summary.sandbox_rc == 0
+    assert trace[0]["event"]["action"] == "patch_group"
+    assert trace[1]["event"]["region_id"] == "group_1"
+    assert 'RESULT = "patched"' in patched_source
 
 
 def test_multiturn_trial_stops_after_max_regenerations(tmp_path, monkeypatch):

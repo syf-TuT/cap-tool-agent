@@ -5,9 +5,11 @@ from typing import Any, Literal
 
 RuntimeActionName = Literal[
     "run_region",
+    "run_group",
     "inspect_trace",
     "inspect_variables",
     "patch_region",
+    "patch_group",
     "rollback_to_checkpoint",
     "resume_from_region",
     "finish",
@@ -16,9 +18,11 @@ RuntimeStatus = Literal["success", "failed", "warning", "invalid", "skipped"]
 
 SUPPORTED_ACTIONS: set[str] = {
     "run_region",
+    "run_group",
     "inspect_trace",
     "inspect_variables",
     "patch_region",
+    "patch_group",
     "rollback_to_checkpoint",
     "resume_from_region",
     "finish",
@@ -37,6 +41,35 @@ class CodeRegion:
             "region_id": self.region_id,
             "source_span": {"start_line": self.start_line, "end_line": self.end_line},
             "source": self.source,
+        }
+
+
+@dataclass
+class CodeRegionGroup:
+    group_id: str
+    start_line: int
+    end_line: int
+    source: str
+    region_ids: list[str] = field(default_factory=list)
+    primitive_calls: list[str] = field(default_factory=list)
+    defined_names: list[str] = field(default_factory=list)
+    used_names: list[str] = field(default_factory=list)
+    has_robot_side_effect: bool = False
+
+    @property
+    def region_id(self) -> str:
+        return self.group_id
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "group_id": self.group_id,
+            "source_span": {"start_line": self.start_line, "end_line": self.end_line},
+            "source": self.source,
+            "region_ids": list(self.region_ids),
+            "primitive_calls": list(self.primitive_calls),
+            "defined_names": list(self.defined_names),
+            "used_names": list(self.used_names),
+            "has_robot_side_effect": self.has_robot_side_effect,
         }
 
 

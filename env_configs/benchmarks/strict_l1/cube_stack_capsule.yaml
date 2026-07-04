@@ -16,13 +16,16 @@ env:
       goto_pose, or any privileged state API. Use camera observations, SAM3 segmentation,
       Contact-GraspNet grasp planning, Pyroki IK, joint motion, and gripper commands.
 
-      Prefer small executable regions. Inspect intermediate variables if perception, grasp
-      planning, or IK fails.
+      Write the program in clear task phases. Capsule will execute semantic source groups,
+      so keep related perception, planning, and the corresponding robot action together.
+      Inspect intermediate variables if perception, grasp planning, or IK fails.
 
       Write ONLY executable Python code. Import numpy/scipy explicitly if needed.
 
 agent_mode: capsule
-max_capsule_steps: 30
+max_capsule_steps: 20
+capsule_execution_granularity: semantic_group
+capsule_max_regions_per_group: 6
 checkpoint_policy: region
 rollback_policy: best_effort
 capsule_feedback_level: source_region_repair_hint

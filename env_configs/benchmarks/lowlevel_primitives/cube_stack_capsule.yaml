@@ -11,7 +11,9 @@ env:
     # prompt is inherited from FrankaPickPlaceCodeEnv class default
 
 agent_mode: capsule
-max_capsule_steps: 60
+max_capsule_steps: 20
+capsule_execution_granularity: semantic_group
+capsule_max_regions_per_group: 6
 checkpoint_policy: region
 rollback_policy: best_effort
 capsule_feedback_level: source_region_repair_hint

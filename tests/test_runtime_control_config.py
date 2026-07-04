@@ -46,6 +46,8 @@ def test_load_config_reads_capsule_fields():
     assert config["max_regenerations"] is None
     assert config["checkpoint_policy"] == "region"
     assert config["rollback_policy"] == "best_effort"
+    assert config["capsule_execution_granularity"] == "semantic_group"
+    assert config["capsule_max_regions_per_group"] == 6
 
 
 def test_load_config_reads_max_regenerations(tmp_path):
@@ -82,3 +84,42 @@ max_regenerations: 5
     _, config, _ = _load_config(args)
 
     assert config["max_regenerations"] == 5
+
+
+def test_load_config_reads_capsule_grouping_fields(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+env:
+  _target_: tests.fake.Env
+trials: 1
+agent_mode: capsule
+capsule_execution_granularity: atomic_region
+capsule_max_regions_per_group: 4
+"""
+    )
+    args = SimpleNamespace(
+        config_path=str(config_path),
+        total_trials=None,
+        num_workers=None,
+        record_video=None,
+        output_dir=None,
+        use_oracle_code=None,
+        use_visual_feedback=None,
+        use_img_differencing=None,
+        use_video_differencing=None,
+        use_wrist_camera=None,
+        use_parallel_ensemble=None,
+        use_multimodel=None,
+        web_ui=None,
+        web_ui_port=None,
+        server_url="http://127.0.0.1:8110/chat/completions",
+        visual_differencing_model="google/gemini-3.1-pro-preview",
+        visual_differencing_model_server_url="http://127.0.0.1:8110/chat/completions",
+        visual_differencing_model_api_key=None,
+    )
+
+    _, config, _ = _load_config(args)
+
+    assert config["capsule_execution_granularity"] == "atomic_region"
+    assert config["capsule_max_regions_per_group"] == 4
