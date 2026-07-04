@@ -258,6 +258,27 @@ def test_capsule_trial_marks_exhausted_budget_as_failed(tmp_path):
     assert summary.num_finishes == 0
 
 
+def test_capsule_trial_finish_without_completion_is_failed(tmp_path):
+    summary = _run_capsule_trial(
+        env=FakeIncompleteCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[{"action": "finish", "args": {}}],
+    )
+
+    assert summary.sandbox_rc == 1
+    assert summary.success is False
+    assert summary.task_completed is None
+    assert summary.num_finishes == 1
+
+
 def test_capsule_trial_records_video_when_requested(tmp_path, monkeypatch):
     video_writes = []
 

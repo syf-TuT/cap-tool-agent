@@ -812,8 +812,8 @@ def _run_capsule_trial(
 
     reward = _safe_compute_reward(env)
     task_completed = _safe_task_completed(env)
-    exhausted_without_completion = not finished and not bool(task_completed) and reward < 1.0
-    sandbox_rc = 1 if failed or exhausted_without_completion else 0
+    task_succeeded = bool(task_completed) or reward >= 1.0
+    sandbox_rc = 0 if task_succeeded and not failed else 1
     code_path = None
     if output_dir:
         code_path = os.path.join(output_dir, f"capsule_code_trial_{trial:02d}.py")
