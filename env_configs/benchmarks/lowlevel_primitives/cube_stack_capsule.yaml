@@ -1,0 +1,34 @@
+# Low-level primitive benchmark: cube_stack, Capsule runtime-control method.
+
+env:
+  _target_: capx.envs.tasks.franka.franka_pick_place.FrankaPickPlaceCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level: franka_robosuite_cubes_low_level
+    privileged: true
+    apis:
+      - FrankaControlPrivilegedApi
+    # prompt is inherited from FrankaPickPlaceCodeEnv class default
+
+agent_mode: capsule
+max_capsule_steps: 60
+checkpoint_policy: region
+rollback_policy: best_effort
+capsule_feedback_level: source_region_repair_hint
+
+api_servers:
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+record_video: true
+use_visual_feedback: false
+use_img_differencing: false
+use_video_differencing: false
+output_dir: ./outputs/bench_lowlevel/cube_stack/capsule
+
+use_oracle_code: false
+trials: 1
+num_workers: 1

@@ -1,0 +1,53 @@
+# Strict first-layer primitive smoke: cube_stack, Capsule runtime-control method.
+
+env:
+  _target_: capx.envs.tasks.franka.franka_pick_place.FrankaPickPlaceCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level: franka_robosuite_cubes_low_level
+    privileged: false
+    apis:
+      - FrankaControlApiReduced
+    prompt: |
+      You are controlling a Franka Emika robot with perception and low-level motion APIs.
+      Goal: pick up the red cube and place it on top of the green cube, then open the gripper.
+
+      Use only the provided first-layer primitives. Do not call get_object_pose, sample_grasp_pose,
+      goto_pose, or any privileged state API. Use camera observations, SAM3 segmentation,
+      Contact-GraspNet grasp planning, Pyroki IK, joint motion, and gripper commands.
+
+      Prefer small executable regions. Inspect intermediate variables if perception, grasp
+      planning, or IK fails.
+
+      Write ONLY executable Python code. Import numpy/scipy explicitly if needed.
+
+agent_mode: capsule
+max_capsule_steps: 30
+checkpoint_policy: region
+rollback_policy: best_effort
+capsule_feedback_level: source_region_repair_hint
+
+api_servers:
+  - _target_: capx.serving.launch_sam3_server.main
+    device: cuda
+    port: 8114
+    host: 127.0.0.1
+  - _target_: capx.serving.launch_contact_graspnet_server.main
+    device: cuda
+    port: 8115
+    host: 127.0.0.1
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+record_video: true
+use_visual_feedback: false
+use_img_differencing: false
+use_video_differencing: false
+output_dir: ./outputs/strict_l1_smoke/cube_stack/capsule
+
+use_oracle_code: false
+trials: 1
+num_workers: 1

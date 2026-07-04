@@ -1,7 +1,7 @@
 import json
 from types import SimpleNamespace
 
-from capx.envs.trial import _execute_runtime_action, _run_capsule_trial
+from capx.envs.trial import _execute_runtime_action, _run_capsule_trial, _run_single_trial
 from capx.runtime_control.executor import CapsuleExecutor
 from capx.runtime_control.schema import CodeRegion, RuntimeAction
 from capx.runtime_control.trace import wrap_function_for_trace
@@ -50,6 +50,53 @@ class FakeCapsuleEnv:
         return 1.0
 
 
+class FakeIncompleteCapsuleEnv(FakeCapsuleEnv):
+    def compute_reward(self):
+        return 0.0
+
+
+class FakeVideoCapsuleEnv(FakeCapsuleEnv):
+    def __init__(self):
+        super().__init__()
+        self.video_capture_args = None
+        self.video_clear_requested = None
+
+    def enable_video_capture(self, enabled, *, clear=False, wrist_camera=False):
+        self.video_capture_args = {
+            "enabled": enabled,
+            "clear": clear,
+            "wrist_camera": wrist_camera,
+        }
+
+    def get_video_frames(self, *, clear=False):
+        self.video_clear_requested = clear
+        return ["frame-1", "frame-2"]
+
+
+class FakeMultiTurnEnv:
+    def __init__(self):
+        self.steps = []
+        self.low_level_env = object()
+        self.obs = {
+            "full_prompt": [
+                {"role": "system", "content": "x"},
+                {"role": "user", "content": [{"type": "text", "text": "task"}]},
+            ]
+        }
+
+    def reset(self, *, seed=None, options=None):
+        return self.obs, {}
+
+    def step(self, code):
+        self.steps.append(code)
+        return self.obs, 0.0, False, False, {
+            "sandbox_rc": 0,
+            "stdout": "",
+            "stderr": "",
+            "task_completed": False,
+        }
+
+
 def test_capsule_trial_runs_scripted_regions(tmp_path):
     summary = _run_capsule_trial(
         env=FakeCapsuleEnv(),
@@ -71,6 +118,120 @@ def test_capsule_trial_runs_scripted_regions(tmp_path):
 
     assert summary.sandbox_rc == 0
     assert summary.num_code_blocks == 2
+    assert summary.num_finishes == 1
+
+
+def test_multiturn_trial_stops_after_max_regenerations(tmp_path, monkeypatch):
+    decision_calls = []
+
+    def fake_initial_code(args, config, obs):
+        return "print('initial')", None, None
+
+    def fake_multi_turn_step(*args, **kwargs):
+        decision_calls.append(1)
+        return "regenerate", "print('regenerated')", None, None, []
+
+    monkeypatch.setattr("capx.envs.trial._query_initial_code", fake_initial_code)
+    monkeypatch.setattr("capx.envs.trial._handle_multi_turn_step", fake_multi_turn_step)
+
+    summary = _run_single_trial(
+        env=FakeMultiTurnEnv(),
+        trial=1,
+        args=SimpleNamespace(
+            model="test",
+            visual_differencing_model="test",
+            visual_differencing_model_server_url="http://example.test",
+            visual_differencing_model_api_key=None,
+            max_tokens=100,
+            temperature=0.2,
+            reasoning_effort="minimal",
+            debug=False,
+        ),
+        config={
+            "output_dir": str(tmp_path),
+            "agent_mode": "code",
+            "record_video": False,
+            "use_visual_feedback": False,
+            "use_img_differencing": False,
+            "use_video_differencing": False,
+            "use_wrist_camera": False,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+            "use_oracle_code": False,
+            "save_multiturn_prompts": False,
+            "max_regenerations": 1,
+        },
+        multi_turn_prompt=(
+            "executed={executed_code}\nstdout={console_stdout}\nstderr={console_stderr}"
+        ),
+    )
+
+    assert len(decision_calls) == 1
+    assert summary.num_regenerations == 1
+    assert len(summary.log) > 0
+
+
+def test_capsule_trial_marks_exhausted_budget_as_failed(tmp_path):
+    summary = _run_capsule_trial(
+        env=FakeIncompleteCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code="x = 1\nRESULT = x + 1\n",
+        scripted_actions=[
+            {"action": "run_region", "args": {"region_id": "region_1"}},
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+        ],
+    )
+
+    assert summary.sandbox_rc == 1
+    assert summary.success is False
+    assert summary.num_finishes == 0
+
+
+def test_capsule_trial_records_video_when_requested(tmp_path, monkeypatch):
+    video_writes = []
+
+    def fake_write_video(frames, base_dir, *, suffix):
+        video_writes.append({"frames": frames, "base_dir": base_dir, "suffix": suffix})
+
+    monkeypatch.setattr("capx.envs.trial._write_video", fake_write_video)
+    env = FakeVideoCapsuleEnv()
+
+    _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "record_video": True,
+            "use_wrist_camera": False,
+            "max_capsule_steps": 4,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code="RESULT = 1\n",
+        scripted_actions=[{"action": "finish", "args": {}}],
+    )
+
+    assert env.video_capture_args == {
+        "enabled": True,
+        "clear": True,
+        "wrist_camera": False,
+    }
+    assert env.video_clear_requested is True
+    assert video_writes == [
+        {
+            "frames": ["frame-1", "frame-2"],
+            "base_dir": str(tmp_path / "trial_01_sandboxrc_0_reward_1.000_taskcompleted_0"),
+            "suffix": "1.000_capsule",
+        }
+    ]
 
 
 def test_capsule_trial_writes_trace_and_feedback_artifact(tmp_path):
@@ -131,3 +292,15 @@ def test_patch_region_accepts_patch_alias():
 
     assert event.status == "success"
     assert event.evidence["source"] == "x = 1\ny = x + 3\n"
+
+
+def test_inspect_variables_requires_names():
+    event = _execute_runtime_action(
+        RuntimeAction("inspect_variables", {"region_id": "region_1"}),
+        CapsuleExecutor(base_globals={}),
+        "x = 1\n",
+        {},
+    )
+
+    assert event.status == "invalid"
+    assert "args.names" in event.message

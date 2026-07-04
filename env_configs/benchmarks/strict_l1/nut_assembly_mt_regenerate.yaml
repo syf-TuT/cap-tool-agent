@@ -1,0 +1,63 @@
+# Strict first-layer primitive smoke: nut_assembly, multiturn full-code regeneration.
+
+env:
+  _target_: capx.envs.tasks.franka.franka_nut_assembly.FrankaNutAssemblyCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level: franka_robosuite_nut_assembly_low_level_visual
+    privileged: false
+    apis:
+      - FrankaControlNutAssemblyApiReduced
+    prompt: |
+      You are controlling a Franka Emika robot with perception and low-level motion APIs.
+      Goal: grasp the brown square nut by its handle and insert it onto the brown square block.
+
+      Use only the provided first-layer primitives. Do not call get_object_pose, sample_grasp_pose,
+      goto_pose, or any privileged state API. Use camera observations, SAM3 segmentation,
+      Contact-GraspNet grasp planning, Pyroki IK, joint motion, and gripper commands.
+
+      Write ONLY executable Python code. Import numpy/scipy explicitly if needed.
+      After this code executes, you will receive stdout/stderr and may regenerate the remaining code.
+    multi_turn_prompt: |
+      The following code blocks were just executed:
+      ```python
+      {executed_code}
+      ```
+      The current console stdout is:
+      ```
+      {console_stdout}
+      ```
+      The current console stderr is:
+      ```
+      {console_stderr}
+      ```
+      If there were errors, regenerate the remaining executable Python code.
+      If the task appears complete, respond with FINISH.
+      Please respond with EXACTLY ONE of the following:
+      - The word 'REGENERATE' followed immediately by new Python code in a fenced code block (```python...```) if you want to modify the remaining code.
+      - The word 'FINISH' if the task appears to be complete.
+
+api_servers:
+  - _target_: capx.serving.launch_sam3_server.main
+    device: cuda
+    port: 8114
+    host: 127.0.0.1
+  - _target_: capx.serving.launch_contact_graspnet_server.main
+    device: cuda
+    port: 8115
+    host: 127.0.0.1
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+record_video: true
+use_visual_feedback: false
+use_img_differencing: false
+use_video_differencing: false
+output_dir: ./outputs/strict_l1_smoke/nut_assembly/mt_regenerate
+
+use_oracle_code: false
+trials: 1
+num_workers: 1

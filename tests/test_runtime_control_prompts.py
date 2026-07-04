@@ -34,4 +34,6 @@ def test_capsule_prompt_documents_patch_region_source_schema():
     text = str(prompt)
 
     assert '{"action": "patch_region", "args": {"region_id": "region_1", "source":' in text
+    assert '{"action": "inspect_variables", "args": {"names": ["variable_name"]}}' in text
+    assert "Do not pass region_id to inspect_variables." in text
     assert "Do not use new_source or patch for patch_region replacement text." in text

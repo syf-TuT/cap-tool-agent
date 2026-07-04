@@ -52,8 +52,11 @@ def build_capsule_prompt(
         "rollback_to_checkpoint, resume_from_region, finish.\n\n"
         "Respond with exactly one JSON object. Examples:\n"
         '{"action": "run_region", "args": {"region_id": "region_1"}}\n'
+        '{"action": "inspect_variables", "args": {"names": ["variable_name"]}}\n'
         '{"action": "patch_region", "args": {"region_id": "region_1", '
         '"source": "replacement Python source for only region_1"}}\n'
+        "For inspect_variables, args.names must be a non-empty list of Python variable "
+        "names to inspect. Do not pass region_id to inspect_variables.\n"
         "For patch_region, args.source must be the complete replacement Python source "
         "for only the requested source region. Do not use new_source or patch for "
         "patch_region replacement text. Do not ask for robot primitives as tools."

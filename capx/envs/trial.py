@@ -662,6 +662,12 @@ def _run_capsule_trial(
     output_dir = config.get("output_dir")
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
+    if config.get("record_video") and hasattr(env, "enable_video_capture"):
+        env.enable_video_capture(
+            True,
+            clear=True,
+            wrist_camera=config.get("use_wrist_camera", False),
+        )
 
     raw_code: str
     if initial_code is not None:
@@ -687,6 +693,7 @@ def _run_capsule_trial(
     history: list[dict[str, Any]] = []
     prompts: list[list[dict[str, Any]]] = []
     failed = False
+    finished = False
     executed_regions = 0
 
     for step_id in range(1, max_steps + 1):
@@ -764,11 +771,13 @@ def _run_capsule_trial(
             region_by_id = {region.region_id: region for region in regions}
 
         if event.action == "finish" or (action.action == "finish" if action is not None else False):
+            finished = True
             break
 
     reward = _safe_compute_reward(env)
     task_completed = _safe_task_completed(env)
-    sandbox_rc = 1 if failed else 0
+    exhausted_without_completion = not finished and not bool(task_completed) and reward < 1.0
+    sandbox_rc = 1 if failed or exhausted_without_completion else 0
     code_path = None
     if output_dir:
         code_path = os.path.join(output_dir, f"capsule_code_trial_{trial:02d}.py")
@@ -778,6 +787,21 @@ def _run_capsule_trial(
             json.dump(history, f, indent=2, default=str)
         with open(os.path.join(output_dir, f"capsule_prompts_trial_{trial:02d}.json"), "w") as f:
             json.dump(prompts, f, indent=2, default=str)
+
+    if config.get("record_video"):
+        info_step = {
+            "sandbox_rc": sandbox_rc,
+            "task_completed": bool(task_completed),
+        }
+        _save_trial_video(
+            env,
+            config,
+            trial,
+            info_step,
+            reward,
+            executed_regions,
+            suffix_extra="capsule",
+        )
 
     log = (
         f"Capsule actions: {len(history)}\n"
@@ -796,7 +820,7 @@ def _run_capsule_trial(
         task_completed=task_completed,
         code_path=code_path,
         num_regenerations=0,
-        num_finishes=1 if sandbox_rc == 0 else 0,
+        num_finishes=1 if finished else 0,
         num_code_blocks=executed_regions,
     )
 
@@ -831,6 +855,16 @@ def _execute_runtime_action(
 
     if action.action == "inspect_variables":
         names = action.args.get("names", [])
+        if (
+            not isinstance(names, list)
+            or not names
+            or not all(isinstance(name, str) for name in names)
+        ):
+            return RuntimeEvent(
+                action=action.action,
+                status="invalid",
+                message="inspect_variables requires args.names as a non-empty list of strings",
+            )
         evidence = {
             str(name): _summarize_runtime_value(executor.globals.get(str(name)))
             for name in names
@@ -1098,6 +1132,10 @@ def _run_single_trial(
         if multi_turn_prompt:
             if "terminated episode" in info_step["stderr"]:
                 truncated = True
+                break
+            max_regenerations = config.get("max_regenerations")
+            if max_regenerations is not None and num_regenerations >= int(max_regenerations):
+                print(f"Reached max_regenerations={max_regenerations}; stopping multi-turn loop")
                 break
 
             # Get turn frames for video differencing

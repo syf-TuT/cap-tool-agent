@@ -16,6 +16,8 @@ env/
 .nvinferencekeys
 .capx_skills.json
 .codex_*.py
+.codex-downloads/
+.codex-upload/
 .claude/
 .agents/
 .pytest_cache/
@@ -66,6 +68,15 @@ core.*
 wandb/
 .webui_secret_key
 .worktrees/
+
+# Local third-party dependency checkouts. Keep tracked vendored snippets above,
+# but do not treat initialized external repositories as ordinary source files.
+capx/third_party/LIBERO-PRO/
+capx/third_party/contact_graspnet_pytorch/
+capx/third_party/curobo/
+capx/third_party/robosuite/
+capx/third_party/sam3/
+capx/third_party/verl/
 
 *.jpg
 *.png

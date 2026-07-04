@@ -241,6 +241,22 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         headers["Authorization"] = f"Bearer {args.api_key}"
     elif os.getenv("OPENAI_API_KEY") is not None and args.model in GPT_MODELS:
         headers["Authorization"] = f"Bearer {os.getenv('OPENAI_API_KEY')}"
+
+    if os.getenv("CAPX_DISABLE_REASONING") == "1":
+        payload["thinking"] = {"type": "disabled"}
+
+    if os.getenv("CAPX_FORCE_STREAMING_CHAT_COMPLETIONS") == "1":
+        print("Using streaming chat completions for model query", flush=True)
+        content = ""
+        reasoning = None
+        for chunk in query_model_streaming(args, prompt):
+            if chunk["type"] == "content_delta":
+                content += chunk["content"]
+            elif chunk["type"] == "done":
+                content = chunk["content"]
+                reasoning = chunk.get("reasoning")
+        return {"content": content, "reasoning": reasoning}
+
     start_time = time.time()
 
     # keep calling until it works
@@ -328,10 +344,15 @@ def query_model_streaming(
     elif os.getenv("OPENAI_API_KEY") is not None and args.model in GPT_MODELS:
         headers["Authorization"] = f"Bearer {os.getenv('OPENAI_API_KEY')}"
 
+    if os.getenv("CAPX_DISABLE_REASONING") == "1":
+        payload["thinking"] = {"type": "disabled"}
+
     full_content = ""
     full_reasoning = ""
 
     start_time = time.time()
+
+    stream_chunks = 0
 
     with requests.post(
         args.server_url,
@@ -353,7 +374,8 @@ def query_model_streaming(
             body = response.json()
             try:
                 full_content = body["choices"][0]["message"]["content"]
-                full_reasoning = body.get("choices", [{}])[0].get("message", {}).get("reasoning")
+                message = body.get("choices", [{}])[0].get("message", {})
+                full_reasoning = message.get("reasoning") or message.get("reasoning_content")
                 if full_reasoning:
                     print(f"Reasoning extracted ({len(full_reasoning)} chars)")
                 else:
@@ -379,6 +401,7 @@ def query_model_streaming(
 
             # SSE format: "data: {...}" or "data: [DONE]"
             if line_str.startswith("data: "):
+                stream_chunks += 1
                 data_str = line_str[6:]  # Remove "data: " prefix
 
                 if data_str == "[DONE]":
@@ -399,10 +422,19 @@ def query_model_streaming(
                         yield {"type": "content_delta", "content": content_delta}
 
                     # Handle reasoning delta (some APIs support this)
-                    reasoning_delta = delta.get("reasoning", "")
+                    reasoning_delta = delta.get("reasoning") or delta.get("reasoning_content") or ""
                     if reasoning_delta:
                         full_reasoning += reasoning_delta
                         yield {"type": "reasoning_delta", "content": reasoning_delta}
+
+                    if stream_chunks % 200 == 0:
+                        print(
+                            "Streaming progress: "
+                            f"chunks={stream_chunks}, "
+                            f"content_chars={len(full_content)}, "
+                            f"reasoning_chars={len(full_reasoning)}",
+                            flush=True,
+                        )
 
                 except json.JSONDecodeError:
                     continue
