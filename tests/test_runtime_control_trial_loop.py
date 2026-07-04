@@ -1,7 +1,9 @@
 import json
 from types import SimpleNamespace
 
-from capx.envs.trial import _run_capsule_trial
+from capx.envs.trial import _execute_runtime_action, _run_capsule_trial
+from capx.runtime_control.executor import CapsuleExecutor
+from capx.runtime_control.schema import CodeRegion, RuntimeAction
 from capx.runtime_control.trace import wrap_function_for_trace
 
 
@@ -95,3 +97,37 @@ def test_capsule_trial_writes_trace_and_feedback_artifact(tmp_path):
     assert trace[0]["feedback"]["region_id"] == "region_1"
     assert trace[0]["trace_events"][0]["name"] == "get_pose"
     assert trace[2]["event"]["evidence"]["events"][0]["name"] == "get_pose"
+
+
+def test_patch_region_accepts_new_source_alias():
+    source = "x = 1\ny = x + 1\n"
+    region = CodeRegion("region_2", 2, 2, "y = x + 1")
+    event = _execute_runtime_action(
+        RuntimeAction(
+            "patch_region",
+            {"region_id": "region_2", "new_source": "y = x + 2"},
+        ),
+        CapsuleExecutor(base_globals={}),
+        source,
+        {"region_2": region},
+    )
+
+    assert event.status == "success"
+    assert event.evidence["source"] == "x = 1\ny = x + 2\n"
+
+
+def test_patch_region_accepts_patch_alias():
+    source = "x = 1\ny = x + 1\n"
+    region = CodeRegion("region_2", 2, 2, "y = x + 1")
+    event = _execute_runtime_action(
+        RuntimeAction(
+            "patch_region",
+            {"region_id": "region_2", "patch": "y = x + 3"},
+        ),
+        CapsuleExecutor(base_globals={}),
+        source,
+        {"region_2": region},
+    )
+
+    assert event.status == "success"
+    assert event.evidence["source"] == "x = 1\ny = x + 3\n"

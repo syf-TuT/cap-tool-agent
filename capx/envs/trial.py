@@ -839,14 +839,17 @@ def _execute_runtime_action(
 
     if action.action == "patch_region":
         region_id = str(action.args.get("region_id", ""))
-        replacement = action.args.get("source")
+        replacement = _runtime_patch_replacement(action.args)
         region = region_by_id.get(region_id)
         if region is None or not isinstance(replacement, str):
             return RuntimeEvent(
                 action=action.action,
                 status="invalid",
                 region_id=region_id,
-                message="patch_region requires a valid region_id and source string",
+                message=(
+                    "patch_region requires args.region_id and args.source as strings; "
+                    "new_source and patch are accepted as compatibility aliases"
+                ),
             )
         patched = replace_region_source(source, region, replacement)
         return RuntimeEvent(
@@ -876,6 +879,14 @@ def _execute_runtime_action(
         return executor.run_region(region)
 
     return RuntimeEvent(action=action.action, status="invalid", message="Unsupported runtime action")
+
+
+def _runtime_patch_replacement(args: dict[str, Any]) -> Any:
+    for key in ("source", "new_source", "patch"):
+        replacement = args.get(key)
+        if isinstance(replacement, str):
+            return replacement
+    return None
 
 
 def _safe_compute_reward(env: CodeExecutionEnvBase) -> float:

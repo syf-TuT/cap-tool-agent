@@ -50,9 +50,13 @@ def build_capsule_prompt(
         "not directly perform robot manipulation.\n\n"
         "Allowed actions: run_region, inspect_trace, inspect_variables, patch_region, "
         "rollback_to_checkpoint, resume_from_region, finish.\n\n"
-        "Respond with exactly one JSON object, for example:\n"
+        "Respond with exactly one JSON object. Examples:\n"
         '{"action": "run_region", "args": {"region_id": "region_1"}}\n'
-        "Patch only the requested source region. Do not ask for robot primitives as tools."
+        '{"action": "patch_region", "args": {"region_id": "region_1", '
+        '"source": "replacement Python source for only region_1"}}\n'
+        "For patch_region, args.source must be the complete replacement Python source "
+        "for only the requested source region. Do not use new_source or patch for "
+        "patch_region replacement text. Do not ask for robot primitives as tools."
     )
     return [
         {"role": "system", "content": "You control execution of generated Python code regions."},

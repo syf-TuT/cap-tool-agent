@@ -22,3 +22,16 @@ def test_capsule_prompt_excludes_robot_tool_list():
     assert "run_region" in text
     assert "solve_ik" not in text
     assert "move_to_joints" not in text
+
+
+def test_capsule_prompt_documents_patch_region_source_schema():
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=[],
+        trace_summary={},
+    )
+    text = str(prompt)
+
+    assert '{"action": "patch_region", "args": {"region_id": "region_1", "source":' in text
+    assert "Do not use new_source or patch for patch_region replacement text." in text
