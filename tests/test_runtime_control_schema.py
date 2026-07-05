@@ -55,6 +55,15 @@ def test_runtime_action_accepts_group_actions():
     assert patch_action.action == "patch_group"
 
 
+def test_runtime_action_accepts_append_recovery():
+    action = RuntimeAction.from_mapping(
+        {"action": "append_recovery", "args": {"source": "obs = get_observation()"}}
+    )
+
+    assert action.action == "append_recovery"
+    assert action.args["source"] == "obs = get_observation()"
+
+
 def test_runtime_action_rejects_rollback_action():
     with pytest.raises(ValueError, match="Unsupported runtime action"):
         RuntimeAction.from_mapping({"action": "rollback_to_checkpoint", "args": {}})

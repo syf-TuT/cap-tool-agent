@@ -11,9 +11,18 @@ from capx.runtime_control.trace import wrap_function_for_trace
 class FakeApi:
     def __init__(self):
         self.moved = False
+        self.observed = False
 
     def functions(self):
-        return {"get_pose": self.get_pose, "move_to": self.move_to}
+        return {
+            "get_observation": self.get_observation,
+            "get_pose": self.get_pose,
+            "move_to": self.move_to,
+        }
+
+    def get_observation(self):
+        self.observed = True
+        return {"state": "current"}
 
     def get_pose(self, name):
         return [1, 2, 3]
@@ -183,6 +192,150 @@ def test_capsule_trial_patches_group_and_regroups(tmp_path):
     assert trace[0]["event"]["action"] == "patch_group"
     assert trace[1]["event"]["region_id"] == "group_1"
     assert 'RESULT = "patched"' in patched_source
+
+
+def test_capsule_trial_appends_recovery_and_regroups(tmp_path):
+    env = FakeCapsuleEnv()
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='pose = get_pose("cube")\nmove_to(pose)\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {
+                "action": "append_recovery",
+                "args": {"source": 'obs = get_observation()\nRESULT = "recovered"'},
+            },
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+    patched_source = Path(summary.code_path).read_text()
+
+    assert summary.sandbox_rc == 0
+    assert env.api.observed is True
+    assert trace[1]["event"]["action"] == "append_recovery"
+    assert trace[2]["event"]["region_id"] == "group_2"
+    assert 'RESULT = "recovered"' in patched_source
+
+
+def test_append_recovery_requires_fresh_observation(tmp_path):
+    summary = _run_capsule_trial(
+        env=FakeIncompleteCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {"action": "append_recovery", "args": {"source": 'RESULT = "no observation"'}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 1
+    assert trace[0]["event"]["status"] == "invalid"
+    assert "get_observation" in trace[0]["event"]["message"]
+
+
+def test_capsule_trial_rejects_rerun_of_executed_side_effect_group(tmp_path):
+    summary = _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='pose = get_pose("cube")\nmove_to(pose)\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 1
+    assert trace[1]["event"]["status"] == "invalid"
+    assert "append_recovery" in trace[1]["event"]["message"]
+
+
+def test_capsule_trial_rejects_patch_of_executed_side_effect_group(tmp_path):
+    summary = _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='pose = get_pose("cube")\nmove_to(pose)\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": 'obs = get_observation()'},
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 1
+    assert trace[1]["event"]["status"] == "invalid"
+    assert "already executed" in trace[1]["event"]["message"]
+    assert "append_recovery" in trace[1]["event"]["message"]
+
+
+def test_capsule_trial_allows_patch_of_executed_non_side_effect_group(tmp_path):
+    summary = _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code="x = 1\nRESULT = x\n",
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "patch_group", "args": {"group_id": "group_1", "source": "x = 2\nRESULT = x"}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+    patched_source = Path(summary.code_path).read_text()
+
+    assert summary.sandbox_rc == 0
+    assert trace[1]["event"]["status"] == "success"
+    assert "x = 2" in patched_source
 
 
 def test_multiturn_trial_stops_after_max_regenerations(tmp_path, monkeypatch):

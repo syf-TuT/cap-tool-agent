@@ -132,12 +132,14 @@ def _repair_hints(
     if status == "warning" and event.action == "run_region":
         return [
             "No rollback is available. Inspect the trace, take a fresh observation, "
-            "and patch this region only as current-state recovery."
+            "and use append_recovery for current-state recovery if prior robot actions "
+            "changed the scene."
         ]
     if status == "warning" and event.action == "run_group":
         return [
             "No rollback is available. Inspect the trace, take a fresh observation, "
-            "and patch this group only as current-state recovery."
+            "and use append_recovery for current-state recovery if prior robot actions "
+            "changed the scene."
         ]
     return []
 

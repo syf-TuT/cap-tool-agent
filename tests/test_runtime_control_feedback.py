@@ -98,6 +98,7 @@ def test_feedback_warns_for_side_effect_group_without_reward_progress():
     assert feedback.patch_scope == "group_1"
     assert any("No rollback is available" in hint for hint in feedback.repair_hints)
     assert any("fresh observation" in hint for hint in feedback.repair_hints)
+    assert any("append_recovery" in hint for hint in feedback.repair_hints)
 
 
 def test_feedback_name_error_hint_mentions_missing_variable():

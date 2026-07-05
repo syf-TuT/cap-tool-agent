@@ -12,6 +12,7 @@ loop extracted from launch.py, covering:
 
 from __future__ import annotations
 
+import ast
 import base64
 import copy
 import gc
@@ -38,6 +39,7 @@ from capx.runtime_control import (
     segment_python_code,
     segment_python_code_groups,
 )
+from capx.runtime_control.segmenter import ROBOT_SIDE_EFFECT_CALLS
 
 from capx.llm.client import (
     VLM_MODELS,
@@ -710,6 +712,8 @@ def _run_capsule_trial(
     failed = False
     finished = False
     executed_regions = 0
+    executed_side_effect_regions: set[str] = set()
+    executed_side_effect_groups: set[str] = set()
 
     for step_id in range(1, max_steps + 1):
         action: RuntimeAction | None = None
@@ -747,20 +751,40 @@ def _run_capsule_trial(
             region_id = str(action.args.get("region_id", ""))
             group_id = str(action.args.get("group_id", ""))
             source_unit_for_feedback = region_by_id.get(region_id) or group_by_id.get(group_id)
-            event = _execute_runtime_action(
+            event = _no_rollback_guard_event(
                 action,
-                executor,
-                source,
-                region_by_id,
-                group_by_id,
+                executed_side_effect_regions,
+                executed_side_effect_groups,
             )
+            if event is None:
+                event = _execute_runtime_action(
+                    action,
+                    executor,
+                    source,
+                    region_by_id,
+                    group_by_id,
+                )
             if event.status in {"failed", "invalid"}:
                 failed = True
-            if action.action == "run_region":
+            if action.action == "run_region" and event.status != "invalid":
                 executed_regions += 1
+                region = region_by_id.get(region_id)
+                if (
+                    event.status == "success"
+                    and region is not None
+                    and _region_has_robot_side_effect(region)
+                ):
+                    executed_side_effect_regions.add(region_id)
             elif action.action == "run_group":
                 group = group_by_id.get(group_id)
-                executed_regions += len(group.region_ids) if group is not None else 0
+                if event.status != "invalid":
+                    executed_regions += len(group.region_ids) if group is not None else 0
+                if event.status == "success" and group is not None and group.has_robot_side_effect:
+                    executed_side_effect_groups.add(group_id)
+                    for member_region_id in group.region_ids:
+                        member_region = region_by_id.get(member_region_id)
+                        if member_region is not None and _region_has_robot_side_effect(member_region):
+                            executed_side_effect_regions.add(member_region_id)
 
         after_state = _capsule_state_snapshot(env)
         trace_events = event.evidence.get("trace_events", [])
@@ -789,7 +813,7 @@ def _run_capsule_trial(
 
         if (
             action is not None
-            and action.action in {"patch_region", "patch_group"}
+            and action.action in {"patch_region", "patch_group", "append_recovery"}
             and event.status == "success"
         ):
             source = str(event.evidence["source"])
@@ -967,6 +991,36 @@ def _execute_runtime_action(
             evidence={"source": patched},
         )
 
+    if action.action == "append_recovery":
+        recovery_source = action.args.get("source")
+        if not isinstance(recovery_source, str) or not recovery_source.strip():
+            return RuntimeEvent(
+                action=action.action,
+                status="invalid",
+                message="append_recovery requires args.source as a non-empty string.",
+            )
+        try:
+            recovery_tree = ast.parse(recovery_source)
+        except SyntaxError as exc:
+            return RuntimeEvent(
+                action=action.action,
+                status="invalid",
+                message=f"append_recovery source must parse as Python: {exc.msg}",
+                evidence={"exception_type": type(exc).__name__},
+            )
+        if not _ast_calls_function(recovery_tree, "get_observation"):
+            return RuntimeEvent(
+                action=action.action,
+                status="invalid",
+                message="append_recovery source must call get_observation().",
+            )
+        patched = _append_recovery_source(source, recovery_source)
+        return RuntimeEvent(
+            action=action.action,
+            status="success",
+            evidence={"source": patched},
+        )
+
     if action.action == "rollback_to_checkpoint":
         return RuntimeEvent(
             action=action.action,
@@ -992,12 +1046,73 @@ def _execute_runtime_action(
     return RuntimeEvent(action=action.action, status="invalid", message="Unsupported runtime action")
 
 
+def _no_rollback_guard_event(
+    action: RuntimeAction,
+    executed_side_effect_regions: set[str],
+    executed_side_effect_groups: set[str],
+) -> RuntimeEvent | None:
+    if action.action in {"run_group", "patch_group"}:
+        group_id = str(action.args.get("group_id", ""))
+        if group_id in executed_side_effect_groups:
+            return _already_executed_side_effect_event(action.action, group_id)
+        return None
+
+    if action.action in {"run_region", "patch_region", "resume_from_region"}:
+        region_id = str(action.args.get("region_id", ""))
+        if region_id in executed_side_effect_regions:
+            return _already_executed_side_effect_event(action.action, region_id)
+        return None
+
+    return None
+
+
+def _already_executed_side_effect_event(action_name: str, unit_id: str) -> RuntimeEvent:
+    return RuntimeEvent(
+        action=action_name,
+        status="invalid",
+        region_id=unit_id,
+        message=(
+            f"{unit_id} already executed robot-side-effect code and rollback is disabled. "
+            "Use append_recovery with a fresh get_observation() to continue from the "
+            "current physical state."
+        ),
+    )
+
+
 def _runtime_patch_replacement(args: dict[str, Any]) -> Any:
     for key in ("source", "new_source", "patch"):
         replacement = args.get(key)
         if isinstance(replacement, str):
             return replacement
     return None
+
+
+def _append_recovery_source(source: str, recovery_source: str) -> str:
+    base = source.rstrip("\n")
+    recovery = recovery_source.strip("\n")
+    if not base:
+        return f"{recovery}\n"
+    return f"{base}\n\n{recovery}\n"
+
+
+def _ast_calls_function(tree: ast.AST, function_name: str) -> bool:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == function_name:
+            return True
+        if isinstance(func, ast.Attribute) and func.attr == function_name:
+            return True
+    return False
+
+
+def _region_has_robot_side_effect(region: Any) -> bool:
+    try:
+        tree = ast.parse(region.source)
+    except SyntaxError:
+        return False
+    return any(_ast_calls_function(tree, call_name) for call_name in ROBOT_SIDE_EFFECT_CALLS)
 
 
 def _safe_compute_reward(env: CodeExecutionEnvBase) -> float:

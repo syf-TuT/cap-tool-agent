@@ -80,3 +80,18 @@ def test_capsule_prompt_uses_no_rollback_forward_recovery_semantics():
     assert "Rollback is unavailable" in text
     assert "fresh observation" in text
     assert "current physical state" in text
+
+
+def test_capsule_prompt_documents_append_recovery():
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=[],
+        trace_summary={},
+    )
+    text = str(prompt)
+
+    assert "append_recovery" in text
+    assert '{"action": "append_recovery", "args": {"source":' in text
+    assert "get_observation()" in text
+    assert "current physical state" in text

@@ -61,9 +61,11 @@ def build_capsule_prompt(
         "changed the current physical state, so repairs must continue from that state. "
         "Use a fresh observation and patch or resume code as current-state recovery; do "
         "not assume earlier robot actions can be undone or replayed from their original "
-        "preconditions.\n\n"
+        "preconditions. For recovery after robot side effects, prefer appending new "
+        "recovery code with append_recovery; the appended code must call "
+        "get_observation() so it starts from the current physical state.\n\n"
         "Allowed actions: run_group, run_region, inspect_trace, inspect_variables, "
-        "patch_group, patch_region, resume_from_region, finish.\n\n"
+        "patch_group, patch_region, append_recovery, resume_from_region, finish.\n\n"
         "Prefer run_group over run_region when code groups are available. A group is a "
         "semantic source chunk that may include setup plus one robot side effect. Use "
         "patch_group for local repairs unless a single atomic region is clearly "
@@ -76,13 +78,18 @@ def build_capsule_prompt(
         '"source": "replacement Python source for the complete group_1 source span"}}\n'
         '{"action": "patch_region", "args": {"region_id": "region_1", '
         '"source": "replacement Python source for only region_1"}}\n'
+        '{"action": "append_recovery", "args": {"source": '
+        '"obs = get_observation()\\n# recover from the current physical state"}}\n'
         "For inspect_variables, args.names must be a non-empty list of Python variable "
         "names to inspect. Do not pass region_id to inspect_variables.\n"
         "For patch_group, args.source must be the complete replacement Python source "
         "for only the requested source group.\n"
         "For patch_region, args.source must be the complete replacement Python source "
         "for only the requested source region. Do not use new_source or patch for "
-        "patch_region replacement text. Do not ask for robot primitives as tools."
+        "patch_region replacement text.\n"
+        "For append_recovery, args.source must be executable Python code that includes "
+        "get_observation() and continues from the current physical state. Do not ask "
+        "for robot primitives as tools."
     )
     return [
         {"role": "system", "content": "You control execution of generated Python code regions."},
