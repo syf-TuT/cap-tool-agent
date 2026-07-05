@@ -65,3 +65,18 @@ def test_capsule_prompt_prefers_group_actions_when_groups_are_available():
     assert '{"action": "run_group", "args": {"group_id": "group_1"}}' in text
     assert '{"action": "patch_group", "args": {"group_id": "group_1", "source":' in text
     assert "Prefer run_group over run_region" in text
+
+
+def test_capsule_prompt_uses_no_rollback_forward_recovery_semantics():
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=[],
+        trace_summary={},
+    )
+    text = str(prompt)
+
+    assert "rollback_to_checkpoint" not in text
+    assert "Rollback is unavailable" in text
+    assert "fresh observation" in text
+    assert "current physical state" in text

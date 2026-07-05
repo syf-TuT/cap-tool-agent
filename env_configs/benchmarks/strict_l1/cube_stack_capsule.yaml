@@ -27,7 +27,7 @@ max_capsule_steps: 20
 capsule_execution_granularity: semantic_group
 capsule_max_regions_per_group: 6
 checkpoint_policy: region
-rollback_policy: best_effort
+rollback_policy: none
 capsule_feedback_level: source_region_repair_hint
 
 api_servers:

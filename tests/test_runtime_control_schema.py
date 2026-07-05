@@ -1,3 +1,5 @@
+import pytest
+
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, RuntimeAction, RuntimeEvent
 
 
@@ -51,6 +53,11 @@ def test_runtime_action_accepts_group_actions():
 
     assert run_action.action == "run_group"
     assert patch_action.action == "patch_group"
+
+
+def test_runtime_action_rejects_rollback_action():
+    with pytest.raises(ValueError, match="Unsupported runtime action"):
+        RuntimeAction.from_mapping({"action": "rollback_to_checkpoint", "args": {}})
 
 
 def test_runtime_event_is_jsonable():

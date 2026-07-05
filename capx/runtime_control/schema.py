@@ -10,7 +10,6 @@ RuntimeActionName = Literal[
     "inspect_variables",
     "patch_region",
     "patch_group",
-    "rollback_to_checkpoint",
     "resume_from_region",
     "finish",
 ]
@@ -23,7 +22,6 @@ SUPPORTED_ACTIONS: set[str] = {
     "inspect_variables",
     "patch_region",
     "patch_group",
-    "rollback_to_checkpoint",
     "resume_from_region",
     "finish",
 }

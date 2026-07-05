@@ -970,8 +970,11 @@ def _execute_runtime_action(
     if action.action == "rollback_to_checkpoint":
         return RuntimeEvent(
             action=action.action,
-            status="skipped",
-            message="Simulator checkpoint rollback is not enabled in the MVP capsule loop.",
+            status="invalid",
+            message=(
+                "Rollback is disabled. Continue from the current physical state with "
+                "fresh observation and recovery code."
+            ),
         )
 
     if action.action == "resume_from_region":

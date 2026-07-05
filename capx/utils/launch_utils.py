@@ -167,7 +167,7 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
             "capsule_max_regions_per_group", 6
         ),
         "checkpoint_policy": configs_dict.get("checkpoint_policy", "region"),
-        "rollback_policy": configs_dict.get("rollback_policy", "best_effort"),
+        "rollback_policy": configs_dict.get("rollback_policy", "none"),
         "capsule_feedback_level": configs_dict.get(
             "capsule_feedback_level", "source_region_repair_hint"
         ),

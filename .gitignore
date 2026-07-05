@@ -17,6 +17,7 @@ env/
 .capx_skills.json
 .codex_*.py
 .codex-downloads/
+.codex-results/
 .codex-upload/
 .claude/
 .agents/

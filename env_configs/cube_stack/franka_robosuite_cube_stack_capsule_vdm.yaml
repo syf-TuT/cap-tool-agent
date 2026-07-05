@@ -18,7 +18,7 @@ env:
 agent_mode: capsule
 max_capsule_steps: 12
 checkpoint_policy: region
-rollback_policy: best_effort
+rollback_policy: none
 capsule_feedback_level: source_region_repair_hint
 
 api_servers:

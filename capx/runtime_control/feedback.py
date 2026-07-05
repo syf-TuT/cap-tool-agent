@@ -130,9 +130,15 @@ def _repair_hints(
     if status == "invalid":
         return [f"Check the {action.action} arguments and available region ids."]
     if status == "warning" and event.action == "run_region":
-        return ["Inspect primitive call trace and patch this region if it should advance the task."]
+        return [
+            "No rollback is available. Inspect the trace, take a fresh observation, "
+            "and patch this region only as current-state recovery."
+        ]
     if status == "warning" and event.action == "run_group":
-        return ["Inspect primitive call trace and patch this group if it should advance the task."]
+        return [
+            "No rollback is available. Inspect the trace, take a fresh observation, "
+            "and patch this group only as current-state recovery."
+        ]
     return []
 
 
