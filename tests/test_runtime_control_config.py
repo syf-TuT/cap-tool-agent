@@ -17,6 +17,15 @@ def test_capsule_yaml_uses_code_primitives_not_robot_tools():
     assert "selecting one JSON tool call" not in data["env"]["cfg"]["prompt"]
 
 
+def test_strict_l1_cube_stack_capsule_uses_30_step_budget():
+    data = yaml.safe_load(
+        Path("env_configs/benchmarks/strict_l1/cube_stack_capsule.yaml").read_text()
+    )
+
+    assert data["agent_mode"] == "capsule"
+    assert data["max_capsule_steps"] == 30
+
+
 def test_load_config_reads_capsule_fields():
     args = SimpleNamespace(
         config_path="env_configs/cube_stack/franka_robosuite_cube_stack_capsule_vdm.yaml",

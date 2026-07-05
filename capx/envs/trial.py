@@ -708,10 +708,12 @@ def _run_capsule_trial(
     script = scripted_actions if scripted_actions is not None else config.get("scripted_actions")
     script_idx = 0
     history: list[dict[str, Any]] = []
+    step_metrics: list[dict[str, Any]] = []
     prompts: list[list[dict[str, Any]]] = []
     failed = False
     finished = False
     executed_regions = 0
+    best_reward_so_far: float | None = None
     executed_side_effect_regions: set[str] = set()
     executed_side_effect_groups: set[str] = set()
 
@@ -810,6 +812,16 @@ def _run_capsule_trial(
                 "state_after": after_state,
             }
         )
+        metric, best_reward_so_far = _capsule_step_metric(
+            step_id=step_id,
+            action=action,
+            event=event,
+            before_state=before_state,
+            after_state=after_state,
+            executed_regions=executed_regions,
+            best_reward_so_far=best_reward_so_far,
+        )
+        step_metrics.append(metric)
 
         if (
             action is not None
@@ -847,6 +859,10 @@ def _run_capsule_trial(
             json.dump(history, f, indent=2, default=str)
         with open(os.path.join(output_dir, f"capsule_prompts_trial_{trial:02d}.json"), "w") as f:
             json.dump(prompts, f, indent=2, default=str)
+        metrics_path = os.path.join(output_dir, f"capsule_step_metrics_trial_{trial:02d}.jsonl")
+        with open(metrics_path, "w") as f:
+            for metric in step_metrics:
+                f.write(json.dumps(metric, default=str) + "\n")
 
     if config.get("record_video"):
         info_step = {
@@ -1123,7 +1139,129 @@ def _safe_compute_reward(env: CodeExecutionEnvBase) -> float:
 
 
 def _capsule_state_snapshot(env: CodeExecutionEnvBase) -> dict[str, Any]:
-    return {"reward": _safe_compute_reward(env), "task_completed": _safe_task_completed(env)}
+    snapshot: dict[str, Any] = {
+        "reward": _safe_compute_reward(env),
+        "task_completed": _safe_task_completed(env),
+    }
+    low_level_env = getattr(env, "low_level_env", None)
+    if low_level_env is None:
+        return snapshot
+
+    for attr in ("_step_count", "_sim_step_count", "_gripper_fraction"):
+        if hasattr(low_level_env, attr):
+            snapshot[attr.removeprefix("_")] = _jsonable_metric_value(getattr(low_level_env, attr))
+
+    gripper_pose = getattr(low_level_env, "gripper_link_wxyz_xyz", None)
+    if gripper_pose is not None:
+        snapshot["gripper_wxyz_xyz"] = _jsonable_metric_value(gripper_pose)
+
+    current_joints = getattr(low_level_env, "_current_joints", None)
+    if current_joints is not None:
+        snapshot["robot_joint_pos"] = _jsonable_metric_value(current_joints)
+
+    object_poses = _capsule_object_pose_snapshot(low_level_env)
+    if object_poses:
+        snapshot["object_poses"] = object_poses
+
+    return snapshot
+
+
+def _capsule_step_metric(
+    *,
+    step_id: int,
+    action: RuntimeAction | None,
+    event: RuntimeEvent,
+    before_state: dict[str, Any],
+    after_state: dict[str, Any],
+    executed_regions: int,
+    best_reward_so_far: float | None,
+) -> tuple[dict[str, Any], float | None]:
+    reward_before = _state_reward(before_state)
+    reward_after = _state_reward(after_state)
+    reward_candidates = [
+        reward
+        for reward in (best_reward_so_far, reward_before, reward_after)
+        if reward is not None
+    ]
+    updated_best = max(reward_candidates) if reward_candidates else best_reward_so_far
+    reward_drop = (
+        updated_best - reward_after
+        if updated_best is not None and reward_after is not None
+        else None
+    )
+
+    region_id = event.region_id
+    if region_id is None and action is not None:
+        region_id = action.args.get("region_id") or action.args.get("group_id")
+
+    metric = {
+        "step_id": step_id,
+        "action": action.action if action is not None else "invalid",
+        "region_id": region_id,
+        "event_action": event.action,
+        "event_status": event.status,
+        "event_message": event.message,
+        "duration_s": event.duration_s,
+        "trace_event_count": len(event.evidence.get("trace_events", [])),
+        "executed_regions_so_far": executed_regions,
+        "reward_before": reward_before,
+        "reward_after": reward_after,
+        "best_reward_so_far": updated_best,
+        "reward_drop_from_best": reward_drop,
+        "task_completed_before": before_state.get("task_completed"),
+        "task_completed_after": after_state.get("task_completed"),
+        "state_before": before_state,
+        "state_after": after_state,
+    }
+    return metric, updated_best
+
+
+def _state_reward(state: dict[str, Any]) -> float | None:
+    value = state.get("reward")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _jsonable_metric_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return _jsonable_metric_value(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _jsonable_metric_value(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_metric_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _capsule_object_pose_snapshot(low_level_env: Any) -> dict[str, Any]:
+    robosuite_env = getattr(low_level_env, "robosuite_env", None)
+    sim = getattr(robosuite_env, "sim", None)
+    if robosuite_env is None or sim is None:
+        return {}
+
+    object_poses: dict[str, Any] = {}
+    for attr_name, obj in vars(robosuite_env).items():
+        root_body = getattr(obj, "root_body", None)
+        if not root_body:
+            continue
+        try:
+            body_id = sim.model.body_name2id(root_body)
+            object_poses[attr_name] = {
+                "body": root_body,
+                "pos": _jsonable_metric_value(sim.data.body_xpos[body_id]),
+                "quat_wxyz": _jsonable_metric_value(sim.data.body_xquat[body_id]),
+            }
+        except Exception as exc:
+            object_poses[attr_name] = {
+                "body": root_body,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+    return object_poses
 
 
 def _safe_task_completed(env: CodeExecutionEnvBase) -> bool | None:

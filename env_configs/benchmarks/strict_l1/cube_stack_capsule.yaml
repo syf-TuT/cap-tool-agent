@@ -23,7 +23,7 @@ env:
       Write ONLY executable Python code. Import numpy/scipy explicitly if needed.
 
 agent_mode: capsule
-max_capsule_steps: 20
+max_capsule_steps: 30
 capsule_execution_granularity: semantic_group
 capsule_max_regions_per_group: 6
 checkpoint_policy: region

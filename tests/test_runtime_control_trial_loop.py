@@ -498,6 +498,37 @@ def test_capsule_trial_writes_trace_and_feedback_artifact(tmp_path):
     assert trace[2]["event"]["evidence"]["events"][0]["name"] == "get_pose"
 
 
+def test_capsule_trial_writes_step_metrics_jsonl(tmp_path):
+    _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='pose = get_pose("cube")\nmove_to(pose)\n',
+        scripted_actions=[
+            {"action": "run_region", "args": {"region_id": "region_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    metrics_path = tmp_path / "capsule_step_metrics_trial_01.jsonl"
+    rows = [json.loads(line) for line in metrics_path.read_text().splitlines()]
+
+    assert [row["step_id"] for row in rows] == [1, 2]
+    assert rows[0]["action"] == "run_region"
+    assert rows[0]["event_status"] == "success"
+    assert rows[0]["reward_before"] == 1.0
+    assert rows[0]["reward_after"] == 1.0
+    assert rows[0]["best_reward_so_far"] == 1.0
+    assert rows[0]["reward_drop_from_best"] == 0.0
+    assert rows[0]["state_after"]["reward"] == 1.0
+
+
 def test_patch_region_accepts_new_source_alias():
     source = "x = 1\ny = x + 1\n"
     region = CodeRegion("region_2", 2, 2, "y = x + 1")
