@@ -1,4 +1,32 @@
-from capx.runtime_control.segmenter import segment_python_code, segment_python_code_groups
+from capx.runtime_control.segmenter import (
+    analyze_python_regions,
+    segment_python_code,
+    segment_python_code_groups,
+)
+
+
+def test_segmenter_regions_partition_source_bytes():
+    source = "x = 1\nmove_to(x)\ny = x + 1"
+
+    regions = segment_python_code(source)
+
+    assert "".join(region.source for region in regions) == source
+
+
+def test_segmenter_exposes_region_analysis_facts():
+    source = "x = 1\nmove_to(x)\n"
+    regions = segment_python_code(source)
+
+    analyses = analyze_python_regions(
+        source,
+        regions,
+        side_effect_calls={"move_to"},
+    )
+
+    assert [analysis.region_id for analysis in analyses] == ["region_1", "region_2"]
+    assert analyses[0].defined_names == ["x"]
+    assert analyses[1].primitive_calls == ["move_to"]
+    assert analyses[1].has_robot_side_effect is True
 
 
 def test_segmenter_groups_top_level_statements():
@@ -12,7 +40,7 @@ def test_segmenter_groups_top_level_statements():
         "region_3",
         "region_4",
     ]
-    assert regions[0].source == "import numpy as np"
+    assert regions[0].source == "import numpy as np\n"
     assert regions[-1].start_line == 4
 
 
@@ -63,7 +91,7 @@ def test_segmenter_keeps_non_side_effect_setup_in_one_group():
     groups = segment_python_code_groups("x = 1\ny = x + 2\nz = y + 3\n")
 
     assert len(groups) == 1
-    assert groups[0].source == "x = 1\ny = x + 2\nz = y + 3"
+    assert groups[0].source == "x = 1\ny = x + 2\nz = y + 3\n"
     assert groups[0].defined_names == ["x", "y", "z"]
     assert groups[0].used_names == ["x", "y"]
     assert groups[0].has_robot_side_effect is False

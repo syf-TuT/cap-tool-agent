@@ -21,36 +21,54 @@ ROBOT_SIDE_EFFECT_CALLS = {
 
 
 @dataclass(frozen=True)
-class _RegionAnalysis:
+class RegionAnalysis:
+    region_id: str
     primitive_calls: list[str]
     defined_names: list[str]
     used_names: list[str]
     has_robot_side_effect: bool
-    is_effect: bool
+    has_structural_effect: bool
 
 
 def segment_python_code(source: str) -> list[CodeRegion]:
     """Split Python source into deterministic top-level execution regions."""
     module = ast.parse(source)
-    lines = source.splitlines()
+    lines = source.splitlines(keepends=True)
     regions: list[CodeRegion] = []
 
-    for idx, node in enumerate(module.body, start=1):
+    for node_index, node in enumerate(module.body):
         start_line = getattr(node, "lineno", None)
-        end_line = getattr(node, "end_lineno", None)
-        if start_line is None or end_line is None:
+        if start_line is None:
             continue
-        region_source = "\n".join(lines[start_line - 1 : end_line])
+        next_node = module.body[node_index + 1] if node_index + 1 < len(module.body) else None
+        next_start_line = getattr(next_node, "lineno", None) if next_node is not None else None
+        slice_start_line = 1 if node_index == 0 else start_line
+        end_line = next_start_line - 1 if next_start_line is not None else len(lines)
+        region_source = "".join(lines[slice_start_line - 1 : end_line])
         regions.append(
             CodeRegion(
-                region_id=f"region_{idx}",
-                start_line=start_line,
+                region_id=f"region_{node_index + 1}",
+                start_line=slice_start_line,
                 end_line=end_line,
                 source=region_source,
             )
         )
 
     return regions
+
+
+def analyze_python_regions(
+    source: str,
+    regions: list[CodeRegion],
+    *,
+    side_effect_calls: set[str],
+) -> list[RegionAnalysis]:
+    """Return structural analysis facts for source regions.
+
+    ``source`` is accepted for the public structural-facts API and for the
+    later normalizer handoff; analysis remains anchored to each region source.
+    """
+    return [_analyze_region(region, side_effect_calls) for region in regions]
 
 
 def segment_python_code_groups(
@@ -84,18 +102,20 @@ def segment_python_code_groups(
         side_effect_calls = ROBOT_SIDE_EFFECT_CALLS
 
     groups: list[CodeRegionGroup] = []
-    current: list[tuple[CodeRegion, _RegionAnalysis]] = []
+    current: list[tuple[CodeRegion, RegionAnalysis]] = []
     current_has_effect = False
 
-    for region in regions:
-        analysis = _analyze_region(region, side_effect_calls)
-        returns_to_sense = current_has_effect and not analysis.is_effect
+    for region, analysis in zip(
+        regions,
+        analyze_python_regions(source, regions, side_effect_calls=side_effect_calls),
+    ):
+        returns_to_sense = current_has_effect and not analysis.has_structural_effect
         if current and (returns_to_sense or len(current) >= max_regions_per_group):
             groups.append(_build_group(len(groups) + 1, current))
             current = []
             current_has_effect = False
         current.append((region, analysis))
-        current_has_effect = current_has_effect or analysis.is_effect
+        current_has_effect = current_has_effect or analysis.has_structural_effect
 
     if current:
         groups.append(_build_group(len(groups) + 1, current))
@@ -103,11 +123,11 @@ def segment_python_code_groups(
     return groups
 
 
-def _analyze_region(region: CodeRegion, side_effect_calls: set[str]) -> _RegionAnalysis:
+def _analyze_region(region: CodeRegion, side_effect_calls: set[str]) -> RegionAnalysis:
     try:
         module = ast.parse(region.source)
     except SyntaxError:
-        return _RegionAnalysis([], [], [], False, False)
+        return RegionAnalysis(region.region_id, [], [], [], False, False)
 
     primitive_calls = _ordered_unique(_call_names(module))
     defined_names = _ordered_unique(_defined_names(module))
@@ -115,12 +135,13 @@ def _analyze_region(region: CodeRegion, side_effect_calls: set[str]) -> _RegionA
     used_names = _ordered_unique(
         name for name in _used_names(module) if name not in defined_name_set
     )
-    return _RegionAnalysis(
+    return RegionAnalysis(
+        region_id=region.region_id,
         primitive_calls=primitive_calls,
         defined_names=defined_names,
         used_names=used_names,
         has_robot_side_effect=any(name in side_effect_calls for name in primitive_calls),
-        is_effect=_is_effect_region(module),
+        has_structural_effect=_is_effect_region(module),
     )
 
 
@@ -139,7 +160,7 @@ def _is_effect_region(module: ast.Module) -> bool:
 
 def _build_group(
     group_index: int,
-    items: list[tuple[CodeRegion, _RegionAnalysis]],
+    items: list[tuple[CodeRegion, RegionAnalysis]],
 ) -> CodeRegionGroup:
     regions = [region for region, _ in items]
     analyses = [analysis for _, analysis in items]
@@ -147,7 +168,7 @@ def _build_group(
         group_id=f"group_{group_index}",
         start_line=regions[0].start_line,
         end_line=regions[-1].end_line,
-        source="\n".join(region.source for region in regions),
+        source="".join(region.source for region in regions),
         region_ids=[region.region_id for region in regions],
         primitive_calls=_ordered_unique(
             call for analysis in analyses for call in analysis.primitive_calls
