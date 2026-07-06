@@ -26,6 +26,7 @@ class _RegionAnalysis:
     defined_names: list[str]
     used_names: list[str]
     has_robot_side_effect: bool
+    is_effect: bool
 
 
 def segment_python_code(source: str) -> list[CodeRegion]:
@@ -56,23 +57,45 @@ def segment_python_code_groups(
     source: str,
     regions: list[CodeRegion] | None = None,
     *,
-    max_regions_per_group: int = 6,
+    max_regions_per_group: int = 20,
+    side_effect_calls: set[str] | None = None,
 ) -> list[CodeRegionGroup]:
-    """Merge atomic regions into deterministic semantic execution groups."""
+    """Merge atomic regions into deterministic sense->act execution groups.
+
+    A group spans a sense/compute prologue plus one or more consecutive effect
+    statements (bare calls whose return value is discarded). When code returns
+    to sensing/computing after an effect, a new group begins. Boundaries are
+    structural and domain-agnostic; the effect-primitive vocabulary is used only
+    to mark ``has_robot_side_effect``, never to decide boundaries.
+
+    ``side_effect_calls`` is the set of primitive names the environment declares
+    as rollback-relevant robot side effects. Defaults to ``ROBOT_SIDE_EFFECT_CALLS``
+    when the caller does not inject one.
+
+    ``max_regions_per_group`` is a loose safety fallback that caps pathological
+    boundary-free code, not the primary segmentation signal.
+    """
     if regions is None:
         regions = segment_python_code(source)
     if not regions:
         return []
 
+    if side_effect_calls is None:
+        side_effect_calls = ROBOT_SIDE_EFFECT_CALLS
+
     groups: list[CodeRegionGroup] = []
     current: list[tuple[CodeRegion, _RegionAnalysis]] = []
+    current_has_effect = False
 
     for region in regions:
-        analysis = _analyze_region(region)
-        current.append((region, analysis))
-        if analysis.has_robot_side_effect or len(current) >= max_regions_per_group:
+        analysis = _analyze_region(region, side_effect_calls)
+        returns_to_sense = current_has_effect and not analysis.is_effect
+        if current and (returns_to_sense or len(current) >= max_regions_per_group):
             groups.append(_build_group(len(groups) + 1, current))
             current = []
+            current_has_effect = False
+        current.append((region, analysis))
+        current_has_effect = current_has_effect or analysis.is_effect
 
     if current:
         groups.append(_build_group(len(groups) + 1, current))
@@ -80,11 +103,11 @@ def segment_python_code_groups(
     return groups
 
 
-def _analyze_region(region: CodeRegion) -> _RegionAnalysis:
+def _analyze_region(region: CodeRegion, side_effect_calls: set[str]) -> _RegionAnalysis:
     try:
         module = ast.parse(region.source)
     except SyntaxError:
-        return _RegionAnalysis([], [], [], False)
+        return _RegionAnalysis([], [], [], False, False)
 
     primitive_calls = _ordered_unique(_call_names(module))
     defined_names = _ordered_unique(_defined_names(module))
@@ -96,7 +119,21 @@ def _analyze_region(region: CodeRegion) -> _RegionAnalysis:
         primitive_calls=primitive_calls,
         defined_names=defined_names,
         used_names=used_names,
-        has_robot_side_effect=any(name in ROBOT_SIDE_EFFECT_CALLS for name in primitive_calls),
+        has_robot_side_effect=any(name in side_effect_calls for name in primitive_calls),
+        is_effect=_is_effect_region(module),
+    )
+
+
+def _is_effect_region(module: ast.Module) -> bool:
+    """A region is an effect if any top-level statement is a bare call whose
+    return value is discarded (e.g. ``move_to_joints(...)`` or ``publish(x)``).
+
+    Boundary detection is structural and domain-agnostic: it does not consult
+    any robot-primitive vocabulary.
+    """
+    return any(
+        isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+        for node in module.body
     )
 
 

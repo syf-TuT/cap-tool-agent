@@ -93,6 +93,16 @@ class ApiBase(ABC):
     def functions(self) -> dict[str, Callable[..., Any]]:
         """Return mapping of public function name -> callable."""
 
+    def side_effect_functions(self) -> set[str]:
+        """Return the names of functions that cause rollback-relevant robot side
+        effects (moving, gripping, executing trajectories).
+
+        Used by capsule runtime control to mark ``has_robot_side_effect`` and
+        enforce no-rollback forward recovery. Sensing/compute-only APIs keep the
+        default empty set; APIs exposing effect primitives should override this.
+        """
+        return set()
+
     def combined_doc(self) -> str:
         """Aggregate function docs in a simple, consistent format.
 

@@ -40,6 +40,7 @@ from capx.runtime_control import (
     segment_python_code_groups,
 )
 from capx.runtime_control.segmenter import ROBOT_SIDE_EFFECT_CALLS
+from capx.runtime_control.side_effects import collect_side_effect_calls
 
 from capx.llm.client import (
     VLM_MODELS,
@@ -687,12 +688,16 @@ def _run_capsule_trial(
     use_semantic_groups = (
         config.get("capsule_execution_granularity", "semantic_group") == "semantic_group"
     )
+    side_effect_calls = collect_side_effect_calls(getattr(env, "_apis", {}).values())
+    if not side_effect_calls:
+        side_effect_calls = ROBOT_SIDE_EFFECT_CALLS
     regions = segment_python_code(source)
     groups = (
         segment_python_code_groups(
             source,
             regions,
             max_regions_per_group=max_regions_per_group,
+            side_effect_calls=side_effect_calls,
         )
         if use_semantic_groups
         else []
@@ -835,6 +840,7 @@ def _run_capsule_trial(
                     source,
                     regions,
                     max_regions_per_group=max_regions_per_group,
+                    side_effect_calls=side_effect_calls,
                 )
                 if use_semantic_groups
                 else []
