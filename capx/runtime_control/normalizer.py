@@ -54,6 +54,7 @@ def normalize_python_code_groups(
     source; each group source is the byte-for-byte concatenation of its member
     region sources.
     """
+    _validate_normalizer_inputs(source, regions, analyses)
     if not regions:
         return []
 
@@ -77,6 +78,25 @@ def normalize_python_code_groups(
         groups.append(_build_group(len(groups) + 1, current))
 
     return groups
+
+
+def _validate_normalizer_inputs(
+    source: str,
+    regions: list[CodeRegion],
+    analyses: list[RegionAnalysis],
+) -> None:
+    if regions and source != "".join(region.source for region in regions):
+        raise ValueError("Normalizer source must match concatenated region source")
+
+    if len(regions) != len(analyses):
+        raise ValueError("Normalizer regions and analyses must have the same number of items")
+
+    for region, analysis in zip(regions, analyses):
+        if region.region_id != analysis.region_id:
+            raise ValueError(
+                "Normalizer analysis region_id must match the paired region "
+                f"({region.region_id} != {analysis.region_id})"
+            )
 
 
 def _build_group(

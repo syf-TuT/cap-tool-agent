@@ -1,5 +1,11 @@
-from capx.runtime_control.normalizer import segment_python_code_groups
-from capx.runtime_control.segmenter import segment_python_code
+import pytest
+
+from capx.runtime_control.normalizer import (
+    GroupingPolicy,
+    normalize_python_code_groups,
+    segment_python_code_groups,
+)
+from capx.runtime_control.segmenter import analyze_python_regions, segment_python_code
 
 
 def _source_with_spacing():
@@ -61,6 +67,48 @@ def test_groups_partition_regions_without_gaps_or_reordering():
 
     assert grouped_region_ids == [region.region_id for region in regions]
     assert len(grouped_region_ids) == len(set(grouped_region_ids))
+
+
+def test_normalizer_rejects_analysis_length_mismatch():
+    source = "x = 1\nmove_to(x)\n"
+    regions = segment_python_code(source)
+    analyses = analyze_python_regions(source, regions, side_effect_calls={"move_to"})
+
+    with pytest.raises(ValueError, match="same number"):
+        normalize_python_code_groups(
+            source,
+            regions,
+            analyses[:-1],
+            policy=GroupingPolicy(),
+        )
+
+
+def test_normalizer_rejects_analysis_region_id_mismatch():
+    source = "x = 1\nmove_to(x)\n"
+    regions = segment_python_code(source)
+    analyses = analyze_python_regions(source, regions, side_effect_calls={"move_to"})
+
+    with pytest.raises(ValueError, match="region_id"):
+        normalize_python_code_groups(
+            source,
+            regions,
+            list(reversed(analyses)),
+            policy=GroupingPolicy(),
+        )
+
+
+def test_normalizer_rejects_source_that_does_not_match_regions():
+    source = "x = 1\nmove_to(x)\n"
+    regions = segment_python_code(source)
+    analyses = analyze_python_regions(source, regions, side_effect_calls={"move_to"})
+
+    with pytest.raises(ValueError, match="source"):
+        normalize_python_code_groups(
+            "stale = True\n",
+            regions,
+            analyses,
+            policy=GroupingPolicy(),
+        )
 
 
 def test_normalizer_merges_consecutive_effects_into_sense_act_block():
