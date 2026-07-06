@@ -62,6 +62,17 @@ class FrankaTwoArmLiftPrivilegedApi(ApiBase):
             "goto_pose_both": self.goto_pose_both,
         }
 
+    def side_effect_functions(self) -> set[str]:
+        return {
+            "goto_pose_arm0",
+            "goto_pose_arm1",
+            "goto_pose_both",
+            "open_gripper_arm0",
+            "close_gripper_arm0",
+            "open_gripper_arm1",
+            "close_gripper_arm1",
+        }
+
     def get_pot_pose(self) -> tuple[np.ndarray, np.ndarray]:
         """Get the pose of the pot body.
 

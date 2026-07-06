@@ -225,6 +225,20 @@ class R1ProControlApi(ApiBase):
             # "debug_pyroik": self.debug_pyroik,
         }
         return fns
+
+    def side_effect_functions(self) -> set[str]:
+        return {
+            "navigate_to_pose",
+            "open_gripper",
+            "close_gripper",
+            "move_hand",
+            "reset_torso",
+            "move_to_joint_positions",
+            "lift_arm",
+            "find_object_base_rotate",
+            "find_object_torso_rotate",
+            "grasp_object",
+        }
     
     def segment_sam3_text_prompt(
         self,

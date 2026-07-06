@@ -83,6 +83,9 @@ class FrankaControlSpillWipeApi(ApiBase):
         }
         return fns
 
+    def side_effect_functions(self) -> set[str]:
+        return {"goto_pose"}
+
     def _get_segmentation_map(
         self, obs: dict[str, Any], rgb: np.ndarray, box: list[float] = None
     ) -> np.ndarray:

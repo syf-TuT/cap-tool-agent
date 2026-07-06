@@ -100,6 +100,9 @@ class FrankaControlApi(ApiBase):
             fns["home_pose"] = self.home_pose
         return fns
 
+    def side_effect_functions(self) -> set[str]:
+        return {"goto_pose", "home_pose", "open_gripper", "close_gripper"}
+
     # def get_observation(self) -> dict[str, Any]:
     #     """Get the observation of the environment.
     #     Returns:

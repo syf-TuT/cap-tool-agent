@@ -74,6 +74,16 @@ class FrankaHandoverApi(ApiBase):
             "close_gripper_arm0": self.close_gripper_arm0,
             "close_gripper_arm1": self.close_gripper_arm1,
         }
+
+    def side_effect_functions(self) -> set[str]:
+        return {
+            "goto_pose_arm0",
+            "goto_pose_arm1",
+            "open_gripper_arm0",
+            "close_gripper_arm0",
+            "open_gripper_arm1",
+            "close_gripper_arm1",
+        }
     
     def _save_segmentation_debug(self, segmentation: np.ndarray, path: pathlib.Path) -> None:
         save_segmentation_debug(segmentation, path)

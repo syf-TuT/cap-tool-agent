@@ -56,6 +56,9 @@ class FrankaControlPrivilegedApi(ApiBase):
         #     base_functions["breakpoint_code_block"] = self.breakpoint_code_block
         return base_functions
 
+    def side_effect_functions(self) -> set[str]:
+        return {"goto_pose", "home_pose", "open_gripper", "close_gripper"}
+
     def get_object_pose(
         self, object_name: str, return_bbox_extent: bool = False
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:

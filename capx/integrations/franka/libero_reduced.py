@@ -109,6 +109,15 @@ class FrankaLiberoApiReduced(ApiBase):
         # fns["execute_joint_trajectory"] = self.execute_joint_trajectory
         return fns
 
+    def side_effect_functions(self) -> set[str]:
+        return {
+            "move_to_joints",
+            "goto_pose",
+            "goto_home_joint_position",
+            "open_gripper",
+            "close_gripper",
+        }
+
 
     def get_observation(self) -> dict[str, Any]:
         """Get the observation of the environment.

@@ -128,6 +128,20 @@ class FrankaControlApiReduced(ApiBase):
 
         return fns
 
+    def side_effect_functions(self) -> set[str]:
+        return {
+            "move_to_joints",
+            "open_gripper",
+            "close_gripper",
+            "move_to_joints_both",
+            "move_to_joints_arm0",
+            "move_to_joints_arm1",
+            "open_gripper_arm0",
+            "close_gripper_arm0",
+            "open_gripper_arm1",
+            "close_gripper_arm1",
+        }
+
     def get_observation(self) -> dict[str, Any]:
         """Get the observation of the environment.
         Returns:

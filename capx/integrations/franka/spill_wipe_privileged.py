@@ -58,6 +58,9 @@ class FrankaControlSpillWipePrivilegedApi(ApiBase):
             "goto_pose": self.goto_pose,
         }
 
+    def side_effect_functions(self) -> set[str]:
+        return {"goto_pose"}
+
     def get_object_pose(
         self, object_name: str, return_bbox_extent: bool = False
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:

@@ -49,6 +49,14 @@ class FrankaControlNutAssemblyPrivilegedApi(ApiBase):
             "close_gripper": self.close_gripper,
         }
 
+    def side_effect_functions(self) -> set[str]:
+        return {
+            "goto_pose",
+            "goto_home_joint_position",
+            "open_gripper",
+            "close_gripper",
+        }
+
     def get_nut_handle_to_center_offset(self, object_name: str) -> np.ndarray:
         """Get the offset of the nut handle from the nut center.
 

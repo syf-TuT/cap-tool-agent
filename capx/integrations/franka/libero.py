@@ -90,6 +90,14 @@ class FrankaLiberoApi(ApiBase):
 
         return fns
 
+    def side_effect_functions(self) -> set[str]:
+        return {
+            "goto_pose",
+            "goto_home_joint_position",
+            "open_gripper",
+            "close_gripper",
+        }
+
     def get_observation(self) -> dict[str, Any]:
         """Get the observation of the environment.
         Returns:

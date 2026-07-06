@@ -66,6 +66,14 @@ class FrankaControlNutAssemblyVisualApi(ApiBase):
             "close_gripper": self.close_gripper,
         }
 
+    def side_effect_functions(self) -> set[str]:
+        return {
+            "goto_pose",
+            "goto_home_joint_position",
+            "open_gripper",
+            "close_gripper",
+        }
+
     def get_object_pose(self, object_name: str) -> tuple[np.ndarray, np.ndarray]:
         """Get the pose of an object in the environment from a natural language description.
         The quaternion from get_object_pose may be unreliable, so disregard it and use the grasp pose quaternion OR (0, 0, 1, 0) wxyz as the gripper down orientation if using this for placement position.
