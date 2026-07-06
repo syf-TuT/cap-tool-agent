@@ -118,7 +118,7 @@ def _analyze_region(region: CodeRegion, side_effect_calls: set[str]) -> RegionAn
             defined_function_call_names={},
         )
 
-    primitive_calls = _ordered_unique(_call_names(module))
+    primitive_calls, executable_direct_call_names = _executable_call_facts(module.body)
     lexical_side_effect_calls = _ordered_unique(
         name for name in primitive_calls if name in side_effect_calls
     )
@@ -138,7 +138,7 @@ def _analyze_region(region: CodeRegion, side_effect_calls: set[str]) -> RegionAn
         has_robot_side_effect=bool(lexical_side_effect_calls),
         has_structural_effect=_is_effect_region(module),
         defined_functions=_defined_functions(module),
-        top_level_call_names=_top_level_call_names(module),
+        top_level_call_names=executable_direct_call_names,
         lexical_side_effect_calls=lexical_side_effect_calls,
         defined_function_side_effect_calls=defined_function_side_effect_calls,
         defined_function_call_names=defined_function_call_names,
@@ -158,16 +158,6 @@ def _is_effect_region(module: ast.Module) -> bool:
     )
 
 
-def _call_names(node: ast.AST) -> list[str]:
-    names: list[str] = []
-    for child in ast.walk(node):
-        if isinstance(child, ast.Call):
-            name = _callable_name(child.func)
-            if name:
-                names.append(name)
-    return names
-
-
 def _callable_name(node: ast.AST) -> str | None:
     if isinstance(node, ast.Name):
         return node.id
@@ -182,16 +172,6 @@ def _defined_functions(module: ast.Module) -> list[str]:
         for node in module.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
-
-
-def _top_level_call_names(module: ast.Module) -> list[str]:
-    names: list[str] = []
-    for node in module.body:
-        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)):
-            continue
-        if isinstance(node.value.func, ast.Name):
-            names.append(node.value.func.id)
-    return _ordered_unique(names)
 
 
 def _defined_function_effect_facts(
@@ -333,13 +313,25 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         return
 
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
     def visit_Call(self, node: ast.Call) -> None:
         name = _callable_name(node.func)
         if name:
             self.call_names.append(name)
         if isinstance(node.func, ast.Name):
             self.direct_call_names.append(node.func.id)
-        self.generic_visit(node)
+
+        if isinstance(node.func, ast.Lambda):
+            self.visit(node.func.body)
+        else:
+            self.visit(node.func)
+
+        for arg in node.args:
+            self.visit(arg)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
 
 
 def _defined_names(node: ast.AST) -> list[str]:

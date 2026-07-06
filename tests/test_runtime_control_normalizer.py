@@ -368,6 +368,98 @@ def test_helper_call_resolves_local_helper_wrapper_side_effect_metadata():
     assert "move_to" in groups[2].primitive_calls
 
 
+def test_control_flow_helper_call_inherits_side_effect_metadata():
+    source = "\n".join(
+        [
+            "def pick():",
+            "    move_to('cube')",
+            "",
+            "ready = True",
+            "if ready:",
+            "    pick()",
+        ]
+    )
+
+    groups = segment_python_code_groups(
+        source,
+        max_regions_per_group=1,
+        side_effect_calls={"move_to"},
+    )
+
+    assert [group.region_ids for group in groups] == [
+        ["region_1"],
+        ["region_2"],
+        ["region_3"],
+    ]
+    assert groups[0].has_robot_side_effect is False
+    assert groups[2].has_robot_side_effect is True
+    assert "move_to" in groups[2].primitive_calls
+
+
+def test_assignment_helper_call_inherits_side_effect_metadata():
+    source = "\n".join(
+        [
+            "def pick():",
+            "    move_to('cube')",
+            "",
+            "ok = pick()",
+        ]
+    )
+
+    groups = segment_python_code_groups(
+        source,
+        max_regions_per_group=1,
+        side_effect_calls={"move_to"},
+    )
+
+    assert [group.region_ids for group in groups] == [["region_1"], ["region_2"]]
+    assert groups[0].has_robot_side_effect is False
+    assert groups[1].has_robot_side_effect is True
+    assert "move_to" in groups[1].primitive_calls
+
+
+def test_class_definition_method_does_not_mark_side_effect_metadata():
+    source = "\n".join(
+        [
+            "class Robot:",
+            "    def move(self):",
+            "        move_to('cube')",
+            "",
+            "x = 1",
+        ]
+    )
+
+    groups = segment_python_code_groups(source, side_effect_calls={"move_to"})
+
+    assert [group.region_ids for group in groups] == [["region_1", "region_2"]]
+    assert all(group.has_robot_side_effect is False for group in groups)
+
+
+def test_lambda_body_is_side_effect_metadata_only_when_called_directly():
+    created_source = "\n".join(
+        [
+            "fn = lambda: move_to('cube')",
+            "x = 1",
+        ]
+    )
+
+    created_groups = segment_python_code_groups(
+        created_source,
+        side_effect_calls={"move_to"},
+    )
+
+    assert [group.region_ids for group in created_groups] == [["region_1", "region_2"]]
+    assert all(group.has_robot_side_effect is False for group in created_groups)
+
+    called_groups = segment_python_code_groups(
+        "(lambda: move_to('cube'))()",
+        side_effect_calls={"move_to"},
+    )
+
+    assert called_groups[0].has_robot_side_effect is True
+    assert "move_to" in called_groups[0].primitive_calls
+
+
 def test_control_flow_region_containing_side_effect_is_effect_metadata():
     source = "\n".join(
         [
