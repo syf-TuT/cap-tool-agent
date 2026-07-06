@@ -10,7 +10,8 @@ from capx.runtime_control.schema import (
     RuntimeEvent,
     RuntimeFeedback,
 )
-from capx.runtime_control.segmenter import segment_python_code, segment_python_code_groups
+from capx.runtime_control.normalizer import segment_python_code_groups
+from capx.runtime_control.segmenter import segment_python_code
 from capx.runtime_control.trace import RuntimeTrace, wrap_function_for_trace
 
 __all__ = [

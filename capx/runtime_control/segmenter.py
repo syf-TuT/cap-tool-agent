@@ -4,7 +4,7 @@ import ast
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from capx.runtime_control.schema import CodeRegion, CodeRegionGroup
+from capx.runtime_control.schema import CodeRegion
 
 
 ROBOT_SIDE_EFFECT_CALLS = {
@@ -95,58 +95,6 @@ def analyze_python_regions(
     return [_analyze_region(region, side_effect_calls) for region in regions]
 
 
-def segment_python_code_groups(
-    source: str,
-    regions: list[CodeRegion] | None = None,
-    *,
-    max_regions_per_group: int = 20,
-    side_effect_calls: set[str] | None = None,
-) -> list[CodeRegionGroup]:
-    """Merge atomic regions into deterministic sense->act execution groups.
-
-    A group spans a sense/compute prologue plus one or more consecutive effect
-    statements (bare calls whose return value is discarded). When code returns
-    to sensing/computing after an effect, a new group begins. Boundaries are
-    structural and domain-agnostic; the effect-primitive vocabulary is used only
-    to mark ``has_robot_side_effect``, never to decide boundaries.
-
-    ``side_effect_calls`` is the set of primitive names the environment declares
-    as rollback-relevant robot side effects. Defaults to ``ROBOT_SIDE_EFFECT_CALLS``
-    when the caller does not inject one.
-
-    ``max_regions_per_group`` is a loose safety fallback that caps pathological
-    boundary-free code, not the primary segmentation signal.
-    """
-    if regions is None:
-        regions = segment_python_code(source)
-    if not regions:
-        return []
-
-    if side_effect_calls is None:
-        side_effect_calls = ROBOT_SIDE_EFFECT_CALLS
-
-    groups: list[CodeRegionGroup] = []
-    current: list[tuple[CodeRegion, RegionAnalysis]] = []
-    current_has_effect = False
-
-    for region, analysis in zip(
-        regions,
-        analyze_python_regions(source, regions, side_effect_calls=side_effect_calls),
-    ):
-        returns_to_sense = current_has_effect and not analysis.has_structural_effect
-        if current and (returns_to_sense or len(current) >= max_regions_per_group):
-            groups.append(_build_group(len(groups) + 1, current))
-            current = []
-            current_has_effect = False
-        current.append((region, analysis))
-        current_has_effect = current_has_effect or analysis.has_structural_effect
-
-    if current:
-        groups.append(_build_group(len(groups) + 1, current))
-
-    return groups
-
-
 def _analyze_region(region: CodeRegion, side_effect_calls: set[str]) -> RegionAnalysis:
     try:
         module = ast.parse(region.source)
@@ -179,29 +127,6 @@ def _is_effect_region(module: ast.Module) -> bool:
     return any(
         isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
         for node in module.body
-    )
-
-
-def _build_group(
-    group_index: int,
-    items: list[tuple[CodeRegion, RegionAnalysis]],
-) -> CodeRegionGroup:
-    regions = [region for region, _ in items]
-    analyses = [analysis for _, analysis in items]
-    return CodeRegionGroup(
-        group_id=f"group_{group_index}",
-        start_line=regions[0].start_line,
-        end_line=regions[-1].end_line,
-        source="".join(region.source for region in regions),
-        region_ids=[region.region_id for region in regions],
-        primitive_calls=_ordered_unique(
-            call for analysis in analyses for call in analysis.primitive_calls
-        ),
-        defined_names=_ordered_unique(
-            name for analysis in analyses for name in analysis.defined_names
-        ),
-        used_names=_ordered_unique(name for analysis in analyses for name in analysis.used_names),
-        has_robot_side_effect=any(analysis.has_robot_side_effect for analysis in analyses),
     )
 
 
