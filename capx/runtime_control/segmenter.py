@@ -180,9 +180,8 @@ def _top_level_call_names(module: ast.Module) -> list[str]:
     for node in module.body:
         if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)):
             continue
-        name = _callable_name(node.value.func)
-        if name:
-            names.append(name)
+        if isinstance(node.value.func, ast.Name):
+            names.append(node.value.func.id)
     return _ordered_unique(names)
 
 
