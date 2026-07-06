@@ -31,6 +31,8 @@ class RegionAnalysis:
     defined_functions: list[str]
     top_level_call_names: list[str]
     lexical_side_effect_calls: list[str]
+    defined_function_side_effect_calls: dict[str, list[str]]
+    defined_function_call_names: dict[str, list[str]]
 
 
 def segment_python_code(source: str) -> list[CodeRegion]:
@@ -112,11 +114,16 @@ def _analyze_region(region: CodeRegion, side_effect_calls: set[str]) -> RegionAn
             defined_functions=[],
             top_level_call_names=[],
             lexical_side_effect_calls=[],
+            defined_function_side_effect_calls={},
+            defined_function_call_names={},
         )
 
     primitive_calls = _ordered_unique(_call_names(module))
     lexical_side_effect_calls = _ordered_unique(
         name for name in primitive_calls if name in side_effect_calls
+    )
+    defined_function_side_effect_calls, defined_function_call_names = (
+        _defined_function_effect_facts(module, side_effect_calls)
     )
     defined_names = _ordered_unique(_defined_names(module))
     defined_name_set = set(defined_names)
@@ -133,6 +140,8 @@ def _analyze_region(region: CodeRegion, side_effect_calls: set[str]) -> RegionAn
         defined_functions=_defined_functions(module),
         top_level_call_names=_top_level_call_names(module),
         lexical_side_effect_calls=lexical_side_effect_calls,
+        defined_function_side_effect_calls=defined_function_side_effect_calls,
+        defined_function_call_names=defined_function_call_names,
     )
 
 
@@ -183,6 +192,154 @@ def _top_level_call_names(module: ast.Module) -> list[str]:
         if isinstance(node.value.func, ast.Name):
             names.append(node.value.func.id)
     return _ordered_unique(names)
+
+
+def _defined_function_effect_facts(
+    module: ast.Module,
+    side_effect_calls: set[str],
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    side_effects: dict[str, list[str]] = {}
+    helper_calls: dict[str, list[str]] = {}
+
+    for node in module.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        function_side_effects, function_helper_calls = _function_effect_facts(
+            node,
+            side_effect_calls,
+        )
+        side_effects[node.name] = function_side_effects
+        helper_calls[node.name] = function_helper_calls
+
+    return side_effects, helper_calls
+
+
+def _function_effect_facts(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    side_effect_calls: set[str],
+) -> tuple[list[str], list[str]]:
+    call_names, direct_call_names = _executable_call_facts(node.body)
+    local_function_facts = _local_function_effect_facts(node.body, side_effect_calls)
+    local_function_names = set(local_function_facts)
+    function_side_effects = [
+        name for name in call_names if name in side_effect_calls
+    ]
+    external_helper_calls: list[str] = []
+
+    for call_name in direct_call_names:
+        if call_name in side_effect_calls:
+            continue
+        if call_name in local_function_names:
+            function_side_effects.extend(
+                _resolve_local_function_side_effects(
+                    call_name,
+                    local_function_facts,
+                    visiting=set(),
+                )
+            )
+            continue
+        external_helper_calls.append(call_name)
+
+    return _ordered_unique(function_side_effects), _ordered_unique(external_helper_calls)
+
+
+def _local_function_effect_facts(
+    statements: list[ast.stmt],
+    side_effect_calls: set[str],
+) -> dict[str, tuple[list[str], list[str]]]:
+    return {
+        name: _raw_function_effect_facts(function, side_effect_calls)
+        for name, function in _local_function_defs(statements).items()
+    }
+
+
+def _raw_function_effect_facts(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    side_effect_calls: set[str],
+) -> tuple[list[str], list[str]]:
+    call_names, direct_call_names = _executable_call_facts(node.body)
+    return (
+        _ordered_unique(name for name in call_names if name in side_effect_calls),
+        _ordered_unique(name for name in direct_call_names if name not in side_effect_calls),
+    )
+
+
+def _resolve_local_function_side_effects(
+    name: str,
+    local_function_facts: dict[str, tuple[list[str], list[str]]],
+    *,
+    visiting: set[str],
+) -> list[str]:
+    if name in visiting:
+        return []
+    direct_side_effects, direct_calls = local_function_facts.get(name, ([], []))
+    side_effects = list(direct_side_effects)
+    next_visiting = {*visiting, name}
+
+    for call_name in direct_calls:
+        if call_name in local_function_facts:
+            side_effects.extend(
+                _resolve_local_function_side_effects(
+                    call_name,
+                    local_function_facts,
+                    visiting=next_visiting,
+                )
+            )
+
+    return _ordered_unique(side_effects)
+
+
+def _local_function_defs(
+    statements: list[ast.stmt],
+) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    visitor = _LocalFunctionDefVisitor()
+    for statement in statements:
+        visitor.visit(statement)
+    return visitor.functions
+
+
+def _executable_call_facts(statements: list[ast.stmt]) -> tuple[list[str], list[str]]:
+    visitor = _ExecutableCallVisitor()
+    for statement in statements:
+        visitor.visit(statement)
+    return _ordered_unique(visitor.call_names), _ordered_unique(visitor.direct_call_names)
+
+
+class _LocalFunctionDefVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.functions[node.name] = node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.functions[node.name] = node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+
+class _ExecutableCallVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.call_names: list[str] = []
+        self.direct_call_names: list[str] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+    def visit_Call(self, node: ast.Call) -> None:
+        name = _callable_name(node.func)
+        if name:
+            self.call_names.append(name)
+        if isinstance(node.func, ast.Name):
+            self.direct_call_names.append(node.func.id)
+        self.generic_visit(node)
 
 
 def _defined_names(node: ast.AST) -> list[str]:

@@ -317,6 +317,57 @@ def test_attribute_call_does_not_inherit_local_helper_side_effect_metadata():
     assert all(group.has_robot_side_effect is False for group in groups)
 
 
+def test_nested_helper_body_does_not_inherit_unexecuted_side_effect_metadata():
+    source = "\n".join(
+        [
+            "def pick():",
+            "    def inner():",
+            "        move_to('cube')",
+            "",
+            "pick()",
+        ]
+    )
+
+    groups = segment_python_code_groups(
+        source,
+        max_regions_per_group=1,
+        side_effect_calls={"move_to"},
+    )
+
+    assert [group.region_ids for group in groups] == [["region_1"], ["region_2"]]
+    assert all(group.has_robot_side_effect is False for group in groups)
+
+
+def test_helper_call_resolves_local_helper_wrapper_side_effect_metadata():
+    source = "\n".join(
+        [
+            "def move():",
+            "    move_to('cube')",
+            "",
+            "def pick():",
+            "    move()",
+            "",
+            "pick()",
+        ]
+    )
+
+    groups = segment_python_code_groups(
+        source,
+        max_regions_per_group=1,
+        side_effect_calls={"move_to"},
+    )
+
+    assert [group.region_ids for group in groups] == [
+        ["region_1"],
+        ["region_2"],
+        ["region_3"],
+    ]
+    assert groups[0].has_robot_side_effect is False
+    assert groups[1].has_robot_side_effect is False
+    assert groups[2].has_robot_side_effect is True
+    assert "move_to" in groups[2].primitive_calls
+
+
 def test_control_flow_region_containing_side_effect_is_effect_metadata():
     source = "\n".join(
         [

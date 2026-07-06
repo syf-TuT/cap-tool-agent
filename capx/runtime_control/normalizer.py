@@ -124,11 +124,53 @@ def _normalize_effect_metadata(
 def _helper_side_effect_calls(
     analyses: list[RegionAnalysis],
 ) -> dict[str, list[str]]:
+    direct_side_effects: dict[str, list[str]] = {}
     helper_calls: dict[str, list[str]] = {}
     for analysis in analyses:
         for helper_name in analysis.defined_functions:
-            helper_calls[helper_name] = list(analysis.lexical_side_effect_calls)
-    return helper_calls
+            direct_side_effects[helper_name] = list(
+                analysis.defined_function_side_effect_calls.get(helper_name, [])
+            )
+            helper_calls[helper_name] = list(
+                analysis.defined_function_call_names.get(helper_name, [])
+            )
+
+    return {
+        helper_name: _resolve_helper_side_effect_calls(
+            helper_name,
+            direct_side_effects,
+            helper_calls,
+            visiting=set(),
+        )
+        for helper_name in direct_side_effects
+    }
+
+
+def _resolve_helper_side_effect_calls(
+    helper_name: str,
+    direct_side_effects: dict[str, list[str]],
+    helper_calls: dict[str, list[str]],
+    *,
+    visiting: set[str],
+) -> list[str]:
+    if helper_name in visiting:
+        return []
+
+    side_effects = list(direct_side_effects.get(helper_name, []))
+    next_visiting = {*visiting, helper_name}
+    for called_helper_name in helper_calls.get(helper_name, []):
+        if called_helper_name not in direct_side_effects:
+            continue
+        side_effects.extend(
+            _resolve_helper_side_effect_calls(
+                called_helper_name,
+                direct_side_effects,
+                helper_calls,
+                visiting=next_visiting,
+            )
+        )
+
+    return _ordered_unique(side_effects)
 
 
 def _normalize_region_effect_metadata(
