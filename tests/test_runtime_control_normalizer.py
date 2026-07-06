@@ -35,6 +35,17 @@ def _assert_group_sources_match_member_regions(groups, regions):
         )
 
 
+def _assert_groups_partition_regions(groups, regions):
+    grouped_region_ids = [
+        region_id
+        for group in groups
+        for region_id in group.region_ids
+    ]
+
+    assert grouped_region_ids == [region.region_id for region in regions]
+    assert len(grouped_region_ids) == len(set(grouped_region_ids))
+
+
 def test_groups_preserve_original_source_bytes():
     source = _source_with_spacing()
 
@@ -59,14 +70,7 @@ def test_groups_partition_regions_without_gaps_or_reordering():
         side_effect_calls={"move_to"},
     )
 
-    grouped_region_ids = [
-        region_id
-        for group in groups
-        for region_id in group.region_ids
-    ]
-
-    assert grouped_region_ids == [region.region_id for region in regions]
-    assert len(grouped_region_ids) == len(set(grouped_region_ids))
+    _assert_groups_partition_regions(groups, regions)
 
 
 def test_normalizer_rejects_analysis_length_mismatch():
@@ -218,6 +222,47 @@ def test_normalizer_cap_fallback_allows_long_setup_block():
     groups = segment_python_code_groups(source)
 
     assert len(groups) == 1
+
+
+def test_normalizer_reduces_many_single_effect_groups_within_policy_band():
+    source = "\n".join(
+        line
+        for i in range(10)
+        for line in [
+            f"target_{i} = [{i}, {i}, {i}]",
+            f"move_to(target_{i})",
+        ]
+    )
+
+    regions = segment_python_code(source)
+    groups = segment_python_code_groups(
+        source,
+        regions,
+        side_effect_calls={"move_to"},
+    )
+
+    _assert_group_sources_match_member_regions(groups, regions)
+    _assert_groups_partition_regions(groups, regions)
+    assert 3 <= len(groups) <= 8
+    assert "".join(group.source for group in groups) == source
+
+
+def test_normalizer_keeps_same_name_replan_boundary():
+    source = "\n".join(
+        [
+            "target = plan_a()",
+            "move_to(target)",
+            "target = observe_and_replan()",
+            "move_to(target)",
+        ]
+    )
+
+    groups = segment_python_code_groups(source, side_effect_calls={"move_to"})
+
+    assert [group.region_ids for group in groups] == [
+        ["region_1", "region_2"],
+        ["region_3", "region_4"],
+    ]
 
 
 def test_normalizer_marks_injected_primitive_as_robot_side_effect():

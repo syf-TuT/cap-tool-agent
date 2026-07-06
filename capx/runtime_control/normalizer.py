@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup
 from capx.runtime_control.segmenter import (
@@ -88,7 +88,7 @@ def normalize_python_code_groups(
     if current:
         groups.append(_build_group(len(groups) + 1, current))
 
-    return groups
+    return _bound_group_count(groups, policy)
 
 
 def _validate_normalizer_inputs(
@@ -231,6 +231,101 @@ def _build_group(
         ),
         has_robot_side_effect=any(analysis.has_robot_side_effect for analysis in analyses),
     )
+
+
+def _bound_group_count(
+    groups: list[CodeRegionGroup],
+    policy: GroupingPolicy,
+) -> list[CodeRegionGroup]:
+    if len(groups) <= policy.max_groups:
+        return groups
+
+    bounded_groups = list(groups)
+    while len(bounded_groups) > policy.max_groups:
+        merge_index = _find_safe_merge_index(bounded_groups)
+        if merge_index is None:
+            break
+
+        merged_group = _merge_adjacent_groups(
+            bounded_groups[merge_index],
+            bounded_groups[merge_index + 1],
+        )
+        bounded_groups = [
+            *bounded_groups[:merge_index],
+            merged_group,
+            *bounded_groups[merge_index + 2 :],
+        ]
+
+    return _renumber_groups(bounded_groups)
+
+
+def _find_safe_merge_index(groups: list[CodeRegionGroup]) -> int | None:
+    candidates = [
+        (
+            len(left.region_ids) + len(right.region_ids),
+            len(left.source) + len(right.source),
+            index,
+        )
+        for index, (left, right) in enumerate(zip(groups, groups[1:]))
+        if _can_merge_adjacent_groups(left, right)
+    ]
+    if not candidates:
+        return None
+
+    _, _, index = min(candidates)
+    return index
+
+
+def _can_merge_adjacent_groups(
+    left: CodeRegionGroup,
+    right: CodeRegionGroup,
+) -> bool:
+    if not left.region_ids or not right.region_ids:
+        return False
+    if not left.source or not right.source:
+        return False
+    if left.end_line > right.start_line:
+        return False
+    if not left.has_robot_side_effect or not right.has_robot_side_effect:
+        return False
+
+    left_defined = set(left.defined_names)
+    right_defined = set(right.defined_names)
+    left_used = set(left.used_names)
+    right_used = set(right.used_names)
+
+    if left_defined & right_defined:
+        return False
+    if left_defined & right_used:
+        return False
+    if right_defined & left_used:
+        return False
+
+    return True
+
+
+def _merge_adjacent_groups(
+    left: CodeRegionGroup,
+    right: CodeRegionGroup,
+) -> CodeRegionGroup:
+    return CodeRegionGroup(
+        group_id=left.group_id,
+        start_line=left.start_line,
+        end_line=right.end_line,
+        source=left.source + right.source,
+        region_ids=[*left.region_ids, *right.region_ids],
+        primitive_calls=_ordered_unique([*left.primitive_calls, *right.primitive_calls]),
+        defined_names=_ordered_unique([*left.defined_names, *right.defined_names]),
+        used_names=_ordered_unique([*left.used_names, *right.used_names]),
+        has_robot_side_effect=left.has_robot_side_effect or right.has_robot_side_effect,
+    )
+
+
+def _renumber_groups(groups: list[CodeRegionGroup]) -> list[CodeRegionGroup]:
+    return [
+        replace(group, group_id=f"group_{index}")
+        for index, group in enumerate(groups, start=1)
+    ]
 
 
 def _ordered_unique(values: Iterable[str]) -> list[str]:
