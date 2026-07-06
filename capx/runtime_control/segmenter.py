@@ -35,19 +35,28 @@ def segment_python_code(source: str) -> list[CodeRegion]:
     module = ast.parse(source)
     lines = source.splitlines(keepends=True)
     regions: list[CodeRegion] = []
+    region_start_lines: list[int] = []
 
-    for node_index, node in enumerate(module.body):
-        start_line = getattr(node, "lineno", None)
+    for node in module.body:
+        start_line = _effective_start_line(node)
         if start_line is None:
             continue
-        next_node = module.body[node_index + 1] if node_index + 1 < len(module.body) else None
-        next_start_line = getattr(next_node, "lineno", None) if next_node is not None else None
-        slice_start_line = 1 if node_index == 0 else start_line
+        if region_start_lines and start_line == region_start_lines[-1]:
+            continue
+        region_start_lines.append(start_line)
+
+    for region_index, start_line in enumerate(region_start_lines):
+        next_start_line = (
+            region_start_lines[region_index + 1]
+            if region_index + 1 < len(region_start_lines)
+            else None
+        )
+        slice_start_line = 1 if region_index == 0 else start_line
         end_line = next_start_line - 1 if next_start_line is not None else len(lines)
         region_source = "".join(lines[slice_start_line - 1 : end_line])
         regions.append(
             CodeRegion(
-                region_id=f"region_{node_index + 1}",
+                region_id=f"region_{region_index + 1}",
                 start_line=slice_start_line,
                 end_line=end_line,
                 source=region_source,
@@ -55,6 +64,21 @@ def segment_python_code(source: str) -> list[CodeRegion]:
         )
 
     return regions
+
+
+def _effective_start_line(node: ast.AST) -> int | None:
+    start_line = getattr(node, "lineno", None)
+    decorator_list = getattr(node, "decorator_list", None)
+    if not decorator_list:
+        return start_line
+    decorator_lines = [
+        decorator.lineno for decorator in decorator_list if getattr(decorator, "lineno", None)
+    ]
+    if not decorator_lines:
+        return start_line
+    if start_line is None:
+        return min(decorator_lines)
+    return min(start_line, *decorator_lines)
 
 
 def analyze_python_regions(
