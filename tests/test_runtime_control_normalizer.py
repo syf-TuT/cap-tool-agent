@@ -2,15 +2,35 @@ from capx.runtime_control.normalizer import segment_python_code_groups
 from capx.runtime_control.segmenter import segment_python_code
 
 
-def test_groups_preserve_original_source_bytes():
-    source = "\n".join(
+def _source_with_spacing():
+    return "\n".join(
         [
             "x = 1",
+            "",
+            "# first motion",
             "move_to(x)",
+            "",
+            "# compute follow-up target",
             "y = x + 1",
+            "",
+            "# second motion",
             "move_to(y)",
+            "",
         ]
     )
+
+
+def _assert_group_sources_match_member_regions(groups, regions):
+    region_by_id = {region.region_id: region for region in regions}
+
+    for group in groups:
+        assert group.source == "".join(
+            region_by_id[region_id].source for region_id in group.region_ids
+        )
+
+
+def test_groups_preserve_original_source_bytes():
+    source = _source_with_spacing()
 
     regions = segment_python_code(source)
     groups = segment_python_code_groups(
@@ -19,18 +39,13 @@ def test_groups_preserve_original_source_bytes():
         side_effect_calls={"move_to"},
     )
 
+    _assert_group_sources_match_member_regions(groups, regions)
     assert "".join(group.source for group in groups) == source
 
 
 def test_groups_partition_regions_without_gaps_or_reordering():
-    source = "\n".join(
-        [
-            "x = 1",
-            "move_to(x)",
-            "y = x + 1",
-            "move_to(y)",
-        ]
-    )
+    source = _source_with_spacing()
+
     regions = segment_python_code(source)
     groups = segment_python_code_groups(
         source,
