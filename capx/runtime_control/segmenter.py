@@ -28,6 +28,9 @@ class RegionAnalysis:
     used_names: list[str]
     has_robot_side_effect: bool
     has_structural_effect: bool
+    defined_functions: list[str]
+    top_level_call_names: list[str]
+    lexical_side_effect_calls: list[str]
 
 
 def segment_python_code(source: str) -> list[CodeRegion]:
@@ -99,9 +102,22 @@ def _analyze_region(region: CodeRegion, side_effect_calls: set[str]) -> RegionAn
     try:
         module = ast.parse(region.source)
     except SyntaxError:
-        return RegionAnalysis(region.region_id, [], [], [], False, False)
+        return RegionAnalysis(
+            region_id=region.region_id,
+            primitive_calls=[],
+            defined_names=[],
+            used_names=[],
+            has_robot_side_effect=False,
+            has_structural_effect=False,
+            defined_functions=[],
+            top_level_call_names=[],
+            lexical_side_effect_calls=[],
+        )
 
     primitive_calls = _ordered_unique(_call_names(module))
+    lexical_side_effect_calls = _ordered_unique(
+        name for name in primitive_calls if name in side_effect_calls
+    )
     defined_names = _ordered_unique(_defined_names(module))
     defined_name_set = set(defined_names)
     used_names = _ordered_unique(
@@ -112,8 +128,11 @@ def _analyze_region(region: CodeRegion, side_effect_calls: set[str]) -> RegionAn
         primitive_calls=primitive_calls,
         defined_names=defined_names,
         used_names=used_names,
-        has_robot_side_effect=any(name in side_effect_calls for name in primitive_calls),
+        has_robot_side_effect=bool(lexical_side_effect_calls),
         has_structural_effect=_is_effect_region(module),
+        defined_functions=_defined_functions(module),
+        top_level_call_names=_top_level_call_names(module),
+        lexical_side_effect_calls=lexical_side_effect_calls,
     )
 
 
@@ -146,6 +165,25 @@ def _callable_name(node: ast.AST) -> str | None:
     if isinstance(node, ast.Attribute):
         return node.attr
     return None
+
+
+def _defined_functions(module: ast.Module) -> list[str]:
+    return [
+        node.name
+        for node in module.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+
+def _top_level_call_names(module: ast.Module) -> list[str]:
+    names: list[str] = []
+    for node in module.body:
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)):
+            continue
+        name = _callable_name(node.value.func)
+        if name:
+            names.append(name)
+    return _ordered_unique(names)
 
 
 def _defined_names(node: ast.AST) -> list[str]:

@@ -252,3 +252,88 @@ def test_normalizer_marks_arbitrary_injected_primitive_name():
     )
 
     assert groups[0].has_robot_side_effect is True
+
+
+def test_helper_definition_alone_is_not_a_robot_side_effect():
+    source = "\n".join(
+        [
+            "def pick():",
+            "    move_to('cube')",
+            "",
+            "x = 1",
+        ]
+    )
+
+    groups = segment_python_code_groups(source, side_effect_calls={"move_to"})
+
+    assert [group.region_ids for group in groups] == [["region_1", "region_2"]]
+    assert all(group.has_robot_side_effect is False for group in groups)
+
+
+def test_helper_call_inherits_declared_side_effect_for_group_metadata():
+    source = "\n".join(
+        [
+            "def pick():",
+            "    move_to('cube')",
+            "",
+            "pick()",
+            "x = 1",
+            "move_to('bin')",
+        ]
+    )
+
+    groups = segment_python_code_groups(
+        source,
+        max_regions_per_group=1,
+        side_effect_calls={"move_to"},
+    )
+
+    assert [group.region_ids for group in groups] == [
+        ["region_1"],
+        ["region_2"],
+        ["region_3"],
+        ["region_4"],
+    ]
+    assert groups[0].has_robot_side_effect is False
+    assert groups[1].has_robot_side_effect is True
+    assert "move_to" in groups[1].primitive_calls
+    assert groups[3].has_robot_side_effect is True
+    assert "move_to" in groups[3].primitive_calls
+
+
+def test_control_flow_region_containing_side_effect_is_effect_metadata():
+    source = "\n".join(
+        [
+            "ready = True",
+            "if ready:",
+            "    move_to('cube')",
+            "target = 'bin'",
+            "move_to(target)",
+        ]
+    )
+
+    groups = segment_python_code_groups(source, side_effect_calls={"move_to"})
+
+    assert [group.region_ids for group in groups] == [
+        ["region_1", "region_2"],
+        ["region_3", "region_4"],
+    ]
+    assert groups[0].has_robot_side_effect is True
+    assert groups[1].has_robot_side_effect is True
+
+
+def test_unresolved_dynamic_helper_call_does_not_infer_side_effect_metadata():
+    source = "\n".join(
+        [
+            "def pick():",
+            "    move_to('cube')",
+            "",
+            "name = 'pick'",
+            "globals()[name]()",
+        ]
+    )
+
+    groups = segment_python_code_groups(source, side_effect_calls={"move_to"})
+
+    assert [group.region_ids for group in groups] == [["region_1", "region_2", "region_3"]]
+    assert all(group.has_robot_side_effect is False for group in groups)

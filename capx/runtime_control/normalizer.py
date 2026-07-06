@@ -19,6 +19,16 @@ class GroupingPolicy:
     max_groups: int = 8
 
 
+@dataclass(frozen=True)
+class _NormalizedRegionAnalysis:
+    region_id: str
+    primitive_calls: list[str]
+    defined_names: list[str]
+    used_names: list[str]
+    has_robot_side_effect: bool
+    has_structural_effect: bool
+
+
 def segment_python_code_groups(
     source: str,
     regions: list[CodeRegion] | None = None,
@@ -58,11 +68,12 @@ def normalize_python_code_groups(
     if not regions:
         return []
 
+    normalized_analyses = _normalize_effect_metadata(analyses)
     groups: list[CodeRegionGroup] = []
-    current: list[tuple[CodeRegion, RegionAnalysis]] = []
+    current: list[tuple[CodeRegion, _NormalizedRegionAnalysis]] = []
     current_has_effect = False
 
-    for region, analysis in zip(regions, analyses):
+    for region, analysis in zip(regions, normalized_analyses):
         returns_to_sense = current_has_effect and not analysis.has_structural_effect
         if current and (
             returns_to_sense or len(current) >= policy.max_regions_per_group
@@ -99,9 +110,65 @@ def _validate_normalizer_inputs(
             )
 
 
+def _normalize_effect_metadata(
+    analyses: list[RegionAnalysis],
+) -> list[_NormalizedRegionAnalysis]:
+    helper_side_effect_calls = _helper_side_effect_calls(analyses)
+
+    return [
+        _normalize_region_effect_metadata(analysis, helper_side_effect_calls)
+        for analysis in analyses
+    ]
+
+
+def _helper_side_effect_calls(
+    analyses: list[RegionAnalysis],
+) -> dict[str, list[str]]:
+    helper_calls: dict[str, list[str]] = {}
+    for analysis in analyses:
+        for helper_name in analysis.defined_functions:
+            helper_calls[helper_name] = list(analysis.lexical_side_effect_calls)
+    return helper_calls
+
+
+def _normalize_region_effect_metadata(
+    analysis: RegionAnalysis,
+    helper_side_effect_calls: dict[str, list[str]],
+) -> _NormalizedRegionAnalysis:
+    inherited_side_effect_calls = _ordered_unique(
+        call
+        for top_level_call_name in analysis.top_level_call_names
+        for call in helper_side_effect_calls.get(top_level_call_name, [])
+    )
+    is_helper_definition = bool(analysis.defined_functions)
+    local_side_effect_calls = (
+        [] if is_helper_definition else list(analysis.lexical_side_effect_calls)
+    )
+    normalized_side_effect_calls = _ordered_unique(
+        [*local_side_effect_calls, *inherited_side_effect_calls]
+    )
+    primitive_calls = list(analysis.primitive_calls)
+    if is_helper_definition:
+        lexical_side_effect_call_set = set(analysis.lexical_side_effect_calls)
+        primitive_calls = [
+            call for call in primitive_calls if call not in lexical_side_effect_call_set
+        ]
+
+    return _NormalizedRegionAnalysis(
+        region_id=analysis.region_id,
+        primitive_calls=_ordered_unique([*primitive_calls, *inherited_side_effect_calls]),
+        defined_names=analysis.defined_names,
+        used_names=analysis.used_names,
+        has_robot_side_effect=bool(normalized_side_effect_calls),
+        has_structural_effect=(
+            analysis.has_structural_effect or bool(normalized_side_effect_calls)
+        ),
+    )
+
+
 def _build_group(
     group_index: int,
-    items: list[tuple[CodeRegion, RegionAnalysis]],
+    items: list[tuple[CodeRegion, _NormalizedRegionAnalysis]],
 ) -> CodeRegionGroup:
     regions = [region for region, _ in items]
     analyses = [analysis for _, analysis in items]
