@@ -684,7 +684,7 @@ def _run_capsule_trial(
         raw_code, _, _ = _query_initial_code(args, config, obs)
         source = "\n\n".join(_extract_code(raw_code))
 
-    max_regions_per_group = int(config.get("capsule_max_regions_per_group", 6))
+    max_regions_per_group = int(config.get("capsule_max_regions_per_group", 20))
     use_semantic_groups = (
         config.get("capsule_execution_granularity", "semantic_group") == "semantic_group"
     )

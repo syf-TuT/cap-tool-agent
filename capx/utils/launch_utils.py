@@ -164,7 +164,7 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
             "capsule_execution_granularity", "semantic_group"
         ),
         "capsule_max_regions_per_group": configs_dict.get(
-            "capsule_max_regions_per_group", 6
+            "capsule_max_regions_per_group", 20
         ),
         "checkpoint_policy": configs_dict.get("checkpoint_policy", "region"),
         "rollback_policy": configs_dict.get("rollback_policy", "none"),

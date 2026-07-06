@@ -234,7 +234,7 @@ Expected: fails because config keys are not loaded.
 Add defaults:
 
 - `capsule_execution_granularity: semantic_group`
-- `capsule_max_regions_per_group: 6`
+- `capsule_max_regions_per_group: 20`
 
 Set cube-stack Capsule benchmark `max_capsule_steps: 20`.
 

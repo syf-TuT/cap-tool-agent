@@ -26,6 +26,16 @@ def test_strict_l1_cube_stack_capsule_uses_30_step_budget():
     assert data["max_capsule_steps"] == 30
 
 
+def test_cube_stack_capsule_benchmarks_use_loose_group_cap():
+    for config_path in [
+        "env_configs/benchmarks/strict_l1/cube_stack_capsule.yaml",
+        "env_configs/benchmarks/lowlevel_primitives/cube_stack_capsule.yaml",
+    ]:
+        data = yaml.safe_load(Path(config_path).read_text())
+
+        assert data["capsule_max_regions_per_group"] == 20
+
+
 def test_load_config_reads_capsule_fields():
     args = SimpleNamespace(
         config_path="env_configs/cube_stack/franka_robosuite_cube_stack_capsule_vdm.yaml",
@@ -56,7 +66,7 @@ def test_load_config_reads_capsule_fields():
     assert config["checkpoint_policy"] == "region"
     assert config["rollback_policy"] == "none"
     assert config["capsule_execution_granularity"] == "semantic_group"
-    assert config["capsule_max_regions_per_group"] == 6
+    assert config["capsule_max_regions_per_group"] == 20
 
 
 def test_load_config_reads_max_regenerations(tmp_path):

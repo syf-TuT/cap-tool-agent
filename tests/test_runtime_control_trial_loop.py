@@ -160,6 +160,30 @@ def test_capsule_trial_runs_scripted_group(tmp_path):
     assert trace[0]["event"]["evidence"]["source_span"] == {"start_line": 1, "end_line": 2}
 
 
+def test_capsule_trial_defaults_to_loose_group_cap(tmp_path):
+    source = "\n".join(f"v{i} = {i}" for i in range(8))
+
+    _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code=source,
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+    assert trace[0]["event"]["evidence"]["source_span"] == {"start_line": 1, "end_line": 8}
+
+
 def test_capsule_trial_patches_group_and_regroups(tmp_path):
     summary = _run_capsule_trial(
         env=FakeCapsuleEnv(),
