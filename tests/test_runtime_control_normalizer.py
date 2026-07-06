@@ -265,6 +265,62 @@ def test_normalizer_keeps_same_name_replan_boundary():
     ]
 
 
+def test_normalizer_keeps_same_name_replan_boundary_under_group_pressure():
+    source = "\n".join(
+        [
+            "target = plan_a()",
+            "move_to(target)",
+            "target = observe_and_replan()",
+            "move_to(target)",
+        ]
+    )
+
+    regions = segment_python_code(source)
+    analyses = analyze_python_regions(source, regions, side_effect_calls={"move_to"})
+    groups = normalize_python_code_groups(
+        source,
+        regions,
+        analyses,
+        policy=GroupingPolicy(max_groups=1),
+    )
+
+    assert [group.region_ids for group in groups] == [
+        ["region_1", "region_2"],
+        ["region_3", "region_4"],
+    ]
+
+
+def test_normalizer_finds_safe_non_greedy_merge_path():
+    source = "\n".join(
+        [
+            "seed = c",
+            "move_to(seed)",
+            "b = 1",
+            "move_to(b)",
+            "c = 2",
+            "move_to(c)",
+            "result_with_extra_padding_to_bias_greedy = b",
+            "move_to(result_with_extra_padding_to_bias_greedy)",
+        ]
+    )
+
+    regions = segment_python_code(source)
+    analyses = analyze_python_regions(source, regions, side_effect_calls={"move_to"})
+    groups = normalize_python_code_groups(
+        source,
+        regions,
+        analyses,
+        policy=GroupingPolicy(max_groups=2),
+    )
+
+    _assert_group_sources_match_member_regions(groups, regions)
+    _assert_groups_partition_regions(groups, regions)
+    assert [group.region_ids for group in groups] == [
+        ["region_1", "region_2", "region_3", "region_4"],
+        ["region_5", "region_6", "region_7", "region_8"],
+    ]
+
+
 def test_normalizer_marks_injected_primitive_as_robot_side_effect():
     """The environment declares its own effect primitives; the normalizer marks
     side effects from that injected set rather than a hardcoded vocabulary.

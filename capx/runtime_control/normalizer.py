@@ -240,40 +240,90 @@ def _bound_group_count(
     if len(groups) <= policy.max_groups:
         return groups
 
-    bounded_groups = list(groups)
-    while len(bounded_groups) > policy.max_groups:
-        merge_index = _find_safe_merge_index(bounded_groups)
-        if merge_index is None:
-            break
-
-        merged_group = _merge_adjacent_groups(
-            bounded_groups[merge_index],
-            bounded_groups[merge_index + 1],
-        )
-        bounded_groups = [
-            *bounded_groups[:merge_index],
-            merged_group,
-            *bounded_groups[merge_index + 2 :],
-        ]
+    bounded_groups = _choose_bounded_group_partition(groups, policy.max_groups)
 
     return _renumber_groups(bounded_groups)
 
 
-def _find_safe_merge_index(groups: list[CodeRegionGroup]) -> int | None:
-    candidates = [
-        (
-            len(left.region_ids) + len(right.region_ids),
-            len(left.source) + len(right.source),
-            index,
-        )
-        for index, (left, right) in enumerate(zip(groups, groups[1:]))
-        if _can_merge_adjacent_groups(left, right)
-    ]
-    if not candidates:
-        return None
+def _choose_bounded_group_partition(
+    groups: list[CodeRegionGroup],
+    max_groups: int,
+) -> list[CodeRegionGroup]:
+    mergeable_groups = _mergeable_group_table(groups)
+    partitions_by_count = _reachable_group_partitions(mergeable_groups)
 
-    _, _, index = min(candidates)
-    return index
+    for group_count in range(max_groups, 0, -1):
+        partition = partitions_by_count.get(group_count)
+        if partition is not None:
+            return partition
+
+    for group_count in range(max_groups + 1, len(groups) + 1):
+        partition = partitions_by_count.get(group_count)
+        if partition is not None:
+            return partition
+
+    return groups
+
+
+def _mergeable_group_table(
+    groups: list[CodeRegionGroup],
+) -> list[list[CodeRegionGroup | None]]:
+    group_count = len(groups)
+    mergeable_groups: list[list[CodeRegionGroup | None]] = [
+        [None] * (group_count + 1) for _ in groups
+    ]
+
+    for index, group in enumerate(groups):
+        mergeable_groups[index][index + 1] = group
+
+    for width in range(2, group_count + 1):
+        for start in range(0, group_count - width + 1):
+            end = start + width
+            mergeable_groups[start][end] = _mergeable_contiguous_group(
+                mergeable_groups,
+                start,
+                end,
+            )
+
+    return mergeable_groups
+
+
+def _mergeable_contiguous_group(
+    mergeable_groups: list[list[CodeRegionGroup | None]],
+    start: int,
+    end: int,
+) -> CodeRegionGroup | None:
+    for split in range(start + 1, end):
+        left = mergeable_groups[start][split]
+        right = mergeable_groups[split][end]
+        if left is None or right is None:
+            continue
+        if _can_merge_adjacent_groups(left, right):
+            return _merge_adjacent_groups(left, right)
+
+    return None
+
+
+def _reachable_group_partitions(
+    mergeable_groups: list[list[CodeRegionGroup | None]],
+) -> dict[int, list[CodeRegionGroup]]:
+    group_count = len(mergeable_groups)
+    partitions: list[dict[int, list[CodeRegionGroup]]] = [
+        {} for _ in range(group_count + 1)
+    ]
+    partitions[0][0] = []
+
+    for end in range(1, group_count + 1):
+        for start in range(end):
+            group = mergeable_groups[start][end]
+            if group is None:
+                continue
+
+            for previous_count, previous_partition in partitions[start].items():
+                next_count = previous_count + 1
+                partitions[end].setdefault(next_count, [*previous_partition, group])
+
+    return partitions[group_count]
 
 
 def _can_merge_adjacent_groups(
