@@ -64,6 +64,7 @@ outputs/
 output_debug/
 outputs**
 artifacts/
+remote_results/
 curobo_debug/
 =*
 core.*
