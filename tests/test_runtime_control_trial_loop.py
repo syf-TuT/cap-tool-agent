@@ -1,8 +1,14 @@
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from capx.envs.trial import _execute_runtime_action, _run_capsule_trial, _run_single_trial
+from capx.envs.trial import (
+    _execute_runtime_action,
+    _no_rollback_guard_event,
+    _run_capsule_trial,
+    _run_single_trial,
+)
 from capx.runtime_control.executor import CapsuleExecutor
 from capx.runtime_control.schema import CodeRegion, RuntimeAction
 from capx.runtime_control.trace import wrap_function_for_trace
@@ -360,6 +366,38 @@ def test_capsule_trial_rejects_rerun_of_executed_side_effect_group(tmp_path):
     assert summary.sandbox_rc == 1
     assert trace[1]["event"]["status"] == "invalid"
     assert "append_recovery" in trace[1]["event"]["message"]
+
+
+def test_no_rollback_guard_prompt_mentions_append_recovery():
+    source = inspect.getsource(_no_rollback_guard_event)
+
+    assert "append_recovery" in source
+
+
+def test_capsule_action_query_uses_separate_max_tokens(tmp_path, monkeypatch):
+    observed_max_tokens = []
+
+    def fake_query_model(args, prompt):
+        observed_max_tokens.append(args.max_tokens)
+        return {"content": '{"action": "finish", "args": {}}', "reasoning": None}
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query_model)
+
+    _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False, max_tokens=8192),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "capsule_action_max_tokens": 512,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code="x = 1\n",
+    )
+
+    assert observed_max_tokens == [512]
 
 
 def test_capsule_trial_rejects_patch_of_executed_side_effect_group(tmp_path):

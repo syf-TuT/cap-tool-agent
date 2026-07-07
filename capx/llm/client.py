@@ -118,6 +118,10 @@ def collapse_text_image_inputs(messages: list[dict]) -> list[dict]:
     return new_prompt
 
 
+def _reasoning_disabled() -> bool:
+    return os.getenv("CAPX_DISABLE_REASONING") == "1"
+
+
 def _completions_to_responses_convert_prompt(prompt: list[dict]) -> list[dict]:
     """Convert completions api format to responses api format.
 
@@ -242,20 +246,38 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     elif os.getenv("OPENAI_API_KEY") is not None and args.model in GPT_MODELS:
         headers["Authorization"] = f"Bearer {os.getenv('OPENAI_API_KEY')}"
 
-    if os.getenv("CAPX_DISABLE_REASONING") == "1":
+    reasoning_disabled = _reasoning_disabled()
+    if reasoning_disabled:
+        payload.pop("reasoning_effort", None)
         payload["thinking"] = {"type": "disabled"}
 
     if os.getenv("CAPX_FORCE_STREAMING_CHAT_COMPLETIONS") == "1":
-        print("Using streaming chat completions for model query", flush=True)
-        content = ""
-        reasoning = None
-        for chunk in query_model_streaming(args, prompt):
-            if chunk["type"] == "content_delta":
-                content += chunk["content"]
-            elif chunk["type"] == "done":
-                content = chunk["content"]
-                reasoning = chunk.get("reasoning")
-        return {"content": content, "reasoning": reasoning}
+        max_attempts = max(1, int(os.getenv("CAPX_STREAMING_CHAT_COMPLETIONS_RETRIES", "1")))
+        last_exc: BaseException | None = None
+        for attempt in range(1, max_attempts + 1):
+            print(
+                "Using streaming chat completions for model query "
+                f"(attempt {attempt}/{max_attempts})",
+                flush=True,
+            )
+            content = ""
+            reasoning = None
+            try:
+                for chunk in query_model_streaming(args, prompt):
+                    if chunk["type"] == "content_delta":
+                        content += chunk["content"]
+                    elif chunk["type"] == "done":
+                        content = chunk["content"]
+                        reasoning = chunk.get("reasoning")
+                if os.getenv("CAPX_STREAMING_REQUIRE_CONTENT") == "1" and not content.strip():
+                    raise TimeoutError("Streaming model query returned empty content")
+                return {"content": content, "reasoning": reasoning}
+            except (TimeoutError, requests.exceptions.RequestException) as exc:
+                last_exc = exc
+                if attempt >= max_attempts:
+                    raise
+                print(f"Streaming model query failed: {exc}. Retrying...", flush=True)
+        raise RuntimeError("Streaming model query failed") from last_exc
 
     start_time = time.time()
 
@@ -287,7 +309,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
             out["content"] = body["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as exc:
         raise RuntimeError(f"Unexpected response format: {body}") from exc
-    if body.get("choices") is not None:
+    if body.get("choices") is not None and not reasoning_disabled:
         out["reasoning"] = body.get("choices")[0].get("message").get("reasoning", None)
     else:
         out["reasoning"] = None
@@ -344,13 +366,19 @@ def query_model_streaming(
     elif os.getenv("OPENAI_API_KEY") is not None and args.model in GPT_MODELS:
         headers["Authorization"] = f"Bearer {os.getenv('OPENAI_API_KEY')}"
 
-    if os.getenv("CAPX_DISABLE_REASONING") == "1":
+    reasoning_disabled = _reasoning_disabled()
+    if reasoning_disabled:
+        payload.pop("reasoning_effort", None)
         payload["thinking"] = {"type": "disabled"}
 
     full_content = ""
     full_reasoning = ""
 
     start_time = time.time()
+    first_content_timeout = float(
+        os.getenv("CAPX_STREAMING_FIRST_CONTENT_TIMEOUT_SECONDS", "0") or 0
+    )
+    request_timeout = float(os.getenv("CAPX_STREAMING_REQUEST_TIMEOUT_SECONDS", "200") or 200)
 
     stream_chunks = 0
 
@@ -358,7 +386,7 @@ def query_model_streaming(
         args.server_url,
         headers=headers,
         data=json.dumps(payload),
-        timeout=200,
+        timeout=request_timeout,
         stream=True,
     ) as response:
         response.raise_for_status()
@@ -375,9 +403,12 @@ def query_model_streaming(
             try:
                 full_content = body["choices"][0]["message"]["content"]
                 message = body.get("choices", [{}])[0].get("message", {})
-                full_reasoning = message.get("reasoning") or message.get("reasoning_content")
+                if not reasoning_disabled:
+                    full_reasoning = message.get("reasoning") or message.get("reasoning_content")
                 if full_reasoning:
                     print(f"Reasoning extracted ({len(full_reasoning)} chars)")
+                elif reasoning_disabled:
+                    print("Reasoning disabled; ignoring any reasoning returned by model")
                 else:
                     print("No reasoning returned by model")
             except (KeyError, IndexError) as exc:
@@ -423,7 +454,7 @@ def query_model_streaming(
 
                     # Handle reasoning delta (some APIs support this)
                     reasoning_delta = delta.get("reasoning") or delta.get("reasoning_content") or ""
-                    if reasoning_delta:
+                    if reasoning_delta and not reasoning_disabled:
                         full_reasoning += reasoning_delta
                         yield {"type": "reasoning_delta", "content": reasoning_delta}
 
@@ -434,6 +465,14 @@ def query_model_streaming(
                             f"content_chars={len(full_content)}, "
                             f"reasoning_chars={len(full_reasoning)}",
                             flush=True,
+                        )
+                    if (
+                        first_content_timeout > 0
+                        and not full_content
+                        and time.time() - start_time > first_content_timeout
+                    ):
+                        raise TimeoutError(
+                            f"No content delta within {first_content_timeout:.1f}s"
                         )
 
                 except json.JSONDecodeError:
@@ -456,6 +495,8 @@ def query_model_streaming(
     print(f"Time taken to query model (streaming): {end_time - start_time:.2f} seconds")
     if full_reasoning:
         print(f"Reasoning extracted ({len(full_reasoning)} chars)")
+    elif reasoning_disabled:
+        print("Reasoning disabled; ignoring any reasoning returned by model")
     else:
         print("No reasoning returned by model")
 

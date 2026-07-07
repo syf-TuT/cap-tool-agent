@@ -710,6 +710,11 @@ def _run_capsule_trial(
         trace=trace,
     )
     max_steps = int(config.get("max_capsule_steps", 12))
+    action_query_args = copy.copy(args)
+    default_action_max_tokens = getattr(args, "max_tokens", 2048 * 10)
+    action_query_args.max_tokens = int(
+        config.get("capsule_action_max_tokens", default_action_max_tokens)
+    )
     script = scripted_actions if scripted_actions is not None else config.get("scripted_actions")
     script_idx = 0
     history: list[dict[str, Any]] = []
@@ -750,7 +755,7 @@ def _run_capsule_trial(
                     action = RuntimeAction.from_mapping(script[script_idx])
                     script_idx += 1
             else:
-                response = _query_model(args, prompt)
+                response = _query_model(action_query_args, prompt)
                 action = parse_runtime_action_response(response["content"])
             action.step_id = step_id
         except ValueError as exc:
@@ -1103,16 +1108,20 @@ def _no_rollback_guard_event(
     executed_side_effect_regions: set[str],
     executed_side_effect_groups: set[str],
 ) -> RuntimeEvent | None:
+    recovery_hint = (
+        "Use append_recovery with a fresh get_observation() to continue from the "
+        "current physical state."
+    )
     if action.action in {"run_group", "patch_group"}:
         group_id = str(action.args.get("group_id", ""))
         if group_id in executed_side_effect_groups:
-            return _already_executed_side_effect_event(action.action, group_id)
+            return _already_executed_side_effect_event(action.action, group_id, recovery_hint)
         return None
 
     if action.action in {"run_region", "patch_region", "resume_from_region"}:
         region_id = str(action.args.get("region_id", ""))
         if region_id in executed_side_effect_regions:
-            return _already_executed_side_effect_event(action.action, region_id)
+            return _already_executed_side_effect_event(action.action, region_id, recovery_hint)
         return None
 
     return None
@@ -1184,15 +1193,16 @@ def _runtime_action_unit_id(action: RuntimeAction) -> str | None:
     return str(unit_id) if unit_id else None
 
 
-def _already_executed_side_effect_event(action_name: str, unit_id: str) -> RuntimeEvent:
+def _already_executed_side_effect_event(
+    action_name: str, unit_id: str, recovery_hint: str
+) -> RuntimeEvent:
     return RuntimeEvent(
         action=action_name,
         status="invalid",
         region_id=unit_id,
         message=(
             f"{unit_id} already executed robot-side-effect code and rollback is disabled. "
-            "Use append_recovery with a fresh get_observation() to continue from the "
-            "current physical state."
+            f"{recovery_hint}"
         ),
     )
 
