@@ -721,6 +721,13 @@ def _run_capsule_trial(
     best_reward_so_far: float | None = None
     executed_side_effect_regions: set[str] = set()
     executed_side_effect_groups: set[str] = set()
+    recovery_side_effect_budget = 0
+    reward_drop_guard_min_best_reward = float(
+        config.get("capsule_reward_drop_guard_min_best_reward", 0.6)
+    )
+    reward_drop_guard_threshold = float(
+        config.get("capsule_reward_drop_guard_threshold", 0.25)
+    )
 
     for step_id in range(1, max_steps + 1):
         action: RuntimeAction | None = None
@@ -764,6 +771,25 @@ def _run_capsule_trial(
                 executed_side_effect_groups,
             )
             if event is None:
+                event = _reward_drop_guard_event(
+                    action,
+                    before_state,
+                    best_reward_so_far,
+                    region_by_id,
+                    group_by_id,
+                    recovery_side_effect_budget=recovery_side_effect_budget,
+                    min_best_reward=reward_drop_guard_min_best_reward,
+                    drop_threshold=reward_drop_guard_threshold,
+                )
+            if event is None:
+                consumes_recovery_side_effect = (
+                    recovery_side_effect_budget > 0
+                    and _runtime_action_targets_side_effect_unit(
+                        action,
+                        region_by_id,
+                        group_by_id,
+                    )
+                )
                 event = _execute_runtime_action(
                     action,
                     executor,
@@ -771,6 +797,8 @@ def _run_capsule_trial(
                     region_by_id,
                     group_by_id,
                 )
+                if consumes_recovery_side_effect:
+                    recovery_side_effect_budget -= 1
             if event.status in {"failed", "invalid"}:
                 failed = True
             if action.action == "run_region" and event.status != "invalid":
@@ -792,6 +820,8 @@ def _run_capsule_trial(
                         member_region = region_by_id.get(member_region_id)
                         if member_region is not None and _region_has_robot_side_effect(member_region):
                             executed_side_effect_regions.add(member_region_id)
+            elif action.action == "append_recovery" and event.status == "success":
+                recovery_side_effect_budget = 1
 
         after_state = _capsule_state_snapshot(env)
         trace_events = event.evidence.get("trace_events", [])
@@ -1086,6 +1116,72 @@ def _no_rollback_guard_event(
         return None
 
     return None
+
+
+def _reward_drop_guard_event(
+    action: RuntimeAction,
+    before_state: dict[str, Any],
+    best_reward_so_far: float | None,
+    region_by_id: dict[str, Any],
+    group_by_id: dict[str, Any],
+    *,
+    recovery_side_effect_budget: int,
+    min_best_reward: float,
+    drop_threshold: float,
+) -> RuntimeEvent | None:
+    if recovery_side_effect_budget > 0:
+        return None
+    if not _runtime_action_targets_side_effect_unit(action, region_by_id, group_by_id):
+        return None
+
+    current_reward = _state_reward(before_state)
+    if best_reward_so_far is None or current_reward is None:
+        return None
+
+    reward_drop = best_reward_so_far - current_reward
+    if best_reward_so_far < min_best_reward or reward_drop < drop_threshold:
+        return None
+
+    unit_id = _runtime_action_unit_id(action)
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=unit_id,
+        message=(
+            f"Current reward dropped from best_reward={best_reward_so_far:.3f} "
+            f"to {current_reward:.3f}. Rollback is disabled. Use append_recovery "
+            "with a fresh get_observation() before executing more robot-side-effect "
+            "code, or finish if the task is complete."
+        ),
+        evidence={
+            "best_reward_so_far": best_reward_so_far,
+            "current_reward": current_reward,
+            "reward_drop_from_best": reward_drop,
+            "drop_threshold": drop_threshold,
+            "min_best_reward": min_best_reward,
+        },
+    )
+
+
+def _runtime_action_targets_side_effect_unit(
+    action: RuntimeAction,
+    region_by_id: dict[str, Any],
+    group_by_id: dict[str, Any],
+) -> bool:
+    if action.action == "run_group":
+        group = group_by_id.get(str(action.args.get("group_id", "")))
+        return bool(group is not None and group.has_robot_side_effect)
+
+    if action.action in {"run_region", "resume_from_region"}:
+        region = region_by_id.get(str(action.args.get("region_id", "")))
+        return bool(region is not None and _region_has_robot_side_effect(region))
+
+    return False
+
+
+def _runtime_action_unit_id(action: RuntimeAction) -> str | None:
+    unit_id = action.args.get("group_id") or action.args.get("region_id")
+    return str(unit_id) if unit_id else None
 
 
 def _already_executed_side_effect_event(action_name: str, unit_id: str) -> RuntimeEvent:

@@ -65,6 +65,34 @@ class FakeIncompleteCapsuleEnv(FakeCapsuleEnv):
         return 0.0
 
 
+class FakeRewardDropApi(FakeApi):
+    def __init__(self, env):
+        super().__init__()
+        self.env = env
+        self.moves = []
+
+    def move_to(self, pose):
+        self.moved = True
+        self.moves.append(pose)
+        if pose == "good":
+            self.env.reward = 0.75
+        elif pose == "bad":
+            self.env.reward = 0.1
+        elif pose == "recover":
+            self.env.reward = 1.0
+
+
+class FakeRewardDropCapsuleEnv(FakeCapsuleEnv):
+    def __init__(self):
+        self.reward = 0.0
+        self.api = FakeRewardDropApi(self)
+        self.low_level_env = object()
+        self._apis = {"fake": self.api}
+
+    def compute_reward(self):
+        return self.reward
+
+
 class FakeVideoCapsuleEnv(FakeCapsuleEnv):
     def __init__(self):
         super().__init__()
@@ -362,6 +390,74 @@ def test_capsule_trial_rejects_patch_of_executed_side_effect_group(tmp_path):
     assert trace[1]["event"]["status"] == "invalid"
     assert "already executed" in trace[1]["event"]["message"]
     assert "append_recovery" in trace[1]["event"]["message"]
+
+
+def test_capsule_trial_blocks_side_effect_after_reward_drop_from_best(tmp_path):
+    env = FakeRewardDropCapsuleEnv()
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "capsule_max_regions_per_group": 1,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='move_to("good")\nmove_to("bad")\nmove_to("worse")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {"action": "run_group", "args": {"group_id": "group_3"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 1
+    assert env.api.moves == ["good", "bad"]
+    assert trace[2]["event"]["status"] == "invalid"
+    assert "reward dropped" in trace[2]["event"]["message"]
+    assert "append_recovery" in trace[2]["event"]["message"]
+
+
+def test_capsule_trial_allows_recovery_side_effect_after_append_recovery(tmp_path):
+    env = FakeRewardDropCapsuleEnv()
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 6,
+            "capsule_max_regions_per_group": 1,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='move_to("good")\nmove_to("bad")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {
+                "action": "append_recovery",
+                "args": {"source": 'obs = get_observation()\nmove_to("recover")'},
+            },
+            {"action": "run_group", "args": {"group_id": "group_3"}},
+            {"action": "run_group", "args": {"group_id": "group_4"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 0
+    assert env.api.observed is True
+    assert env.api.moves == ["good", "bad", "recover"]
+    assert trace[4]["event"]["status"] == "success"
 
 
 def test_capsule_trial_allows_patch_of_executed_non_side_effect_group(tmp_path):
