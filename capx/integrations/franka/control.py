@@ -89,35 +89,23 @@ class FrankaControlApi(ApiBase):
     def functions(self) -> dict[str, Any]:
         fns = {
             "get_object_pose": self.get_object_pose,
+            "get_observation": self.get_observation,
             "sample_grasp_pose": self.sample_grasp_pose,
             "goto_pose": self.goto_pose,
             "open_gripper": self.open_gripper,
             "close_gripper": self.close_gripper,
             # "home_pose": self.home_pose,
-            # "get_observation": self.get_observation,
         }
-        if not self.real: # Only include home pose in simulation
+        if not self.real:  # Only include home pose in simulation
             fns["home_pose"] = self.home_pose
         return fns
 
     def side_effect_functions(self) -> set[str]:
         return {"goto_pose", "home_pose", "open_gripper", "close_gripper"}
 
-    # def get_observation(self) -> dict[str, Any]:
-    #     """Get the observation of the environment.
-    #     Returns:
-    #         observation:
-    #             A dictionary containing the observation of the environment.
-    #             The dictionary contains the following keys:
-    #             - ["robot_cartesian_pos"]: Current cartesian position of the robot as a numpy array of shape (7,), dtype float64.
-    #                 - [0:3]: Position of the robot in the world frame.
-    #                 - [3:7]: Quaternion of the robot in the world frame.
-    #                 - [7]: Gripper position in metric units.
-    #             - ["robot_joint_pos"]: Current joint position of the robot as a numpy array of shape (7,), dtype float64.
-    #                 - [0:7]: Joint positions of the robot.
-    #                 - [7]: Gripper position in metric units.
-    #     """
-    #     return self._env.get_observation()
+    def get_observation(self) -> dict[str, Any]:
+        """Get the current low-level environment observation."""
+        return self._env.get_observation()
 
     def _get_segmentation_map(
         self, obs: dict[str, Any], rgb: np.ndarray, box: list[float] = None

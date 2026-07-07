@@ -738,6 +738,7 @@ def _run_capsule_trial(
         action: RuntimeAction | None = None
         before_state = _capsule_state_snapshot(env)
         source_unit_for_feedback = None
+        consumes_recovery_side_effect = False
         prompt = build_capsule_prompt(
             task=_task_text_from_obs(obs),
             regions=regions,
@@ -860,6 +861,7 @@ def _run_capsule_trial(
             after_state=after_state,
             executed_regions=executed_regions,
             best_reward_so_far=best_reward_so_far,
+            recovery_execution_attempt=consumes_recovery_side_effect,
         )
         step_metrics.append(metric)
 
@@ -1287,9 +1289,15 @@ def _capsule_step_metric(
     after_state: dict[str, Any],
     executed_regions: int,
     best_reward_so_far: float | None,
+    recovery_execution_attempt: bool,
 ) -> tuple[dict[str, Any], float | None]:
     reward_before = _state_reward(before_state)
     reward_after = _state_reward(after_state)
+    reward_delta = (
+        reward_after - reward_before
+        if reward_before is not None and reward_after is not None
+        else None
+    )
     reward_candidates = [
         reward
         for reward in (best_reward_so_far, reward_before, reward_after)
@@ -1306,6 +1314,19 @@ def _capsule_step_metric(
     if region_id is None and action is not None:
         region_id = action.args.get("region_id") or action.args.get("group_id")
 
+    trace_event_count = len(event.evidence.get("trace_events", []))
+    append_recovery_source_appended = (
+        action is not None
+        and action.action == "append_recovery"
+        and event.status == "success"
+    )
+    recovery_execution_reward_improved = bool(
+        recovery_execution_attempt and reward_delta is not None and reward_delta > 0
+    )
+    recovery_execution_trace_improved = bool(
+        recovery_execution_attempt and trace_event_count > 0
+    )
+
     metric = {
         "step_id": step_id,
         "action": action.action if action is not None else "invalid",
@@ -1314,12 +1335,20 @@ def _capsule_step_metric(
         "event_status": event.status,
         "event_message": event.message,
         "duration_s": event.duration_s,
-        "trace_event_count": len(event.evidence.get("trace_events", [])),
+        "trace_event_count": trace_event_count,
         "executed_regions_so_far": executed_regions,
         "reward_before": reward_before,
         "reward_after": reward_after,
+        "reward_delta": reward_delta,
         "best_reward_so_far": updated_best,
         "reward_drop_from_best": reward_drop,
+        "append_recovery_source_appended": append_recovery_source_appended,
+        "recovery_execution_attempt": recovery_execution_attempt,
+        "recovery_execution_reward_improved": recovery_execution_reward_improved,
+        "recovery_execution_trace_improved": recovery_execution_trace_improved,
+        "recovery_execution_improved": (
+            recovery_execution_reward_improved or recovery_execution_trace_improved
+        ),
         "task_completed_before": before_state.get("task_completed"),
         "task_completed_after": after_state.get("task_completed"),
         "state_before": before_state,

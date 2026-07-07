@@ -498,6 +498,46 @@ def test_capsule_trial_allows_recovery_side_effect_after_append_recovery(tmp_pat
     assert trace[4]["event"]["status"] == "success"
 
 
+def test_capsule_metrics_split_append_source_from_recovery_execution(tmp_path):
+    _run_capsule_trial(
+        env=FakeRewardDropCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 5,
+            "capsule_max_regions_per_group": 1,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='move_to("good")\nmove_to("bad")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {
+                "action": "append_recovery",
+                "args": {"source": 'obs = get_observation()\nmove_to("recover")'},
+            },
+            {"action": "run_group", "args": {"group_id": "group_3"}},
+            {"action": "run_group", "args": {"group_id": "group_4"}},
+        ],
+    )
+
+    metrics_path = tmp_path / "capsule_step_metrics_trial_01.jsonl"
+    rows = [json.loads(line) for line in metrics_path.read_text().splitlines()]
+
+    assert rows[2]["action"] == "append_recovery"
+    assert rows[2]["append_recovery_source_appended"] is True
+    assert rows[2]["recovery_execution_attempt"] is False
+    assert rows[2]["recovery_execution_improved"] is False
+
+    assert rows[4]["action"] == "run_group"
+    assert rows[4]["recovery_execution_attempt"] is True
+    assert rows[4]["recovery_execution_reward_improved"] is True
+    assert rows[4]["recovery_execution_trace_improved"] is True
+    assert rows[4]["recovery_execution_improved"] is True
+
+
 def test_capsule_trial_allows_patch_of_executed_non_side_effect_group(tmp_path):
     summary = _run_capsule_trial(
         env=FakeCapsuleEnv(),

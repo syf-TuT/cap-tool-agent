@@ -86,6 +86,14 @@ class _LegacyApi:
     """An older API that predates the declaration method."""
 
 
+class _ObservationEnv:
+    def __init__(self):
+        self.observation = {"robot": "current"}
+
+    def get_observation(self):
+        return self.observation
+
+
 def test_collect_returns_empty_for_no_apis():
     assert collect_side_effect_calls([]) == set()
 
@@ -116,6 +124,18 @@ def test_franka_control_api_declares_pose_and_gripper_side_effects():
     api = object.__new__(FrankaControlApi)
 
     assert SINGLE_ARM_CONTROL_SIDE_EFFECTS <= api.side_effect_functions()
+
+
+def test_franka_control_api_exposes_current_observation():
+    env = _ObservationEnv()
+    api = object.__new__(FrankaControlApi)
+    api._env = env
+    api.real = False
+
+    functions = api.functions()
+
+    assert "get_observation" in functions
+    assert functions["get_observation"]() is env.observation
 
 
 def test_franka_privileged_api_declares_pose_and_gripper_side_effects():
