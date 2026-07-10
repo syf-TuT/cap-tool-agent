@@ -180,6 +180,15 @@ class TrialResultWriter:
         self.output_dir = Path(output_dir)
         self._path: Path | None = None
 
+    @classmethod
+    def open_existing(cls, result_path: str | Path) -> "TrialResultWriter":
+        """Attach a writer to an already-created canonical result file."""
+
+        path = Path(result_path)
+        writer = cls(path.parent)
+        writer._path = path
+        return writer
+
     @property
     def path(self) -> Path:
         if self._path is None:
