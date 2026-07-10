@@ -18,6 +18,10 @@ from typing import TYPE_CHECKING, Any
 
 import requests
 
+from capx.llm.context import get_trial_llm_context
+from capx.llm.errors import LLMErrorKind, LLMQueryError
+from capx.llm.resilience import LLMRetryPolicy
+
 if TYPE_CHECKING:
     from capx.envs.launch import LaunchArgs
 
@@ -120,6 +124,42 @@ def collapse_text_image_inputs(messages: list[dict]) -> list[dict]:
 
 def _reasoning_disabled() -> bool:
     return os.getenv("CAPX_DISABLE_REASONING") == "1"
+
+
+_RETRYABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
+
+
+def _http_error_kind(status_code: int) -> LLMErrorKind:
+    if status_code == 429:
+        return LLMErrorKind.RATE_LIMITED
+    if status_code >= 500:
+        return LLMErrorKind.HTTP_5XX
+    if status_code in (401, 403):
+        return LLMErrorKind.AUTH_ERROR
+    return LLMErrorKind.REQUEST_REJECTED
+
+
+def _request_error_kind(error: requests.exceptions.RequestException) -> LLMErrorKind:
+    if isinstance(error, requests.exceptions.ConnectTimeout):
+        return LLMErrorKind.CONNECT_TIMEOUT
+    if isinstance(error, (requests.exceptions.ReadTimeout, requests.exceptions.Timeout)):
+        return LLMErrorKind.READ_TIMEOUT
+    return LLMErrorKind.CONNECTION_ERROR
+
+
+def _retry_delay(response: requests.Response | None, policy: LLMRetryPolicy) -> float:
+    delay = policy.retry_backoff_seconds + random.uniform(0, policy.retry_jitter_seconds)
+    if response is None:
+        return delay
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            numeric_retry_after = max(0.0, float(retry_after))
+        except ValueError:
+            pass
+        else:
+            delay = max(delay, min(numeric_retry_after, policy.retry_after_cap_seconds))
+    return delay
 
 
 def _completions_to_responses_convert_prompt(prompt: list[dict]) -> list[dict]:
@@ -293,72 +333,204 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         if not fallback_to_non_streaming:
             raise RuntimeError("Streaming model query failed") from last_exc
 
-    start_time = time.time()
-    request_timeout = float(
-        os.getenv(
-            "CAPX_NONSTREAMING_REQUEST_TIMEOUT_SECONDS",
-            os.getenv("CAPX_NON_STREAMING_REQUEST_TIMEOUT_SECONDS", "200"),
+    policy = LLMRetryPolicy.from_env()
+    context = get_trial_llm_context()
+    call_index = context.next_call_index() if context is not None else 1
+    call_started = time.monotonic()
+
+    def raise_query_error(
+        kind: LLMErrorKind,
+        attempt: int,
+        status_code: int | None,
+        message: str,
+    ) -> None:
+        raise LLMQueryError(
+            kind=kind,
+            call_index=call_index,
+            attempt=attempt,
+            status_code=status_code,
+            elapsed_seconds=max(0.0, time.monotonic() - call_started),
+            message=message,
         )
-    )
-    request_retries = max(
-        0,
-        int(
-            os.getenv(
-                "CAPX_NONSTREAMING_REQUEST_RETRIES",
-                os.getenv("CAPX_NON_STREAMING_REQUEST_RETRIES", "0"),
+
+    for attempt in range(1, policy.max_attempts + 1):
+        remaining_before = context.remaining_seconds() if context is not None else None
+        if remaining_before is not None and remaining_before <= 0:
+            raise_query_error(
+                LLMErrorKind.TRIAL_BUDGET_EXHAUSTED,
+                attempt,
+                None,
+                "Trial budget exhausted before LLM request",
             )
-        ),
-    )
+        request_timeout = policy.request_timeout_seconds
+        if remaining_before is not None:
+            request_timeout = min(request_timeout, remaining_before)
+        if request_timeout <= 0:
+            raise_query_error(
+                LLMErrorKind.TRIAL_BUDGET_EXHAUSTED,
+                attempt,
+                None,
+                "Trial budget cannot cover a positive LLM request timeout",
+            )
 
-    def post_non_streaming() -> requests.Response:
-        attempt = 0
-        while True:
-            try:
-                return requests.post(
-                    server_url,
-                    headers=headers,
-                    data=json.dumps(payload),
-                    timeout=request_timeout,
+        started = time.monotonic()
+        remaining_before_ms = (
+            None if remaining_before is None else int(round(remaining_before * 1000))
+        )
+        response: requests.Response | None = None
+        status_code: int | None = None
+        ttfb_ms: int | None = None
+        try:
+            response = requests.post(
+                server_url,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=request_timeout,
+                stream=True,
+            )
+            status_code = response.status_code
+            body_chunks = []
+            for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                if ttfb_ms is None:
+                    ttfb_ms = int(round((time.monotonic() - started) * 1000))
+                body_chunks.append(chunk)
+            body_bytes = b"".join(body_chunks)
+        except requests.exceptions.RequestException as error:
+            finished = time.monotonic()
+            kind = _request_error_kind(error)
+            can_retry = attempt < policy.max_attempts
+            delay = _retry_delay(response, policy) if can_retry else 0.0
+            remaining = context.remaining_seconds() if context is not None else None
+            budget_allows_retry = remaining is None or (
+                remaining >= policy.minimum_retry_budget_seconds and remaining > delay
+            )
+            retry_scheduled = can_retry and budget_allows_retry
+            if context is not None:
+                context.record_attempt(
+                    call_index=call_index,
+                    attempt=attempt,
+                    mode="non_streaming",
+                    http_status=status_code,
+                    ttfb_ms=ttfb_ms,
+                    first_content_ms=None,
+                    started_monotonic=started,
+                    finished_monotonic=finished,
+                    remaining_before_ms=remaining_before_ms,
+                    outcome="retryable_transport_error" if can_retry else "transport_error",
+                    error_kind=kind.value,
+                    retry_scheduled=retry_scheduled,
                 )
-            except requests.exceptions.Timeout:
-                if attempt >= request_retries:
-                    raise
-                attempt += 1
-                print(
-                    "Non-streaming model query timed out after "
-                    f"{request_timeout:.1f}s; retrying ({attempt}/{request_retries})",
-                    flush=True,
+            if retry_scheduled:
+                time.sleep(delay)
+                continue
+            if can_retry and not budget_allows_retry:
+                raise_query_error(
+                    LLMErrorKind.TRIAL_BUDGET_EXHAUSTED,
+                    attempt,
+                    status_code,
+                    "Trial budget cannot cover the minimum retry budget and delay",
                 )
+            raise_query_error(kind, attempt, status_code, f"LLM transport failed: {kind.value}")
 
-    # keep calling until it works
-    response = post_non_streaming()
-    retry = 1
-    while response.status_code in [404, 500, 502, 503, 504]:
-        sleep_time = 240 + random.uniform(-90, 90)
-        print(f"Retry {retry}. Model query failed with status code {response.status_code}. Error: {response.text}. Retrying in {sleep_time} seconds...")
-        time.sleep(sleep_time)
-        response = post_non_streaming()
-        retry += 1
+        finished = time.monotonic()
+        if status_code is not None and status_code >= 400:
+            kind = _http_error_kind(status_code)
+            can_retry = status_code in _RETRYABLE_HTTP_STATUSES and attempt < policy.max_attempts
+            delay = _retry_delay(response, policy) if can_retry else 0.0
+            remaining = context.remaining_seconds() if context is not None else None
+            budget_allows_retry = remaining is None or (
+                remaining >= policy.minimum_retry_budget_seconds and remaining > delay
+            )
+            retry_scheduled = can_retry and budget_allows_retry
+            if context is not None:
+                context.record_attempt(
+                    call_index=call_index,
+                    attempt=attempt,
+                    mode="non_streaming",
+                    http_status=status_code,
+                    ttfb_ms=ttfb_ms,
+                    first_content_ms=None,
+                    started_monotonic=started,
+                    finished_monotonic=finished,
+                    remaining_before_ms=remaining_before_ms,
+                    outcome="retryable_http_error" if can_retry else "http_error",
+                    error_kind=kind.value,
+                    retry_scheduled=retry_scheduled,
+                )
+            if retry_scheduled:
+                time.sleep(delay)
+                continue
+            if can_retry and not budget_allows_retry:
+                raise_query_error(
+                    LLMErrorKind.TRIAL_BUDGET_EXHAUSTED,
+                    attempt,
+                    status_code,
+                    "Trial budget cannot cover the minimum retry budget and delay",
+                )
+            raise_query_error(
+                kind,
+                attempt,
+                status_code,
+                f"LLM request rejected with HTTP status {status_code}",
+            )
 
-    end_time = time.time()
-    print(f"Time taken to query model: {end_time - start_time:.2f} seconds")
-    response.raise_for_status()
-    body = response.json()
-    out = {}
-    if args.debug:
-        print(json.dumps(body, indent=2))
-    try:
-        if args.model in GPT_MODELS and "codex" in args.model:
-            out["content"] = body["output_text"]
-        else:
-            out["content"] = body["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as exc:
-        raise RuntimeError(f"Unexpected response format: {body}") from exc
-    if body.get("choices") is not None and not reasoning_disabled:
-        out["reasoning"] = body.get("choices")[0].get("message").get("reasoning", None)
-    else:
-        out["reasoning"] = None
-    return out  # type: ignore[return-value]
+        try:
+            body = json.loads(body_bytes)
+            if args.model in GPT_MODELS and "codex" in args.model:
+                content = body["output_text"]
+                reasoning = None
+            else:
+                message = body["choices"][0]["message"]
+                content = message["content"]
+                reasoning = None if reasoning_disabled else message.get("reasoning")
+            if not isinstance(content, str):
+                raise TypeError("response content must be a string")
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, IndexError, TypeError):
+            finished = time.monotonic()
+            if context is not None:
+                context.record_attempt(
+                    call_index=call_index,
+                    attempt=attempt,
+                    mode="non_streaming",
+                    http_status=status_code,
+                    ttfb_ms=ttfb_ms,
+                    first_content_ms=None,
+                    started_monotonic=started,
+                    finished_monotonic=finished,
+                    remaining_before_ms=remaining_before_ms,
+                    outcome="invalid_response",
+                    error_kind=LLMErrorKind.INVALID_RESPONSE.value,
+                    retry_scheduled=False,
+                )
+            raise_query_error(
+                LLMErrorKind.INVALID_RESPONSE,
+                attempt,
+                status_code,
+                "LLM response was not valid JSON with the expected schema",
+            )
+
+        finished = time.monotonic()
+        if context is not None:
+            context.record_attempt(
+                call_index=call_index,
+                attempt=attempt,
+                mode="non_streaming",
+                http_status=status_code,
+                ttfb_ms=ttfb_ms,
+                first_content_ms=None,
+                started_monotonic=started,
+                finished_monotonic=finished,
+                remaining_before_ms=remaining_before_ms,
+                outcome="success",
+                error_kind=None,
+                retry_scheduled=False,
+            )
+        print(f"Time taken to query model: {finished - call_started:.2f} seconds")
+        return {"content": content, "reasoning": reasoning}
+
+    raise RuntimeError("bounded LLM attempt loop exited unexpectedly")
 
 
 def query_model_streaming(
