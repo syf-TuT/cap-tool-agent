@@ -180,6 +180,29 @@ def test_attempt_record_contains_required_diagnostics(tmp_path):
 Add a concurrency test that submits several `next_call_index()` calls and asserts unique,
 monotonically increasing values.
 
+Treat the following as the required, exact JSONL field contract. Tests must assert every key,
+including nullable values, rather than accepting abbreviated internal names:
+
+```text
+trial
+call_index
+stage
+attempt
+mode
+http_status
+ttfb_ms
+first_content_ms
+duration_ms
+trial_remaining_ms_before
+trial_remaining_ms_after
+outcome
+error_kind
+retry_scheduled
+```
+
+The writer may accept convenient internal argument names, but the serialized record must use
+these exact keys.
+
 **Step 2: Run the focused test and observe failure**
 
 Copy `tests/test_llm_context.py` into WSL and run:
