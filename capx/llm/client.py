@@ -231,6 +231,11 @@ def _call_with_deadline(
     """Run a potentially blocking Requests operation behind a hard wall-clock deadline."""
     results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
     cancelled = threading.Event()
+    ownership = threading.Lock()
+
+    def dispose_late_result(succeeded: bool, value: Any) -> None:
+        if succeeded and on_late_result is not None:
+            on_late_result(value)
 
     def run() -> None:
         try:
@@ -238,13 +243,18 @@ def _call_with_deadline(
         except Exception as error:
             result_item = (False, error)
         else:
-            if cancelled.is_set() and on_late_result is not None:
-                on_late_result(result)
             result_item = (True, result)
-        try:
-            results.put_nowait(result_item)
-        except queue.Full:
-            pass
+        dispose_result = False
+        with ownership:
+            if cancelled.is_set():
+                dispose_result = True
+            else:
+                try:
+                    results.put_nowait(result_item)
+                except queue.Full:
+                    dispose_result = True
+        if dispose_result:
+            dispose_late_result(*result_item)
 
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
@@ -253,7 +263,15 @@ def _call_with_deadline(
         try:
             succeeded, value = results.get(timeout=wait_seconds)
         except queue.Empty:
-            cancelled.set()
+            reclaimed_result = None
+            with ownership:
+                cancelled.set()
+                try:
+                    reclaimed_result = results.get_nowait()
+                except queue.Empty:
+                    pass
+            if reclaimed_result is not None:
+                dispose_late_result(*reclaimed_result)
             if on_timeout is not None:
                 on_timeout()
             raise timeout_error
@@ -331,6 +349,7 @@ def _iter_stream_lines_with_deadlines(
                 raise _StreamingInvalidResponse("Streaming response line was not bytes")
             yield item, received_at
     finally:
+        response.close()
         worker.join(timeout=0.01)
 
 

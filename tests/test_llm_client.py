@@ -1,5 +1,6 @@
 import json
 import os
+import queue as stdlib_queue
 import threading
 import time
 from types import SimpleNamespace
@@ -7,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import requests
 
-from capx.llm.client import query_model, query_model_streaming
+from capx.llm.client import _call_with_deadline, query_model, query_model_streaming
 from capx.llm.context import TelemetryWriteError, trial_llm_context
 from capx.llm.errors import LLMErrorKind, LLMQueryError
 
@@ -664,6 +665,50 @@ def test_slow_json_body_cannot_succeed_after_attempt_deadline(monkeypatch):
     assert result["content"] == "ok"
     assert elapsed < 0.07
     assert late_json.closed is True
+
+
+def test_deadline_cancellation_race_reclaims_queued_response(monkeypatch):
+    queue_class = stdlib_queue.Queue
+    result_queue = queue_class(maxsize=1)
+    put_started = threading.Event()
+    allow_put = threading.Event()
+    original_put = result_queue.put_nowait
+
+    def blocked_put(item):
+        put_started.set()
+        allow_put.wait(timeout=1)
+        original_put(item)
+
+    monkeypatch.setattr(result_queue, "put_nowait", blocked_put)
+    monkeypatch.setattr(
+        "capx.llm.client.queue.Queue", lambda *args, **kwargs: result_queue
+    )
+    response = _ScriptedStreamingResponse()
+    errors = []
+
+    def invoke():
+        try:
+            _call_with_deadline(
+                lambda: response,
+                deadline=time.monotonic() + 0.02,
+                timeout_error=requests.exceptions.ReadTimeout("deadline"),
+                on_late_result=lambda late_response: late_response.close(),
+            )
+        except requests.exceptions.ReadTimeout:
+            return
+        except Exception as error:
+            errors.append(error)
+
+    caller = threading.Thread(target=invoke)
+    caller.start()
+    assert put_started.wait(timeout=0.5)
+    time.sleep(0.04)
+    allow_put.set()
+    caller.join(timeout=0.5)
+
+    assert not errors
+    assert not caller.is_alive()
+    assert response.closed is True
 
 
 def test_direct_streaming_generator_remains_single_attempt_and_event_compatible(monkeypatch):
