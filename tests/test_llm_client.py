@@ -781,6 +781,26 @@ def test_direct_streaming_early_generator_close_records_cancelled_attempt(monkey
     assert response.closed is True
 
 
+def test_direct_streaming_close_after_done_keeps_success_telemetry(monkeypatch, tmp_path):
+    _streaming_policy(monkeypatch, attempts=1)
+    response = _ScriptedStreamingResponse(
+        lines=[(0, _sse({"content": "answer"})), (0, b"data: [DONE]")]
+    )
+    monkeypatch.setattr("capx.llm.client.requests.post", lambda *args, **kwargs: response)
+    telemetry = tmp_path / "calls.jsonl"
+
+    with trial_llm_context(trial=11, telemetry_path=telemetry):
+        generator = query_model_streaming(_args(), [{"role": "user", "content": "hi"}])
+        assert next(generator)["type"] == "content_delta"
+        assert next(generator)["type"] == "done"
+        generator.close()
+
+    records = [json.loads(line) for line in telemetry.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["outcome"] == "success"
+    assert response.closed is True
+
+
 def test_streaming_eof_after_partial_content_falls_back_once(monkeypatch):
     _streaming_policy(monkeypatch)
     partial = _ScriptedStreamingResponse(lines=[(0, _sse({"content": "partial"}))])

@@ -1116,17 +1116,36 @@ def query_model_streaming(
     error_fields = {"call_index": call_index, "call_started": call_started}
     request_timeout, remaining_before_ms = _attempt_budget(context, policy, 1, **error_fields)
     metrics = _StreamingMetrics(started=time.monotonic())
+    completed = False
     try:
-        yield from _streaming_events(
+        for event in _streaming_events(
             args,
             prompt,
             server_url=args.server_url,
             request_timeout=request_timeout,
             first_content_timeout=policy.first_content_timeout_seconds,
             metrics=metrics,
-        )
+        ):
+            if event["type"] == "done":
+                completed = True
+                if context is not None:
+                    context.record_attempt(
+                        call_index=call_index,
+                        attempt=1,
+                        mode="streaming",
+                        http_status=metrics.http_status,
+                        ttfb_ms=metrics.ttfb_ms,
+                        first_content_ms=metrics.first_content_ms,
+                        started_monotonic=metrics.started,
+                        finished_monotonic=time.monotonic(),
+                        remaining_before_ms=remaining_before_ms,
+                        outcome="success",
+                        error_kind=None,
+                        retry_scheduled=False,
+                    )
+            yield event
     except GeneratorExit:
-        if context is not None:
+        if context is not None and not completed:
             context.record_attempt(
                 call_index=call_index,
                 attempt=1,
@@ -1181,7 +1200,7 @@ def query_model_streaming(
             **error_fields,
         )
     else:
-        if context is not None:
+        if context is not None and not completed:
             context.record_attempt(
                 call_index=call_index,
                 attempt=1,
