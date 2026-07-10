@@ -1,5 +1,8 @@
 import json
+import os
 from types import SimpleNamespace
+
+import requests
 
 from capx.llm.client import query_model, query_model_streaming
 
@@ -112,6 +115,94 @@ def test_query_model_retries_empty_streaming_content(monkeypatch):
         "reasoning": None,
     }
     assert len(calls) == 2
+
+
+def test_query_model_falls_back_to_non_streaming_after_empty_streaming_content(monkeypatch):
+    stream_calls = []
+    post_payloads = []
+
+    def fake_streaming(args, prompt):
+        stream_calls.append(1)
+        yield {"type": "done", "content": "", "reasoning": None}
+
+    class NonStreamingResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "fallback ok"}}]}
+
+    def fake_post(*args, data, **kwargs):
+        post_payloads.append(json.loads(data))
+        return NonStreamingResponse()
+
+    monkeypatch.setenv("CAPX_FORCE_STREAMING_CHAT_COMPLETIONS", "1")
+    monkeypatch.setenv("CAPX_STREAMING_CHAT_COMPLETIONS_RETRIES", "2")
+    monkeypatch.setenv("CAPX_STREAMING_REQUIRE_CONTENT", "1")
+    monkeypatch.setenv("CAPX_DISABLE_REASONING", "1")
+    monkeypatch.setattr("capx.llm.client.query_model_streaming", fake_streaming)
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+
+    args = SimpleNamespace(
+        model="deepseek-v4-flash",
+        server_url="https://example.invalid/v1/chat/completions",
+        api_key="test-key",
+        temperature=0.2,
+        max_tokens=256,
+        reasoning_effort="minimal",
+        debug=False,
+    )
+
+    assert query_model(args, [{"role": "user", "content": "hi"}]) == {
+        "content": "fallback ok",
+        "reasoning": None,
+    }
+    assert len(stream_calls) == 2
+    assert post_payloads[0]["thinking"] == {"type": "disabled"}
+    assert os.environ["CAPX_FORCE_STREAMING_CHAT_COMPLETIONS"] == "1"
+
+
+def test_query_model_retries_non_streaming_timeout_once(monkeypatch):
+    request_timeouts = []
+
+    class NonStreamingResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "retry ok"}}]}
+
+    def fake_post(*args, timeout, **kwargs):
+        request_timeouts.append(timeout)
+        if len(request_timeouts) == 1:
+            raise requests.exceptions.Timeout("request timed out")
+        return NonStreamingResponse()
+
+    monkeypatch.delenv("CAPX_FORCE_STREAMING_CHAT_COMPLETIONS", raising=False)
+    monkeypatch.setenv("CAPX_DISABLE_REASONING", "1")
+    monkeypatch.setenv("CAPX_NONSTREAMING_REQUEST_TIMEOUT_SECONDS", "60")
+    monkeypatch.setenv("CAPX_NONSTREAMING_REQUEST_RETRIES", "1")
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+
+    args = SimpleNamespace(
+        model="deepseek-v4-flash",
+        server_url="https://example.invalid/v1/chat/completions",
+        api_key="test-key",
+        temperature=0.2,
+        max_tokens=256,
+        reasoning_effort="minimal",
+        debug=False,
+    )
+
+    assert query_model(args, [{"role": "user", "content": "hi"}]) == {
+        "content": "retry ok",
+        "reasoning": None,
+    }
+    assert request_timeouts == [60.0, 60.0]
 
 
 def test_streaming_query_times_out_before_first_content(monkeypatch):

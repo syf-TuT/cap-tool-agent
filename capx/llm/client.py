@@ -254,6 +254,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     if os.getenv("CAPX_FORCE_STREAMING_CHAT_COMPLETIONS") == "1":
         max_attempts = max(1, int(os.getenv("CAPX_STREAMING_CHAT_COMPLETIONS_RETRIES", "1")))
         last_exc: BaseException | None = None
+        fallback_to_non_streaming = False
         for attempt in range(1, max_attempts + 1):
             print(
                 "Using streaming chat completions for model query "
@@ -274,25 +275,69 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
                 return {"content": content, "reasoning": reasoning}
             except (TimeoutError, requests.exceptions.RequestException) as exc:
                 last_exc = exc
+                empty_streaming_content = (
+                    isinstance(exc, TimeoutError)
+                    and str(exc) == "Streaming model query returned empty content"
+                )
                 if attempt >= max_attempts:
+                    if empty_streaming_content:
+                        print(
+                            "Streaming returned empty content after retries; "
+                            "falling back to non-streaming chat completion",
+                            flush=True,
+                        )
+                        fallback_to_non_streaming = True
+                        break
                     raise
                 print(f"Streaming model query failed: {exc}. Retrying...", flush=True)
-        raise RuntimeError("Streaming model query failed") from last_exc
+        if not fallback_to_non_streaming:
+            raise RuntimeError("Streaming model query failed") from last_exc
 
     start_time = time.time()
+    request_timeout = float(
+        os.getenv(
+            "CAPX_NONSTREAMING_REQUEST_TIMEOUT_SECONDS",
+            os.getenv("CAPX_NON_STREAMING_REQUEST_TIMEOUT_SECONDS", "200"),
+        )
+    )
+    request_retries = max(
+        0,
+        int(
+            os.getenv(
+                "CAPX_NONSTREAMING_REQUEST_RETRIES",
+                os.getenv("CAPX_NON_STREAMING_REQUEST_RETRIES", "0"),
+            )
+        ),
+    )
+
+    def post_non_streaming() -> requests.Response:
+        attempt = 0
+        while True:
+            try:
+                return requests.post(
+                    server_url,
+                    headers=headers,
+                    data=json.dumps(payload),
+                    timeout=request_timeout,
+                )
+            except requests.exceptions.Timeout:
+                if attempt >= request_retries:
+                    raise
+                attempt += 1
+                print(
+                    "Non-streaming model query timed out after "
+                    f"{request_timeout:.1f}s; retrying ({attempt}/{request_retries})",
+                    flush=True,
+                )
 
     # keep calling until it works
-    response = requests.post(
-        server_url, headers=headers, data=json.dumps(payload), timeout=200
-    )
+    response = post_non_streaming()
     retry = 1
     while response.status_code in [404, 500, 502, 503, 504]:
         sleep_time = 240 + random.uniform(-90, 90)
         print(f"Retry {retry}. Model query failed with status code {response.status_code}. Error: {response.text}. Retrying in {sleep_time} seconds...")
         time.sleep(sleep_time)
-        response = requests.post(
-            server_url, headers=headers, data=json.dumps(payload), timeout=200
-        )
+        response = post_non_streaming()
         retry += 1
 
     end_time = time.time()
