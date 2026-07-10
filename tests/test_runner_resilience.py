@@ -171,10 +171,11 @@ def test_result_write_failure_after_finished_trial_propagates_without_reclassifi
     monkeypatch.setattr(runner, "_run_single_trial", lambda *args, **kwargs: _summary())
     monkeypatch.setattr(runner.TrialResultWriter, "finalize", fail_finalize)
 
-    with pytest.raises(OSError, match="disk full"):
+    with pytest.raises(OSError, match="disk full") as raised:
         runner._run_trial_with_retries(object(), 1, _args(), _config(tmp_path), None)
 
     assert calls == 1
+    assert raised.value.__cause__ is None
 
 
 def test_result_write_failure_chains_from_original_llm_failure(tmp_path, monkeypatch):

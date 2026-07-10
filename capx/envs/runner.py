@@ -328,7 +328,7 @@ def _run_single_trial_with_timeout(
                 started_monotonic=trial_started_monotonic,
             )
     except TrialResultPersistenceError as exc:
-        raise exc.cause from exc
+        raise exc.cause from None
     except LLMQueryError as exc:
         outcome = (
             RunOutcome.TRIAL_BUDGET_EXHAUSTED
