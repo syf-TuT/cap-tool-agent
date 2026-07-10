@@ -113,7 +113,10 @@ def test_legacy_non_streaming_value_is_converted_from_retries_to_attempts(
     assert LLMRetryPolicy.from_env().max_attempts == expected_attempts
 
 
-@pytest.mark.parametrize("configured_attempts, expected", [("-2", 1), ("0", 1), ("1", 1), ("2", 2), ("3", 2)])
+@pytest.mark.parametrize(
+    ("configured_attempts", "expected"),
+    [("-2", 1), ("0", 1), ("1", 1), ("2", 2), ("3", 2)],
+)
 def test_canonical_max_attempts_is_clamped(monkeypatch, configured_attempts, expected):
     clear_llm_policy_env(monkeypatch)
     monkeypatch.setenv("CAPX_LLM_MAX_ATTEMPTS", configured_attempts)
@@ -171,6 +174,41 @@ def test_non_positive_timeout_values_raise_value_error(monkeypatch, name, value)
         LLMRetryPolicy.from_env()
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CAPX_LLM_REQUEST_TIMEOUT_SECONDS",
+        "CAPX_LLM_RETRY_BACKOFF_SECONDS",
+        "CAPX_LLM_RETRY_AFTER_CAP_SECONDS",
+        "CAPX_STREAMING_FIRST_CONTENT_TIMEOUT_SECONDS",
+    ],
+)
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_non_finite_environment_numbers_raise_value_error(monkeypatch, name, value):
+    clear_llm_policy_env(monkeypatch)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        LLMRetryPolicy.from_env()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "request_timeout_seconds",
+        "retry_backoff_seconds",
+        "retry_jitter_seconds",
+        "retry_after_cap_seconds",
+        "minimum_retry_budget_seconds",
+        "first_content_timeout_seconds",
+    ],
+)
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_direct_policy_construction_rejects_non_finite_numbers(field, value):
+    with pytest.raises(ValueError, match=field):
+        LLMRetryPolicy(**{field: value})
+
+
 def test_llm_query_error_exposes_only_safe_scalar_metadata():
     error = LLMQueryError(
         kind=LLMErrorKind.HTTP_5XX,
@@ -207,7 +245,6 @@ def test_llm_query_error_exposes_only_safe_scalar_metadata():
     assert "also-secret" not in encoded
     assert "sk-openai-secret" not in encoded
     assert "sk-openrouter-secret" not in encoded
-    assert "Authorization" not in encoded
     assert error.kind is LLMErrorKind.HTTP_5XX
     assert str(error) == safe["message"]
 
@@ -226,3 +263,46 @@ def test_llm_query_error_allows_missing_optional_http_metadata():
 
     assert safe["status_code"] is None
     assert all(value is None or isinstance(value, (str, int, float)) for value in safe.values())
+
+
+@pytest.mark.parametrize(
+    ("message", "secret", "preserved_syntax"),
+    [
+        (
+            '{"api_key": "sk-json-secret", "model": "x"}',
+            "sk-json-secret",
+            '{"api_key": "[REDACTED]", "model": "x"}',
+        ),
+        (
+            "{'OPENAI_API_KEY': 'sk-python-secret', 'x': 1}",
+            "sk-python-secret",
+            "{'OPENAI_API_KEY': '[REDACTED]', 'x': 1}",
+        ),
+        (
+            '{"Authorization": "Bearer sk-auth-secret", "x": 1}',
+            "sk-auth-secret",
+            '{"Authorization": "[REDACTED]", "x": 1}',
+        ),
+        (
+            "https://provider.test/chat?api_key=sk-query-secret&x=1",
+            "sk-query-secret",
+            "api_key=[REDACTED]&x=1",
+        ),
+    ],
+)
+def test_llm_query_error_redacts_common_credential_syntax(
+    message, secret, preserved_syntax
+):
+    error = LLMQueryError(
+        kind=LLMErrorKind.AUTH_ERROR,
+        call_index=1,
+        attempt=1,
+        status_code=401,
+        elapsed_seconds=0.2,
+        message=message,
+    )
+
+    safe_message = error.to_safe_dict()["message"]
+
+    assert secret not in safe_message
+    assert preserved_syntax in safe_message

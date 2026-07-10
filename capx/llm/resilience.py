@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Mapping
@@ -23,9 +24,12 @@ def _parse_int(name: str, value: str) -> int:
 
 def _parse_float(name: str, value: str) -> float:
     try:
-        return float(value)
+        parsed = float(value)
     except ValueError as exc:
         raise ValueError(f"{name} must be a number, got {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return parsed
 
 
 def _positive_float(name: str, value: str) -> float:
@@ -56,6 +60,16 @@ class LLMRetryPolicy:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_attempts", min(2, max(1, int(self.max_attempts))))
+        for name in (
+            "request_timeout_seconds",
+            "retry_backoff_seconds",
+            "retry_jitter_seconds",
+            "retry_after_cap_seconds",
+            "minimum_retry_budget_seconds",
+            "first_content_timeout_seconds",
+        ):
+            if not math.isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
         if self.request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be greater than zero")
         if self.first_content_timeout_seconds <= 0:

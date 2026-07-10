@@ -23,20 +23,32 @@ class LLMErrorKind(str, Enum):
 
 _MAX_SAFE_MESSAGE_LENGTH = 512
 _AUTHORIZATION_PATTERN = re.compile(
-    r"(?i)\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s,;]+"
+    r"(?i)(?P<prefix>(?P<key_quote>[\"']?)authorization(?P=key_quote)\s*[:=]\s*)"
+    r"(?P<value>\"[^\"]*\"|'[^']*'|(?:bearer\s+)?[^\s,;&}\]]+)"
 )
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 _CREDENTIAL_PATTERN = re.compile(
-    r"(?i)\b(?:(?:[a-z0-9]+_)*api[_-]?key|access[_-]?token|token|secret|password)"
-    r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    r"(?i)(?P<prefix>(?P<key_quote>[\"']?)"
+    r"(?:(?:[a-z0-9]+_)*api[_-]?key|access[_-]?token|token|secret|password)"
+    r"(?P=key_quote)\s*[:=]\s*)"
+    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;&}\]]+)"
 )
+
+
+def _redact_matched_value(match: re.Match[str]) -> str:
+    value = match.group("value")
+    if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+        redacted_value = f"{value[0]}[REDACTED]{value[0]}"
+    else:
+        redacted_value = "[REDACTED]"
+    return f"{match.group('prefix')}{redacted_value}"
 
 
 def _sanitize_message(message: object) -> str:
     safe = str(message).replace("\r", " ").replace("\n", " ")
-    safe = _AUTHORIZATION_PATTERN.sub("[REDACTED]", safe)
+    safe = _AUTHORIZATION_PATTERN.sub(_redact_matched_value, safe)
     safe = _BEARER_PATTERN.sub("[REDACTED]", safe)
-    safe = _CREDENTIAL_PATTERN.sub("[REDACTED]", safe)
+    safe = _CREDENTIAL_PATTERN.sub(_redact_matched_value, safe)
     safe = " ".join(safe.split())
     return safe[:_MAX_SAFE_MESSAGE_LENGTH]
 
