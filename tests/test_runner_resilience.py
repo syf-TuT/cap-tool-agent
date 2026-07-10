@@ -144,6 +144,65 @@ def test_timeout_is_persisted_as_trial_budget_exhausted(tmp_path, monkeypatch):
     )
 
 
+def test_timeout_summary_uses_the_same_resolved_budget_as_the_alarm(tmp_path, monkeypatch):
+    def change_environment_then_timeout(*args, **kwargs):
+        monkeypatch.setenv("CAPX_TRIAL_TIMEOUT_SECONDS", "999")
+        raise TimeoutError("budget exhausted")
+
+    monkeypatch.setattr(runner, "_run_single_trial", change_environment_then_timeout)
+
+    summary = runner._run_single_trial_with_timeout(
+        object(), 1, _args(), _config(tmp_path), None, timeout_s=17
+    )
+
+    assert "timed out after 17 seconds" in summary.log
+
+
+def test_result_write_failure_after_finished_trial_propagates_without_reclassification(
+    tmp_path, monkeypatch
+):
+    calls = 0
+
+    def fail_finalize(self, result):
+        nonlocal calls
+        calls += 1
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runner, "_run_single_trial", lambda *args, **kwargs: _summary())
+    monkeypatch.setattr(runner.TrialResultWriter, "finalize", fail_finalize)
+
+    with pytest.raises(OSError, match="disk full"):
+        runner._run_trial_with_retries(object(), 1, _args(), _config(tmp_path), None)
+
+    assert calls == 1
+
+
+def test_result_write_failure_chains_from_original_llm_failure(tmp_path, monkeypatch):
+    original = LLMQueryError(
+        kind=LLMErrorKind.HTTP_5XX,
+        call_index=2,
+        attempt=2,
+        status_code=503,
+        elapsed_seconds=3.0,
+        message="provider unavailable",
+    )
+
+    monkeypatch.setattr(
+        runner, "_run_single_trial", lambda *args, **kwargs: (_ for _ in ()).throw(original)
+    )
+    monkeypatch.setattr(
+        runner.TrialResultWriter,
+        "finalize",
+        lambda self, result: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(LLMQueryError, match="provider unavailable") as raised:
+        runner._run_trial_with_retries(object(), 1, _args(), _config(tmp_path), None)
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert str(raised.value.__cause__) == "disk full"
+
+
 def test_unexpected_exception_is_execution_failed_not_llm_failed(tmp_path, monkeypatch):
     monkeypatch.setattr(
         runner,

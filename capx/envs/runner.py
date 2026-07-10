@@ -44,6 +44,14 @@ from capx.utils.parallel_eval import run_parallel_with_setup
 TRIAL_TIMEOUT_SECONDS = 450
 
 
+class TrialResultPersistenceError(RuntimeError):
+    """Signals that terminal-result persistence failed after trial execution."""
+
+    def __init__(self, cause: Exception) -> None:
+        self.cause = cause
+        super().__init__("failed to persist structured trial result")
+
+
 def _trial_timeout_seconds() -> int:
     """Read the complete per-trial budget once, with the approved default."""
 
@@ -302,9 +310,12 @@ def _run_single_trial_with_timeout(
 
     partial_artifacts: dict[str, Any] = {}
     llm_context: TrialLLMContext | None = None
-    previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(timeout_seconds)
+    previous_handler = None
+    alarm_started = False
     try:
+        previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(timeout_seconds)
+        alarm_started = True
         with context_manager as llm_context:
             summary = _run_single_trial(
                 env, trial, args, config, multi_turn_prompt, partial_artifacts=partial_artifacts
@@ -316,44 +327,54 @@ def _run_single_trial_with_timeout(
                 outcome=RunOutcome.FINISHED,
                 started_monotonic=trial_started_monotonic,
             )
+    except TrialResultPersistenceError as exc:
+        raise exc.cause from exc
     except LLMQueryError as exc:
         outcome = (
             RunOutcome.TRIAL_BUDGET_EXHAUSTED
             if exc.kind is LLMErrorKind.TRIAL_BUDGET_EXHAUSTED
             else RunOutcome.LLM_FAILED
         )
-        return _finalize_exception(
-            trial=trial,
-            config=config,
-            writer=writer,
-            outcome=outcome,
-            failure_kind=exc.kind.value,
-            failure_message=exc.message,
-            partial_artifacts=partial_artifacts,
-            started_monotonic=trial_started_monotonic,
-            llm_context=llm_context,
-        )
+        try:
+            return _finalize_exception(
+                trial=trial,
+                config=config,
+                writer=writer,
+                outcome=outcome,
+                failure_kind=exc.kind.value,
+                failure_message=exc.message,
+                partial_artifacts=partial_artifacts,
+                timeout_seconds=timeout_seconds,
+                started_monotonic=trial_started_monotonic,
+                llm_context=llm_context,
+            )
+        except TrialResultPersistenceError as persistence_error:
+            raise exc from persistence_error.cause
     except (TimeoutError, KeyboardInterrupt) as exc:
         outcome = (
             RunOutcome.TRIAL_BUDGET_EXHAUSTED
             if timed_out or isinstance(exc, TimeoutError)
             else RunOutcome.CANCELLED
         )
-        return _finalize_exception(
-            trial=trial,
-            config=config,
-            writer=writer,
-            outcome=outcome,
-            failure_kind=(
-                "trial_budget_exhausted"
-                if outcome is RunOutcome.TRIAL_BUDGET_EXHAUSTED
-                else "cancelled"
-            ),
-            failure_message=str(exc),
-            partial_artifacts=partial_artifacts,
-            started_monotonic=trial_started_monotonic,
-            llm_context=llm_context,
-        )
+        try:
+            return _finalize_exception(
+                trial=trial,
+                config=config,
+                writer=writer,
+                outcome=outcome,
+                failure_kind=(
+                    "trial_budget_exhausted"
+                    if outcome is RunOutcome.TRIAL_BUDGET_EXHAUSTED
+                    else "cancelled"
+                ),
+                failure_message=str(exc),
+                partial_artifacts=partial_artifacts,
+                timeout_seconds=timeout_seconds,
+                started_monotonic=trial_started_monotonic,
+                llm_context=llm_context,
+            )
+        except TrialResultPersistenceError as persistence_error:
+            raise exc from persistence_error.cause
     except BaseException as exc:
         is_timeout = timed_out or isinstance(exc, TimeoutError)
         try:
@@ -362,31 +383,31 @@ def _run_single_trial_with_timeout(
         except Exception:
             pass
         if is_timeout:
+            outcome = RunOutcome.TRIAL_BUDGET_EXHAUSTED
+            failure_kind = "trial_budget_exhausted"
+        else:
+            outcome = RunOutcome.EXECUTION_FAILED
+            failure_kind = type(exc).__name__
+        try:
             return _finalize_exception(
                 trial=trial,
                 config=config,
                 writer=writer,
-                outcome=RunOutcome.TRIAL_BUDGET_EXHAUSTED,
-                failure_kind="trial_budget_exhausted",
+                outcome=outcome,
+                failure_kind=failure_kind,
                 failure_message=str(exc),
                 partial_artifacts=partial_artifacts,
+                timeout_seconds=timeout_seconds,
                 started_monotonic=trial_started_monotonic,
                 llm_context=llm_context,
             )
-        return _finalize_exception(
-            trial=trial,
-            config=config,
-            writer=writer,
-            outcome=RunOutcome.EXECUTION_FAILED,
-            failure_kind=type(exc).__name__,
-            failure_message=str(exc),
-            partial_artifacts=partial_artifacts,
-            started_monotonic=trial_started_monotonic,
-            llm_context=llm_context,
-        )
+        except TrialResultPersistenceError as persistence_error:
+            raise exc from persistence_error.cause
     finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, previous_handler)
+        if alarm_started:
+            signal.alarm(0)
+        if previous_handler is not None:
+            signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _llm_accounting(context: TrialLLMContext | None) -> dict[str, int | float]:
@@ -421,20 +442,23 @@ def _finalize_trial(
     summary.llm_retry_count = int(llm["retry_count"])
     summary.llm_elapsed_seconds = float(llm["elapsed_seconds"])
     if writer is not None:
-        writer.finalize(
-            {
-                "run_outcome": outcome,
-                "failure_kind": failure_kind,
-                "failure_stage": failure_stage,
-                "failure_message": failure_message,
-                "finished_at": datetime.now(timezone.utc),
-                "elapsed_seconds": time.monotonic() - started_monotonic,
-                "reward": summary.reward,
-                "task_completed": summary.task_completed,
-                "sandbox_rc": summary.sandbox_rc,
-                "llm": llm,
-            }
-        )
+        try:
+            writer.finalize(
+                {
+                    "run_outcome": outcome,
+                    "failure_kind": failure_kind,
+                    "failure_stage": failure_stage,
+                    "failure_message": failure_message,
+                    "finished_at": datetime.now(timezone.utc),
+                    "elapsed_seconds": time.monotonic() - started_monotonic,
+                    "reward": summary.reward,
+                    "task_completed": summary.task_completed,
+                    "sandbox_rc": summary.sandbox_rc,
+                    "llm": llm,
+                }
+            )
+        except Exception as exc:
+            raise TrialResultPersistenceError(exc) from exc
     return summary
 
 
@@ -447,6 +471,7 @@ def _finalize_exception(
     failure_kind: str,
     failure_message: str,
     partial_artifacts: dict[str, Any],
+    timeout_seconds: int,
     started_monotonic: float,
     llm_context: TrialLLMContext | None,
 ) -> TrialSummary:
@@ -456,7 +481,7 @@ def _finalize_exception(
     if outcome is RunOutcome.TRIAL_BUDGET_EXHAUSTED:
         summary = _build_timeout_summary(
             trial,
-            _trial_timeout_seconds(),
+            timeout_seconds,
             partial_artifacts,
             config,
             TimeoutError(failure_message),
