@@ -10,6 +10,7 @@ import logging
 import multiprocessing
 import os
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -502,27 +503,38 @@ def _print_and_save_summary(
     total_regenerations = 0
     total_finishes = 0
     executed_trials = len(summaries)
+    outcome_counts: Counter[str] = Counter()
+    finished_summaries: list[TrialSummary] = []
 
     for summary in summaries:
         print(summary.log)
         if summary.code_path:
             print(f"Code saved to {summary.code_path}")
-        success_count += int(summary.success)
-        total_reward += summary.reward
-        task_completed_count += int(summary.task_completed is not None and summary.task_completed)
-        total_code_blocks += summary.num_code_blocks
-        total_regenerations += summary.num_regenerations
-        total_finishes += summary.num_finishes
+        outcome = summary.run_outcome or "finished"
+        outcome_counts[outcome] += 1
+        if outcome == "finished":
+            finished_summaries.append(summary)
+            success_count += int(summary.success)
+            total_reward += summary.reward
+            task_completed_count += int(summary.task_completed is not None and summary.task_completed)
+            total_code_blocks += summary.num_code_blocks
+            total_regenerations += summary.num_regenerations
+            total_finishes += summary.num_finishes
 
     if executed_trials == 0:
         print("No trials completed.")
         return
 
-    success_rate = success_count / executed_trials
-    average_reward = total_reward / executed_trials
-    average_code_blocks = total_code_blocks / executed_trials
-    average_regenerations = total_regenerations / executed_trials
-    average_finishes = total_finishes / executed_trials
+    finished_count = len(finished_summaries)
+    denominator = finished_count or 1
+    success_rate = success_count / denominator
+    average_reward = total_reward / denominator
+    average_code_blocks = total_code_blocks / denominator
+    average_regenerations = total_regenerations / denominator
+    average_finishes = total_finishes / denominator
+    outcome_text = ", ".join(
+        f"{outcome}={count}" for outcome, count in sorted(outcome_counts.items())
+    )
 
     # Retrieve Git info
     import subprocess
@@ -556,6 +568,8 @@ def _print_and_save_summary(
     print(f"Config Path: {args.config_path}")
     print(f"Git Commit: {git_commit} (Dirty: {is_dirty})")
     print(f"Total number of trials: {executed_trials}")
+    print(f"Finished trials: {finished_count}")
+    print(f"Outcome counts: {outcome_text}")
     print(
         f"Code generation success rate / Average reward / Task completed: \n{success_rate:.3f}/{average_reward:.3f}/{task_completed_count}"
     )
@@ -574,6 +588,8 @@ def _print_and_save_summary(
             f.write(f"Config Path: {args.config_path}\n")
             f.write(f"Git Commit: {git_commit} (Dirty: {is_dirty})\n")
             f.write(f"Total number of trials: {executed_trials}\n")
+            f.write(f"Finished trials: {finished_count}\n")
+            f.write(f"Outcome counts: {outcome_text}\n")
             f.write(
                 f"Code generation success rate / Average reward / Task completed: \n{success_rate:.3f}/{average_reward:.3f}/{task_completed_count}\n"
             )

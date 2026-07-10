@@ -1464,12 +1464,6 @@ def _run_single_trial(
 
     # --- 1. Reset environment ---
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
-    # Reset the SIGALRM timer AFTER env.reset() so the timeout only covers
-    # actual task execution, not scene loading / cuRobo JIT compilation.
-    import signal
-    remaining = signal.alarm(0)  # cancel current alarm
-    if remaining > 0:
-        signal.alarm(1000)  # restart fresh 1000s from now
     obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
     _patch_libero_goal(env, obs)
 
