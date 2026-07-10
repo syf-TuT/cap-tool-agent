@@ -760,6 +760,27 @@ def test_direct_streaming_records_trial_telemetry(monkeypatch, tmp_path):
     assert records[0]["outcome"] == "success"
 
 
+def test_direct_streaming_early_generator_close_records_cancelled_attempt(monkeypatch, tmp_path):
+    _streaming_policy(monkeypatch, attempts=1)
+    response = _ScriptedStreamingResponse(lines=[(0, _sse({"content": "partial"}))])
+    monkeypatch.setattr("capx.llm.client.requests.post", lambda *args, **kwargs: response)
+    telemetry = tmp_path / "calls.jsonl"
+
+    with trial_llm_context(trial=10, telemetry_path=telemetry):
+        generator = query_model_streaming(_args(), [{"role": "user", "content": "hi"}])
+        assert next(generator) == {"type": "content_delta", "content": "partial"}
+        generator.close()
+
+    records = [json.loads(line) for line in telemetry.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["call_index"] == 1
+    assert records[0]["attempt"] == 1
+    assert records[0]["http_status"] == 200
+    assert records[0]["ttfb_ms"] is not None
+    assert records[0]["outcome"] == "cancelled"
+    assert response.closed is True
+
+
 def test_streaming_eof_after_partial_content_falls_back_once(monkeypatch):
     _streaming_policy(monkeypatch)
     partial = _ScriptedStreamingResponse(lines=[(0, _sse({"content": "partial"}))])

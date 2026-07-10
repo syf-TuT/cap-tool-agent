@@ -1125,6 +1125,23 @@ def query_model_streaming(
             first_content_timeout=policy.first_content_timeout_seconds,
             metrics=metrics,
         )
+    except GeneratorExit:
+        if context is not None:
+            context.record_attempt(
+                call_index=call_index,
+                attempt=1,
+                mode="streaming",
+                http_status=metrics.http_status,
+                ttfb_ms=metrics.ttfb_ms,
+                first_content_ms=metrics.first_content_ms,
+                started_monotonic=metrics.started,
+                finished_monotonic=time.monotonic(),
+                remaining_before_ms=remaining_before_ms,
+                outcome="cancelled",
+                error_kind=None,
+                retry_scheduled=False,
+            )
+        raise
     except (TimeoutError, requests.exceptions.RequestException, _StreamingInvalidResponse) as error:
         finished = time.monotonic()
         status_code = metrics.http_status
