@@ -60,7 +60,9 @@ When contributing, please use ruff (automatically installed) for linting. See [r
 Each logical LLM call has at most two HTTP attempts. The canonical controls are
 `CAPX_LLM_MAX_ATTEMPTS` (default `2`), `CAPX_LLM_REQUEST_TIMEOUT_SECONDS`
 (default `60`), `CAPX_LLM_RETRY_BACKOFF_SECONDS` (default `1`), and
-`CAPX_LLM_RETRY_AFTER_CAP_SECONDS` (default `10`). Existing streaming and
+`CAPX_LLM_RETRY_AFTER_CAP_SECONDS` (default `10`),
+`CAPX_TRIAL_TIMEOUT_SECONDS` (default `450`), and
+`CAPX_PARENT_TIMEOUT_GRACE_SECONDS` (default `30`). Existing streaming and
 non-streaming timeout variables remain supported as compatibility aliases.
 
 The complete trial timeout includes environment reset, LLM calls, simulation, and
@@ -69,7 +71,8 @@ persist its terminal record:
 
 ```python
 TRIAL_TIMEOUT_SECONDS = 450
-PARENT_TIMEOUT_SECONDS = TRIAL_TIMEOUT_SECONDS + 30  # 480 seconds
+PARENT_TIMEOUT_GRACE_SECONDS = 30
+PARENT_TIMEOUT_SECONDS = TRIAL_TIMEOUT_SECONDS + PARENT_TIMEOUT_GRACE_SECONDS  # 480 seconds
 ```
 
 For each trial, `<seed-output-dir>/llm_calls_trial_<trial>.jsonl` records one

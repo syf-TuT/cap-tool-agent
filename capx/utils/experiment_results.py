@@ -9,23 +9,13 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from capx.envs.trial_results import SCHEMA_VERSION, RunOutcome, TrialResultWriter
+from capx.envs.trial_results import RunOutcome, TrialResultWriter, validate_trial_result
 
 
 _LEGACY_DIRECTORY = re.compile(
     r"^trial_(?P<trial>\d+)_sandboxrc_(?P<sandbox_rc>-?\d+)_reward_"
     r"(?P<reward>-?\d+(?:\.\d+)?)_taskcompleted_(?P<task_completed>[01])$"
 )
-_STRUCTURED_REQUIRED_FIELDS = {
-    "schema_version",
-    "trial",
-    "run_outcome",
-    "reward",
-    "task_completed",
-    "sandbox_rc",
-}
-
-
 def load_trial_result(seed_output_dir: Path, trial: int) -> dict[str, Any]:
     """Load a canonical result, falling back safely to a historical directory.
 
@@ -102,22 +92,15 @@ def _load_structured_result(path: Path, trial: int) -> dict[str, Any]:
     try:
         with path.open(encoding="utf-8") as handle:
             result = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         return _unknown_result(trial, "corrupt", f"cannot parse structured result: {exc}")
-    if not isinstance(result, dict):
-        return _unknown_result(trial, "invalid_schema", "structured result must be a JSON object")
-    missing = _STRUCTURED_REQUIRED_FIELDS - set(result)
-    if missing or result.get("schema_version") != SCHEMA_VERSION or result.get("trial") != trial:
-        return _unknown_result(
-            trial,
-            "invalid_schema",
-            "structured result has an unsupported schema, trial, or missing required fields",
-        )
     try:
-        RunOutcome(result["run_outcome"])
-    except (TypeError, ValueError):
-        return _unknown_result(trial, "invalid_schema", "structured result has an unknown run outcome")
-    return {**result, "result_source": "structured", "diagnostic": None}
+        normalized = validate_trial_result(result)
+    except (TypeError, ValueError) as exc:
+        return _unknown_result(trial, "invalid_schema", f"invalid structured result schema: {exc}")
+    if normalized["trial"] != trial:
+        return _unknown_result(trial, "invalid_schema", "structured result trial does not match its path")
+    return {**normalized, "result_source": "structured", "diagnostic": None}
 
 
 def _unknown_result(trial: int, source: str, diagnostic: str) -> dict[str, Any]:

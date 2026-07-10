@@ -173,6 +173,25 @@ def _normalize_result(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_trial_result(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a complete on-disk schema-v1 result record.
+
+    This is intentionally stricter than ``finalize`` merging a partial update:
+    loaders must reject truncated or forward-incompatible files rather than
+    silently manufacturing defaults.
+    """
+
+    if not isinstance(value, Mapping):
+        raise TypeError("trial result must be a mapping")
+    missing = _RESULT_FIELDS - set(value)
+    if missing:
+        raise ValueError(f"missing trial result fields: {sorted(missing)}")
+    normalized = _normalize_result(value)
+    if normalized["schema_version"] != SCHEMA_VERSION:
+        raise ValueError(f"unsupported schema version: {normalized['schema_version']}")
+    return normalized
+
+
 class TrialResultWriter:
     """Persist a single trial's running and terminal states atomically."""
 

@@ -90,6 +90,37 @@ def test_missing_or_invalid_result_is_explicit_and_keeps_diagnostic(
     assert result["failure_kind"] == "unknown_legacy_failure"
 
 
+def test_truncated_schema_v1_result_is_not_accepted_as_structured(tmp_path):
+    (tmp_path / "trial_10_result.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "trial": 10,
+                "run_outcome": "running",
+                "reward": None,
+                "task_completed": None,
+                "sandbox_rc": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = load_trial_result(tmp_path, 10)
+
+    assert result["run_outcome"] == "invalid_result"
+    assert result["result_source"] == "invalid_schema"
+    assert "schema" in result["diagnostic"]
+
+
+def test_non_utf8_structured_result_is_reported_as_corrupt(tmp_path):
+    (tmp_path / "trial_11_result.json").write_bytes(b"\xff\xfe")
+
+    result = load_trial_result(tmp_path, 11)
+
+    assert result["run_outcome"] == "invalid_result"
+    assert result["result_source"] == "corrupt"
+
+
 def test_parent_guard_finalizes_only_residual_running_result(tmp_path):
     writer = TrialResultWriter(tmp_path)
     running_path = writer.start(trial=1, started_at=datetime(2026, 7, 10, tzinfo=timezone.utc))
