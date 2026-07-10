@@ -22,7 +22,7 @@ import pytest
 from capx.envs.trial_results import RunOutcome, TrialResultWriter
 from capx.llm.client import query_model
 from capx.llm.context import trial_llm_context
-from capx.llm.errors import LLMErrorKind
+from capx.llm.errors import LLMErrorKind, LLMQueryError
 from capx.utils.experiment_results import aggregate_trial_results
 
 
@@ -54,8 +54,7 @@ class _FaultHandler(BaseHTTPRequestHandler):
             time.sleep(0.04)
             self._json(200, _success_body("delayed"))
         elif scenario == "heartbeats":
-            self._sse(b": heartbeat\n\n")
-            time.sleep(0.15)
+            self._heartbeats_until_client_closes()
         elif scenario == "partial_close":
             payload = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
             self.send_response(200)
@@ -89,6 +88,23 @@ class _FaultHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
         self.wfile.flush()
+
+    def _heartbeats_until_client_closes(self) -> None:
+        """Keep a chunked SSE connection alive past the first-content deadline."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        heartbeats = (b": heartbeat\n\n", b'data: {"choices":[{"delta":{}}]}\n\n')
+        try:
+            for index in range(8):
+                payload = heartbeats[index % len(heartbeats)]
+                self.wfile.write(f"{len(payload):X}\r\n".encode() + payload + b"\r\n")
+                self.wfile.flush()
+                time.sleep(0.02)
+        except OSError:
+            # The client deliberately closes once its first-content deadline expires.
+            return
 
 
 def _success_body(content: str) -> dict:
@@ -194,18 +210,48 @@ def test_real_requests_oversized_retry_after_is_capped(monkeypatch):
     assert result["content"] == "ok"
     assert elapsed >= 0.04
     assert elapsed < 0.5
+    assert len(_FaultHandler.request_bodies) == 2
 
 
 @pytest.mark.parametrize("scenario", ["heartbeats", "partial_close"])
-def test_real_stream_breakages_fall_back_once_to_non_streaming(monkeypatch, scenario):
+def test_real_stream_breakages_fall_back_once_to_non_streaming(monkeypatch, tmp_path, scenario):
     _policy(monkeypatch, streaming=True)
+    telemetry_path = tmp_path / f"llm_calls_trial_{scenario}.jsonl"
     with _fault_server(scenario, "json") as server_url:
-        result = query_model(_args(server_url), [{"role": "user", "content": "hello"}])
+        with trial_llm_context(trial=scenario, telemetry_path=telemetry_path):
+            result = query_model(_args(server_url), [{"role": "user", "content": "hello"}])
 
     assert result == {"content": "ok", "reasoning": None}
     assert len(_FaultHandler.request_bodies) == 2
     assert _FaultHandler.request_bodies[0]["stream"] is True
     assert "stream" not in _FaultHandler.request_bodies[1]
+    if scenario == "heartbeats":
+        first_attempt = _telemetry(telemetry_path)[0]
+        assert first_attempt["outcome"] == "no_content"
+        assert first_attempt["error_kind"] == LLMErrorKind.NO_CONTENT.value
+        assert first_attempt["first_content_ms"] is None
+        assert first_attempt["duration_ms"] >= 40
+
+
+def test_real_http_budget_guard_suppresses_retry_after_503(monkeypatch, tmp_path):
+    _policy(monkeypatch)
+    telemetry_path = tmp_path / "llm_calls_trial_budget.jsonl"
+    with _fault_server("503", "json") as server_url:
+        with trial_llm_context(
+            trial="budget",
+            deadline_monotonic=time.monotonic() + 0.2,
+            telemetry_path=telemetry_path,
+        ):
+            with pytest.raises(LLMQueryError) as error_info:
+                query_model(_args(server_url), [{"role": "user", "content": "hello"}])
+
+    error = error_info.value
+    assert error.kind is LLMErrorKind.TRIAL_BUDGET_EXHAUSTED
+    assert len(_FaultHandler.request_bodies) == 1
+    records = _telemetry(telemetry_path)
+    assert len(records) == 1
+    assert records[0]["http_status"] == 503
+    assert records[0]["retry_scheduled"] is False
 
 
 def test_result_outcomes_and_aggregation_keep_finished_metrics_separate(tmp_path):
