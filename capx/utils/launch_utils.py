@@ -64,6 +64,14 @@ class TrialSummary:
     num_regenerations: int = 0
     num_finishes: int = 0
     num_code_blocks: int = 0
+    run_outcome: str | None = None
+    failure_kind: str | None = None
+    failure_stage: str | None = None
+    failure_message: str | None = None
+    llm_call_count: int = 0
+    llm_attempt_count: int = 0
+    llm_retry_count: int = 0
+    llm_elapsed_seconds: float = 0.0
 
 
 def run_server_proc(api_cfg) -> multiprocessing.Process:
