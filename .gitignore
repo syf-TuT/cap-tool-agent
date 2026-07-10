@@ -16,6 +16,7 @@ env/
 .nvinferencekeys
 .capx_skills.json
 .codex_*.py
+.codex_start_services_*.sh
 .codex-downloads/
 .codex-results/
 .codex-upload/
@@ -65,7 +66,9 @@ output_debug/
 outputs**
 artifacts/
 remote_results/
-r1/
+/cl[0-9]*/
+/r[0-9]*/
+/rr/
 curobo_debug/
 =*
 core.*

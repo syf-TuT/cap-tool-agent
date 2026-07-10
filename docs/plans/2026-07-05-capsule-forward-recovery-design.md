@@ -20,6 +20,8 @@ already-executed side-effect group. That makes the contract advisory rather than
 
 ## Recommended Architecture
 
+![Capsule runtime-control architecture](../figures/capsule-runtime-control-architecture.svg)
+
 Keep source patching for code that has not already changed the world, and add explicit
 forward recovery for code that must respond to the current state.
 

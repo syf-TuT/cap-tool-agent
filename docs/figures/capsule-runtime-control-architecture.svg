@@ -1,0 +1,402 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Capsule: Region-based Runtime Control for Code-as-Policy Robot Agents</title>
+  <desc id="desc">A three-lane architecture diagram showing task input, initial code generation, generated Python program, Capsule runtime-control core, Capsule action LLM, robot execution environment, and closed-loop feedback.</desc>
+  <defs>
+    <style>
+      text {
+        font-family: "Aptos", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+        fill: #0f172a;
+      }
+      .title {
+        font-size: 30px;
+        font-weight: 760;
+      }
+      .subtitle {
+        font-size: 14px;
+        fill: #475569;
+      }
+      .lane-title {
+        font-size: 13px;
+        font-weight: 720;
+        fill: #475569;
+      }
+      .box-title {
+        font-size: 15px;
+        font-weight: 730;
+      }
+      .box-subtitle {
+        font-size: 12px;
+        fill: #475569;
+      }
+      .body {
+        font-size: 12px;
+        fill: #334155;
+      }
+      .body-small {
+        font-size: 11px;
+        fill: #475569;
+      }
+      .code {
+        font-family: "Cascadia Mono", "Consolas", "SFMono-Regular", monospace;
+        font-size: 11px;
+        fill: #1e293b;
+      }
+      .chip-text {
+        font-size: 11px;
+        font-weight: 650;
+      }
+      .lane {
+        fill: #fbfdff;
+        stroke: #e2e8f0;
+        stroke-width: 1;
+      }
+      .blue-box {
+        fill: #eff6ff;
+        stroke: #2563eb;
+        stroke-width: 1.6;
+      }
+      .blue-light {
+        fill: #f8fbff;
+        stroke: #93c5fd;
+        stroke-width: 1.2;
+      }
+      .purple-core {
+        fill: #f7f3ff;
+        stroke: #7c3aed;
+        stroke-width: 2;
+      }
+      .purple-module {
+        fill: #ffffff;
+        stroke: #a78bfa;
+        stroke-width: 1.35;
+      }
+      .orange-module {
+        fill: #fff7ed;
+        stroke: #f97316;
+        stroke-width: 1.5;
+      }
+      .red-module {
+        fill: #fff1f2;
+        stroke: #dc2626;
+        stroke-width: 1.5;
+      }
+      .green-box {
+        fill: #ecfdf5;
+        stroke: #16a34a;
+        stroke-width: 1.5;
+      }
+      .green-light {
+        fill: #f7fefb;
+        stroke: #86efac;
+        stroke-width: 1.15;
+      }
+      .chip-blue {
+        fill: #dbeafe;
+        stroke: #60a5fa;
+      }
+      .chip-purple {
+        fill: #ede9fe;
+        stroke: #a78bfa;
+      }
+      .chip-orange {
+        fill: #ffedd5;
+        stroke: #fb923c;
+      }
+      .chip-green {
+        fill: #dcfce7;
+        stroke: #4ade80;
+      }
+      .chip-red {
+        fill: #fee2e2;
+        stroke: #f87171;
+      }
+      .arrow-blue {
+        stroke: #2563eb;
+        stroke-width: 2.2;
+        fill: none;
+      }
+      .arrow-purple {
+        stroke: #7c3aed;
+        stroke-width: 2.2;
+        fill: none;
+      }
+      .arrow-green {
+        stroke: #16a34a;
+        stroke-width: 2.2;
+        fill: none;
+      }
+      .arrow-orange {
+        stroke: #f97316;
+        stroke-width: 2.4;
+        fill: none;
+      }
+      .arrow-red {
+        stroke: #dc2626;
+        stroke-width: 2;
+        fill: none;
+      }
+      .dash {
+        stroke-dasharray: 7 6;
+      }
+    </style>
+    <filter id="soft-shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2.2" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#16a34a"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#dc2626"/>
+    </marker>
+    <symbol id="lock-icon" viewBox="0 0 24 24">
+      <path d="M7 10V8a5 5 0 0 1 10 0v2" fill="none" stroke="#dc2626" stroke-width="2" stroke-linecap="round"/>
+      <rect x="5" y="10" width="14" height="10" rx="2" fill="#fee2e2" stroke="#dc2626" stroke-width="1.8"/>
+      <circle cx="12" cy="15" r="1.4" fill="#dc2626"/>
+    </symbol>
+    <symbol id="warning-icon" viewBox="0 0 24 24">
+      <path d="M12 3L22 20H2Z" fill="#fee2e2" stroke="#dc2626" stroke-width="1.8" stroke-linejoin="round"/>
+      <path d="M12 8v6" stroke="#dc2626" stroke-width="2" stroke-linecap="round"/>
+      <circle cx="12" cy="17" r="1.2" fill="#dc2626"/>
+    </symbol>
+  </defs>
+
+  <rect x="0" y="0" width="1600" height="900" fill="#ffffff"/>
+
+  <text x="64" y="45" class="title">Capsule: Region-based Runtime Control for Code-as-Policy Robot Agents</text>
+  <text x="64" y="68" class="subtitle">Capsule controls source-code execution and repair; robot environment APIs remain unchanged.</text>
+
+  <rect x="46" y="86" width="1508" height="202" rx="10" class="lane"/>
+  <rect x="46" y="295" width="1508" height="345" rx="10" class="lane"/>
+  <rect x="46" y="645" width="1508" height="190" rx="10" class="lane"/>
+
+  <text x="64" y="108" class="lane-title">TOP LANE: LLM PLANNING AND RUNTIME ACTIONS</text>
+  <text x="64" y="318" class="lane-title">MIDDLE LANE: CAPSULE RUNTIME-CONTROL CORE</text>
+  <text x="64" y="668" class="lane-title">BOTTOM LANE: ROBOT ENVIRONMENT AND FEEDBACK</text>
+
+  <!-- Top-lane input and generation path -->
+  <g filter="url(#soft-shadow)">
+    <rect x="70" y="130" width="190" height="100" rx="7" class="blue-light"/>
+    <text x="88" y="156" class="box-title">Task Instruction</text>
+    <text x="88" y="177" class="box-title">+ Observation</text>
+    <text x="88" y="200" class="body">Goal text, images,</text>
+    <text x="88" y="218" class="body">scene and robot state</text>
+  </g>
+
+  <g filter="url(#soft-shadow)">
+    <rect x="300" y="122" width="220" height="116" rx="7" class="blue-box"/>
+    <text x="320" y="150" class="box-title">Initial Code</text>
+    <text x="320" y="170" class="box-title">Generation LLM</text>
+    <text x="320" y="195" class="body">Generates a complete</text>
+    <text x="320" y="212" class="body">CaP-style Python program,</text>
+    <text x="320" y="229" class="body">not direct robot actions.</text>
+  </g>
+
+  <g filter="url(#soft-shadow)">
+    <rect x="560" y="105" width="260" height="154" rx="7" class="blue-light"/>
+    <text x="582" y="132" class="box-title">Generated Python Program</text>
+    <text x="582" y="154" class="box-subtitle">Executable robot-control source</text>
+    <rect x="582" y="168" width="216" height="74" rx="5" fill="#ffffff" stroke="#bfdbfe"/>
+    <text x="596" y="188" class="code">obs = get_observation()</text>
+    <text x="596" y="205" class="code">target = plan_pick(obs)</text>
+    <text x="596" y="222" class="code">q = solve_ik(target)</text>
+    <text x="596" y="239" class="code">move_to_joints(q)</text>
+  </g>
+
+  <g filter="url(#soft-shadow)">
+    <rect x="1242" y="96" width="292" height="184" rx="7" class="blue-box"/>
+    <text x="1264" y="128" class="box-title">Capsule Action LLM</text>
+    <text x="1264" y="150" class="body">Chooses one runtime-control action</text>
+    <rect x="1264" y="164" width="112" height="23" rx="11" class="chip-blue"/>
+    <text x="1277" y="180" class="chip-text">regions + groups</text>
+    <rect x="1384" y="164" width="58" height="23" rx="11" class="chip-blue"/>
+    <text x="1397" y="180" class="chip-text">history</text>
+    <rect x="1449" y="164" width="74" height="23" rx="11" class="chip-blue"/>
+    <text x="1462" y="180" class="chip-text">feedback</text>
+    <text x="1264" y="210" class="body-small">Allowed actions:</text>
+    <text x="1264" y="229" class="code">run_group, run_region</text>
+    <text x="1264" y="246" class="code">inspect_trace, inspect_variables</text>
+    <text x="1264" y="263" class="code">patch_group, patch_region</text>
+    <text x="1264" y="276" class="code">append_recovery, finish</text>
+  </g>
+
+  <path d="M260 180H296" class="arrow-blue" marker-end="url(#arrow-blue)"/>
+  <path d="M520 180H556" class="arrow-blue" marker-end="url(#arrow-blue)"/>
+  <text x="525" y="164" class="body-small" fill="#2563eb">full source</text>
+
+  <!-- Capsule core -->
+  <g filter="url(#soft-shadow)">
+    <rect x="405" y="328" width="790" height="270" rx="10" class="purple-core"/>
+  </g>
+  <text x="430" y="360" class="box-title" fill="#5b21b6">Runtime Control Layer / Capsule Core</text>
+  <text x="430" y="381" class="body">Segments generated code, builds prompts, parses JSON actions, guards side effects, repairs source, executes code, and records traces.</text>
+
+  <g>
+    <rect x="430" y="405" width="165" height="58" rx="6" class="purple-module"/>
+    <text x="448" y="427" class="box-title">segmenter</text>
+    <text x="448" y="447" class="body-small">split Python source</text>
+    <text x="448" y="460" class="body-small">into CodeRegion</text>
+
+    <rect x="615" y="405" width="165" height="58" rx="6" class="purple-module"/>
+    <text x="633" y="427" class="box-title">normalizer</text>
+    <text x="633" y="447" class="body-small">merge regions into</text>
+    <text x="633" y="460" class="body-small">semantic groups</text>
+
+    <rect x="800" y="405" width="165" height="58" rx="6" class="purple-module"/>
+    <text x="818" y="427" class="box-title">prompt builder</text>
+    <text x="818" y="447" class="body-small">build Capsule</text>
+    <text x="818" y="460" class="body-small">action prompt</text>
+
+    <rect x="985" y="405" width="165" height="58" rx="6" class="purple-module"/>
+    <text x="1003" y="427" class="box-title">runtime parser</text>
+    <text x="1003" y="447" class="body-small">parse JSON action</text>
+    <text x="1003" y="460" class="body-small">and arguments</text>
+
+    <rect x="430" y="486" width="165" height="58" rx="6" class="red-module"/>
+    <use href="#lock-icon" x="448" y="500" width="21" height="21"/>
+    <text x="476" y="508" class="box-title">no-rollback</text>
+    <text x="476" y="527" class="box-title">guard</text>
+    <text x="448" y="541" class="body-small">block rerun/patch of executed effects</text>
+
+    <rect x="615" y="486" width="165" height="58" rx="6" class="orange-module"/>
+    <text x="633" y="508" class="box-title">patching /</text>
+    <text x="633" y="527" class="box-title">append_recovery</text>
+    <text x="633" y="541" class="body-small">local repair or forward recovery</text>
+
+    <rect x="800" y="486" width="165" height="58" rx="6" class="purple-module"/>
+    <text x="818" y="508" class="box-title">executor</text>
+    <text x="818" y="528" class="body-small">execute selected</text>
+    <text x="818" y="541" class="body-small">region or group</text>
+
+    <rect x="985" y="486" width="165" height="58" rx="6" class="green-light"/>
+    <text x="1003" y="508" class="box-title">trace recorder</text>
+    <text x="1003" y="528" class="body-small">primitive calls, outputs,</text>
+    <text x="1003" y="541" class="body-small">stdout, stderr</text>
+  </g>
+
+  <path d="M595 434H612" class="arrow-purple" marker-end="url(#arrow-purple)"/>
+  <path d="M780 434H797" class="arrow-purple" marker-end="url(#arrow-purple)"/>
+  <path d="M965 434H982" class="arrow-purple" marker-end="url(#arrow-purple)"/>
+  <path d="M1068 464V482" class="arrow-purple" marker-end="url(#arrow-purple)"/>
+  <path d="M985 516H968" class="arrow-purple" marker-end="url(#arrow-purple)"/>
+  <path d="M800 516H783" class="arrow-orange" marker-end="url(#arrow-orange)"/>
+  <path d="M615 516H598" class="arrow-red" marker-end="url(#arrow-red)"/>
+
+  <path d="M690 259C690 292 512 293 512 401" class="arrow-blue" marker-end="url(#arrow-blue)"/>
+  <text x="564" y="298" class="body-small" fill="#2563eb">source enters runtime control</text>
+
+  <path d="M965 424C1072 358 1144 308 1240 202" class="arrow-purple" marker-end="url(#arrow-purple)"/>
+  <text x="1048" y="345" class="body-small" fill="#7c3aed">prompt: groups, regions, history, trace</text>
+  <path d="M1242 229C1162 289 1100 328 1068 402" class="arrow-purple" marker-end="url(#arrow-purple)"/>
+  <text x="1110" y="292" class="body-small" fill="#7c3aed">JSON action</text>
+
+  <g>
+    <rect x="430" y="560" width="720" height="24" rx="6" fill="#ffffff" stroke="#ddd6fe"/>
+    <text x="447" y="577" class="body-small">Generated source view:</text>
+    <rect x="562" y="565" width="52" height="14" rx="3" class="chip-purple"/>
+    <text x="574" y="576" class="body-small">R1</text>
+    <rect x="620" y="565" width="52" height="14" rx="3" class="chip-purple"/>
+    <text x="632" y="576" class="body-small">R2</text>
+    <rect x="678" y="565" width="52" height="14" rx="3" class="chip-purple"/>
+    <text x="690" y="576" class="body-small">R3</text>
+    <rect x="736" y="565" width="52" height="14" rx="3" class="chip-purple"/>
+    <text x="748" y="576" class="body-small">R4</text>
+    <path d="M806 572H840" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#arrow-purple)"/>
+    <rect x="850" y="565" width="82" height="14" rx="3" class="chip-purple"/>
+    <text x="857" y="576" class="body-small">G1 sense</text>
+    <rect x="938" y="565" width="82" height="14" rx="3" class="chip-purple"/>
+    <text x="944" y="576" class="body-small">G2 plan</text>
+    <rect x="1026" y="565" width="98" height="14" rx="3" class="chip-red"/>
+    <text x="1032" y="576" class="body-small">G3 act</text>
+    <use href="#lock-icon" x="1090" y="561" width="18" height="18"/>
+  </g>
+
+  <g>
+    <rect x="420" y="604" width="330" height="34" rx="6" fill="#fff7ed" stroke="#fed7aa"/>
+    <text x="438" y="626" class="body-small" fill="#9a3412">After patch_group, patch_region, or append_recovery: re-segment and regroup source.</text>
+    <path d="M707 604C748 585 753 553 696 547C624 540 545 548 513 486" class="arrow-orange dash" marker-end="url(#arrow-orange)"/>
+  </g>
+
+  <g>
+    <rect x="784" y="604" width="385" height="34" rx="6" fill="#fff1f2" stroke="#fecdd3"/>
+    <use href="#warning-icon" x="802" y="610" width="20" height="20"/>
+    <text x="828" y="626" class="body-small" fill="#991b1b">Executed robot-side-effect groups assume no rollback; recover forward from fresh observation.</text>
+  </g>
+
+  <!-- Environment and feedback lane -->
+  <g filter="url(#soft-shadow)">
+    <rect x="1212" y="674" width="320" height="136" rx="8" class="green-box"/>
+    <text x="1234" y="702" class="box-title">Execution Environment</text>
+    <text x="1234" y="724" class="body">Robosuite / LIBERO / real robot</text>
+    <text x="1234" y="747" class="body-small">Unchanged APIs called by executed Python:</text>
+    <text x="1234" y="766" class="code">get_observation, solve_ik</text>
+    <text x="1234" y="783" class="code">move_to_joints, open_gripper, close_gripper</text>
+    <text x="1234" y="801" class="body-small" fill="#166534">Capsule actions do not directly call primitives.</text>
+  </g>
+
+  <g filter="url(#soft-shadow)">
+    <rect x="545" y="678" width="610" height="136" rx="8" class="green-light"/>
+    <text x="568" y="706" class="box-title">Feedback Loop</text>
+    <text x="568" y="728" class="body">Executor and environment return evidence for the next runtime-control decision.</text>
+    <rect x="568" y="746" width="108" height="25" rx="12" class="chip-green"/>
+    <text x="586" y="763" class="chip-text">RuntimeTrace</text>
+    <rect x="686" y="746" width="111" height="25" rx="12" class="chip-green"/>
+    <text x="701" y="763" class="chip-text">variable state</text>
+    <rect x="807" y="746" width="72" height="25" rx="12" class="chip-green"/>
+    <text x="827" y="763" class="chip-text">reward</text>
+    <rect x="889" y="746" width="125" height="25" rx="12" class="chip-green"/>
+    <text x="904" y="763" class="chip-text">task_completed</text>
+    <rect x="568" y="782" width="174" height="25" rx="12" class="chip-green"/>
+    <text x="584" y="799" class="chip-text">before/after state snapshot</text>
+    <rect x="752" y="782" width="151" height="25" rx="12" class="chip-green"/>
+    <text x="770" y="799" class="chip-text">source-bound feedback</text>
+  </g>
+
+  <path d="M883 544C898 650 1118 662 1224 690" class="arrow-purple" marker-end="url(#arrow-purple)"/>
+  <path d="M1212 742H1159" class="arrow-green" marker-end="url(#arrow-green)"/>
+  <path d="M1068 544C1068 602 1008 640 990 676" class="arrow-green" marker-end="url(#arrow-green)"/>
+  <text x="999" y="632" class="body-small" fill="#16a34a">trace summary</text>
+
+  <path d="M1155 716C1230 646 1250 350 1346 281" class="arrow-green dash" marker-end="url(#arrow-green)"/>
+  <text x="1194" y="526" class="body-small" fill="#16a34a">history + feedback</text>
+  <path d="M830 678C758 640 738 612 706 545" class="arrow-green dash" marker-end="url(#arrow-green)"/>
+  <text x="734" y="650" class="body-small" fill="#16a34a">source-bound repair hints</text>
+
+  <g>
+    <rect x="1210" y="326" width="330" height="82" rx="7" fill="#ffffff" stroke="#cbd5e1"/>
+    <text x="1230" y="352" class="box-title">Key runtime-control boundary</text>
+    <text x="1230" y="376" class="body">The action LLM selects code-level actions.</text>
+    <text x="1230" y="394" class="body">Robot primitives remain ordinary Python API calls.</text>
+  </g>
+
+  <g>
+    <rect x="72" y="694" width="385" height="96" rx="7" fill="#ffffff" stroke="#cbd5e1"/>
+    <text x="92" y="722" class="box-title">Execution-unit semantics</text>
+    <text x="92" y="746" class="body">CodeRegionGroup is preferred over raw regions.</text>
+    <text x="92" y="766" class="body">Each group may contain perception, planning,</text>
+    <text x="92" y="786" class="body">or one robot side effect marked with a lock.</text>
+  </g>
+
+  <g>
+    <rect x="72" y="336" width="285" height="230" rx="8" fill="#ffffff" stroke="#cbd5e1"/>
+    <text x="94" y="364" class="box-title">What Capsule adds</text>
+    <text x="94" y="389" class="body">1. Source regions instead of primitive tools</text>
+    <text x="94" y="412" class="body">2. Semantic groups as execution units</text>
+    <text x="94" y="435" class="body">3. JSON runtime-control actions</text>
+    <text x="94" y="458" class="body">4. Trace-grounded local patches</text>
+    <text x="94" y="481" class="body">5. Forward recovery after side effects</text>
+    <rect x="94" y="509" width="236" height="34" rx="5" fill="#fff1f2" stroke="#fecdd3"/>
+    <use href="#lock-icon" x="108" y="516" width="20" height="20"/>
+    <text x="134" y="532" class="body-small" fill="#991b1b">No rollback after robot actuation</text>
+  </g>
+
+  <path d="M357 448H405" class="arrow-purple" marker-end="url(#arrow-purple)"/>
+</svg>
