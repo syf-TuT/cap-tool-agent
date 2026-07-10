@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from capx.envs import runner
+from capx.llm.context import llm_call_stage
 from capx.llm.errors import LLMErrorKind, LLMQueryError
 from capx.utils.launch_utils import TrialSummary, _print_and_save_summary
 
@@ -85,6 +86,47 @@ def test_typed_llm_failure_is_persisted_without_retrying_whole_trial(tmp_path, m
     assert summary.failure_kind == "http_5xx"
     assert result["run_outcome"] == "llm_failed"
     assert result["failure_kind"] == "http_5xx"
+
+
+def test_typed_trial_budget_llm_error_is_classified_as_budget_exhausted(tmp_path, monkeypatch):
+    def fail_with_budget_error(*args, **kwargs):
+        raise LLMQueryError(
+            kind=LLMErrorKind.TRIAL_BUDGET_EXHAUSTED,
+            call_index=2,
+            attempt=1,
+            status_code=None,
+            elapsed_seconds=3.0,
+            message="trial budget exhausted",
+        )
+
+    monkeypatch.setattr(runner, "_run_single_trial", fail_with_budget_error)
+
+    summary = runner._run_trial_with_retries(object(), 1, _args(), _config(tmp_path), None)
+
+    result = json.loads((tmp_path / "trial_1_result.json").read_text())
+    assert summary.run_outcome == "trial_budget_exhausted"
+    assert result["run_outcome"] == "trial_budget_exhausted"
+
+
+def test_llm_failure_retains_active_call_stage_in_summary_and_result(tmp_path, monkeypatch):
+    def fail_from_capsule_action(*args, **kwargs):
+        with llm_call_stage("capsule_action"):
+            raise LLMQueryError(
+                kind=LLMErrorKind.HTTP_5XX,
+                call_index=2,
+                attempt=2,
+                status_code=503,
+                elapsed_seconds=3.0,
+                message="provider unavailable",
+            )
+
+    monkeypatch.setattr(runner, "_run_single_trial", fail_from_capsule_action)
+
+    summary = runner._run_trial_with_retries(object(), 1, _args(), _config(tmp_path), None)
+
+    result = json.loads((tmp_path / "trial_1_result.json").read_text())
+    assert summary.failure_stage == "capsule_action"
+    assert result["failure_stage"] == "capsule_action"
 
 
 def test_timeout_is_persisted_as_trial_budget_exhausted(tmp_path, monkeypatch):

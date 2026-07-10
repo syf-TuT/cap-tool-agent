@@ -40,6 +40,7 @@ class TrialLLMContext:
     _attempt_count: int = field(default=0, init=False, repr=False)
     _retry_count: int = field(default=0, init=False, repr=False)
     _elapsed_seconds: float = field(default=0.0, init=False, repr=False)
+    _last_stage: str = field(default=_DEFAULT_STAGE, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.telemetry_path is not None:
@@ -56,6 +57,16 @@ class TrialLLMContext:
         with self._lock:
             self._logical_call_count += 1
             return self._logical_call_count
+
+    def note_stage(self, stage: str) -> None:
+        """Remember the latest active call-site label for failure accounting."""
+        with self._lock:
+            self._last_stage = stage
+
+    def last_stage(self) -> str:
+        """Return the latest call-site label without exposing prompt content."""
+        with self._lock:
+            return self._last_stage
 
     def record_attempt(
         self,
@@ -197,6 +208,9 @@ def get_trial_llm_context() -> TrialLLMContext | None:
 @contextmanager
 def llm_call_stage(name: str) -> Iterator[None]:
     """Set the current call stage, restoring the enclosing stage on exit."""
+    context = _active_context.get()
+    if context is not None:
+        context.note_stage(name)
     token = _active_stage.set(name)
     try:
         yield

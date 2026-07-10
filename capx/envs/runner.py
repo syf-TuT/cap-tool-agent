@@ -28,7 +28,7 @@ from capx.envs.trial import (
 )
 from capx.envs.trial_results import RunOutcome, TrialResultWriter
 from capx.llm.context import TrialLLMContext, trial_llm_context
-from capx.llm.errors import LLMQueryError
+from capx.llm.errors import LLMErrorKind, LLMQueryError
 from capx.utils.launch_utils import (
     TrialSummary,
     _print_and_save_summary,
@@ -317,11 +317,16 @@ def _run_single_trial_with_timeout(
                 started_monotonic=trial_started_monotonic,
             )
     except LLMQueryError as exc:
+        outcome = (
+            RunOutcome.TRIAL_BUDGET_EXHAUSTED
+            if exc.kind is LLMErrorKind.TRIAL_BUDGET_EXHAUSTED
+            else RunOutcome.LLM_FAILED
+        )
         return _finalize_exception(
             trial=trial,
             config=config,
             writer=writer,
-            outcome=RunOutcome.LLM_FAILED,
+            outcome=outcome,
             failure_kind=exc.kind.value,
             failure_message=exc.message,
             partial_artifacts=partial_artifacts,
@@ -403,11 +408,13 @@ def _finalize_trial(
     outcome: RunOutcome,
     started_monotonic: float,
     failure_kind: str | None = None,
+    failure_stage: str | None = None,
     failure_message: str | None = None,
 ) -> TrialSummary:
     llm = _llm_accounting(llm_context)
     summary.run_outcome = outcome.value
     summary.failure_kind = failure_kind
+    summary.failure_stage = failure_stage
     summary.failure_message = failure_message
     summary.llm_call_count = int(llm["call_count"])
     summary.llm_attempt_count = int(llm["attempt_count"])
@@ -418,7 +425,7 @@ def _finalize_trial(
             {
                 "run_outcome": outcome,
                 "failure_kind": failure_kind,
-                "failure_stage": None,
+                "failure_stage": failure_stage,
                 "failure_message": failure_message,
                 "finished_at": datetime.now(timezone.utc),
                 "elapsed_seconds": time.monotonic() - started_monotonic,
@@ -443,6 +450,9 @@ def _finalize_exception(
     started_monotonic: float,
     llm_context: TrialLLMContext | None,
 ) -> TrialSummary:
+    failure_stage = llm_context.last_stage() if llm_context is not None else None
+    if failure_stage == "unknown":
+        failure_stage = None
     if outcome is RunOutcome.TRIAL_BUDGET_EXHAUSTED:
         summary = _build_timeout_summary(
             trial,
@@ -473,6 +483,7 @@ def _finalize_exception(
         outcome=outcome,
         started_monotonic=started_monotonic,
         failure_kind=failure_kind,
+        failure_stage=failure_stage,
         failure_message=failure_message,
     )
 
