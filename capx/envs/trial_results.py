@@ -189,6 +189,12 @@ def validate_trial_result(value: Mapping[str, Any]) -> dict[str, Any]:
     normalized = _normalize_result(value)
     if normalized["schema_version"] != SCHEMA_VERSION:
         raise ValueError(f"unsupported schema version: {normalized['schema_version']}")
+    outcome = RunOutcome(normalized["run_outcome"])
+    if outcome is RunOutcome.RUNNING:
+        if normalized["finished_at"] is not None:
+            raise ValueError("a running result cannot have finished_at")
+    elif normalized["finished_at"] is None:
+        raise ValueError("a terminal result requires finished_at")
     return normalized
 
 
@@ -260,19 +266,11 @@ class TrialResultWriter:
 
         with self._exclusive_lock(self.path):
             current = self._read()
-            candidate = _normalize_result({**current, **result})
+            candidate = self._terminal_candidate(current, result)
             if current["run_outcome"] != RunOutcome.RUNNING.value:
                 if candidate == current:
                     return
                 raise ValueError("trial result is already terminal")
-            if (
-                candidate["schema_version"] != SCHEMA_VERSION
-                or candidate["trial"] != current["trial"]
-            ):
-                raise ValueError("schema_version and trial cannot change during finalization")
-            if candidate["finished_at"] is None:
-                raise ValueError("a terminal result requires finished_at")
-
             self._atomic_write(self.path, candidate)
 
     def mark_parent_guard_killed(self, *, process_rc: int, elapsed_seconds: float) -> None:
@@ -290,10 +288,48 @@ class TrialResultWriter:
             }
         )
 
+    def try_mark_parent_guard_killed(self, *, process_rc: int, elapsed_seconds: float) -> bool:
+        """Atomically mark only a currently-running record as parent-guard killed."""
+
+        with self._exclusive_lock(self.path):
+            current = self._read()
+            if current["run_outcome"] != RunOutcome.RUNNING.value:
+                return False
+            candidate = self._terminal_candidate(
+                current,
+                {
+                    "run_outcome": RunOutcome.PARENT_GUARD_KILLED,
+                    "failure_kind": RunOutcome.PARENT_GUARD_KILLED.value,
+                    "failure_stage": None,
+                    "failure_message": (
+                        f"Parent process guard exited with return code {process_rc}"
+                    ),
+                    "finished_at": datetime.now(timezone.utc),
+                    "elapsed_seconds": elapsed_seconds,
+                    "sandbox_rc": process_rc,
+                },
+            )
+            self._atomic_write(self.path, candidate)
+            return True
+
+    @staticmethod
+    def _terminal_candidate(
+        current: Mapping[str, Any], result: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        candidate = _normalize_result({**current, **result})
+        if (
+            candidate["schema_version"] != SCHEMA_VERSION
+            or candidate["trial"] != current["trial"]
+        ):
+            raise ValueError("schema_version and trial cannot change during finalization")
+        if candidate["finished_at"] is None:
+            raise ValueError("a terminal result requires finished_at")
+        return candidate
+
     def _read(self) -> dict[str, Any]:
         with self.path.open("r", encoding="utf-8") as handle:
             value = json.load(handle)
-        return _normalize_result(value)
+        return validate_trial_result(value)
 
     @staticmethod
     @contextmanager

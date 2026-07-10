@@ -53,13 +53,8 @@ def finalize_parent_guard_exit(result_path: Path, process_rc: int, elapsed_secon
     path = Path(result_path)
     if process_rc != 124 or not path.is_file():
         return False
-    try:
-        result = _load_structured_result(path, trial=_trial_from_path(path))
-    except ValueError:
-        return False
-    if result["result_source"] != "structured" or result["run_outcome"] != RunOutcome.RUNNING.value:
-        return False
-    TrialResultWriter.open_existing(path).mark_parent_guard_killed(
+    _trial_from_path(path)
+    return TrialResultWriter.open_existing(path).try_mark_parent_guard_killed(
         process_rc=process_rc, elapsed_seconds=elapsed_seconds
     )
     return True

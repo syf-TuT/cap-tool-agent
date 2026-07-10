@@ -270,6 +270,45 @@ def test_concurrent_finalizers_cannot_read_running_during_first_terminal_write(
     assert "terminal" in str(errors[0])
 
 
+def test_parent_guard_try_mark_returns_false_when_child_wins_finalization_race(
+    tmp_path, monkeypatch
+):
+    writer = TrialResultWriter(tmp_path)
+    path = writer.start(trial=18, started_at=STARTED_AT)
+    child = TrialResultWriter.open_existing(path)
+    parent = TrialResultWriter.open_existing(path)
+    child_write_entered = threading.Event()
+    release_child_write = threading.Event()
+    original_atomic_write = child._atomic_write
+
+    def controlled_atomic_write(target, value):
+        if value["run_outcome"] == RunOutcome.FINISHED.value:
+            child_write_entered.set()
+            assert release_child_write.wait(timeout=2)
+        original_atomic_write(target, value)
+
+    monkeypatch.setattr(child, "_atomic_write", controlled_atomic_write)
+    child_thread = threading.Thread(target=lambda: child.finalize(_finished_result()))
+    child_thread.start()
+    assert child_write_entered.wait(timeout=2)
+
+    parent_result = []
+    parent_thread = threading.Thread(
+        target=lambda: parent_result.append(
+            parent.try_mark_parent_guard_killed(process_rc=124, elapsed_seconds=480.0)
+        )
+    )
+    parent_thread.start()
+    release_child_write.set()
+    child_thread.join(timeout=2)
+    parent_thread.join(timeout=2)
+
+    assert not child_thread.is_alive()
+    assert not parent_thread.is_alive()
+    assert parent_result == [False]
+    assert _load(path)["run_outcome"] == RunOutcome.FINISHED.value
+
+
 @pytest.mark.parametrize("trial", [True, -1, 1.5, "1"])
 def test_start_rejects_invalid_trial_identifiers(tmp_path, trial):
     writer = TrialResultWriter(tmp_path)

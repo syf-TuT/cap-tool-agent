@@ -121,6 +121,42 @@ def test_non_utf8_structured_result_is_reported_as_corrupt(tmp_path):
     assert result["result_source"] == "corrupt"
 
 
+def test_terminal_result_without_finished_timestamp_is_invalid_schema(tmp_path):
+    path = tmp_path / "trial_12_result.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "trial": 12,
+                "run_outcome": "finished",
+                "failure_kind": None,
+                "failure_stage": None,
+                "failure_message": None,
+                "started_at": "2026-07-10T00:00:00Z",
+                "finished_at": None,
+                "elapsed_seconds": 1.0,
+                "reward": 1.0,
+                "task_completed": True,
+                "sandbox_rc": 0,
+                "llm": {
+                    "call_count": 0,
+                    "attempt_count": 0,
+                    "retry_count": 0,
+                    "elapsed_seconds": 0.0,
+                    "last_call_index": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = load_trial_result(tmp_path, 12)
+
+    assert result["run_outcome"] == "invalid_result"
+    assert result["result_source"] == "invalid_schema"
+    assert "finished_at" in result["diagnostic"]
+
+
 def test_parent_guard_finalizes_only_residual_running_result(tmp_path):
     writer = TrialResultWriter(tmp_path)
     running_path = writer.start(trial=1, started_at=datetime(2026, 7, 10, tzinfo=timezone.utc))
