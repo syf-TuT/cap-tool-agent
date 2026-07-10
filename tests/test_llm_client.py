@@ -72,10 +72,15 @@ def _non_streaming_policy(monkeypatch, *, attempts=2, timeout=60, backoff=0):
 class _StreamingResponse:
     headers = {"content-type": "text/event-stream"}
 
+    def __init__(self):
+        self.status_code = 200
+        self.closed = False
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        self.close()
         return False
 
     def raise_for_status(self):
@@ -89,6 +94,55 @@ class _StreamingResponse:
         for chunk in chunks:
             yield f"data: {json.dumps(chunk)}".encode()
         yield b"data: [DONE]"
+
+    def close(self):
+        self.closed = True
+
+
+class _ScriptedStreamingResponse:
+    def __init__(self, *, status_code=200, lines=(), clock=None, headers=None):
+        self.status_code = status_code
+        self.headers = headers or {"content-type": "text/event-stream"}
+        self.lines = list(lines)
+        self.clock = clock
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def raise_for_status(self):
+        if not 200 <= self.status_code < 300:
+            error = requests.exceptions.HTTPError(f"HTTP {self.status_code}")
+            error.response = self
+            raise error
+
+    def iter_lines(self):
+        for delay, line in self.lines:
+            if self.clock is not None:
+                self.clock.advance(delay)
+            if isinstance(line, BaseException):
+                raise line
+            yield line
+
+    def close(self):
+        self.closed = True
+
+
+def _sse(delta):
+    return f"data: {json.dumps({'choices': [{'delta': delta}]})}".encode()
+
+
+def _streaming_policy(monkeypatch, *, attempts=2, timeout=60, first_content=5, backoff=0):
+    monkeypatch.setenv("CAPX_FORCE_STREAMING_CHAT_COMPLETIONS", "1")
+    monkeypatch.setenv("CAPX_LLM_MAX_ATTEMPTS", str(attempts))
+    monkeypatch.setenv("CAPX_LLM_REQUEST_TIMEOUT_SECONDS", str(timeout))
+    monkeypatch.setenv("CAPX_STREAMING_FIRST_CONTENT_TIMEOUT_SECONDS", str(first_content))
+    monkeypatch.setenv("CAPX_LLM_RETRY_BACKOFF_SECONDS", str(backoff))
+    monkeypatch.setenv("CAPX_DISABLE_REASONING", "1")
 
 
 def test_streaming_query_drops_reasoning_when_disabled(monkeypatch):
@@ -115,119 +169,81 @@ def test_streaming_query_drops_reasoning_when_disabled(monkeypatch):
     assert chunks[-1] == {"type": "done", "content": "answer", "reasoning": None}
 
 
-def test_query_model_retries_streaming_timeout(monkeypatch):
-    calls = []
-
-    def fake_streaming(args, prompt):
-        calls.append(1)
-        if len(calls) == 1:
-            raise TimeoutError("no content delta")
-        yield {"type": "content_delta", "content": "ok"}
-        yield {"type": "done", "content": "ok", "reasoning": None}
-
-    monkeypatch.setenv("CAPX_FORCE_STREAMING_CHAT_COMPLETIONS", "1")
-    monkeypatch.setenv("CAPX_STREAMING_CHAT_COMPLETIONS_RETRIES", "2")
-    monkeypatch.setattr("capx.llm.client.query_model_streaming", fake_streaming)
-
-    args = SimpleNamespace(
-        model="deepseek-v4-flash",
-        server_url="https://example.invalid/v1/chat/completions",
-        api_key="test-key",
-        temperature=0.2,
-        max_tokens=256,
-        reasoning_effort="minimal",
-        debug=False,
+def test_first_content_timeout_falls_back_to_non_streaming_once(monkeypatch):
+    _streaming_policy(monkeypatch, first_content=1)
+    clock = _Clock()
+    streaming_response = _ScriptedStreamingResponse(
+        lines=[(1.1, _sse({"reasoning_content": "still thinking"}))], clock=clock
     )
-
-    assert query_model(args, [{"role": "user", "content": "hi"}]) == {
-        "content": "ok",
-        "reasoning": None,
-    }
-    assert len(calls) == 2
-
-
-def test_query_model_retries_empty_streaming_content(monkeypatch):
-    calls = []
-
-    def fake_streaming(args, prompt):
-        calls.append(1)
-        if len(calls) == 1:
-            yield {"type": "done", "content": "", "reasoning": None}
-            return
-        yield {"type": "content_delta", "content": "ok"}
-        yield {"type": "done", "content": "ok", "reasoning": None}
-
-    monkeypatch.setenv("CAPX_FORCE_STREAMING_CHAT_COMPLETIONS", "1")
-    monkeypatch.setenv("CAPX_STREAMING_CHAT_COMPLETIONS_RETRIES", "2")
-    monkeypatch.setenv("CAPX_STREAMING_REQUIRE_CONTENT", "1")
-    monkeypatch.setattr("capx.llm.client.query_model_streaming", fake_streaming)
-
-    args = SimpleNamespace(
-        model="deepseek-v4-flash",
-        server_url="https://example.invalid/v1/chat/completions",
-        api_key="test-key",
-        temperature=0.2,
-        max_tokens=256,
-        reasoning_effort="minimal",
-        debug=False,
-    )
-
-    assert query_model(args, [{"role": "user", "content": "hi"}]) == {
-        "content": "ok",
-        "reasoning": None,
-    }
-    assert len(calls) == 2
-
-
-def test_query_model_falls_back_to_non_streaming_after_empty_streaming_content(monkeypatch):
-    stream_calls = []
-    post_payloads = []
-
-    def fake_streaming(args, prompt):
-        stream_calls.append(1)
-        yield {"type": "done", "content": "", "reasoning": None}
-
-    class NonStreamingResponse:
-        status_code = 200
-        headers = {}
-
-        def iter_content(self, chunk_size=8192):
-            del chunk_size
-            yield json.dumps(
-                {"choices": [{"message": {"content": "fallback ok"}}]}
-            ).encode()
-
-        def close(self):
-            return None
+    responses = [
+        streaming_response,
+        _NonStreamingResponse(body={"choices": [{"message": {"content": "fallback"}}]}),
+    ]
+    payloads = []
 
     def fake_post(*args, data, **kwargs):
-        post_payloads.append(json.loads(data))
-        return NonStreamingResponse()
+        payloads.append(json.loads(data))
+        return responses.pop(0)
 
-    monkeypatch.setenv("CAPX_FORCE_STREAMING_CHAT_COMPLETIONS", "1")
-    monkeypatch.setenv("CAPX_STREAMING_CHAT_COMPLETIONS_RETRIES", "2")
-    monkeypatch.setenv("CAPX_STREAMING_REQUIRE_CONTENT", "1")
-    monkeypatch.setenv("CAPX_DISABLE_REASONING", "1")
-    monkeypatch.setattr("capx.llm.client.query_model_streaming", fake_streaming)
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+    monkeypatch.setattr("capx.llm.client.time.monotonic", clock)
+
+    result = query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert result["content"] == "fallback"
+    assert [payload.get("stream", False) for payload in payloads] == [True, False]
+    assert len(payloads) == 2
+    assert streaming_response.closed is True
+
+
+def test_empty_stream_falls_back_to_non_streaming_once(monkeypatch):
+    _streaming_policy(monkeypatch)
+    responses = [
+        _ScriptedStreamingResponse(lines=[(0, b"data: [DONE]")]),
+        _NonStreamingResponse(body={"choices": [{"message": {"content": "fallback"}}]}),
+    ]
+    payloads = []
+
+    def fake_post(*args, data, **kwargs):
+        payloads.append(json.loads(data))
+        return responses.pop(0)
+
     monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
 
-    args = SimpleNamespace(
-        model="deepseek-v4-flash",
-        server_url="https://example.invalid/v1/chat/completions",
-        api_key="test-key",
-        temperature=0.2,
-        max_tokens=256,
-        reasoning_effort="minimal",
-        debug=False,
-    )
+    assert query_model(_args(), [{"role": "user", "content": "hi"}])["content"] == "fallback"
+    assert [payload.get("stream", False) for payload in payloads] == [True, False]
 
-    assert query_model(args, [{"role": "user", "content": "hi"}]) == {
-        "content": "fallback ok",
-        "reasoning": None,
-    }
-    assert len(stream_calls) == 2
-    assert post_payloads[0]["thinking"] == {"type": "disabled"}
-    assert os.environ["CAPX_FORCE_STREAMING_CHAT_COMPLETIONS"] == "1"
+
+@pytest.mark.parametrize(
+    "interruption",
+    [
+        requests.exceptions.ReadTimeout("stream stalled"),
+        requests.exceptions.ConnectionError("stream reset"),
+    ],
+)
+def test_partial_stream_disconnect_discards_partial_and_falls_back(monkeypatch, interruption):
+    _streaming_policy(monkeypatch)
+    streaming_response = _ScriptedStreamingResponse(
+        lines=[(0, _sse({"content": "partial"})), (0, interruption)]
+    )
+    responses = [
+        streaming_response,
+        _NonStreamingResponse(body={"choices": [{"message": {"content": "replacement"}}]}),
+    ]
+    payloads = []
+
+    def fake_post(*args, data, **kwargs):
+        payloads.append(json.loads(data))
+        return responses.pop(0)
+
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+
+    result = query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert result["content"] == "replacement"
+    assert "partial" not in result["content"]
+    assert [payload.get("stream", False) for payload in payloads] == [True, False]
+    assert streaming_response.closed is True
 
 
 def test_query_model_retries_non_streaming_timeout_once(monkeypatch):
@@ -275,20 +291,23 @@ def test_query_model_retries_non_streaming_timeout_once(monkeypatch):
 
 
 def test_streaming_query_times_out_before_first_content(monkeypatch):
-    class ReasoningOnlyResponse(_StreamingResponse):
-        def iter_lines(self):
-            for _ in range(3):
-                yield b'data: {"choices": [{"delta": {"reasoning_content": "thinking"}}]}'
+    clock = _Clock(0.0)
+    response = _ScriptedStreamingResponse(
+        lines=[
+            (0.4, _sse({"reasoning_content": "thinking"})),
+            (0.4, _sse({"reasoning_content": "thinking"})),
+            (0.4, _sse({"reasoning_content": "thinking"})),
+        ],
+        clock=clock,
+    )
 
     def fake_post(*args, data, **kwargs):
-        return ReasoningOnlyResponse()
-
-    times = iter([0.0, 0.0, 2.0])
+        return response
 
     monkeypatch.setenv("CAPX_DISABLE_REASONING", "1")
     monkeypatch.setenv("CAPX_STREAMING_FIRST_CONTENT_TIMEOUT_SECONDS", "1")
     monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
-    monkeypatch.setattr("capx.llm.client.time.time", lambda: next(times))
+    monkeypatch.setattr("capx.llm.client.time.monotonic", clock)
 
     args = SimpleNamespace(
         model="deepseek-v4-flash",
@@ -305,6 +324,192 @@ def test_streaming_query_times_out_before_first_content(monkeypatch):
         assert "No content delta" in str(exc)
     else:
         raise AssertionError("expected first-content timeout")
+
+
+def test_streaming_503_retries_in_streaming_mode(monkeypatch):
+    _streaming_policy(monkeypatch)
+    responses = [
+        _ScriptedStreamingResponse(status_code=503),
+        _ScriptedStreamingResponse(
+            lines=[(0, _sse({"content": "ok"})), (0, b"data: [DONE]")]
+        ),
+    ]
+    payloads = []
+
+    def fake_post(*args, data, **kwargs):
+        payloads.append(json.loads(data))
+        return responses.pop(0)
+
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+    monkeypatch.setattr("capx.llm.client.random.uniform", lambda *args: 0.0)
+
+    assert query_model(_args(), [{"role": "user", "content": "hi"}])["content"] == "ok"
+    assert [payload["stream"] for payload in payloads] == [True, True]
+
+
+def test_streaming_503_twice_raises_typed_http_5xx(monkeypatch):
+    _streaming_policy(monkeypatch)
+    all_responses = [
+        _ScriptedStreamingResponse(status_code=503),
+        _ScriptedStreamingResponse(status_code=503),
+    ]
+    responses = list(all_responses)
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+    monkeypatch.setattr("capx.llm.client.random.uniform", lambda *args: 0.0)
+
+    with pytest.raises(LLMQueryError) as raised:
+        query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert raised.value.kind is LLMErrorKind.HTTP_5XX
+    assert raised.value.attempt == 2
+    assert raised.value.status_code == 503
+    assert len(calls) == 2
+    assert all(response.closed for response in all_responses)
+
+
+@pytest.mark.parametrize("status", [401, 404])
+def test_streaming_non_retryable_http_error_uses_one_attempt(monkeypatch, status):
+    _streaming_policy(monkeypatch)
+    response = _ScriptedStreamingResponse(status_code=status)
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs)
+        return response
+
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+
+    with pytest.raises(LLMQueryError) as raised:
+        query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert raised.value.kind is (
+        LLMErrorKind.AUTH_ERROR if status == 401 else LLMErrorKind.REQUEST_REJECTED
+    )
+    assert raised.value.attempt == 1
+    assert len(calls) == 1
+    assert response.closed is True
+
+
+def test_streaming_failure_with_no_budget_does_not_fallback(monkeypatch, tmp_path):
+    _streaming_policy(monkeypatch)
+    clock = _Clock()
+    response = _ScriptedStreamingResponse(lines=[(0, b"data: [DONE]")], clock=clock)
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs)
+        return response
+
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+    monkeypatch.setattr("capx.llm.client.time.monotonic", clock)
+    with trial_llm_context(
+        trial=1,
+        deadline_monotonic=clock() + 4.5,
+        telemetry_path=tmp_path / "calls.jsonl",
+        monotonic=clock,
+    ):
+        with pytest.raises(LLMQueryError) as raised:
+            query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert raised.value.kind is LLMErrorKind.TRIAL_BUDGET_EXHAUSTED
+    assert len(calls) == 1
+
+
+def test_streaming_telemetry_shares_call_index_and_tracks_mode_transition(
+    monkeypatch, tmp_path
+):
+    _streaming_policy(monkeypatch)
+    clock = _Clock()
+    responses = [
+        _ScriptedStreamingResponse(
+            lines=[
+                (0.2, b": heartbeat"),
+                (0.3, _sse({"content": "partial"})),
+                (0.1, requests.exceptions.ReadTimeout("stalled")),
+            ],
+            clock=clock,
+        ),
+        _NonStreamingResponse(
+            body={"choices": [{"message": {"content": "replacement"}}]},
+            chunks=[
+                (
+                    0.4,
+                    json.dumps(
+                        {"choices": [{"message": {"content": "replacement"}}]}
+                    ).encode(),
+                )
+            ],
+            clock=clock,
+        ),
+    ]
+    monkeypatch.setattr("capx.llm.client.requests.post", lambda *args, **kwargs: responses.pop(0))
+    monkeypatch.setattr("capx.llm.client.time.monotonic", clock)
+    telemetry = tmp_path / "calls.jsonl"
+
+    with trial_llm_context(
+        trial=4,
+        deadline_monotonic=clock() + 30,
+        telemetry_path=telemetry,
+        monotonic=clock,
+    ):
+        query_model(_args(), [{"role": "user", "content": "secret prompt"}])
+
+    records = [json.loads(line) for line in telemetry.read_text(encoding="utf-8").splitlines()]
+    assert [record["call_index"] for record in records] == [1, 1]
+    assert [record["attempt"] for record in records] == [1, 2]
+    assert [record["mode"] for record in records] == ["streaming", "non_streaming"]
+    assert records[0]["ttfb_ms"] == 200
+    assert records[0]["first_content_ms"] == 500
+    assert records[0]["retry_scheduled"] is True
+    assert records[1]["outcome"] == "success"
+    assert "secret prompt" not in telemetry.read_text(encoding="utf-8")
+
+
+def test_streaming_heartbeat_lines_cannot_bypass_first_content_watchdog(monkeypatch):
+    _streaming_policy(monkeypatch, attempts=1, first_content=1)
+    clock = _Clock()
+    response = _ScriptedStreamingResponse(
+        lines=[(0.4, b": heartbeat"), (0.4, b""), (0.4, b'data: {"choices": []}')],
+        clock=clock,
+    )
+    monkeypatch.setattr("capx.llm.client.requests.post", lambda *args, **kwargs: response)
+    monkeypatch.setattr("capx.llm.client.time.monotonic", clock)
+
+    with pytest.raises(LLMQueryError) as raised:
+        query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert raised.value.kind is LLMErrorKind.NO_CONTENT
+    assert response.closed is True
+
+
+def test_direct_streaming_generator_remains_single_attempt_and_event_compatible(monkeypatch):
+    response = _ScriptedStreamingResponse(
+        lines=[
+            (0, _sse({"reasoning_content": "thought"})),
+            (0, _sse({"content": "answer"})),
+            (0, b"data: [DONE]"),
+        ]
+    )
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs)
+        return response
+
+    monkeypatch.delenv("CAPX_DISABLE_REASONING", raising=False)
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+
+    events = list(query_model_streaming(_args(), [{"role": "user", "content": "hi"}]))
+
+    assert [event["type"] for event in events] == ["reasoning_delta", "content_delta", "done"]
+    assert len(calls) == 1
+    assert response.closed is True
 
 
 def test_non_streaming_503_then_200_retries_once_and_succeeds(monkeypatch):
