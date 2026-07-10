@@ -30,13 +30,21 @@ class _NonStreamingResponse:
         encoded = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.chunks = [(0, encoded)] if chunks is None else chunks
         self.clock = clock
+        self.closed = False
+        self.iterated = False
 
     def iter_content(self, chunk_size=8192):
         del chunk_size
+        self.iterated = True
         for delay, chunk in self.chunks:
             if self.clock is not None:
                 self.clock.advance(delay)
+            if isinstance(chunk, BaseException):
+                raise chunk
             yield chunk
+
+    def close(self):
+        self.closed = True
 
 
 def _args(**overrides):
@@ -189,6 +197,9 @@ def test_query_model_falls_back_to_non_streaming_after_empty_streaming_content(m
                 {"choices": [{"message": {"content": "fallback ok"}}]}
             ).encode()
 
+        def close(self):
+            return None
+
     def fake_post(*args, data, **kwargs):
         post_payloads.append(json.loads(data))
         return NonStreamingResponse()
@@ -229,6 +240,9 @@ def test_query_model_retries_non_streaming_timeout_once(monkeypatch):
         def iter_content(self, chunk_size=8192):
             del chunk_size
             yield json.dumps({"choices": [{"message": {"content": "retry ok"}}]}).encode()
+
+        def close(self):
+            return None
 
     def fake_post(*args, timeout, **kwargs):
         request_timeouts.append(timeout)
@@ -524,7 +538,7 @@ def test_non_streaming_attempt_telemetry_shares_call_index_and_is_safe(monkeypat
     assert records[0]["outcome"] == "retryable_http_error"
     assert records[0]["error_kind"] == "http_5xx"
     assert records[0]["retry_scheduled"] is True
-    assert records[0]["ttfb_ms"] == 0
+    assert records[0]["ttfb_ms"] is None
     assert records[0]["duration_ms"] == 0
     assert records[0]["trial_remaining_ms_before"] == 30_000
     assert records[0]["trial_remaining_ms_after"] == 30_000
@@ -598,4 +612,119 @@ def test_non_streaming_telemetry_write_failure_is_terminal(monkeypatch):
         with pytest.raises(TelemetryWriteError):
             query_model(_args(), [{"role": "user", "content": "hi"}])
 
+    assert len(calls) == 1
+
+
+def test_non_streaming_closes_response_after_success(monkeypatch):
+    _non_streaming_policy(monkeypatch, attempts=1)
+    response = _NonStreamingResponse(200)
+    monkeypatch.setattr("capx.llm.client.requests.post", lambda *args, **kwargs: response)
+
+    query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert response.closed is True
+    assert response.iterated is True
+
+
+def test_non_streaming_closes_each_response_without_reading_http_error_body(monkeypatch):
+    _non_streaming_policy(monkeypatch)
+    responses = [_NonStreamingResponse(503), _NonStreamingResponse(200)]
+    monkeypatch.setattr("capx.llm.client.requests.post", lambda *args, **kwargs: responses.pop(0))
+    monkeypatch.setattr("capx.llm.client.random.uniform", lambda *args: 0.0)
+    first, second = responses
+
+    query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert first.closed is True
+    assert first.iterated is False
+    assert second.closed is True
+    assert second.iterated is True
+
+
+def test_non_streaming_closes_terminal_http_error_without_reading_body(monkeypatch):
+    _non_streaming_policy(monkeypatch)
+    response = _NonStreamingResponse(401)
+    monkeypatch.setattr("capx.llm.client.requests.post", lambda *args, **kwargs: response)
+
+    with pytest.raises(LLMQueryError):
+        query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert response.closed is True
+    assert response.iterated is False
+
+
+def test_non_streaming_closes_response_after_invalid_json(monkeypatch):
+    _non_streaming_policy(monkeypatch)
+    response = _NonStreamingResponse(200, body=b"not json")
+    monkeypatch.setattr("capx.llm.client.requests.post", lambda *args, **kwargs: response)
+
+    with pytest.raises(LLMQueryError):
+        query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert response.closed is True
+
+
+def test_non_streaming_closes_response_when_body_iteration_times_out(monkeypatch):
+    _non_streaming_policy(monkeypatch, attempts=1)
+    response = _NonStreamingResponse(
+        200,
+        chunks=[(0, requests.exceptions.ReadTimeout("body timed out"))],
+    )
+    monkeypatch.setattr("capx.llm.client.requests.post", lambda *args, **kwargs: response)
+
+    with pytest.raises(LLMQueryError) as raised:
+        query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert raised.value.kind is LLMErrorKind.READ_TIMEOUT
+    assert response.closed is True
+
+
+def test_non_streaming_retry_budget_equality_reserves_delay_and_minimum_attempt(
+    monkeypatch,
+):
+    _non_streaming_policy(monkeypatch, backoff=1)
+    clock = _Clock()
+    responses = [_NonStreamingResponse(503), _NonStreamingResponse(200)]
+    timeouts = []
+
+    def fake_post(*args, timeout, **kwargs):
+        timeouts.append(timeout)
+        return responses.pop(0)
+
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+    monkeypatch.setattr("capx.llm.client.random.uniform", lambda *args: 0.5)
+    monkeypatch.setattr("capx.llm.client.time.monotonic", clock)
+    monkeypatch.setattr("capx.llm.client.time.sleep", clock.advance)
+    with trial_llm_context(
+        trial=1,
+        deadline_monotonic=clock() + 6.5,
+        monotonic=clock,
+    ):
+        query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert timeouts == [pytest.approx(6.5), pytest.approx(5.0)]
+
+
+def test_non_streaming_retry_after_requires_delay_plus_minimum_attempt_budget(monkeypatch):
+    _non_streaming_policy(monkeypatch)
+    clock = _Clock()
+    response = _NonStreamingResponse(429, headers={"Retry-After": "90"})
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs)
+        return response
+
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+    monkeypatch.setattr("capx.llm.client.random.uniform", lambda *args: 0.0)
+    monkeypatch.setattr("capx.llm.client.time.monotonic", clock)
+    with trial_llm_context(
+        trial=1,
+        deadline_monotonic=clock() + 14.999,
+        monotonic=clock,
+    ):
+        with pytest.raises(LLMQueryError) as raised:
+            query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert raised.value.kind is LLMErrorKind.TRIAL_BUDGET_EXHAUSTED
     assert len(calls) == 1

@@ -162,6 +162,17 @@ def _retry_delay(response: requests.Response | None, policy: LLMRetryPolicy) -> 
     return delay
 
 
+def _retry_fits_budget(
+    remaining_seconds: float | None,
+    delay_seconds: float,
+    policy: LLMRetryPolicy,
+) -> bool:
+    """Reserve both the retry delay and the minimum attempt budget; equality is allowed."""
+    return remaining_seconds is None or remaining_seconds >= (
+        delay_seconds + policy.minimum_retry_budget_seconds
+    )
+
+
 def _completions_to_responses_convert_prompt(prompt: list[dict]) -> list[dict]:
     """Convert completions api format to responses api format.
 
@@ -381,31 +392,34 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         status_code: int | None = None
         ttfb_ms: int | None = None
         try:
-            response = requests.post(
-                server_url,
-                headers=headers,
-                data=json.dumps(payload),
-                timeout=request_timeout,
-                stream=True,
-            )
-            status_code = response.status_code
-            body_chunks = []
-            for chunk in response.iter_content(chunk_size=8192):
-                if not chunk:
-                    continue
-                if ttfb_ms is None:
-                    ttfb_ms = int(round((time.monotonic() - started) * 1000))
-                body_chunks.append(chunk)
-            body_bytes = b"".join(body_chunks)
+            try:
+                response = requests.post(
+                    server_url,
+                    headers=headers,
+                    data=json.dumps(payload),
+                    timeout=request_timeout,
+                    stream=True,
+                )
+                status_code = response.status_code
+                body_chunks = []
+                if 200 <= status_code < 300:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        if ttfb_ms is None:
+                            ttfb_ms = int(round((time.monotonic() - started) * 1000))
+                        body_chunks.append(chunk)
+                body_bytes = b"".join(body_chunks)
+            finally:
+                if response is not None:
+                    response.close()
         except requests.exceptions.RequestException as error:
             finished = time.monotonic()
             kind = _request_error_kind(error)
             can_retry = attempt < policy.max_attempts
             delay = _retry_delay(response, policy) if can_retry else 0.0
             remaining = context.remaining_seconds() if context is not None else None
-            budget_allows_retry = remaining is None or (
-                remaining >= policy.minimum_retry_budget_seconds and remaining > delay
-            )
+            budget_allows_retry = _retry_fits_budget(remaining, delay, policy)
             retry_scheduled = can_retry and budget_allows_retry
             if context is not None:
                 context.record_attempt(
@@ -435,14 +449,12 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
             raise_query_error(kind, attempt, status_code, f"LLM transport failed: {kind.value}")
 
         finished = time.monotonic()
-        if status_code is not None and status_code >= 400:
+        if status_code is not None and not 200 <= status_code < 300:
             kind = _http_error_kind(status_code)
             can_retry = status_code in _RETRYABLE_HTTP_STATUSES and attempt < policy.max_attempts
             delay = _retry_delay(response, policy) if can_retry else 0.0
             remaining = context.remaining_seconds() if context is not None else None
-            budget_allows_retry = remaining is None or (
-                remaining >= policy.minimum_retry_budget_seconds and remaining > delay
-            )
+            budget_allows_retry = _retry_fits_budget(remaining, delay, policy)
             retry_scheduled = can_retry and budget_allows_retry
             if context is not None:
                 context.record_attempt(
