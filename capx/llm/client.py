@@ -14,11 +14,12 @@ import queue
 import random
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import requests
+from urllib3.util import Timeout as Urllib3Timeout
 
 from capx.llm.context import TrialLLMContext, get_trial_llm_context
 from capx.llm.errors import LLMErrorKind, LLMQueryError
@@ -200,6 +201,76 @@ class _StreamingInvalidResponse(RuntimeError):
 _STREAM_END = object()
 
 
+def _stream_deadline_error(
+    *,
+    waiting_for_content: bool,
+    observed_at: float,
+    first_content_deadline: float,
+    attempt_deadline: float,
+) -> Exception | None:
+    """Classify a deadline using whichever independent deadline expires first."""
+    if observed_at >= attempt_deadline and (
+        not waiting_for_content or attempt_deadline <= first_content_deadline
+    ):
+        return requests.exceptions.ReadTimeout("Streaming attempt deadline exceeded")
+    if waiting_for_content and observed_at >= first_content_deadline:
+        return TimeoutError("No content delta before the first-content deadline")
+    if observed_at >= attempt_deadline:
+        return requests.exceptions.ReadTimeout("Streaming attempt deadline exceeded")
+    return None
+
+
+def _call_with_deadline(
+    call: Callable[[], Any],
+    *,
+    deadline: float,
+    timeout_error: Exception,
+    on_timeout: Callable[[], None] | None = None,
+    on_late_result: Callable[[Any], None] | None = None,
+) -> Any:
+    """Run a potentially blocking Requests operation behind a hard wall-clock deadline."""
+    results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+    cancelled = threading.Event()
+
+    def run() -> None:
+        try:
+            result = call()
+        except Exception as error:
+            result_item = (False, error)
+        else:
+            if cancelled.is_set() and on_late_result is not None:
+                on_late_result(result)
+            result_item = (True, result)
+        try:
+            results.put_nowait(result_item)
+        except queue.Full:
+            pass
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    try:
+        wait_seconds = max(0.0, deadline - time.monotonic())
+        try:
+            succeeded, value = results.get(timeout=wait_seconds)
+        except queue.Empty:
+            cancelled.set()
+            if on_timeout is not None:
+                on_timeout()
+            raise timeout_error
+        if time.monotonic() >= deadline:
+            cancelled.set()
+            if succeeded and on_late_result is not None:
+                on_late_result(value)
+            elif on_timeout is not None:
+                on_timeout()
+            raise timeout_error
+        if not succeeded:
+            raise value
+        return value
+    finally:
+        worker.join(timeout=0.01)
+
+
 def _iter_stream_lines_with_deadlines(
     response: requests.Response,
     *,
@@ -219,32 +290,48 @@ def _iter_stream_lines_with_deadlines(
         finally:
             items.put((time.monotonic(), _STREAM_END, None))
 
-    threading.Thread(target=read_lines, daemon=True).start()
-    while True:
-        waiting_for_content = metrics.first_content_ms is None
-        active_deadline = attempt_deadline
-        if waiting_for_content:
-            active_deadline = min(active_deadline, first_content_deadline)
-        wait_seconds = max(0.0, active_deadline - time.monotonic())
-        try:
-            received_at, item, error = items.get(timeout=wait_seconds)
-        except queue.Empty:
-            if waiting_for_content and first_content_deadline <= attempt_deadline:
-                raise TimeoutError("No content delta before the first-content deadline")
-            raise requests.exceptions.ReadTimeout("Streaming attempt deadline exceeded")
+    worker = threading.Thread(target=read_lines, daemon=True)
+    worker.start()
+    try:
+        while True:
+            waiting_for_content = metrics.first_content_ms is None
+            active_deadline = attempt_deadline
+            if waiting_for_content:
+                active_deadline = min(active_deadline, first_content_deadline)
+            wait_seconds = max(0.0, active_deadline - time.monotonic())
+            try:
+                received_at, item, error = items.get(timeout=wait_seconds)
+            except queue.Empty:
+                deadline_error = _stream_deadline_error(
+                    waiting_for_content=waiting_for_content,
+                    observed_at=time.monotonic(),
+                    first_content_deadline=first_content_deadline,
+                    attempt_deadline=attempt_deadline,
+                )
+                if deadline_error is None:
+                    deadline_error = requests.exceptions.ReadTimeout(
+                        "Streaming deadline wait ended unexpectedly"
+                    )
+                raise deadline_error
 
-        observed_at = max(received_at, time.monotonic())
-        if waiting_for_content and observed_at >= first_content_deadline:
-            raise TimeoutError("No content delta before the first-content deadline")
-        if observed_at >= attempt_deadline:
-            raise requests.exceptions.ReadTimeout("Streaming attempt deadline exceeded")
-        if error is not None:
-            raise error
-        if item is _STREAM_END:
-            return
-        if not isinstance(item, bytes):
-            raise _StreamingInvalidResponse("Streaming response line was not bytes")
-        yield item, received_at
+            observed_at = max(received_at, time.monotonic())
+            deadline_error = _stream_deadline_error(
+                waiting_for_content=waiting_for_content,
+                observed_at=observed_at,
+                first_content_deadline=first_content_deadline,
+                attempt_deadline=attempt_deadline,
+            )
+            if deadline_error is not None:
+                raise deadline_error
+            if error is not None:
+                raise error
+            if item is _STREAM_END:
+                return
+            if not isinstance(item, bytes):
+                raise _StreamingInvalidResponse("Streaming response line was not bytes")
+            yield item, received_at
+    finally:
+        worker.join(timeout=0.01)
 
 
 def _completions_to_responses_convert_prompt(prompt: list[dict]) -> list[dict]:
@@ -837,16 +924,32 @@ def _streaming_events(
     full_reasoning = ""
     response: requests.Response | None = None
     attempt_deadline = metrics.started + request_timeout
-    first_content_deadline = min(
-        attempt_deadline, metrics.started + first_content_timeout
+    first_content_deadline = metrics.started + first_content_timeout
+    initial_deadline = min(attempt_deadline, first_content_deadline)
+    initial_timeout_error = _stream_deadline_error(
+        waiting_for_content=True,
+        observed_at=initial_deadline,
+        first_content_deadline=first_content_deadline,
+        attempt_deadline=attempt_deadline,
     )
+    if initial_timeout_error is None:
+        raise RuntimeError("streaming deadline classification failed")
     try:
-        response = requests.post(
-            server_url,
-            headers=headers,
-            data=json.dumps(payload),
-            timeout=request_timeout,
-            stream=True,
+        response = _call_with_deadline(
+            lambda: requests.post(
+                server_url,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=Urllib3Timeout(
+                    total=request_timeout,
+                    connect=request_timeout,
+                    read=request_timeout,
+                ),
+                stream=True,
+            ),
+            deadline=initial_deadline,
+            timeout_error=initial_timeout_error,
+            on_late_result=lambda late_response: late_response.close(),
         )
         metrics.http_status = response.status_code
         metrics.response_headers = dict(response.headers)
@@ -857,7 +960,12 @@ def _streaming_events(
         is_json = "application/json" in content_type
         if is_json and not is_sse:
             try:
-                body = response.json()
+                body = _call_with_deadline(
+                    response.json,
+                    deadline=initial_deadline,
+                    timeout_error=initial_timeout_error,
+                    on_timeout=response.close,
+                )
                 message = body["choices"][0]["message"]
                 full_content = message["content"]
                 if not isinstance(full_content, str):
@@ -870,6 +978,14 @@ def _streaming_events(
                 raise _StreamingInvalidResponse("Unexpected streaming JSON response") from error
             if full_content:
                 now = time.monotonic()
+                deadline_error = _stream_deadline_error(
+                    waiting_for_content=True,
+                    observed_at=now,
+                    first_content_deadline=first_content_deadline,
+                    attempt_deadline=attempt_deadline,
+                )
+                if deadline_error is not None:
+                    raise deadline_error
                 metrics.ttfb_ms = int(round((now - metrics.started) * 1000))
                 metrics.first_content_ms = metrics.ttfb_ms
                 yield {"type": "content_delta", "content": full_content}
@@ -908,14 +1024,14 @@ def _streaming_events(
                         delta = choices[0].get("delta", {})
                         content_delta = delta.get("content", "")
                         if content_delta:
-                            if now >= first_content_deadline:
-                                raise TimeoutError(
-                                    "No content delta before the first-content deadline"
-                                )
-                            if time.monotonic() >= attempt_deadline:
-                                raise requests.exceptions.ReadTimeout(
-                                    "Streaming attempt deadline exceeded"
-                                )
+                            deadline_error = _stream_deadline_error(
+                                waiting_for_content=metrics.first_content_ms is None,
+                                observed_at=time.monotonic(),
+                                first_content_deadline=first_content_deadline,
+                                attempt_deadline=attempt_deadline,
+                            )
+                            if deadline_error is not None:
+                                raise deadline_error
                             if metrics.first_content_ms is None:
                                 metrics.first_content_ms = int(
                                     round((received_at - metrics.started) * 1000)

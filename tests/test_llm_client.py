@@ -165,6 +165,17 @@ class _DripStreamingResponse(_ScriptedStreamingResponse):
                 yield b": heartbeat"
 
 
+class _SlowJSONStreamingResponse(_ScriptedStreamingResponse):
+    def __init__(self, *, delay_seconds, content):
+        super().__init__(headers={"content-type": "application/json"})
+        self.delay_seconds = delay_seconds
+        self.content = content
+
+    def json(self):
+        time.sleep(self.delay_seconds)
+        return {"choices": [{"message": {"content": self.content}}]}
+
+
 def _sse(delta):
     return f"data: {json.dumps({'choices': [{'delta': delta}]})}".encode()
 
@@ -576,6 +587,83 @@ def test_continuous_stream_data_cannot_exceed_total_attempt_budget(monkeypatch):
     assert result["content"] == "ok"
     assert "partial" not in result["content"]
     assert streaming_response.closed is True
+
+
+def test_attempt_deadline_before_first_content_deadline_retries_streaming(monkeypatch):
+    _streaming_policy(monkeypatch, timeout=0.03, first_content=0.1)
+    first = _BlockingStreamingResponse()
+    second = _ScriptedStreamingResponse(
+        lines=[(0, _sse({"content": "ok"})), (0, b"data: [DONE]")]
+    )
+    responses = [first, second]
+    payloads = []
+
+    def fake_post(*args, data, **kwargs):
+        payloads.append(json.loads(data))
+        return responses.pop(0)
+
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+
+    result = query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert result["content"] == "ok"
+    assert [payload["stream"] for payload in payloads] == [True, True]
+    assert first.closed is True
+
+
+def test_slow_response_headers_cannot_exceed_attempt_deadline(monkeypatch):
+    _streaming_policy(monkeypatch, timeout=0.03, first_content=0.1)
+    late_response = _ScriptedStreamingResponse(
+        lines=[(0, _sse({"content": "late"})), (0, b"data: [DONE]")]
+    )
+    retry_response = _ScriptedStreamingResponse(
+        lines=[(0, _sse({"content": "ok"})), (0, b"data: [DONE]")]
+    )
+    calls = 0
+    lock = threading.Lock()
+
+    def fake_post(*args, **kwargs):
+        nonlocal calls
+        with lock:
+            calls += 1
+            call = calls
+        if call == 1:
+            time.sleep(0.08)
+            return late_response
+        return retry_response
+
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+
+    started = time.monotonic()
+    result = query_model(_args(), [{"role": "user", "content": "hi"}])
+    elapsed = time.monotonic() - started
+    time.sleep(0.07)
+
+    assert result["content"] == "ok"
+    assert elapsed < 0.07
+    assert calls == 2
+    assert late_response.closed is True
+
+
+def test_slow_json_body_cannot_succeed_after_attempt_deadline(monkeypatch):
+    _streaming_policy(monkeypatch, timeout=0.03, first_content=0.1)
+    late_json = _SlowJSONStreamingResponse(delay_seconds=0.08, content="late")
+    retry_response = _ScriptedStreamingResponse(
+        lines=[(0, _sse({"content": "ok"})), (0, b"data: [DONE]")]
+    )
+    responses = [late_json, retry_response]
+
+    monkeypatch.setattr(
+        "capx.llm.client.requests.post", lambda *args, **kwargs: responses.pop(0)
+    )
+
+    started = time.monotonic()
+    result = query_model(_args(), [{"role": "user", "content": "hi"}])
+    elapsed = time.monotonic() - started
+
+    assert result["content"] == "ok"
+    assert elapsed < 0.07
+    assert late_json.closed is True
 
 
 def test_direct_streaming_generator_remains_single_attempt_and_event_compatible(monkeypatch):
