@@ -10,7 +10,9 @@ import concurrent.futures
 import copy
 import json
 import os
+import queue
 import random
+import threading
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -193,6 +195,56 @@ class _StreamingMetrics:
 
 class _StreamingInvalidResponse(RuntimeError):
     """A streaming response could not be interpreted using the expected schema."""
+
+
+_STREAM_END = object()
+
+
+def _iter_stream_lines_with_deadlines(
+    response: requests.Response,
+    *,
+    metrics: _StreamingMetrics,
+    first_content_deadline: float,
+    attempt_deadline: float,
+) -> Iterable[tuple[bytes, float]]:
+    """Read response lines without letting a blocking socket bypass wall-clock deadlines."""
+    items: queue.Queue[tuple[float, object, Exception | None]] = queue.Queue()
+
+    def read_lines() -> None:
+        try:
+            for line in response.iter_lines():
+                items.put((time.monotonic(), line, None))
+        except Exception as error:
+            items.put((time.monotonic(), _STREAM_END, error))
+        finally:
+            items.put((time.monotonic(), _STREAM_END, None))
+
+    threading.Thread(target=read_lines, daemon=True).start()
+    while True:
+        waiting_for_content = metrics.first_content_ms is None
+        active_deadline = attempt_deadline
+        if waiting_for_content:
+            active_deadline = min(active_deadline, first_content_deadline)
+        wait_seconds = max(0.0, active_deadline - time.monotonic())
+        try:
+            received_at, item, error = items.get(timeout=wait_seconds)
+        except queue.Empty:
+            if waiting_for_content and first_content_deadline <= attempt_deadline:
+                raise TimeoutError("No content delta before the first-content deadline")
+            raise requests.exceptions.ReadTimeout("Streaming attempt deadline exceeded")
+
+        observed_at = max(received_at, time.monotonic())
+        if waiting_for_content and observed_at >= first_content_deadline:
+            raise TimeoutError("No content delta before the first-content deadline")
+        if observed_at >= attempt_deadline:
+            raise requests.exceptions.ReadTimeout("Streaming attempt deadline exceeded")
+        if error is not None:
+            raise error
+        if item is _STREAM_END:
+            return
+        if not isinstance(item, bytes):
+            raise _StreamingInvalidResponse("Streaming response line was not bytes")
+        yield item, received_at
 
 
 def _completions_to_responses_convert_prompt(prompt: list[dict]) -> list[dict]:
@@ -784,6 +836,10 @@ def _streaming_events(
     full_content = ""
     full_reasoning = ""
     response: requests.Response | None = None
+    attempt_deadline = metrics.started + request_timeout
+    first_content_deadline = min(
+        attempt_deadline, metrics.started + first_content_timeout
+    )
     try:
         response = requests.post(
             server_url,
@@ -824,10 +880,15 @@ def _streaming_events(
             }
             return
 
-        for line in response.iter_lines():
+        for line, received_at in _iter_stream_lines_with_deadlines(
+            response,
+            metrics=metrics,
+            first_content_deadline=first_content_deadline,
+            attempt_deadline=attempt_deadline,
+        ):
             now = time.monotonic()
             if line and metrics.ttfb_ms is None:
-                metrics.ttfb_ms = int(round((now - metrics.started) * 1000))
+                metrics.ttfb_ms = int(round((received_at - metrics.started) * 1000))
 
             if line:
                 try:
@@ -847,9 +908,17 @@ def _streaming_events(
                         delta = choices[0].get("delta", {})
                         content_delta = delta.get("content", "")
                         if content_delta:
+                            if now >= first_content_deadline:
+                                raise TimeoutError(
+                                    "No content delta before the first-content deadline"
+                                )
+                            if time.monotonic() >= attempt_deadline:
+                                raise requests.exceptions.ReadTimeout(
+                                    "Streaming attempt deadline exceeded"
+                                )
                             if metrics.first_content_ms is None:
                                 metrics.first_content_ms = int(
-                                    round((now - metrics.started) * 1000)
+                                    round((received_at - metrics.started) * 1000)
                                 )
                             full_content += content_delta
                             yield {"type": "content_delta", "content": content_delta}
@@ -857,16 +926,12 @@ def _streaming_events(
                             delta.get("reasoning") or delta.get("reasoning_content") or ""
                         )
                         if reasoning_delta and not reasoning_disabled:
+                            if time.monotonic() >= attempt_deadline:
+                                raise requests.exceptions.ReadTimeout(
+                                    "Streaming attempt deadline exceeded"
+                                )
                             full_reasoning += reasoning_delta
                             yield {"type": "reasoning_delta", "content": reasoning_delta}
-
-            if (
-                metrics.first_content_ms is None
-                and time.monotonic() - metrics.started >= first_content_timeout
-            ):
-                raise TimeoutError(
-                    f"No content delta within {first_content_timeout:.1f}s"
-                )
     finally:
         if response is not None:
             response.close()

@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -132,6 +134,37 @@ class _ScriptedStreamingResponse:
         self.closed = True
 
 
+class _BlockingStreamingResponse(_ScriptedStreamingResponse):
+    def __init__(self, *, delayed_line=None, delay_seconds=None):
+        super().__init__()
+        self.delayed_line = delayed_line
+        self.delay_seconds = delay_seconds
+        self.released = threading.Event()
+
+    def iter_lines(self):
+        if self.delay_seconds is None:
+            self.released.wait(timeout=1)
+        else:
+            time.sleep(self.delay_seconds)
+        if self.delayed_line is not None:
+            yield self.delayed_line
+
+    def close(self):
+        self.closed = True
+        self.released.set()
+
+
+class _DripStreamingResponse(_ScriptedStreamingResponse):
+    def iter_lines(self):
+        yield _sse({"content": "partial"})
+        for index in range(6):
+            time.sleep(0.015)
+            if index % 2:
+                yield _sse({"content": " drip"})
+            else:
+                yield b": heartbeat"
+
+
 def _sse(delta):
     return f"data: {json.dumps({'choices': [{'delta': delta}]})}".encode()
 
@@ -143,6 +176,7 @@ def _streaming_policy(monkeypatch, *, attempts=2, timeout=60, first_content=5, b
     monkeypatch.setenv("CAPX_STREAMING_FIRST_CONTENT_TIMEOUT_SECONDS", str(first_content))
     monkeypatch.setenv("CAPX_LLM_RETRY_BACKOFF_SECONDS", str(backoff))
     monkeypatch.setenv("CAPX_DISABLE_REASONING", "1")
+    monkeypatch.setattr("capx.llm.client.random.uniform", lambda *args: 0.0)
 
 
 def test_streaming_query_drops_reasoning_when_disabled(monkeypatch):
@@ -486,6 +520,62 @@ def test_streaming_heartbeat_lines_cannot_bypass_first_content_watchdog(monkeypa
 
     assert raised.value.kind is LLMErrorKind.NO_CONTENT
     assert response.closed is True
+
+
+def test_completely_silent_stream_hits_first_content_deadline_and_falls_back(monkeypatch):
+    _streaming_policy(monkeypatch, first_content=0.03)
+    streaming_response = _BlockingStreamingResponse()
+    responses = [streaming_response, _NonStreamingResponse()]
+    payloads = []
+
+    def fake_post(*args, data, **kwargs):
+        payloads.append(json.loads(data))
+        return responses.pop(0)
+
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+
+    started = time.monotonic()
+    result = query_model(_args(), [{"role": "user", "content": "hi"}])
+    elapsed = time.monotonic() - started
+
+    assert result["content"] == "ok"
+    assert elapsed < 0.5
+    assert [payload.get("stream", False) for payload in payloads] == [True, False]
+    assert streaming_response.closed is True
+
+
+def test_content_arriving_after_first_content_deadline_is_not_yielded(monkeypatch):
+    _streaming_policy(monkeypatch, first_content=0.02)
+    streaming_response = _BlockingStreamingResponse(
+        delayed_line=_sse({"content": "too late"}), delay_seconds=0.05
+    )
+    responses = [streaming_response, _NonStreamingResponse()]
+
+    monkeypatch.setattr(
+        "capx.llm.client.requests.post", lambda *args, **kwargs: responses.pop(0)
+    )
+
+    result = query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert result["content"] == "ok"
+    assert "too late" not in result["content"]
+    assert streaming_response.closed is True
+
+
+def test_continuous_stream_data_cannot_exceed_total_attempt_budget(monkeypatch):
+    _streaming_policy(monkeypatch, timeout=0.05, first_content=0.02)
+    streaming_response = _DripStreamingResponse()
+    responses = [streaming_response, _NonStreamingResponse()]
+
+    monkeypatch.setattr(
+        "capx.llm.client.requests.post", lambda *args, **kwargs: responses.pop(0)
+    )
+
+    result = query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert result["content"] == "ok"
+    assert "partial" not in result["content"]
+    assert streaming_response.closed is True
 
 
 def test_direct_streaming_generator_remains_single_attempt_and_event_compatible(monkeypatch):
