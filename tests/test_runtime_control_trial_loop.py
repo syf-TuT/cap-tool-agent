@@ -4,11 +4,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from capx.envs.trial import (
+    _describe_initial_scene,
     _execute_runtime_action,
+    _get_video_differencing_feedback,
+    _get_visual_differencing_feedback,
+    _handle_multi_turn_step,
     _no_rollback_guard_event,
+    _query_initial_code,
     _run_capsule_trial,
     _run_single_trial,
 )
+from capx.llm.client import ModelQueryArgs
+from capx.llm.context import get_trial_llm_context, trial_llm_context
 from capx.runtime_control.executor import CapsuleExecutor
 from capx.runtime_control.schema import CodeRegion, RuntimeAction
 from capx.runtime_control.trace import wrap_function_for_trace
@@ -115,6 +122,149 @@ class FakeVideoCapsuleEnv(FakeCapsuleEnv):
     def get_video_frames(self, *, clear=False):
         self.video_clear_requested = clear
         return ["frame-1", "frame-2"]
+
+
+def _record_current_stage():
+    context = get_trial_llm_context()
+    assert context is not None
+    call_index = context.next_call_index()
+    context.record_attempt(
+        call_index=call_index,
+        attempt=1,
+        mode="nonstreaming",
+        http_status=200,
+        ttfb_ms=1,
+        first_content_ms=1,
+        started_monotonic=1.0,
+        finished_monotonic=1.001,
+        remaining_before_ms=None,
+        outcome="success",
+        error_kind=None,
+        retry_scheduled=False,
+    )
+    return {"content": "FINISH", "reasoning": None}
+
+
+def _telemetry_stages(path):
+    return [json.loads(line)["stage"] for line in path.read_text().splitlines()]
+
+
+def test_initial_generation_query_uses_initial_code_stage(tmp_path, monkeypatch):
+    telemetry_path = tmp_path / "initial.jsonl"
+    monkeypatch.setattr(
+        "capx.envs.trial._query_model", lambda args, prompt: _record_current_stage()
+    )
+    args = SimpleNamespace(model="test")
+    config = {
+        "output_dir": str(tmp_path),
+        "use_parallel_ensemble": False,
+    }
+
+    with trial_llm_context(trial=1, telemetry_path=telemetry_path):
+        _query_initial_code(
+            args,
+            config,
+            {"full_prompt": [{"role": "user", "content": "task"}]},
+        )
+
+    assert _telemetry_stages(telemetry_path) == ["initial_code"]
+
+
+def test_visual_model_queries_use_visual_feedback_stage(tmp_path, monkeypatch):
+    telemetry_path = tmp_path / "visual.jsonl"
+    monkeypatch.setattr(
+        "capx.envs.trial._query_model", lambda args, prompt: _record_current_stage()
+    )
+    monkeypatch.setattr("capx.envs.trial._encode_video_base64", lambda frames: "video-data")
+    query_args = ModelQueryArgs(
+        model="test",
+        server_url="http://example.test",
+        api_key=None,
+        temperature=0.2,
+        max_tokens=100,
+    )
+
+    with trial_llm_context(trial=1, telemetry_path=telemetry_path):
+        _describe_initial_scene(query_args, "task", "image-data")
+        _get_visual_differencing_feedback(
+            query_args,
+            "task",
+            ["before-image", "after-image"],
+        )
+        _get_video_differencing_feedback(query_args, "task", [object()])
+
+    assert _telemetry_stages(telemetry_path) == [
+        "visual_feedback",
+        "visual_feedback",
+        "visual_feedback",
+    ]
+
+
+def test_multi_turn_decision_query_uses_multi_turn_stage(tmp_path, monkeypatch):
+    telemetry_path = tmp_path / "multi_turn.jsonl"
+    monkeypatch.setattr(
+        "capx.envs.trial._query_model", lambda args, prompt: _record_current_stage()
+    )
+    monkeypatch.setattr(
+        "capx.envs.trial._build_multi_turn_decision_prompt",
+        lambda *args, **kwargs: [{"role": "user", "content": "decide"}],
+    )
+    args = SimpleNamespace(
+        model="test",
+        use_legacy_multi_turn_decision_prompt=False,
+    )
+    config = {
+        "use_visual_feedback": False,
+        "use_img_differencing": False,
+        "use_video_differencing": False,
+        "use_wrist_camera": False,
+        "use_parallel_ensemble": False,
+    }
+
+    with trial_llm_context(trial=1, telemetry_path=telemetry_path):
+        decision, *_ = _handle_multi_turn_step(
+            object(),
+            {"full_prompt": []},
+            args,
+            config,
+            SimpleNamespace(model="test"),
+            "executed={executed_code} stdout={console_stdout} stderr={console_stderr}",
+            ["print('done')"],
+            1,
+            {"stdout": "", "stderr": ""},
+            "task",
+            [],
+            [],
+            [],
+        )
+
+    assert decision == "finish"
+    assert _telemetry_stages(telemetry_path) == ["multi_turn"]
+
+
+def test_capsule_action_query_uses_capsule_action_stage(tmp_path, monkeypatch):
+    telemetry_path = tmp_path / "capsule.jsonl"
+
+    def fake_query(args, prompt):
+        _record_current_stage()
+        return {"content": '{"action":"finish","args":{}}', "reasoning": None}
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query)
+    with trial_llm_context(trial=1, telemetry_path=telemetry_path):
+        _run_capsule_trial(
+            env=FakeCapsuleEnv(),
+            trial=1,
+            args=SimpleNamespace(model="test", use_oracle_code=False, max_tokens=100),
+            config={
+                "output_dir": str(tmp_path),
+                "max_capsule_steps": 1,
+                "use_parallel_ensemble": False,
+                "use_multimodel": False,
+            },
+            initial_code="x = 1\n",
+        )
+
+    assert _telemetry_stages(telemetry_path) == ["capsule_action"]
 
 
 class FakeMultiTurnEnv:

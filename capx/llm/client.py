@@ -7,6 +7,7 @@ from launch/config utilities.
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import copy
 import json
 import os
@@ -1131,7 +1132,10 @@ def query_model_ensemble(
     tasks = [(m, t) for m, temps in ENSEMBLE_CONFIGS for t in temps]
     responses = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
-        futures = {executor.submit(query_single, m, t): (m, t) for m, t in tasks}
+        futures = {
+            executor.submit(contextvars.copy_context().run, query_single, m, t): (m, t)
+            for m, t in tasks
+        }
         for future in concurrent.futures.as_completed(futures):
             resp = future.result()
             responses.append(resp)
@@ -1290,7 +1294,10 @@ def query_single_model_ensemble(
     temperatures = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     responses = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
-        futures = {executor.submit(query_single, t): t for t in temperatures}
+        futures = {
+            executor.submit(contextvars.copy_context().run, query_single, t): t
+            for t in temperatures
+        }
         for future in concurrent.futures.as_completed(futures):
             resp = future.result()
             responses.append(resp)

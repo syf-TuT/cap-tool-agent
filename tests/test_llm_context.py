@@ -1,15 +1,18 @@
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+import capx.llm.client as client_module
 import capx.llm.context as context_module
 from capx.llm.context import (
     get_trial_llm_context,
     llm_call_stage,
     trial_llm_context,
 )
+from capx.llm.client import ModelQueryArgs
 
 
 TELEMETRY_FIELDS = {
@@ -410,3 +413,97 @@ def test_concurrent_attempt_records_are_complete_and_not_interleaved(tmp_path):
         "elapsed_seconds": pytest.approx(21.35),
         "last_call_index": 50,
     }
+
+
+def test_ensemble_workers_inherit_trial_context_with_unique_call_indices(
+    tmp_path, monkeypatch
+):
+    telemetry_path = tmp_path / "ensemble_calls.jsonl"
+    candidate_barrier = threading.Barrier(2)
+
+    def fake_query_model(args, prompt):
+        context = get_trial_llm_context()
+        assert context is not None
+        if args.model == "candidate-model":
+            candidate_barrier.wait(timeout=2)
+        call_index = context.next_call_index()
+        _record_attempt(
+            context,
+            call_index=call_index,
+            http_status=200,
+            outcome="success",
+            error_kind=None,
+            retry_scheduled=False,
+        )
+        return {"content": "candidate", "reasoning": None}
+
+    monkeypatch.setattr(client_module, "query_model", fake_query_model)
+    monkeypatch.setattr(
+        client_module,
+        "ENSEMBLE_CONFIGS",
+        [("candidate-model", [0.1, 0.2])],
+    )
+    args = ModelQueryArgs(
+        model="unused",
+        server_url="http://example.test",
+        api_key=None,
+        temperature=0.2,
+        max_tokens=100,
+    )
+
+    with trial_llm_context(trial="trial-ensemble", telemetry_path=telemetry_path):
+        with llm_call_stage("initial_code"):
+            result = client_module.query_model_ensemble(
+                args,
+                [{"role": "user", "content": "task"}],
+                synthesis_model="synthesis-model",
+            )
+
+    records = [json.loads(line) for line in telemetry_path.read_text().splitlines()]
+    assert result["content"] == "candidate"
+    assert len(records) == 3
+    assert {record["trial"] for record in records} == {"trial-ensemble"}
+    assert {record["stage"] for record in records} == {"initial_code"}
+    assert sorted(record["call_index"] for record in records) == [1, 2, 3]
+
+
+def test_single_model_ensemble_workers_inherit_trial_context(tmp_path, monkeypatch):
+    telemetry_path = tmp_path / "single_model_ensemble_calls.jsonl"
+
+    def fake_query_model(args, prompt):
+        context = get_trial_llm_context()
+        assert context is not None
+        call_index = context.next_call_index()
+        _record_attempt(
+            context,
+            call_index=call_index,
+            http_status=200,
+            outcome="success",
+            error_kind=None,
+            retry_scheduled=False,
+        )
+        return {"content": "candidate", "reasoning": None}
+
+    monkeypatch.setattr(client_module, "query_model", fake_query_model)
+    args = ModelQueryArgs(
+        model="candidate-model",
+        server_url="http://example.test",
+        api_key=None,
+        temperature=0.2,
+        max_tokens=100,
+    )
+
+    with trial_llm_context(trial="trial-single", telemetry_path=telemetry_path):
+        with llm_call_stage("multi_turn"):
+            result = client_module.query_single_model_ensemble(
+                args,
+                [{"role": "user", "content": "task"}],
+                "candidate-model",
+            )
+
+    records = [json.loads(line) for line in telemetry_path.read_text().splitlines()]
+    assert result["content"] == "candidate"
+    assert len(records) == 10
+    assert {record["trial"] for record in records} == {"trial-single"}
+    assert {record["stage"] for record in records} == {"multi_turn"}
+    assert sorted(record["call_index"] for record in records) == list(range(1, 11))
