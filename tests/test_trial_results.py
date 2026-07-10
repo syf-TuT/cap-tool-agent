@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -201,6 +202,100 @@ def test_start_does_not_overwrite_an_existing_terminal_result(tmp_path):
         TrialResultWriter(tmp_path).start(trial=13, started_at=STARTED_AT)
 
     assert path.read_bytes() == original
+
+
+def test_concurrent_finalizers_cannot_read_running_during_first_terminal_write(
+    tmp_path, monkeypatch
+):
+    writer = TrialResultWriter(tmp_path)
+    path = writer.start(trial=14, started_at=STARTED_AT)
+    first_write_entered = threading.Event()
+    release_first_write = threading.Event()
+    second_started = threading.Event()
+    second_read_entered = threading.Event()
+    original_atomic_write = writer._atomic_write
+    original_read = writer._read
+
+    def controlled_atomic_write(target, value):
+        if (
+            threading.current_thread().name == "first-finalizer"
+            and value["run_outcome"] == RunOutcome.FINISHED.value
+        ):
+            first_write_entered.set()
+            assert release_first_write.wait(timeout=2)
+        original_atomic_write(target, value)
+
+    def observed_read():
+        if threading.current_thread().name == "second-finalizer":
+            second_read_entered.set()
+        return original_read()
+
+    monkeypatch.setattr(writer, "_atomic_write", controlled_atomic_write)
+    monkeypatch.setattr(writer, "_read", observed_read)
+    errors = []
+
+    first = threading.Thread(
+        name="first-finalizer", target=lambda: writer.finalize(_finished_result())
+    )
+
+    def finalize_second():
+        second_started.set()
+        try:
+            writer.finalize(
+                _finished_result(
+                    run_outcome=RunOutcome.CANCELLED,
+                    failure_kind="cancelled",
+                )
+            )
+        except Exception as error:
+            errors.append(error)
+
+    second = threading.Thread(name="second-finalizer", target=finalize_second)
+    first.start()
+    assert first_write_entered.wait(timeout=2)
+    second.start()
+    assert second_started.wait(timeout=2)
+    try:
+        assert not second_read_entered.wait(timeout=0.2)
+    finally:
+        release_first_write.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert _load(path)["run_outcome"] == "finished"
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert "terminal" in str(errors[0])
+
+
+@pytest.mark.parametrize("trial", [True, -1, 1.5, "1"])
+def test_start_rejects_invalid_trial_identifiers(tmp_path, trial):
+    writer = TrialResultWriter(tmp_path)
+
+    with pytest.raises((TypeError, ValueError), match="trial"):
+        writer.start(trial=trial, started_at=STARTED_AT)
+
+
+@pytest.mark.parametrize(
+    "reward", [float("nan"), float("inf"), -float("inf"), True, "1.0"]
+)
+def test_finalize_rejects_invalid_reward(tmp_path, reward):
+    writer = TrialResultWriter(tmp_path)
+    writer.start(trial=15, started_at=STARTED_AT)
+
+    with pytest.raises(ValueError, match="reward"):
+        writer.finalize(_finished_result(reward=reward))
+
+
+@pytest.mark.parametrize("task_completed", [0, 1, "yes"])
+def test_finalize_rejects_nonboolean_task_completed(tmp_path, task_completed):
+    writer = TrialResultWriter(tmp_path)
+    writer.start(trial=16, started_at=STARTED_AT)
+
+    with pytest.raises(TypeError, match="task_completed"):
+        writer.finalize(_finished_result(task_completed=task_completed))
 
 
 def test_old_trial_summary_constructor_remains_valid():

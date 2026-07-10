@@ -6,10 +6,12 @@ import json
 import math
 import os
 import tempfile
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from capx.llm.errors import _sanitize_message
 
@@ -73,12 +75,32 @@ def _nonnegative_float(value: Any, *, field: str) -> float:
 
 
 def _nonnegative_int(value: Any, *, field: str) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{field} must be an integer")
-    number = int(value)
-    if number < 0 or number != value:
+    if value < 0:
         raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _trial_id(value: Any) -> int:
+    return _nonnegative_int(value, field="trial")
+
+
+def _finite_float(value: Any, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be finite")
     return number
+
+
+def _optional_bool(value: Any, *, field: str) -> bool | None:
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise TypeError(f"{field} must be a boolean or None")
+    return value
 
 
 def _empty_llm_accounting() -> dict[str, int | float]:
@@ -125,8 +147,8 @@ def _normalize_result(value: Mapping[str, Any]) -> dict[str, Any]:
     outcome = RunOutcome(value["run_outcome"])
     failure_message = value.get("failure_message")
     return {
-        "schema_version": int(value["schema_version"]),
-        "trial": int(value["trial"]),
+        "schema_version": _nonnegative_int(value["schema_version"], field="schema_version"),
+        "trial": _trial_id(value["trial"]),
         "run_outcome": outcome.value,
         "failure_kind": (
             None if value.get("failure_kind") is None else _safe_message(value["failure_kind"])
@@ -140,8 +162,12 @@ def _normalize_result(value: Mapping[str, Any]) -> dict[str, Any]:
         "elapsed_seconds": _nonnegative_float(
             value.get("elapsed_seconds", 0.0), field="elapsed_seconds"
         ),
-        "reward": None if value.get("reward") is None else float(value["reward"]),
-        "task_completed": value.get("task_completed"),
+        "reward": (
+            None
+            if value.get("reward") is None
+            else _finite_float(value["reward"], field="reward")
+        ),
+        "task_completed": _optional_bool(value.get("task_completed"), field="task_completed"),
         "sandbox_rc": None if value.get("sandbox_rc") is None else int(value["sandbox_rc"]),
         "llm": _normalize_llm_accounting(value.get("llm", {})),
     }
@@ -165,10 +191,9 @@ class TrialResultWriter:
 
         if self._path is not None:
             raise RuntimeError("this writer has already been started")
+        trial = _trial_id(trial)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        path = self.output_dir / f"trial_{int(trial)}_result.json"
-        if path.exists():
-            raise ValueError(f"trial result already exists: {path}")
+        path = self.output_dir / f"trial_{trial}_result.json"
 
         result = _normalize_result(
             {
@@ -187,7 +212,10 @@ class TrialResultWriter:
                 "llm": _empty_llm_accounting(),
             }
         )
-        self._atomic_write(path, result)
+        with self._exclusive_lock(path):
+            if path.exists():
+                raise ValueError(f"trial result already exists: {path}")
+            self._atomic_write(path, result)
         self._path = path
         return path
 
@@ -202,18 +230,22 @@ class TrialResultWriter:
         if requested_outcome is RunOutcome.RUNNING:
             raise ValueError("finalize requires a terminal outcome")
 
-        current = self._read()
-        candidate = _normalize_result({**current, **result})
-        if current["run_outcome"] != RunOutcome.RUNNING.value:
-            if candidate == current:
-                return
-            raise ValueError("trial result is already terminal")
-        if candidate["schema_version"] != SCHEMA_VERSION or candidate["trial"] != current["trial"]:
-            raise ValueError("schema_version and trial cannot change during finalization")
-        if candidate["finished_at"] is None:
-            raise ValueError("a terminal result requires finished_at")
+        with self._exclusive_lock(self.path):
+            current = self._read()
+            candidate = _normalize_result({**current, **result})
+            if current["run_outcome"] != RunOutcome.RUNNING.value:
+                if candidate == current:
+                    return
+                raise ValueError("trial result is already terminal")
+            if (
+                candidate["schema_version"] != SCHEMA_VERSION
+                or candidate["trial"] != current["trial"]
+            ):
+                raise ValueError("schema_version and trial cannot change during finalization")
+            if candidate["finished_at"] is None:
+                raise ValueError("a terminal result requires finished_at")
 
-        self._atomic_write(self.path, candidate)
+            self._atomic_write(self.path, candidate)
 
     def mark_parent_guard_killed(self, *, process_rc: int, elapsed_seconds: float) -> None:
         """Finalize a residual running result after its parent guard kills it."""
@@ -234,6 +266,37 @@ class TrialResultWriter:
         with self.path.open("r", encoding="utf-8") as handle:
             value = json.load(handle)
         return _normalize_result(value)
+
+    @staticmethod
+    @contextmanager
+    def _exclusive_lock(result_path: Path) -> Iterator[None]:
+        """Hold an OS-managed cross-process lock for one result transition."""
+
+        lock_path = result_path.with_name(f".{result_path.name}.lock")
+        # Keep this stable sidecar: unlinking it can let a waiter and a newcomer
+        # lock different inodes, recreating the finalization race.
+        with lock_path.open("a+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
     def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
