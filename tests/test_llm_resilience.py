@@ -180,6 +180,8 @@ def test_llm_query_error_exposes_only_safe_scalar_metadata():
         elapsed_seconds=1.25,
         message=(
             "Authorization: Bearer sk-secret-token api_key=also-secret "
+            "OPENAI_API_KEY=sk-openai-secret "
+            "OPENROUTER_API_KEY=sk-openrouter-secret "
             + "provider unavailable " * 100
         ),
     )
@@ -203,6 +205,8 @@ def test_llm_query_error_exposes_only_safe_scalar_metadata():
     assert len(safe["message"]) <= 512
     assert "sk-secret-token" not in encoded
     assert "also-secret" not in encoded
+    assert "sk-openai-secret" not in encoded
+    assert "sk-openrouter-secret" not in encoded
     assert "Authorization" not in encoded
     assert error.kind is LLMErrorKind.HTTP_5XX
     assert str(error) == safe["message"]

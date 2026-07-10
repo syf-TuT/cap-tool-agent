@@ -27,7 +27,7 @@ _AUTHORIZATION_PATTERN = re.compile(
 )
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 _CREDENTIAL_PATTERN = re.compile(
-    r"(?i)\b(?:api[_-]?key|access[_-]?token|token|secret|password)"
+    r"(?i)\b(?:(?:[a-z0-9]+_)*api[_-]?key|access[_-]?token|token|secret|password)"
     r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 
