@@ -590,17 +590,37 @@ def _query_model_non_streaming(
         ttfb_ms: int | None = None
         try:
             try:
-                response = requests.post(
-                    server_url,
-                    headers=headers,
-                    data=json.dumps(payload),
-                    timeout=request_timeout,
-                    stream=True,
+                attempt_deadline = started + request_timeout
+                response = _call_with_deadline(
+                    lambda: requests.post(
+                        server_url,
+                        headers=headers,
+                        data=json.dumps(payload),
+                        timeout=request_timeout,
+                        stream=True,
+                    ),
+                    deadline=attempt_deadline,
+                    timeout_error=requests.exceptions.ReadTimeout(
+                        "Non-streaming attempt deadline exceeded"
+                    ),
+                    on_late_result=lambda late_response: late_response.close(),
                 )
                 status_code = response.status_code
                 body_chunks = []
                 if 200 <= status_code < 300:
-                    for chunk in response.iter_content(chunk_size=8192):
+                    iterator = iter(response.iter_content(chunk_size=8192))
+                    while True:
+                        try:
+                            chunk = _call_with_deadline(
+                                lambda: next(iterator),
+                                deadline=attempt_deadline,
+                                timeout_error=requests.exceptions.ReadTimeout(
+                                    "Non-streaming attempt deadline exceeded"
+                                ),
+                                on_timeout=response.close,
+                            )
+                        except StopIteration:
+                            break
                         if not chunk:
                             continue
                         if ttfb_ms is None:
@@ -942,6 +962,7 @@ def _streaming_events(
 
     full_content = ""
     full_reasoning = ""
+    stream_finished = False
     response: requests.Response | None = None
     attempt_deadline = metrics.started + request_timeout
     first_content_deadline = metrics.started + first_content_timeout
@@ -1033,6 +1054,7 @@ def _streaming_events(
                     raise _StreamingInvalidResponse("Streaming line was not UTF-8") from error
                 data_str = line_str[6:] if line_str.startswith("data: ") else line_str
                 if data_str == "[DONE]":
+                    stream_finished = True
                     break
                 try:
                     data = json.loads(data_str)
@@ -1072,6 +1094,9 @@ def _streaming_events(
         if response is not None:
             response.close()
 
+    if full_content and not stream_finished:
+        raise requests.exceptions.ConnectionError("Streaming response ended before [DONE]")
+
     yield {
         "type": "done",
         "content": full_content,
@@ -1086,21 +1111,74 @@ def query_model_streaming(
     """Issue one streaming request for direct Web UI consumption."""
     policy = LLMRetryPolicy.from_env()
     context = get_trial_llm_context()
-    remaining = context.remaining_seconds() if context is not None else None
-    request_timeout = policy.request_timeout_seconds
-    if remaining is not None:
-        request_timeout = min(request_timeout, remaining)
-    if request_timeout <= 0:
-        raise TimeoutError("Trial budget exhausted before streaming request")
+    call_index = context.next_call_index() if context is not None else 1
+    call_started = time.monotonic()
+    error_fields = {"call_index": call_index, "call_started": call_started}
+    request_timeout, remaining_before_ms = _attempt_budget(context, policy, 1, **error_fields)
     metrics = _StreamingMetrics(started=time.monotonic())
-    yield from _streaming_events(
-        args,
-        prompt,
-        server_url=args.server_url,
-        request_timeout=request_timeout,
-        first_content_timeout=policy.first_content_timeout_seconds,
-        metrics=metrics,
-    )
+    try:
+        yield from _streaming_events(
+            args,
+            prompt,
+            server_url=args.server_url,
+            request_timeout=request_timeout,
+            first_content_timeout=policy.first_content_timeout_seconds,
+            metrics=metrics,
+        )
+    except (TimeoutError, requests.exceptions.RequestException, _StreamingInvalidResponse) as error:
+        finished = time.monotonic()
+        status_code = metrics.http_status
+        if isinstance(error, _StreamingInvalidResponse):
+            kind, outcome = LLMErrorKind.INVALID_RESPONSE, "invalid_response"
+        elif isinstance(error, TimeoutError):
+            kind, outcome = LLMErrorKind.NO_CONTENT, "no_content"
+        elif status_code is not None and not 200 <= status_code < 300:
+            kind = _http_error_kind(status_code)
+            outcome = (
+                "retryable_http_error"
+                if status_code in _RETRYABLE_HTTP_STATUSES
+                else "http_error"
+            )
+        else:
+            kind, outcome = _request_error_kind(error), "transport_error"
+        if context is not None:
+            context.record_attempt(
+                call_index=call_index,
+                attempt=1,
+                mode="streaming",
+                http_status=status_code,
+                ttfb_ms=metrics.ttfb_ms,
+                first_content_ms=metrics.first_content_ms,
+                started_monotonic=metrics.started,
+                finished_monotonic=finished,
+                remaining_before_ms=remaining_before_ms,
+                outcome=outcome,
+                error_kind=kind.value,
+                retry_scheduled=False,
+            )
+        _raise_query_error(
+            kind=kind,
+            attempt=1,
+            status_code=status_code,
+            message=f"Streaming LLM request failed: {kind.value}",
+            **error_fields,
+        )
+    else:
+        if context is not None:
+            context.record_attempt(
+                call_index=call_index,
+                attempt=1,
+                mode="streaming",
+                http_status=metrics.http_status,
+                ttfb_ms=metrics.ttfb_ms,
+                first_content_ms=metrics.first_content_ms,
+                started_monotonic=metrics.started,
+                finished_monotonic=time.monotonic(),
+                remaining_before_ms=remaining_before_ms,
+                outcome="success",
+                error_kind=None,
+                retry_scheduled=False,
+            )
 
 
 def query_model_ensemble(
@@ -1126,7 +1204,13 @@ def query_model_ensemble(
         except Exception as e:
             error_msg = str(e)
             print(f"[Multimodel Ensemble] {model} temp={temp} FAILED: {error_msg}")
-            return {"model": model, "temp": temp, "content": error_msg, "ok": False}
+            return {
+                "model": model,
+                "temp": temp,
+                "content": error_msg,
+                "ok": False,
+                "error": e,
+            }
 
     # Build all (model, temp) pairs and query in parallel
     tasks = [(m, t) for m, temps in ENSEMBLE_CONFIGS for t in temps]
@@ -1148,6 +1232,12 @@ def query_model_ensemble(
         print("\n=== All ensemble queries failed. Errors: ===")
         for r in responses:
             print(f"  {r['model']} temp={r['temp']}: {r['content']}")
+        typed_error = next(
+            (response["error"] for response in responses if isinstance(response.get("error"), LLMQueryError)),
+            None,
+        )
+        if typed_error is not None:
+            raise typed_error
         raise RuntimeError("All ensemble queries failed")
 
     # Build synthesis prompt
@@ -1288,7 +1378,13 @@ def query_single_model_ensemble(
         except Exception as e:
             error_msg = str(e)
             print(f"[Single Model Ensemble] {model} temp={temp} FAILED: {error_msg}")
-            return {"model": model, "temp": temp, "content": error_msg, "ok": False}
+            return {
+                "model": model,
+                "temp": temp,
+                "content": error_msg,
+                "ok": False,
+                "error": e,
+            }
 
     # Query same model with 9 different temperatures (0.1 to 0.9)
     temperatures = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -1310,6 +1406,12 @@ def query_single_model_ensemble(
         print("\n=== All single model ensemble queries failed. Errors: ===")
         for r in responses:
             print(f"  {r['model']} temp={r['temp']}: {r['content']}")
+        typed_error = next(
+            (response["error"] for response in responses if isinstance(response.get("error"), LLMQueryError)),
+            None,
+        )
+        if typed_error is not None:
+            raise typed_error
         raise RuntimeError("All single model ensemble queries failed")
 
     # Build synthesis prompt

@@ -8,7 +8,13 @@ from types import SimpleNamespace
 import pytest
 import requests
 
-from capx.llm.client import _call_with_deadline, query_model, query_model_streaming
+from capx.llm.client import (
+    _call_with_deadline,
+    query_model,
+    query_model_ensemble,
+    query_model_streaming,
+    query_single_model_ensemble,
+)
 from capx.llm.context import TelemetryWriteError, trial_llm_context
 from capx.llm.errors import LLMErrorKind, LLMQueryError
 
@@ -364,12 +370,10 @@ def test_streaming_query_times_out_before_first_content(monkeypatch):
         reasoning_effort="minimal",
     )
 
-    try:
+    with pytest.raises(LLMQueryError) as raised:
         list(query_model_streaming(args, [{"role": "user", "content": "hi"}]))
-    except TimeoutError as exc:
-        assert "No content delta" in str(exc)
-    else:
-        raise AssertionError("expected first-content timeout")
+
+    assert raised.value.kind is LLMErrorKind.NO_CONTENT
 
 
 def test_streaming_503_retries_in_streaming_mode(monkeypatch):
@@ -733,6 +737,94 @@ def test_direct_streaming_generator_remains_single_attempt_and_event_compatible(
     assert [event["type"] for event in events] == ["reasoning_delta", "content_delta", "done"]
     assert len(calls) == 1
     assert response.closed is True
+
+
+def test_direct_streaming_records_trial_telemetry(monkeypatch, tmp_path):
+    _streaming_policy(monkeypatch, attempts=1)
+    response = _ScriptedStreamingResponse(
+        lines=[(0, _sse({"content": "answer"})), (0, b"data: [DONE]")]
+    )
+    monkeypatch.setattr("capx.llm.client.requests.post", lambda *args, **kwargs: response)
+    telemetry = tmp_path / "calls.jsonl"
+
+    with trial_llm_context(trial=9, telemetry_path=telemetry):
+        assert list(query_model_streaming(_args(), [{"role": "user", "content": "hi"}]))[-1][
+            "content"
+        ] == "answer"
+
+    records = [json.loads(line) for line in telemetry.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["call_index"] == 1
+    assert records[0]["attempt"] == 1
+    assert records[0]["mode"] == "streaming"
+    assert records[0]["outcome"] == "success"
+
+
+def test_streaming_eof_after_partial_content_falls_back_once(monkeypatch):
+    _streaming_policy(monkeypatch)
+    partial = _ScriptedStreamingResponse(lines=[(0, _sse({"content": "partial"}))])
+    fallback = _NonStreamingResponse(body={"choices": [{"message": {"content": "replacement"}}]})
+    responses = [partial, fallback]
+    payloads = []
+
+    def fake_post(*args, data, **kwargs):
+        payloads.append(json.loads(data))
+        return responses.pop(0)
+
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+
+    result = query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert result["content"] == "replacement"
+    assert [payload.get("stream", False) for payload in payloads] == [True, False]
+
+
+def test_non_streaming_slow_body_cannot_exceed_attempt_deadline(monkeypatch):
+    _non_streaming_policy(monkeypatch, timeout=0.03, backoff=0)
+
+    class SlowResponse(_NonStreamingResponse):
+        def iter_content(self, chunk_size=8192):
+            del chunk_size
+            time.sleep(0.08)
+            yield json.dumps({"choices": [{"message": {"content": "late"}}]}).encode()
+
+    slow = SlowResponse()
+    fallback = _NonStreamingResponse(body={"choices": [{"message": {"content": "ok"}}]})
+    responses = [slow, fallback]
+    monkeypatch.setattr("capx.llm.client.requests.post", lambda *args, **kwargs: responses.pop(0))
+    monkeypatch.setattr("capx.llm.client.random.uniform", lambda *_args: 0.0)
+
+    started = time.monotonic()
+    result = query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert result["content"] == "ok"
+    assert time.monotonic() - started < 0.07
+    assert slow.closed is True
+
+
+@pytest.mark.parametrize("ensemble", [query_model_ensemble, query_single_model_ensemble])
+def test_all_llm_failed_ensemble_reraises_typed_error(monkeypatch, ensemble):
+    error = LLMQueryError(
+        kind=LLMErrorKind.HTTP_5XX,
+        call_index=3,
+        attempt=2,
+        status_code=503,
+        elapsed_seconds=1.0,
+        message="provider unavailable",
+    )
+    monkeypatch.setattr(
+        "capx.llm.client.query_model",
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr("capx.llm.client.ENSEMBLE_CONFIGS", [("model", [0.1])])
+
+    with pytest.raises(LLMQueryError) as raised:
+        if ensemble is query_single_model_ensemble:
+            ensemble(_args(), [{"role": "user", "content": "hi"}], model="model")
+        else:
+            ensemble(_args(), [{"role": "user", "content": "hi"}])
+
+    assert raised.value is error
 
 
 def test_non_streaming_503_then_200_retries_once_and_succeeds(monkeypatch):

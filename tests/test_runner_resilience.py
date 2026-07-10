@@ -8,6 +8,7 @@ import pytest
 from capx.envs import runner
 from capx.llm.context import llm_call_stage
 from capx.llm.errors import LLMErrorKind, LLMQueryError
+from capx.llm import client as llm_client
 from capx.utils.launch_utils import TrialSummary, _print_and_save_summary
 
 
@@ -86,6 +87,43 @@ def test_typed_llm_failure_is_persisted_without_retrying_whole_trial(tmp_path, m
     assert summary.failure_kind == "http_5xx"
     assert result["run_outcome"] == "llm_failed"
     assert result["failure_kind"] == "http_5xx"
+
+
+def test_all_llm_failed_ensemble_is_classified_as_llm_failure(tmp_path, monkeypatch):
+    error = LLMQueryError(
+        kind=LLMErrorKind.HTTP_5XX,
+        call_index=2,
+        attempt=2,
+        status_code=503,
+        elapsed_seconds=1.0,
+        message="provider unavailable",
+    )
+    llm_args = SimpleNamespace(
+        model="test-model",
+        server_url="http://localhost:1",
+        api_key=None,
+        temperature=0.2,
+        max_tokens=32,
+        reasoning_effort="minimal",
+    )
+    monkeypatch.setattr(llm_client, "ENSEMBLE_CONFIGS", [("test-model", [0.1])])
+    monkeypatch.setattr(
+        llm_client,
+        "query_model",
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_run_single_trial",
+        lambda *args, **kwargs: llm_client.query_model_ensemble(
+            llm_args, [{"role": "user", "content": "hi"}]
+        ),
+    )
+
+    summary = runner._run_trial_with_retries(object(), 1, _args(), _config(tmp_path), None)
+
+    assert summary.run_outcome == "llm_failed"
+    assert json.loads((tmp_path / "trial_1_result.json").read_text())["failure_kind"] == "http_5xx"
 
 
 def test_typed_trial_budget_llm_error_is_classified_as_budget_exhausted(tmp_path, monkeypatch):
