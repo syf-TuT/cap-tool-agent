@@ -20,6 +20,13 @@ _active_context: ContextVar[TrialLLMContext | None] = ContextVar(
 _active_stage: ContextVar[str] = ContextVar("active_llm_call_stage", default=_DEFAULT_STAGE)
 
 
+class TelemetryWriteError(RuntimeError):
+    """Raised when an attempt record cannot be durably persisted."""
+
+    def __init__(self) -> None:
+        super().__init__("failed to persist LLM attempt telemetry")
+
+
 @dataclass
 class TrialLLMContext:
     """Mutable accounting shared by all LLM calls within one trial."""
@@ -67,8 +74,22 @@ class TrialLLMContext:
         retry_scheduled: bool,
     ) -> None:
         """Account for and durably append one HTTP attempt."""
-        duration_seconds = max(0.0, finished_monotonic - started_monotonic)
-        remaining_after = self.remaining_seconds()
+        self._validate_attempt(
+            call_index=call_index,
+            attempt=attempt,
+            ttfb_ms=ttfb_ms,
+            first_content_ms=first_content_ms,
+            started_monotonic=started_monotonic,
+            finished_monotonic=finished_monotonic,
+            remaining_before_ms=remaining_before_ms,
+            retry_scheduled=retry_scheduled,
+        )
+        duration_seconds = finished_monotonic - started_monotonic
+        remaining_after = (
+            None
+            if self.deadline_monotonic is None
+            else max(0.0, self.deadline_monotonic - finished_monotonic)
+        )
         remaining_after_ms = (
             None if remaining_after is None else int(round(remaining_after * 1000))
         )
@@ -90,16 +111,49 @@ class TrialLLMContext:
         }
 
         with self._lock:
+            if self.telemetry_path is not None:
+                try:
+                    self.telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+                    with self.telemetry_path.open("a", encoding="utf-8") as telemetry_file:
+                        telemetry_file.write(json.dumps(record, separators=(",", ":")) + "\n")
+                        telemetry_file.flush()
+                        os.fsync(telemetry_file.fileno())
+                except OSError as error:
+                    raise TelemetryWriteError() from error
             self._attempt_count += 1
             if attempt > 1:
                 self._retry_count += 1
             self._elapsed_seconds += duration_seconds
-            if self.telemetry_path is not None:
-                self.telemetry_path.parent.mkdir(parents=True, exist_ok=True)
-                with self.telemetry_path.open("a", encoding="utf-8") as telemetry_file:
-                    telemetry_file.write(json.dumps(record, separators=(",", ":")) + "\n")
-                    telemetry_file.flush()
-                    os.fsync(telemetry_file.fileno())
+
+    @staticmethod
+    def _validate_attempt(
+        *,
+        call_index: int,
+        attempt: int,
+        ttfb_ms: int | None,
+        first_content_ms: int | None,
+        started_monotonic: float,
+        finished_monotonic: float,
+        remaining_before_ms: int | None,
+        retry_scheduled: bool,
+    ) -> None:
+        if isinstance(call_index, bool) or not isinstance(call_index, int) or call_index < 1:
+            raise ValueError("call_index must be a positive integer")
+        if isinstance(attempt, bool) or attempt not in (1, 2):
+            raise ValueError("attempt must be 1 or 2")
+        for name, value in (
+            ("started_monotonic", started_monotonic),
+            ("finished_monotonic", finished_monotonic),
+            ("ttfb_ms", ttfb_ms),
+            ("first_content_ms", first_content_ms),
+            ("remaining_before_ms", remaining_before_ms),
+        ):
+            if value is not None and value < 0:
+                raise ValueError(f"{name} cannot be negative")
+        if finished_monotonic < started_monotonic:
+            raise ValueError("finished_monotonic cannot precede started_monotonic")
+        if not isinstance(retry_scheduled, bool):
+            raise ValueError("retry_scheduled must be a boolean")
 
     def summary(self) -> dict[str, int | float]:
         """Return a thread-safe scalar snapshot of LLM accounting."""
