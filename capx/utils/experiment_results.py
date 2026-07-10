@@ -53,11 +53,13 @@ def finalize_parent_guard_exit(result_path: Path, process_rc: int, elapsed_secon
     path = Path(result_path)
     if process_rc != 124 or not path.is_file():
         return False
-    _trial_from_path(path)
+    try:
+        trial = _trial_from_path(path)
+    except ValueError:
+        return False
     return TrialResultWriter.open_existing(path).try_mark_parent_guard_killed(
-        process_rc=process_rc, elapsed_seconds=elapsed_seconds
+        process_rc=process_rc, elapsed_seconds=elapsed_seconds, expected_trial=trial
     )
-    return True
 
 
 def aggregate_trial_results(results: Iterable[Mapping[str, Any]]) -> dict[str, Any]:

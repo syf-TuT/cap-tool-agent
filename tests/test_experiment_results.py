@@ -171,6 +171,42 @@ def test_parent_guard_finalizes_only_residual_running_result(tmp_path):
     assert json.loads(finished_path.read_text())["run_outcome"] == "finished"
 
 
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "{not json",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "trial": 13,
+                "run_outcome": "running",
+            }
+        ),
+    ],
+)
+def test_parent_guard_returns_false_for_invalid_result_and_preserves_diagnostic(tmp_path, contents):
+    path = tmp_path / "trial_13_result.json"
+    path.write_text(contents, encoding="utf-8")
+
+    assert finalize_parent_guard_exit(path, process_rc=124, elapsed_seconds=480.0) is False
+    assert path.read_text(encoding="utf-8") == contents
+    assert load_trial_result(tmp_path, 13)["result_source"] in {"corrupt", "invalid_schema"}
+
+
+def test_parent_guard_returns_false_when_path_trial_differs_from_payload_trial(tmp_path):
+    path = _write_result(
+        tmp_path, 14, outcome=RunOutcome.FINISHED, reward=1.0, task_completed=True
+    )
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["trial"] = 15
+    value["run_outcome"] = "running"
+    value["finished_at"] = None
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+    assert finalize_parent_guard_exit(path, process_rc=124, elapsed_seconds=480.0) is False
+    assert json.loads(path.read_text(encoding="utf-8"))["trial"] == 15
+
+
 def test_aggregate_counts_outcomes_and_uses_finished_only_denominators():
     summary = aggregate_trial_results(
         [

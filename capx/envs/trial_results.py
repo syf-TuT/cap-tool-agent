@@ -288,11 +288,22 @@ class TrialResultWriter:
             }
         )
 
-    def try_mark_parent_guard_killed(self, *, process_rc: int, elapsed_seconds: float) -> bool:
+    def try_mark_parent_guard_killed(
+        self,
+        *,
+        process_rc: int,
+        elapsed_seconds: float,
+        expected_trial: int | None = None,
+    ) -> bool:
         """Atomically mark only a currently-running record as parent-guard killed."""
 
         with self._exclusive_lock(self.path):
-            current = self._read()
+            try:
+                current = self._read()
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+                return False
+            if expected_trial is not None and current["trial"] != expected_trial:
+                return False
             if current["run_outcome"] != RunOutcome.RUNNING.value:
                 return False
             candidate = self._terminal_candidate(

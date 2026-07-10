@@ -66,8 +66,10 @@ Each logical LLM call has at most two HTTP attempts. The canonical controls are
 non-streaming timeout variables remain supported as compatibility aliases.
 
 The complete trial timeout includes environment reset, LLM calls, simulation, and
-artifact writing. Keep the external parent guard 30 seconds longer so a child can
-persist its terminal record:
+artifact writing. `CAPX_PARENT_TIMEOUT_GRACE_SECONDS` is an **external parent-runner
+contract**, not a child-runner setting that CaP-X applies automatically. The caller
+must keep its external guard 30 seconds longer so a child can persist its terminal
+record:
 
 ```python
 TRIAL_TIMEOUT_SECONDS = 450
@@ -83,8 +85,8 @@ canonical schema-v1 trial record. Its `run_outcome` is one of `running`,
 `cancelled`, or `parent_guard_killed`. Reward and task-completion rates must use
 only `finished` records as their denominator.
 
-After a parent process exits with return code 124, finalize only a residual
-`running` record (never overwrite terminal evidence):
+After the external parent runner exits with return code 124, it must finalize only
+a residual `running` record (never overwrite terminal evidence):
 
 ```python
 from capx.utils.experiment_results import finalize_parent_guard_exit
