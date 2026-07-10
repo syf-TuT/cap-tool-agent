@@ -20,6 +20,7 @@ from typing import Iterator
 import pytest
 
 from capx.envs.trial_results import RunOutcome, TrialResultWriter
+from capx.llm import client as llm_client
 from capx.llm.client import query_model
 from capx.llm.context import trial_llm_context
 from capx.llm.errors import LLMErrorKind, LLMQueryError
@@ -138,6 +139,7 @@ def _args(server_url: str) -> SimpleNamespace:
 
 
 def _policy(monkeypatch: pytest.MonkeyPatch, *, streaming: bool = False) -> None:
+    monkeypatch.setattr("capx.llm.client.random.uniform", lambda _lower, _upper: 0.0)
     monkeypatch.setenv("CAPX_LLM_MAX_ATTEMPTS", "2")
     monkeypatch.setenv("CAPX_LLM_REQUEST_TIMEOUT_SECONDS", "1")
     monkeypatch.setenv("CAPX_LLM_RETRY_BACKOFF_SECONDS", "0")
@@ -150,6 +152,12 @@ def _policy(monkeypatch: pytest.MonkeyPatch, *, streaming: bool = False) -> None
         monkeypatch.setenv("CAPX_FORCE_STREAMING_CHAT_COMPLETIONS", "1")
     else:
         monkeypatch.delenv("CAPX_FORCE_STREAMING_CHAT_COMPLETIONS", raising=False)
+
+
+def test_fault_policy_uses_no_retry_jitter(monkeypatch):
+    _policy(monkeypatch)
+
+    assert llm_client.random.uniform(0.0, 0.5) == 0.0
 
 
 def _telemetry(path: Path) -> list[dict]:
