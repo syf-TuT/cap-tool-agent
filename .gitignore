@@ -20,6 +20,8 @@ env/
 .codex-downloads/
 .codex-results/
 .codex-upload/
+/.codex_runs/
+/.codex_sync_*.bundle
 .claude/
 .agents/
 .pytest_cache/
