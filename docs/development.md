@@ -55,6 +55,54 @@ ruff format         # format
 
 When contributing, please use ruff (automatically installed) for linting. See [ruff docs](https://docs.astral.sh/ruff/tutorial/#getting-started).
 
+## LLM call resilience and experiment results
+
+Each logical LLM call has at most two HTTP attempts. The canonical controls are
+`CAPX_LLM_MAX_ATTEMPTS` (default `2`), `CAPX_LLM_REQUEST_TIMEOUT_SECONDS`
+(default `60`), `CAPX_LLM_RETRY_BACKOFF_SECONDS` (default `1`), and
+`CAPX_LLM_RETRY_AFTER_CAP_SECONDS` (default `10`),
+`CAPX_TRIAL_TIMEOUT_SECONDS` (default `450`), and
+`CAPX_PARENT_TIMEOUT_GRACE_SECONDS` (default `30`). Existing streaming and
+non-streaming timeout variables remain supported as compatibility aliases.
+
+The complete trial timeout includes environment reset, LLM calls, simulation, and
+artifact writing. `CAPX_PARENT_TIMEOUT_GRACE_SECONDS` is an **external parent-runner
+contract**, not a child-runner setting that CaP-X applies automatically. The caller
+must keep its external guard 30 seconds longer so a child can persist its terminal
+record:
+
+```python
+TRIAL_TIMEOUT_SECONDS = 450
+PARENT_TIMEOUT_GRACE_SECONDS = 30
+PARENT_TIMEOUT_SECONDS = TRIAL_TIMEOUT_SECONDS + PARENT_TIMEOUT_GRACE_SECONDS  # 480 seconds
+```
+
+For each trial, `<seed-output-dir>/llm_calls_trial_<trial>.jsonl` records one
+redacted attempt row with call index, HTTP status, TTFB, total duration, and
+remaining trial budget. `<seed-output-dir>/trial_<trial>_result.json` is the
+canonical schema-v1 trial record. Its `run_outcome` is one of `running`,
+`finished`, `llm_failed`, `trial_budget_exhausted`, `execution_failed`,
+`cancelled`, or `parent_guard_killed`. Reward and task-completion rates must use
+only `finished` records as their denominator.
+
+After the external parent runner exits with return code 124, it must finalize only
+a residual `running` record (never overwrite terminal evidence):
+
+```python
+from capx.utils.experiment_results import finalize_parent_guard_exit
+
+finalize_parent_guard_exit(result_path, process_rc=124, elapsed_seconds=480.0)
+```
+
+For local diagnosis, inspect the result and its attempt telemetry without printing
+prompts, responses, or credentials:
+
+```bash
+cat trial_01_result.json
+python -m json.tool trial_01_result.json
+tail -n 20 llm_calls_trial_01.jsonl
+```
+
 ## SAM3 access
 
 SAM3 by facebookresearch is currently not yet an accessible HuggingFace autogenerator module, so we install it as a package via third party integrations. Before using SAM 3, please request access to the checkpoints on the SAM 3 Hugging Face repo: https://github.com/facebookresearch/sam3

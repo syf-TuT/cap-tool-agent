@@ -142,6 +142,40 @@ uv run --no-sync --active capx/serving/openrouter_server.py --key-file .openrout
 
 See [docs/configuration.md](docs/configuration.md) for all provider options (OpenRouter, vLLM, custom).
 
+### LLM failure accounting and time limits
+
+Each logical LLM call makes at most **two** HTTP attempts. The defaults are a 60-second
+request timeout, a one-second retry backoff (with small jitter), and a `Retry-After` cap of
+10 seconds. Configure them with the canonical environment variables below; existing streaming
+and non-streaming retry/timeout variables are still accepted for compatibility.
+
+```bash
+export CAPX_LLM_MAX_ATTEMPTS=2
+export CAPX_LLM_REQUEST_TIMEOUT_SECONDS=60
+export CAPX_LLM_RETRY_BACKOFF_SECONDS=1
+export CAPX_LLM_RETRY_AFTER_CAP_SECONDS=10
+export CAPX_TRIAL_TIMEOUT_SECONDS=450
+export CAPX_PARENT_TIMEOUT_GRACE_SECONDS=30
+```
+
+Never put a provider key in these variables, logs, result files, or committed configuration.
+Keep it in an ignored key file such as `.openrouterkey`. CaP-X records no prompts, responses,
+images, authorization headers, or keys in its resilience artifacts.
+
+For each trial, the seed output directory contains append-only attempt telemetry at
+`llm_calls_trial_<trial>.jsonl` and a canonical structured result at
+`trial_<trial>_result.json`. Each telemetry row has the logical call index, HTTP status,
+attempt, time-to-first-byte (TTFB), total duration, and remaining trial budget, along with
+the failure classification. Trial outcomes are `finished`, `llm_failed`,
+`trial_budget_exhausted`, `execution_failed`, `cancelled`, or `parent_guard_killed`; only
+`finished` trials contribute to reward and task-completion averages.
+
+The 450-second trial budget covers **all** work in the trial: environment setup, LLM waiting,
+simulation, and execution. If invoking a child process from a batch runner, set its external
+parent guard to 480 seconds (`450 + 30`): the final 30 seconds are reserved for saving the
+structured result and final telemetry. When that guard returns exit code 124, call
+`finalize_parent_guard_exit()` so a residual `running` result becomes `parent_guard_killed`.
+
 ### 3. Run evaluation
 
 ```bash

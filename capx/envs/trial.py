@@ -49,6 +49,7 @@ from capx.llm.client import (
     query_model_ensemble as _query_model_ensemble,
     query_single_model_ensemble as _query_single_model_ensemble,
 )
+from capx.llm.context import llm_call_stage
 from capx.utils.launch_utils import (
     TrialSummary,
     _build_multi_turn_decision_prompt,
@@ -341,7 +342,8 @@ def _describe_initial_scene(
         },
         {"role": "user", "content": user_content},
     ]
-    return _query_model(visual_differencing_args, prompt)["content"]
+    with llm_call_stage("visual_feedback"):
+        return _query_model(visual_differencing_args, prompt)["content"]
 
 
 def _get_visual_differencing_feedback(
@@ -398,7 +400,8 @@ def _get_visual_differencing_feedback(
         },
         {"role": "user", "content": user_content},
     ]
-    return _query_model(visual_differencing_args, prompt)["content"]
+    with llm_call_stage("visual_feedback"):
+        return _query_model(visual_differencing_args, prompt)["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +477,8 @@ def _get_video_differencing_feedback(
         },
         {"role": "user", "content": user_content},
     ]
-    return _query_model(visual_differencing_args, prompt)["content"]
+    with llm_call_stage("visual_feedback"):
+        return _query_model(visual_differencing_args, prompt)["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -499,16 +503,21 @@ def _query_initial_code(
     if config["use_parallel_ensemble"]:
         if config.get("use_multimodel", False):
             print("RUNNING MULTIMODEL ENSEMBLE QUERY")
-            out = _query_model_ensemble(args, obs["full_prompt"], is_multiturn=False)
+            with llm_call_stage("initial_code"):
+                out = _query_model_ensemble(args, obs["full_prompt"], is_multiturn=False)
         else:
             print("RUNNING SINGLE MODEL ENSEMBLE QUERY")
-            out = _query_single_model_ensemble(args, obs["full_prompt"], args.model, is_multiturn=False)
+            with llm_call_stage("initial_code"):
+                out = _query_single_model_ensemble(
+                    args, obs["full_prompt"], args.model, is_multiturn=False
+                )
         ensemble_data = {
             "ensemble_candidates_txt": out["ensemble_candidates_txt"],
             "ensemble_synthesis_txt": out["ensemble_synthesis_txt"],
         }
     else:
-        out = _query_model(args, obs["full_prompt"])
+        with llm_call_stage("initial_code"):
+            out = _query_model(args, obs["full_prompt"])
 
     return out["content"], out["reasoning"], ensemble_data
 
@@ -620,16 +629,21 @@ def _handle_multi_turn_step(
     if config["use_parallel_ensemble"]:
         if config.get("use_multimodel", False):
             print("RUNNING MULTITURN MULTIMODEL ENSEMBLE QUERY")
-            content = _query_model_ensemble(args, decision_prompt, is_multiturn=True)
+            with llm_call_stage("multi_turn"):
+                content = _query_model_ensemble(args, decision_prompt, is_multiturn=True)
         else:
             print("RUNNING MULTITURN SINGLE MODEL ENSEMBLE QUERY")
-            content = _query_single_model_ensemble(args, decision_prompt, args.model, is_multiturn=True)
+            with llm_call_stage("multi_turn"):
+                content = _query_single_model_ensemble(
+                    args, decision_prompt, args.model, is_multiturn=True
+                )
         multiturn_ensemble_entry = {
             "ensemble_candidates_txt": content.get("ensemble_candidates_txt", ""),
             "ensemble_synthesis_txt": content.get("ensemble_synthesis_txt", ""),
         }
     else:
-        content = _query_model(args, decision_prompt)
+        with llm_call_stage("multi_turn"):
+            content = _query_model(args, decision_prompt)
 
     reasoning = content["reasoning"]
     decision, new_code = _parse_multi_turn_decision(content["content"])
@@ -756,7 +770,8 @@ def _run_capsule_trial(
                     action = RuntimeAction.from_mapping(script[script_idx])
                     script_idx += 1
             else:
-                response = _query_model(action_query_args, prompt)
+                with llm_call_stage("capsule_action"):
+                    response = _query_model(action_query_args, prompt)
                 action = parse_runtime_action_response(response["content"])
             action.step_id = step_id
         except ValueError as exc:
@@ -1449,12 +1464,6 @@ def _run_single_trial(
 
     # --- 1. Reset environment ---
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
-    # Reset the SIGALRM timer AFTER env.reset() so the timeout only covers
-    # actual task execution, not scene loading / cuRobo JIT compilation.
-    import signal
-    remaining = signal.alarm(0)  # cancel current alarm
-    if remaining > 0:
-        signal.alarm(1000)  # restart fresh 1000s from now
     obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
     _patch_libero_goal(env, obs)
 

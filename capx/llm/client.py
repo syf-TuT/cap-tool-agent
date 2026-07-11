@@ -7,16 +7,24 @@ from launch/config utilities.
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import copy
 import json
 import os
+import queue
 import random
+import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import requests
+from urllib3.util import Timeout as Urllib3Timeout
+
+from capx.llm.context import TrialLLMContext, get_trial_llm_context
+from capx.llm.errors import LLMErrorKind, LLMQueryError
+from capx.llm.resilience import LLMRetryPolicy
 
 if TYPE_CHECKING:
     from capx.envs.launch import LaunchArgs
@@ -122,6 +130,230 @@ def _reasoning_disabled() -> bool:
     return os.getenv("CAPX_DISABLE_REASONING") == "1"
 
 
+_RETRYABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
+
+
+def _http_error_kind(status_code: int) -> LLMErrorKind:
+    if status_code == 429:
+        return LLMErrorKind.RATE_LIMITED
+    if status_code >= 500:
+        return LLMErrorKind.HTTP_5XX
+    if status_code in (401, 403):
+        return LLMErrorKind.AUTH_ERROR
+    return LLMErrorKind.REQUEST_REJECTED
+
+
+def _request_error_kind(error: requests.exceptions.RequestException) -> LLMErrorKind:
+    if isinstance(error, requests.exceptions.ConnectTimeout):
+        return LLMErrorKind.CONNECT_TIMEOUT
+    if isinstance(error, (requests.exceptions.ReadTimeout, requests.exceptions.Timeout)):
+        return LLMErrorKind.READ_TIMEOUT
+    return LLMErrorKind.CONNECTION_ERROR
+
+
+def _retry_delay(response: requests.Response | None, policy: LLMRetryPolicy) -> float:
+    headers = None if response is None else response.headers
+    return _retry_delay_from_headers(headers, policy)
+
+
+def _retry_delay_from_headers(
+    headers: Mapping[str, str] | None, policy: LLMRetryPolicy
+) -> float:
+    delay = policy.retry_backoff_seconds + random.uniform(0, policy.retry_jitter_seconds)
+    if headers is None:
+        return delay
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            numeric_retry_after = max(0.0, float(retry_after))
+        except ValueError:
+            pass
+        else:
+            delay = max(delay, min(numeric_retry_after, policy.retry_after_cap_seconds))
+    return delay
+
+
+def _retry_fits_budget(
+    remaining_seconds: float | None,
+    delay_seconds: float,
+    policy: LLMRetryPolicy,
+) -> bool:
+    """Reserve both the retry delay and the minimum attempt budget; equality is allowed."""
+    return remaining_seconds is None or remaining_seconds >= (
+        delay_seconds + policy.minimum_retry_budget_seconds
+    )
+
+
+@dataclass
+class _StreamingMetrics:
+    """Mutable timings captured while a single streaming response is consumed."""
+
+    started: float
+    http_status: int | None = None
+    response_headers: dict[str, str] | None = None
+    ttfb_ms: int | None = None
+    first_content_ms: int | None = None
+
+
+class _StreamingInvalidResponse(RuntimeError):
+    """A streaming response could not be interpreted using the expected schema."""
+
+
+_STREAM_END = object()
+
+
+def _stream_deadline_error(
+    *,
+    waiting_for_content: bool,
+    observed_at: float,
+    first_content_deadline: float,
+    attempt_deadline: float,
+) -> Exception | None:
+    """Classify a deadline using whichever independent deadline expires first."""
+    if observed_at >= attempt_deadline and (
+        not waiting_for_content or attempt_deadline <= first_content_deadline
+    ):
+        return requests.exceptions.ReadTimeout("Streaming attempt deadline exceeded")
+    if waiting_for_content and observed_at >= first_content_deadline:
+        return TimeoutError("No content delta before the first-content deadline")
+    if observed_at >= attempt_deadline:
+        return requests.exceptions.ReadTimeout("Streaming attempt deadline exceeded")
+    return None
+
+
+def _call_with_deadline(
+    call: Callable[[], Any],
+    *,
+    deadline: float,
+    timeout_error: Exception,
+    on_timeout: Callable[[], None] | None = None,
+    on_late_result: Callable[[Any], None] | None = None,
+) -> Any:
+    """Run a potentially blocking Requests operation behind a hard wall-clock deadline."""
+    results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+    cancelled = threading.Event()
+    ownership = threading.Lock()
+
+    def dispose_late_result(succeeded: bool, value: Any) -> None:
+        if succeeded and on_late_result is not None:
+            on_late_result(value)
+
+    def run() -> None:
+        try:
+            result = call()
+        except Exception as error:
+            result_item = (False, error)
+        else:
+            result_item = (True, result)
+        dispose_result = False
+        with ownership:
+            if cancelled.is_set():
+                dispose_result = True
+            else:
+                try:
+                    results.put_nowait(result_item)
+                except queue.Full:
+                    dispose_result = True
+        if dispose_result:
+            dispose_late_result(*result_item)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    try:
+        wait_seconds = max(0.0, deadline - time.monotonic())
+        try:
+            succeeded, value = results.get(timeout=wait_seconds)
+        except queue.Empty:
+            reclaimed_result = None
+            with ownership:
+                cancelled.set()
+                try:
+                    reclaimed_result = results.get_nowait()
+                except queue.Empty:
+                    pass
+            if reclaimed_result is not None:
+                dispose_late_result(*reclaimed_result)
+            if on_timeout is not None:
+                on_timeout()
+            raise timeout_error
+        if time.monotonic() >= deadline:
+            cancelled.set()
+            if succeeded and on_late_result is not None:
+                on_late_result(value)
+            elif on_timeout is not None:
+                on_timeout()
+            raise timeout_error
+        if not succeeded:
+            raise value
+        return value
+    finally:
+        worker.join(timeout=0.01)
+
+
+def _iter_stream_lines_with_deadlines(
+    response: requests.Response,
+    *,
+    metrics: _StreamingMetrics,
+    first_content_deadline: float,
+    attempt_deadline: float,
+) -> Iterable[tuple[bytes, float]]:
+    """Read response lines without letting a blocking socket bypass wall-clock deadlines."""
+    items: queue.Queue[tuple[float, object, Exception | None]] = queue.Queue()
+
+    def read_lines() -> None:
+        try:
+            for line in response.iter_lines():
+                items.put((time.monotonic(), line, None))
+        except Exception as error:
+            items.put((time.monotonic(), _STREAM_END, error))
+        finally:
+            items.put((time.monotonic(), _STREAM_END, None))
+
+    worker = threading.Thread(target=read_lines, daemon=True)
+    worker.start()
+    try:
+        while True:
+            waiting_for_content = metrics.first_content_ms is None
+            active_deadline = attempt_deadline
+            if waiting_for_content:
+                active_deadline = min(active_deadline, first_content_deadline)
+            wait_seconds = max(0.0, active_deadline - time.monotonic())
+            try:
+                received_at, item, error = items.get(timeout=wait_seconds)
+            except queue.Empty:
+                deadline_error = _stream_deadline_error(
+                    waiting_for_content=waiting_for_content,
+                    observed_at=time.monotonic(),
+                    first_content_deadline=first_content_deadline,
+                    attempt_deadline=attempt_deadline,
+                )
+                if deadline_error is None:
+                    deadline_error = requests.exceptions.ReadTimeout(
+                        "Streaming deadline wait ended unexpectedly"
+                    )
+                raise deadline_error
+
+            observed_at = max(received_at, time.monotonic())
+            deadline_error = _stream_deadline_error(
+                waiting_for_content=waiting_for_content,
+                observed_at=observed_at,
+                first_content_deadline=first_content_deadline,
+                attempt_deadline=attempt_deadline,
+            )
+            if deadline_error is not None:
+                raise deadline_error
+            if error is not None:
+                raise error
+            if item is _STREAM_END:
+                return
+            if not isinstance(item, bytes):
+                raise _StreamingInvalidResponse("Streaming response line was not bytes")
+            yield item, received_at
+    finally:
+        response.close()
+        worker.join(timeout=0.01)
+
+
 def _completions_to_responses_convert_prompt(prompt: list[dict]) -> list[dict]:
     """Convert completions api format to responses api format.
 
@@ -181,7 +413,7 @@ def _completions_to_responses_convert_prompt(prompt: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
+def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict[str, Any]:
     """Query vLLM server for code generation.
 
     Args:
@@ -251,134 +483,447 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         payload.pop("reasoning_effort", None)
         payload["thinking"] = {"type": "disabled"}
 
+    policy = LLMRetryPolicy.from_env()
+    context = get_trial_llm_context()
+    call_index = context.next_call_index() if context is not None else 1
+    call_started = time.monotonic()
     if os.getenv("CAPX_FORCE_STREAMING_CHAT_COMPLETIONS") == "1":
-        max_attempts = max(1, int(os.getenv("CAPX_STREAMING_CHAT_COMPLETIONS_RETRIES", "1")))
-        last_exc: BaseException | None = None
-        fallback_to_non_streaming = False
-        for attempt in range(1, max_attempts + 1):
-            print(
-                "Using streaming chat completions for model query "
-                f"(attempt {attempt}/{max_attempts})",
-                flush=True,
-            )
-            content = ""
-            reasoning = None
-            try:
-                for chunk in query_model_streaming(args, prompt):
-                    if chunk["type"] == "content_delta":
-                        content += chunk["content"]
-                    elif chunk["type"] == "done":
-                        content = chunk["content"]
-                        reasoning = chunk.get("reasoning")
-                if os.getenv("CAPX_STREAMING_REQUIRE_CONTENT") == "1" and not content.strip():
-                    raise TimeoutError("Streaming model query returned empty content")
-                return {"content": content, "reasoning": reasoning}
-            except (TimeoutError, requests.exceptions.RequestException) as exc:
-                last_exc = exc
-                empty_streaming_content = (
-                    isinstance(exc, TimeoutError)
-                    and str(exc) == "Streaming model query returned empty content"
-                )
-                if attempt >= max_attempts:
-                    if empty_streaming_content:
-                        print(
-                            "Streaming returned empty content after retries; "
-                            "falling back to non-streaming chat completion",
-                            flush=True,
-                        )
-                        fallback_to_non_streaming = True
-                        break
-                    raise
-                print(f"Streaming model query failed: {exc}. Retrying...", flush=True)
-        if not fallback_to_non_streaming:
-            raise RuntimeError("Streaming model query failed") from last_exc
-
-    start_time = time.time()
-    request_timeout = float(
-        os.getenv(
-            "CAPX_NONSTREAMING_REQUEST_TIMEOUT_SECONDS",
-            os.getenv("CAPX_NON_STREAMING_REQUEST_TIMEOUT_SECONDS", "200"),
+        return _query_model_with_streaming(
+            args=args,
+            prompt=prompt,
+            server_url=server_url,
+            payload=payload,
+            headers=headers,
+            reasoning_disabled=reasoning_disabled,
+            policy=policy,
+            context=context,
+            call_index=call_index,
+            call_started=call_started,
         )
-    )
-    request_retries = max(
-        0,
-        int(
-            os.getenv(
-                "CAPX_NONSTREAMING_REQUEST_RETRIES",
-                os.getenv("CAPX_NON_STREAMING_REQUEST_RETRIES", "0"),
-            )
-        ),
+    return _query_model_non_streaming(
+        args=args,
+        server_url=server_url,
+        payload=payload,
+        headers=headers,
+        reasoning_disabled=reasoning_disabled,
+        policy=policy,
+        context=context,
+        call_index=call_index,
+        call_started=call_started,
+        first_attempt=1,
+        final_attempt=policy.max_attempts,
     )
 
-    def post_non_streaming() -> requests.Response:
-        attempt = 0
-        while True:
+
+def _raise_query_error(
+    *,
+    kind: LLMErrorKind,
+    call_index: int,
+    attempt: int,
+    status_code: int | None,
+    call_started: float,
+    message: str,
+) -> None:
+    raise LLMQueryError(
+        kind=kind,
+        call_index=call_index,
+        attempt=attempt,
+        status_code=status_code,
+        elapsed_seconds=max(0.0, time.monotonic() - call_started),
+        message=message,
+    )
+
+
+def _attempt_budget(
+    context: TrialLLMContext | None,
+    policy: LLMRetryPolicy,
+    attempt: int,
+    **error_fields: Any,
+) -> tuple[float, int | None]:
+    remaining = context.remaining_seconds() if context is not None else None
+    if remaining is not None and remaining <= 0:
+        _raise_query_error(
+            kind=LLMErrorKind.TRIAL_BUDGET_EXHAUSTED,
+            attempt=attempt,
+            status_code=None,
+            message="Trial budget exhausted before LLM request",
+            **error_fields,
+        )
+    request_timeout = policy.request_timeout_seconds
+    if remaining is not None:
+        request_timeout = min(request_timeout, remaining)
+    if request_timeout <= 0:
+        _raise_query_error(
+            kind=LLMErrorKind.TRIAL_BUDGET_EXHAUSTED,
+            attempt=attempt,
+            status_code=None,
+            message="Trial budget cannot cover a positive LLM request timeout",
+            **error_fields,
+        )
+    remaining_ms = None if remaining is None else int(round(remaining * 1000))
+    return request_timeout, remaining_ms
+
+
+def _query_model_non_streaming(
+    *,
+    args: "LaunchArgs | ModelQueryArgs",
+    server_url: str,
+    payload: dict,
+    headers: dict,
+    reasoning_disabled: bool,
+    policy: LLMRetryPolicy,
+    context: TrialLLMContext | None,
+    call_index: int,
+    call_started: float,
+    first_attempt: int,
+    final_attempt: int,
+) -> dict[str, Any]:
+    """Run only the assigned non-streaming attempts for an existing logical call."""
+    error_fields = {"call_index": call_index, "call_started": call_started}
+    for attempt in range(first_attempt, final_attempt + 1):
+        request_timeout, remaining_before_ms = _attempt_budget(
+            context, policy, attempt, **error_fields
+        )
+        started = time.monotonic()
+        response: requests.Response | None = None
+        status_code: int | None = None
+        ttfb_ms: int | None = None
+        try:
             try:
-                return requests.post(
-                    server_url,
-                    headers=headers,
-                    data=json.dumps(payload),
-                    timeout=request_timeout,
+                attempt_deadline = started + request_timeout
+                response = _call_with_deadline(
+                    lambda: requests.post(
+                        server_url,
+                        headers=headers,
+                        data=json.dumps(payload),
+                        timeout=request_timeout,
+                        stream=True,
+                    ),
+                    deadline=attempt_deadline,
+                    timeout_error=requests.exceptions.ReadTimeout(
+                        "Non-streaming attempt deadline exceeded"
+                    ),
+                    on_late_result=lambda late_response: late_response.close(),
                 )
-            except requests.exceptions.Timeout:
-                if attempt >= request_retries:
-                    raise
-                attempt += 1
-                print(
-                    "Non-streaming model query timed out after "
-                    f"{request_timeout:.1f}s; retrying ({attempt}/{request_retries})",
-                    flush=True,
+                status_code = response.status_code
+                body_chunks = []
+                if 200 <= status_code < 300:
+                    iterator = iter(response.iter_content(chunk_size=8192))
+                    while True:
+                        try:
+                            chunk = _call_with_deadline(
+                                lambda: next(iterator),
+                                deadline=attempt_deadline,
+                                timeout_error=requests.exceptions.ReadTimeout(
+                                    "Non-streaming attempt deadline exceeded"
+                                ),
+                                on_timeout=response.close,
+                            )
+                        except StopIteration:
+                            break
+                        if not chunk:
+                            continue
+                        if ttfb_ms is None:
+                            ttfb_ms = int(round((time.monotonic() - started) * 1000))
+                        body_chunks.append(chunk)
+                body_bytes = b"".join(body_chunks)
+            finally:
+                if response is not None:
+                    response.close()
+        except requests.exceptions.RequestException as error:
+            finished = time.monotonic()
+            kind = _request_error_kind(error)
+            can_retry = attempt < final_attempt
+            delay = _retry_delay(response, policy) if can_retry else 0.0
+            remaining = context.remaining_seconds() if context is not None else None
+            budget_allows_retry = _retry_fits_budget(remaining, delay, policy)
+            retry_scheduled = can_retry and budget_allows_retry
+            if context is not None:
+                context.record_attempt(
+                    call_index=call_index,
+                    attempt=attempt,
+                    mode="non_streaming",
+                    http_status=status_code,
+                    ttfb_ms=ttfb_ms,
+                    first_content_ms=None,
+                    started_monotonic=started,
+                    finished_monotonic=finished,
+                    remaining_before_ms=remaining_before_ms,
+                    outcome="retryable_transport_error" if can_retry else "transport_error",
+                    error_kind=kind.value,
+                    retry_scheduled=retry_scheduled,
                 )
+            if retry_scheduled:
+                time.sleep(delay)
+                continue
+            if can_retry and not budget_allows_retry:
+                _raise_query_error(
+                    kind=LLMErrorKind.TRIAL_BUDGET_EXHAUSTED,
+                    attempt=attempt,
+                    status_code=status_code,
+                    message="Trial budget cannot cover the minimum retry budget and delay",
+                    **error_fields,
+                )
+            _raise_query_error(
+                kind=kind,
+                attempt=attempt,
+                status_code=status_code,
+                message=f"LLM transport failed: {kind.value}",
+                **error_fields,
+            )
 
-    # keep calling until it works
-    response = post_non_streaming()
-    retry = 1
-    while response.status_code in [404, 500, 502, 503, 504]:
-        sleep_time = 240 + random.uniform(-90, 90)
-        print(f"Retry {retry}. Model query failed with status code {response.status_code}. Error: {response.text}. Retrying in {sleep_time} seconds...")
-        time.sleep(sleep_time)
-        response = post_non_streaming()
-        retry += 1
+        finished = time.monotonic()
+        if status_code is not None and not 200 <= status_code < 300:
+            kind = _http_error_kind(status_code)
+            can_retry = status_code in _RETRYABLE_HTTP_STATUSES and attempt < final_attempt
+            delay = _retry_delay(response, policy) if can_retry else 0.0
+            remaining = context.remaining_seconds() if context is not None else None
+            budget_allows_retry = _retry_fits_budget(remaining, delay, policy)
+            retry_scheduled = can_retry and budget_allows_retry
+            if context is not None:
+                context.record_attempt(
+                    call_index=call_index,
+                    attempt=attempt,
+                    mode="non_streaming",
+                    http_status=status_code,
+                    ttfb_ms=ttfb_ms,
+                    first_content_ms=None,
+                    started_monotonic=started,
+                    finished_monotonic=finished,
+                    remaining_before_ms=remaining_before_ms,
+                    outcome="retryable_http_error" if can_retry else "http_error",
+                    error_kind=kind.value,
+                    retry_scheduled=retry_scheduled,
+                )
+            if retry_scheduled:
+                time.sleep(delay)
+                continue
+            if can_retry and not budget_allows_retry:
+                _raise_query_error(
+                    kind=LLMErrorKind.TRIAL_BUDGET_EXHAUSTED,
+                    attempt=attempt,
+                    status_code=status_code,
+                    message="Trial budget cannot cover the minimum retry budget and delay",
+                    **error_fields,
+                )
+            _raise_query_error(
+                kind=kind,
+                attempt=attempt,
+                status_code=status_code,
+                message=f"LLM request rejected with HTTP status {status_code}",
+                **error_fields,
+            )
 
-    end_time = time.time()
-    print(f"Time taken to query model: {end_time - start_time:.2f} seconds")
-    response.raise_for_status()
-    body = response.json()
-    out = {}
-    if args.debug:
-        print(json.dumps(body, indent=2))
-    try:
-        if args.model in GPT_MODELS and "codex" in args.model:
-            out["content"] = body["output_text"]
-        else:
-            out["content"] = body["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as exc:
-        raise RuntimeError(f"Unexpected response format: {body}") from exc
-    if body.get("choices") is not None and not reasoning_disabled:
-        out["reasoning"] = body.get("choices")[0].get("message").get("reasoning", None)
-    else:
-        out["reasoning"] = None
-    return out  # type: ignore[return-value]
+        try:
+            body = json.loads(body_bytes)
+            if args.model in GPT_MODELS and "codex" in args.model:
+                content = body["output_text"]
+                reasoning = None
+            else:
+                message = body["choices"][0]["message"]
+                content = message["content"]
+                reasoning = None if reasoning_disabled else message.get("reasoning")
+            if not isinstance(content, str):
+                raise TypeError("response content must be a string")
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, IndexError, TypeError):
+            finished = time.monotonic()
+            if context is not None:
+                context.record_attempt(
+                    call_index=call_index,
+                    attempt=attempt,
+                    mode="non_streaming",
+                    http_status=status_code,
+                    ttfb_ms=ttfb_ms,
+                    first_content_ms=None,
+                    started_monotonic=started,
+                    finished_monotonic=finished,
+                    remaining_before_ms=remaining_before_ms,
+                    outcome="invalid_response",
+                    error_kind=LLMErrorKind.INVALID_RESPONSE.value,
+                    retry_scheduled=False,
+                )
+            _raise_query_error(
+                kind=LLMErrorKind.INVALID_RESPONSE,
+                attempt=attempt,
+                status_code=status_code,
+                message="LLM response was not valid JSON with the expected schema",
+                **error_fields,
+            )
+
+        finished = time.monotonic()
+        if context is not None:
+            context.record_attempt(
+                call_index=call_index,
+                attempt=attempt,
+                mode="non_streaming",
+                http_status=status_code,
+                ttfb_ms=ttfb_ms,
+                first_content_ms=None,
+                started_monotonic=started,
+                finished_monotonic=finished,
+                remaining_before_ms=remaining_before_ms,
+                outcome="success",
+                error_kind=None,
+                retry_scheduled=False,
+            )
+        print(f"Time taken to query model: {finished - call_started:.2f} seconds")
+        return {"content": content, "reasoning": reasoning}
+    raise RuntimeError("bounded non-streaming attempt loop exited unexpectedly")
 
 
-def query_model_streaming(
+def _query_model_with_streaming(
+    *,
     args: "LaunchArgs | ModelQueryArgs",
     prompt: list[dict],
+    server_url: str,
+    payload: dict,
+    headers: dict,
+    reasoning_disabled: bool,
+    policy: LLMRetryPolicy,
+    context: TrialLLMContext | None,
+    call_index: int,
+    call_started: float,
+) -> dict[str, Any]:
+    """Own one logical call across at most two streaming/non-streaming attempts."""
+    error_fields = {"call_index": call_index, "call_started": call_started}
+    for attempt in range(1, policy.max_attempts + 1):
+        request_timeout, remaining_before_ms = _attempt_budget(
+            context, policy, attempt, **error_fields
+        )
+        started = time.monotonic()
+        metrics = _StreamingMetrics(started=started)
+        content = ""
+        reasoning = None
+        try:
+            for event in _streaming_events(
+                args,
+                prompt,
+                server_url=server_url,
+                request_timeout=request_timeout,
+                first_content_timeout=policy.first_content_timeout_seconds,
+                metrics=metrics,
+            ):
+                if event["type"] == "content_delta":
+                    content += event["content"]
+                elif event["type"] == "done":
+                    content = event["content"]
+                    reasoning = event.get("reasoning")
+            if not content.strip():
+                raise TimeoutError("Streaming model query returned no usable content")
+        except (
+            TimeoutError,
+            requests.exceptions.RequestException,
+            _StreamingInvalidResponse,
+        ) as error:
+            finished = time.monotonic()
+            status_code = metrics.http_status
+            prefer_non_streaming = False
+            retryable = True
+            if isinstance(error, _StreamingInvalidResponse):
+                kind = LLMErrorKind.INVALID_RESPONSE
+                retryable = False
+                outcome = "invalid_response"
+            elif isinstance(error, TimeoutError):
+                kind = LLMErrorKind.NO_CONTENT
+                prefer_non_streaming = True
+                outcome = "no_content"
+            elif status_code is not None and not 200 <= status_code < 300:
+                kind = _http_error_kind(status_code)
+                retryable = status_code in _RETRYABLE_HTTP_STATUSES
+                outcome = "retryable_http_error" if retryable else "http_error"
+            else:
+                kind = _request_error_kind(error)
+                prefer_non_streaming = bool(content)
+                outcome = "retryable_transport_error"
+
+            can_retry = retryable and attempt < policy.max_attempts
+            delay = (
+                _retry_delay_from_headers(metrics.response_headers, policy)
+                if can_retry
+                else 0.0
+            )
+            remaining = context.remaining_seconds() if context is not None else None
+            budget_allows_retry = _retry_fits_budget(remaining, delay, policy)
+            retry_scheduled = can_retry and budget_allows_retry
+            if context is not None:
+                context.record_attempt(
+                    call_index=call_index,
+                    attempt=attempt,
+                    mode="streaming",
+                    http_status=status_code,
+                    ttfb_ms=metrics.ttfb_ms,
+                    first_content_ms=metrics.first_content_ms,
+                    started_monotonic=started,
+                    finished_monotonic=finished,
+                    remaining_before_ms=remaining_before_ms,
+                    outcome=outcome,
+                    error_kind=kind.value,
+                    retry_scheduled=retry_scheduled,
+                )
+            if retry_scheduled:
+                time.sleep(delay)
+                if prefer_non_streaming:
+                    return _query_model_non_streaming(
+                        args=args,
+                        server_url=server_url,
+                        payload=payload,
+                        headers=headers,
+                        reasoning_disabled=reasoning_disabled,
+                        policy=policy,
+                        context=context,
+                        call_index=call_index,
+                        call_started=call_started,
+                        first_attempt=attempt + 1,
+                        final_attempt=attempt + 1,
+                    )
+                continue
+            if can_retry and not budget_allows_retry:
+                _raise_query_error(
+                    kind=LLMErrorKind.TRIAL_BUDGET_EXHAUSTED,
+                    attempt=attempt,
+                    status_code=status_code,
+                    message="Trial budget cannot cover the minimum retry budget and delay",
+                    **error_fields,
+                )
+            _raise_query_error(
+                kind=kind,
+                attempt=attempt,
+                status_code=status_code,
+                message=f"Streaming LLM request failed: {kind.value}",
+                **error_fields,
+            )
+
+        finished = time.monotonic()
+        if context is not None:
+            context.record_attempt(
+                call_index=call_index,
+                attempt=attempt,
+                mode="streaming",
+                http_status=metrics.http_status,
+                ttfb_ms=metrics.ttfb_ms,
+                first_content_ms=metrics.first_content_ms,
+                started_monotonic=started,
+                finished_monotonic=finished,
+                remaining_before_ms=remaining_before_ms,
+                outcome="success",
+                error_kind=None,
+                retry_scheduled=False,
+            )
+        print(f"Time taken to query model: {finished - call_started:.2f} seconds")
+        return {"content": content, "reasoning": reasoning}
+    raise RuntimeError("bounded streaming attempt loop exited unexpectedly")
+
+
+def _streaming_events(
+    args: "LaunchArgs | ModelQueryArgs",
+    prompt: list[dict],
+    *,
+    server_url: str,
+    request_timeout: float,
+    first_content_timeout: float,
+    metrics: _StreamingMetrics,
 ) -> Iterable[dict]:
-    """Query model with streaming enabled, yielding partial responses.
-
-    Yields dictionaries with:
-      - {"type": "content_delta", "content": "partial text"}
-      - {"type": "reasoning_delta", "content": "partial reasoning"} (if supported)
-      - {"type": "done", "content": "full content", "reasoning": "full reasoning or None"}
-
-    Args:
-        args: Configuration with server URL and model settings
-        prompt: Full prompt containing environment observation
-
-    Yields:
-        Partial response chunks as they arrive
-    """
+    """Yield one HTTP streaming attempt while capturing transport timings."""
     if args.model in GPT_MODELS:
         payload = {
             "model": args.model,
@@ -404,7 +949,6 @@ def query_model_streaming(
             "messages": prompt,
             "stream": True,
         }
-
     headers = {"Content-Type": "application/json"}
     if args.api_key:
         headers["Authorization"] = f"Bearer {args.api_key}"
@@ -418,138 +962,259 @@ def query_model_streaming(
 
     full_content = ""
     full_reasoning = ""
-
-    start_time = time.time()
-    first_content_timeout = float(
-        os.getenv("CAPX_STREAMING_FIRST_CONTENT_TIMEOUT_SECONDS", "0") or 0
+    stream_finished = False
+    response: requests.Response | None = None
+    attempt_deadline = metrics.started + request_timeout
+    first_content_deadline = metrics.started + first_content_timeout
+    initial_deadline = min(attempt_deadline, first_content_deadline)
+    initial_timeout_error = _stream_deadline_error(
+        waiting_for_content=True,
+        observed_at=initial_deadline,
+        first_content_deadline=first_content_deadline,
+        attempt_deadline=attempt_deadline,
     )
-    request_timeout = float(os.getenv("CAPX_STREAMING_REQUEST_TIMEOUT_SECONDS", "200") or 200)
-
-    stream_chunks = 0
-
-    with requests.post(
-        args.server_url,
-        headers=headers,
-        data=json.dumps(payload),
-        timeout=request_timeout,
-        stream=True,
-    ) as response:
+    if initial_timeout_error is None:
+        raise RuntimeError("streaming deadline classification failed")
+    try:
+        response = _call_with_deadline(
+            lambda: requests.post(
+                server_url,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=Urllib3Timeout(
+                    total=request_timeout,
+                    connect=request_timeout,
+                    read=request_timeout,
+                ),
+                stream=True,
+            ),
+            deadline=initial_deadline,
+            timeout_error=initial_timeout_error,
+            on_late_result=lambda late_response: late_response.close(),
+        )
+        metrics.http_status = response.status_code
+        metrics.response_headers = dict(response.headers)
         response.raise_for_status()
 
         content_type = response.headers.get("content-type", "")
         is_sse = "text/event-stream" in content_type
         is_json = "application/json" in content_type
-
-        # If it's a regular JSON response (server doesn't support streaming),
-        # fall back to non-streaming behavior
         if is_json and not is_sse:
-            print("Warning: Server returned JSON instead of SSE stream, falling back to non-streaming")
-            body = response.json()
             try:
-                full_content = body["choices"][0]["message"]["content"]
-                message = body.get("choices", [{}])[0].get("message", {})
+                body = _call_with_deadline(
+                    response.json,
+                    deadline=initial_deadline,
+                    timeout_error=initial_timeout_error,
+                    on_timeout=response.close,
+                )
+                message = body["choices"][0]["message"]
+                full_content = message["content"]
+                if not isinstance(full_content, str):
+                    raise TypeError("content must be a string")
                 if not reasoning_disabled:
-                    full_reasoning = message.get("reasoning") or message.get("reasoning_content")
-                if full_reasoning:
-                    print(f"Reasoning extracted ({len(full_reasoning)} chars)")
-                elif reasoning_disabled:
-                    print("Reasoning disabled; ignoring any reasoning returned by model")
-                else:
-                    print("No reasoning returned by model")
-            except (KeyError, IndexError) as exc:
-                raise RuntimeError(f"Unexpected response format: {body}") from exc
-
-            yield {"type": "content_delta", "content": full_content}
+                    full_reasoning = message.get("reasoning") or message.get(
+                        "reasoning_content"
+                    )
+            except (ValueError, KeyError, IndexError, TypeError) as error:
+                raise _StreamingInvalidResponse("Unexpected streaming JSON response") from error
+            if full_content:
+                now = time.monotonic()
+                deadline_error = _stream_deadline_error(
+                    waiting_for_content=True,
+                    observed_at=now,
+                    first_content_deadline=first_content_deadline,
+                    attempt_deadline=attempt_deadline,
+                )
+                if deadline_error is not None:
+                    raise deadline_error
+                metrics.ttfb_ms = int(round((now - metrics.started) * 1000))
+                metrics.first_content_ms = metrics.ttfb_ms
+                yield {"type": "content_delta", "content": full_content}
             yield {
                 "type": "done",
                 "content": full_content,
-                "reasoning": full_reasoning if full_reasoning else None,
+                "reasoning": full_reasoning or None,
             }
-            end_time = time.time()
-            print(f"Time taken to query model (streaming fallback): {end_time - start_time:.2f} seconds")
             return
 
-        for line in response.iter_lines():
-            if not line:
-                continue
+        for line, received_at in _iter_stream_lines_with_deadlines(
+            response,
+            metrics=metrics,
+            first_content_deadline=first_content_deadline,
+            attempt_deadline=attempt_deadline,
+        ):
+            now = time.monotonic()
+            if line and metrics.ttfb_ms is None:
+                metrics.ttfb_ms = int(round((received_at - metrics.started) * 1000))
 
-            line_str = line.decode("utf-8")
-
-            # SSE format: "data: {...}" or "data: [DONE]"
-            if line_str.startswith("data: "):
-                stream_chunks += 1
-                data_str = line_str[6:]  # Remove "data: " prefix
-
+            if line:
+                try:
+                    line_str = line.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise _StreamingInvalidResponse("Streaming line was not UTF-8") from error
+                data_str = line_str[6:] if line_str.startswith("data: ") else line_str
                 if data_str == "[DONE]":
+                    stream_finished = True
                     break
-
                 try:
                     data = json.loads(data_str)
-                    choices = data.get("choices", [])
-                    if not choices:
-                        continue
-
-                    delta = choices[0].get("delta", {})
-
-                    # Handle content delta
-                    content_delta = delta.get("content", "")
-                    if content_delta:
-                        full_content += content_delta
-                        yield {"type": "content_delta", "content": content_delta}
-
-                    # Handle reasoning delta (some APIs support this)
-                    reasoning_delta = delta.get("reasoning") or delta.get("reasoning_content") or ""
-                    if reasoning_delta and not reasoning_disabled:
-                        full_reasoning += reasoning_delta
-                        yield {"type": "reasoning_delta", "content": reasoning_delta}
-
-                    if stream_chunks % 200 == 0:
-                        print(
-                            "Streaming progress: "
-                            f"chunks={stream_chunks}, "
-                            f"content_chars={len(full_content)}, "
-                            f"reasoning_chars={len(full_reasoning)}",
-                            flush=True,
-                        )
-                    if (
-                        first_content_timeout > 0
-                        and not full_content
-                        and time.time() - start_time > first_content_timeout
-                    ):
-                        raise TimeoutError(
-                            f"No content delta within {first_content_timeout:.1f}s"
-                        )
-
                 except json.JSONDecodeError:
-                    continue
-            else:
-                # Try parsing as raw JSON (non-SSE format)
-                try:
-                    data = json.loads(line_str)
+                    data = None
+                if isinstance(data, dict):
                     choices = data.get("choices", [])
                     if choices:
                         delta = choices[0].get("delta", {})
                         content_delta = delta.get("content", "")
                         if content_delta:
+                            deadline_error = _stream_deadline_error(
+                                waiting_for_content=metrics.first_content_ms is None,
+                                observed_at=time.monotonic(),
+                                first_content_deadline=first_content_deadline,
+                                attempt_deadline=attempt_deadline,
+                            )
+                            if deadline_error is not None:
+                                raise deadline_error
+                            if metrics.first_content_ms is None:
+                                metrics.first_content_ms = int(
+                                    round((received_at - metrics.started) * 1000)
+                                )
                             full_content += content_delta
                             yield {"type": "content_delta", "content": content_delta}
-                except json.JSONDecodeError:
-                    continue
+                        reasoning_delta = (
+                            delta.get("reasoning") or delta.get("reasoning_content") or ""
+                        )
+                        if reasoning_delta and not reasoning_disabled:
+                            if time.monotonic() >= attempt_deadline:
+                                raise requests.exceptions.ReadTimeout(
+                                    "Streaming attempt deadline exceeded"
+                                )
+                            full_reasoning += reasoning_delta
+                            yield {"type": "reasoning_delta", "content": reasoning_delta}
+    finally:
+        if response is not None:
+            response.close()
 
-    end_time = time.time()
-    print(f"Time taken to query model (streaming): {end_time - start_time:.2f} seconds")
-    if full_reasoning:
-        print(f"Reasoning extracted ({len(full_reasoning)} chars)")
-    elif reasoning_disabled:
-        print("Reasoning disabled; ignoring any reasoning returned by model")
-    else:
-        print("No reasoning returned by model")
+    if full_content and not stream_finished:
+        raise requests.exceptions.ConnectionError("Streaming response ended before [DONE]")
 
     yield {
         "type": "done",
         "content": full_content,
-        "reasoning": full_reasoning if full_reasoning else None,
+        "reasoning": full_reasoning or None,
     }
+
+
+def query_model_streaming(
+    args: "LaunchArgs | ModelQueryArgs",
+    prompt: list[dict],
+) -> Iterable[dict]:
+    """Issue one streaming request for direct Web UI consumption."""
+    policy = LLMRetryPolicy.from_env()
+    context = get_trial_llm_context()
+    call_index = context.next_call_index() if context is not None else 1
+    call_started = time.monotonic()
+    error_fields = {"call_index": call_index, "call_started": call_started}
+    request_timeout, remaining_before_ms = _attempt_budget(context, policy, 1, **error_fields)
+    metrics = _StreamingMetrics(started=time.monotonic())
+    completed = False
+    try:
+        for event in _streaming_events(
+            args,
+            prompt,
+            server_url=args.server_url,
+            request_timeout=request_timeout,
+            first_content_timeout=policy.first_content_timeout_seconds,
+            metrics=metrics,
+        ):
+            if event["type"] == "done":
+                completed = True
+                if context is not None:
+                    context.record_attempt(
+                        call_index=call_index,
+                        attempt=1,
+                        mode="streaming",
+                        http_status=metrics.http_status,
+                        ttfb_ms=metrics.ttfb_ms,
+                        first_content_ms=metrics.first_content_ms,
+                        started_monotonic=metrics.started,
+                        finished_monotonic=time.monotonic(),
+                        remaining_before_ms=remaining_before_ms,
+                        outcome="success",
+                        error_kind=None,
+                        retry_scheduled=False,
+                    )
+            yield event
+    except GeneratorExit:
+        if context is not None and not completed:
+            context.record_attempt(
+                call_index=call_index,
+                attempt=1,
+                mode="streaming",
+                http_status=metrics.http_status,
+                ttfb_ms=metrics.ttfb_ms,
+                first_content_ms=metrics.first_content_ms,
+                started_monotonic=metrics.started,
+                finished_monotonic=time.monotonic(),
+                remaining_before_ms=remaining_before_ms,
+                outcome="cancelled",
+                error_kind=None,
+                retry_scheduled=False,
+            )
+        raise
+    except (TimeoutError, requests.exceptions.RequestException, _StreamingInvalidResponse) as error:
+        finished = time.monotonic()
+        status_code = metrics.http_status
+        if isinstance(error, _StreamingInvalidResponse):
+            kind, outcome = LLMErrorKind.INVALID_RESPONSE, "invalid_response"
+        elif isinstance(error, TimeoutError):
+            kind, outcome = LLMErrorKind.NO_CONTENT, "no_content"
+        elif status_code is not None and not 200 <= status_code < 300:
+            kind = _http_error_kind(status_code)
+            outcome = (
+                "retryable_http_error"
+                if status_code in _RETRYABLE_HTTP_STATUSES
+                else "http_error"
+            )
+        else:
+            kind, outcome = _request_error_kind(error), "transport_error"
+        if context is not None:
+            context.record_attempt(
+                call_index=call_index,
+                attempt=1,
+                mode="streaming",
+                http_status=status_code,
+                ttfb_ms=metrics.ttfb_ms,
+                first_content_ms=metrics.first_content_ms,
+                started_monotonic=metrics.started,
+                finished_monotonic=finished,
+                remaining_before_ms=remaining_before_ms,
+                outcome=outcome,
+                error_kind=kind.value,
+                retry_scheduled=False,
+            )
+        _raise_query_error(
+            kind=kind,
+            attempt=1,
+            status_code=status_code,
+            message=f"Streaming LLM request failed: {kind.value}",
+            **error_fields,
+        )
+    else:
+        if context is not None and not completed:
+            context.record_attempt(
+                call_index=call_index,
+                attempt=1,
+                mode="streaming",
+                http_status=metrics.http_status,
+                ttfb_ms=metrics.ttfb_ms,
+                first_content_ms=metrics.first_content_ms,
+                started_monotonic=metrics.started,
+                finished_monotonic=time.monotonic(),
+                remaining_before_ms=remaining_before_ms,
+                outcome="success",
+                error_kind=None,
+                retry_scheduled=False,
+            )
 
 
 def query_model_ensemble(
@@ -575,13 +1240,22 @@ def query_model_ensemble(
         except Exception as e:
             error_msg = str(e)
             print(f"[Multimodel Ensemble] {model} temp={temp} FAILED: {error_msg}")
-            return {"model": model, "temp": temp, "content": error_msg, "ok": False}
+            return {
+                "model": model,
+                "temp": temp,
+                "content": error_msg,
+                "ok": False,
+                "error": e,
+            }
 
     # Build all (model, temp) pairs and query in parallel
     tasks = [(m, t) for m, temps in ENSEMBLE_CONFIGS for t in temps]
     responses = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
-        futures = {executor.submit(query_single, m, t): (m, t) for m, t in tasks}
+        futures = {
+            executor.submit(contextvars.copy_context().run, query_single, m, t): (m, t)
+            for m, t in tasks
+        }
         for future in concurrent.futures.as_completed(futures):
             resp = future.result()
             responses.append(resp)
@@ -594,6 +1268,12 @@ def query_model_ensemble(
         print("\n=== All ensemble queries failed. Errors: ===")
         for r in responses:
             print(f"  {r['model']} temp={r['temp']}: {r['content']}")
+        typed_error = next(
+            (response["error"] for response in responses if isinstance(response.get("error"), LLMQueryError)),
+            None,
+        )
+        if typed_error is not None:
+            raise typed_error
         raise RuntimeError("All ensemble queries failed")
 
     # Build synthesis prompt
@@ -734,13 +1414,22 @@ def query_single_model_ensemble(
         except Exception as e:
             error_msg = str(e)
             print(f"[Single Model Ensemble] {model} temp={temp} FAILED: {error_msg}")
-            return {"model": model, "temp": temp, "content": error_msg, "ok": False}
+            return {
+                "model": model,
+                "temp": temp,
+                "content": error_msg,
+                "ok": False,
+                "error": e,
+            }
 
     # Query same model with 9 different temperatures (0.1 to 0.9)
     temperatures = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     responses = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
-        futures = {executor.submit(query_single, t): t for t in temperatures}
+        futures = {
+            executor.submit(contextvars.copy_context().run, query_single, t): t
+            for t in temperatures
+        }
         for future in concurrent.futures.as_completed(futures):
             resp = future.result()
             responses.append(resp)
@@ -753,6 +1442,12 @@ def query_single_model_ensemble(
         print("\n=== All single model ensemble queries failed. Errors: ===")
         for r in responses:
             print(f"  {r['model']} temp={r['temp']}: {r['content']}")
+        typed_error = next(
+            (response["error"] for response in responses if isinstance(response.get("error"), LLMQueryError)),
+            None,
+        )
+        if typed_error is not None:
+            raise typed_error
         raise RuntimeError("All single model ensemble queries failed")
 
     # Build synthesis prompt
