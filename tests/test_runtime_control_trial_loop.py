@@ -432,6 +432,80 @@ def test_capsule_trial_patches_group_and_regroups(tmp_path):
     assert 'RESULT = "patched"' in patched_source
 
 
+def test_capsule_repairs_invalid_initial_source_with_patch_group(tmp_path):
+    summary = _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code="value = (\n",
+        scripted_actions=[
+            {
+                "action": "patch_group",
+                "args": {
+                    "group_id": "group_1",
+                    "source": "value = 1\nRESULT = value\n",
+                },
+            },
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 0
+    assert trace[0]["event"]["action"] == "initial_parse"
+    assert trace[0]["event"]["evidence"]["exception_type"] == "SyntaxError"
+    assert trace[1]["event"]["action"] == "patch_group"
+    assert trace[2]["event"]["action"] == "run_group"
+
+
+def test_capsule_retries_after_syntax_error_in_group_patch(tmp_path):
+    summary = _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code="value = (\n",
+        scripted_actions=[
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": "value = [\n"},
+            },
+            {
+                "action": "patch_group",
+                "args": {
+                    "group_id": "group_1",
+                    "source": "value = 1\nRESULT = value\n",
+                },
+            },
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+    final_source = Path(summary.code_path).read_text()
+
+    assert trace[1]["event"]["action"] == "patch_group"
+    assert trace[1]["event"]["status"] == "invalid"
+    assert trace[1]["event"]["evidence"]["exception_type"] == "SyntaxError"
+    assert trace[2]["event"]["status"] == "success"
+    assert trace[3]["event"]["status"] == "success"
+    assert final_source == "value = 1\nRESULT = value\n"
+
+
 def test_capsule_trial_appends_recovery_and_regroups(tmp_path):
     env = FakeCapsuleEnv()
 
@@ -939,6 +1013,25 @@ def test_patch_region_accepts_patch_alias():
 
     assert event.status == "success"
     assert event.evidence["source"] == "x = 1\ny = x + 3\n"
+
+
+def test_patch_region_rejects_syntax_error_in_complete_source():
+    source = "x = 1\ny = x + 1\n"
+    region = CodeRegion("region_2", 2, 2, "y = x + 1")
+    event = _execute_runtime_action(
+        RuntimeAction(
+            "patch_region",
+            {"region_id": "region_2", "source": "y = ("},
+        ),
+        CapsuleExecutor(base_globals={}),
+        source,
+        {"region_2": region},
+    )
+
+    assert event.status == "invalid"
+    assert event.region_id == "region_2"
+    assert event.evidence["exception_type"] == "SyntaxError"
+    assert "source" not in event.evidence
 
 
 def test_inspect_variables_requires_names():

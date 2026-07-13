@@ -29,6 +29,8 @@ from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
 from capx.runtime_control import (
     CapsuleExecutor,
+    CodeRegion,
+    CodeRegionGroup,
     RuntimeAction,
     RuntimeEvent,
     RuntimeTrace,
@@ -667,6 +669,56 @@ def _task_text_from_obs(obs: dict[str, Any]) -> str:
     return str(content)
 
 
+def _whole_source_fallback_units(
+    source: str,
+) -> tuple[list[CodeRegion], list[CodeRegionGroup]]:
+    line_count = max(1, len(source.splitlines()))
+    region = CodeRegion(
+        region_id="region_1",
+        start_line=1,
+        end_line=line_count,
+        source=source,
+    )
+    group = CodeRegionGroup(
+        group_id="group_1",
+        start_line=1,
+        end_line=line_count,
+        source=source,
+        region_ids=[region.region_id],
+    )
+    return [region], [group]
+
+
+def _initial_syntax_error_history_entry(exc: SyntaxError) -> dict[str, Any]:
+    return {
+        "step_id": 0,
+        "action": {"action": "initial_parse"},
+        "event": {
+            "action": "initial_parse",
+            "status": "failed",
+            "region_id": "group_1",
+            "message": str(exc),
+            "evidence": {
+                "exception_type": type(exc).__name__,
+                "lineno": exc.lineno,
+                "offset": exc.offset,
+                "text": exc.text,
+            },
+        },
+        "feedback": {
+            "status": "failed",
+            "region_id": "group_1",
+            "message": (
+                "Initial source is invalid Python. Use patch_group to replace the "
+                "complete group_1 source with valid Python."
+            ),
+            "repair_hints": [
+                "Patch the complete group_1 source before attempting execution."
+            ],
+        },
+    }
+
+
 def _run_capsule_trial(
     env: CodeExecutionEnvBase,
     trial: int,
@@ -705,17 +757,23 @@ def _run_capsule_trial(
     side_effect_calls = collect_side_effect_calls(getattr(env, "_apis", {}).values())
     if not side_effect_calls:
         side_effect_calls = ROBOT_SIDE_EFFECT_CALLS
-    regions = segment_python_code(source)
-    groups = (
-        segment_python_code_groups(
-            source,
-            regions,
-            max_regions_per_group=max_regions_per_group,
-            side_effect_calls=side_effect_calls,
+    initial_syntax_error: SyntaxError | None = None
+    try:
+        regions = segment_python_code(source)
+        groups = (
+            segment_python_code_groups(
+                source,
+                regions,
+                max_regions_per_group=max_regions_per_group,
+                side_effect_calls=side_effect_calls,
+            )
+            if use_semantic_groups
+            else []
         )
-        if use_semantic_groups
-        else []
-    )
+    except SyntaxError as exc:
+        initial_syntax_error = exc
+        regions, fallback_groups = _whole_source_fallback_units(source)
+        groups = fallback_groups if use_semantic_groups else []
     region_by_id = {region.region_id: region for region in regions}
     group_by_id = {group.group_id: group for group in groups}
     trace = RuntimeTrace()
@@ -732,6 +790,8 @@ def _run_capsule_trial(
     script = scripted_actions if scripted_actions is not None else config.get("scripted_actions")
     script_idx = 0
     history: list[dict[str, Any]] = []
+    if initial_syntax_error is not None:
+        history.append(_initial_syntax_error_history_entry(initial_syntax_error))
     step_metrics: list[dict[str, Any]] = []
     prompts: list[list[dict[str, Any]]] = []
     failed = False
@@ -959,6 +1019,27 @@ def _run_capsule_trial(
     )
 
 
+def _validate_patched_source(
+    *, action: str, region_id: str, source: str
+) -> RuntimeEvent | None:
+    try:
+        ast.parse(source)
+    except SyntaxError as exc:
+        return RuntimeEvent(
+            action=action,
+            status="invalid",
+            region_id=region_id,
+            message=f"Patched source is invalid Python: {exc}",
+            evidence={
+                "exception_type": type(exc).__name__,
+                "lineno": exc.lineno,
+                "offset": exc.offset,
+                "text": exc.text,
+            },
+        )
+    return None
+
+
 def _execute_runtime_action(
     action: RuntimeAction,
     executor: CapsuleExecutor,
@@ -1036,6 +1117,13 @@ def _execute_runtime_action(
                 ),
             )
         patched = replace_region_source(source, region, replacement)
+        syntax_error_event = _validate_patched_source(
+            action=action.action,
+            region_id=region_id,
+            source=patched,
+        )
+        if syntax_error_event is not None:
+            return syntax_error_event
         return RuntimeEvent(
             action=action.action,
             status="success",
@@ -1058,6 +1146,13 @@ def _execute_runtime_action(
                 ),
             )
         patched = replace_region_source(source, group, replacement)
+        syntax_error_event = _validate_patched_source(
+            action=action.action,
+            region_id=group_id,
+            source=patched,
+        )
+        if syntax_error_event is not None:
+            return syntax_error_event
         return RuntimeEvent(
             action=action.action,
             status="success",
