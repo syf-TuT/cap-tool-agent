@@ -289,7 +289,10 @@ class CodeExecutionEnvBase(Env):
             self.low_level_env._update_viser_server()
         reward = self.compute_reward()
         if hasattr(self.low_level_env, "task_completed"):
-            task_completed = self.low_level_env.task_completed()
+            raw_task_completed = self.low_level_env.task_completed()
+            task_completed = (
+                None if raw_task_completed is None else bool(raw_task_completed)
+            )
         else:
             task_completed = None
         terminated = reward == 1.0
