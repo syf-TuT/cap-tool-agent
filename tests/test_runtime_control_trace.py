@@ -1,3 +1,5 @@
+import numpy as np
+
 from capx.runtime_control.trace import RuntimeTrace, wrap_function_for_trace
 
 
@@ -37,3 +39,39 @@ def test_trace_window_returns_events_since_mark():
     trace.log({"name": "second"})
 
     assert [event["name"] for event in trace.events_since(start)] == ["first", "second"]
+
+
+def test_trace_includes_values_for_small_numeric_arrays():
+    trace = RuntimeTrace()
+    wrapped = wrap_function_for_trace("pose", lambda: np.array([0.1, 0.2, 0.3]), trace)
+
+    wrapped()
+
+    assert trace.events[0]["result"]["value"] == [0.1, 0.2, 0.3]
+
+
+def test_trace_omits_values_for_large_numeric_arrays():
+    trace = RuntimeTrace()
+    wrapped = wrap_function_for_trace("image", lambda: np.zeros((8, 8)), trace)
+
+    wrapped()
+
+    assert trace.events[0]["result"]["shape"] == [8, 8]
+    assert "value" not in trace.events[0]["result"]
+
+
+def test_trace_safely_summarizes_non_numpy_shaped_values():
+    class TensorLike:
+        shape = (3,)
+        dtype = "float32"
+
+        def size(self):
+            return 3
+
+    trace = RuntimeTrace()
+    wrapped = wrap_function_for_trace("tensor", TensorLike, trace)
+
+    wrapped()
+
+    assert trace.events[0]["result"]["shape"] == [3]
+    assert "value" not in trace.events[0]["result"]

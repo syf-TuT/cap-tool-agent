@@ -103,6 +103,15 @@ class ApiBase(ABC):
         """
         return set()
 
+    def recovery_observation_functions(self) -> set[str]:
+        """Return public sensing functions that refresh physical task state.
+
+        Capsule recovery code must call at least one declared function before it
+        performs new robot side effects. APIs that expose ``get_observation`` keep
+        that as the default contract; task-specific APIs can override this method.
+        """
+        return {"get_observation"} if "get_observation" in self.functions() else set()
+
     def combined_doc(self) -> str:
         """Aggregate function docs in a simple, consistent format.
 

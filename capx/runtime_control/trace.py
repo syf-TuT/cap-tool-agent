@@ -5,6 +5,8 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+import numpy as np
+
 
 class RuntimeTrace:
     def __init__(self) -> None:
@@ -67,6 +69,8 @@ def _summarize_value(value: Any) -> dict[str, Any]:
         summary["shape"] = list(shape)
     if dtype is not None:
         summary["dtype"] = str(dtype)
+    if isinstance(value, np.ndarray) and value.size <= 32 and value.dtype.kind in "biuf":
+        summary["value"] = value.tolist()
     if shape is None:
         summary["repr"] = repr(value)[:200]
     return summary

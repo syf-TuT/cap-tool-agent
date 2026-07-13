@@ -1,4 +1,3 @@
-import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,13 +10,15 @@ from capx.envs.trial import (
     _handle_multi_turn_step,
     _no_rollback_guard_event,
     _query_initial_code,
+    _reward_drop_guard_event,
     _run_capsule_trial,
     _run_single_trial,
+    _summarize_runtime_value,
 )
 from capx.llm.client import ModelQueryArgs
 from capx.llm.context import get_trial_llm_context, trial_llm_context
 from capx.runtime_control.executor import CapsuleExecutor
-from capx.runtime_control.schema import CodeRegion, RuntimeAction
+from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, RuntimeAction
 from capx.runtime_control.trace import wrap_function_for_trace
 
 
@@ -76,6 +77,28 @@ class FakeCapsuleEnv:
 class FakeIncompleteCapsuleEnv(FakeCapsuleEnv):
     def compute_reward(self):
         return 0.0
+
+
+class FakeHandleRecoveryApi:
+    def __init__(self):
+        self.observed = False
+
+    def functions(self):
+        return {"get_handle0_pos": self.get_handle0_pos}
+
+    def recovery_observation_functions(self):
+        return {"get_handle0_pos"}
+
+    def get_handle0_pos(self):
+        self.observed = True
+        return [0.1, 0.2, 0.3]
+
+
+class FakeHandleRecoveryEnv(FakeIncompleteCapsuleEnv):
+    def __init__(self):
+        self.api = FakeHandleRecoveryApi()
+        self.low_level_env = object()
+        self._apis = {"fake": self.api}
 
 
 class FakeRewardDropApi(FakeApi):
@@ -566,6 +589,71 @@ def test_append_recovery_requires_fresh_observation(tmp_path):
     assert "get_observation" in trace[0]["event"]["message"]
 
 
+def test_append_recovery_accepts_api_declared_fresh_state_function(tmp_path):
+    env = FakeHandleRecoveryEnv()
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {"action": "append_recovery", "args": {"source": "handle = get_handle0_pos()"}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 1  # The fake task never succeeds, but recovery is valid.
+    assert trace[0]["event"]["status"] == "success"
+    assert trace[1]["event"]["status"] == "success"
+    assert env.api.observed is True
+
+
+def test_append_recovery_rejects_blind_code_for_task_specific_observation_api(tmp_path):
+    _run_capsule_trial(
+        env=FakeHandleRecoveryEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {"action": "append_recovery", "args": {"source": 'RESULT = "blind"'}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert trace[0]["event"]["status"] == "invalid"
+    assert "get_handle0_pos" in trace[0]["event"]["message"]
+
+
+def test_append_recovery_rejects_api_without_fresh_state_capability():
+    event = _execute_runtime_action(
+        RuntimeAction("append_recovery", {"source": "x = 1"}),
+        CapsuleExecutor(base_globals={}),
+        "",
+        {},
+        recovery_observation_functions=set(),
+    )
+
+    assert event.status == "invalid"
+    assert "does not declare" in event.message
+
+
 def test_capsule_trial_rejects_rerun_of_executed_side_effect_group(tmp_path):
     summary = _run_capsule_trial(
         env=FakeCapsuleEnv(),
@@ -592,10 +680,46 @@ def test_capsule_trial_rejects_rerun_of_executed_side_effect_group(tmp_path):
     assert "append_recovery" in trace[1]["event"]["message"]
 
 
-def test_no_rollback_guard_prompt_mentions_append_recovery():
-    source = inspect.getsource(_no_rollback_guard_event)
+def test_no_rollback_guard_uses_task_specific_recovery_function():
+    event = _no_rollback_guard_event(
+        RuntimeAction("run_group", {"group_id": "group_1"}),
+        set(),
+        {"group_1"},
+        recovery_observation_functions={"get_handle0_pos"},
+    )
 
-    assert "append_recovery" in source
+    assert event is not None
+    assert "get_handle0_pos()" in event.message
+    assert "get_observation()" not in event.message
+
+
+def test_reward_drop_guard_uses_task_specific_recovery_function():
+    group = CodeRegionGroup(
+        group_id="group_1",
+        start_line=1,
+        end_line=1,
+        source="move_to('next')",
+        region_ids=["region_1"],
+        primitive_calls=["move_to"],
+        defined_names=[],
+        used_names=["move_to"],
+        has_robot_side_effect=True,
+    )
+    event = _reward_drop_guard_event(
+        RuntimeAction("run_group", {"group_id": "group_1"}),
+        {"reward": 0.01},
+        0.1,
+        {},
+        {"group_1": group},
+        recovery_side_effect_budget=0,
+        min_best_reward=0.05,
+        drop_threshold=0.03,
+        recovery_observation_functions={"get_handle0_pos"},
+    )
+
+    assert event is not None
+    assert "get_handle0_pos()" in event.message
+    assert "get_observation()" not in event.message
 
 
 def test_capsule_action_query_uses_separate_max_tokens(tmp_path, monkeypatch):
@@ -760,6 +884,31 @@ def test_capsule_metrics_split_append_source_from_recovery_execution(tmp_path):
     assert rows[4]["recovery_execution_reward_improved"] is True
     assert rows[4]["recovery_execution_trace_improved"] is True
     assert rows[4]["recovery_execution_improved"] is True
+    assert rows[4]["recovery_execution_effective"] is True
+
+
+def test_runtime_variable_summary_includes_only_small_array_values():
+    import numpy as np
+
+    small = _summarize_runtime_value(np.array([1.0, 2.0, 3.0]))
+    large = _summarize_runtime_value(np.zeros((8, 8)))
+
+    assert small["value"] == [1.0, 2.0, 3.0]
+    assert "value" not in large
+
+
+def test_runtime_variable_summary_safely_handles_non_numpy_shape():
+    class TensorLike:
+        shape = (3,)
+        dtype = "float32"
+
+        def size(self):
+            return 3
+
+    summary = _summarize_runtime_value(TensorLike())
+
+    assert summary["shape"] == [3]
+    assert "value" not in summary
 
 
 def test_capsule_trial_allows_patch_of_executed_non_side_effect_group(tmp_path):

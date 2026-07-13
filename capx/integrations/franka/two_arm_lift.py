@@ -39,12 +39,42 @@ def _draw_boxes(
     return img
 
 
+def _best_grasp_pose_world(
+    grasp_samples: np.ndarray,
+    grasp_scores: np.ndarray,
+    *,
+    camera_pose: np.ndarray,
+    approach_offset: float = 0.12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Select the best Contact-GraspNet pose and transform it into world coordinates."""
+    samples = np.asarray(grasp_samples, dtype=np.float64)
+    scores = np.asarray(grasp_scores, dtype=np.float64).reshape(-1)
+    if samples.ndim != 3 or samples.shape[1:] != (4, 4) or len(samples) == 0:
+        raise ValueError("Contact-GraspNet returned no grasp candidates.")
+    if len(scores) != len(samples) or not np.any(np.isfinite(scores)):
+        raise ValueError("Contact-GraspNet returned invalid grasp scores.")
+
+    best_index = int(np.nanargmax(scores))
+    grasp_camera = vtf.SE3.from_matrix(samples[best_index]) @ vtf.SE3.from_translation(
+        np.array([0.0, 0.0, approach_offset], dtype=np.float64)
+    )
+    camera_pose = np.asarray(camera_pose, dtype=np.float64).reshape(7)
+    camera_world = vtf.SE3.from_rotation_and_translation(
+        rotation=vtf.SO3(wxyz=camera_pose[3:]),
+        translation=camera_pose[:3],
+    )
+    grasp_world = camera_world @ grasp_camera
+    return grasp_world.translation(), grasp_world.rotation().wxyz
+
+
 class FrankaTwoArmLiftApi(ApiBase):
     """Robot control API for two-arm lift task using vision-based perception (Non-privileged).
 
     Functions:
       - get_handle0_pos() -> bbox_center: np.ndarray:
       - get_handle1_pos() -> bbox_center: np.ndarray:
+      - get_handle0_grasp_pose() -> (position: np.ndarray, quaternion_wxyz: np.ndarray):
+      - get_handle1_grasp_pose() -> (position: np.ndarray, quaternion_wxyz: np.ndarray):
       - get_arm0_gripper_pose() -> (position: np.ndarray, quaternion_wxyz: np.ndarray):
       - get_arm1_gripper_pose() -> (position: np.ndarray, quaternion_wxyz: np.ndarray):
       - update_handle0_pose_viser(position: np.ndarray, quaternion_wxyz: np.ndarray) -> None
@@ -97,6 +127,8 @@ class FrankaTwoArmLiftApi(ApiBase):
             # "get_pot_pose": self.get_pot_pose,
             "get_handle0_pos": self.get_handle0_pos,
             "get_handle1_pos": self.get_handle1_pos,
+            "get_handle0_grasp_pose": self.get_handle0_grasp_pose,
+            "get_handle1_grasp_pose": self.get_handle1_grasp_pose,
             "get_arm0_gripper_pose": self.get_arm0_gripper_pose,
             "get_arm1_gripper_pose": self.get_arm1_gripper_pose,
             # "update_handle0_pose_viser": self.update_handle0_pose_viser,
@@ -110,6 +142,16 @@ class FrankaTwoArmLiftApi(ApiBase):
             "open_gripper_arm1": self.open_gripper_arm1,
             "close_gripper_arm1": self.close_gripper_arm1,
             "goto_pose_both": self.goto_pose_both,
+        }
+
+    def recovery_observation_functions(self) -> set[str]:
+        return {
+            "get_handle0_pos",
+            "get_handle1_pos",
+            "get_handle0_grasp_pose",
+            "get_handle1_grasp_pose",
+            "get_arm0_gripper_pose",
+            "get_arm1_gripper_pose",
         }
 
     def side_effect_functions(self) -> set[str]:
@@ -237,8 +279,8 @@ class FrankaTwoArmLiftApi(ApiBase):
         return queried_instance_idx, seg_crop
 
     def _get_handle_pose_with_graspnet(
-        self, object_name: str, index: int = 0
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        self, object_name: str, index: int = 0, *, plan_grasp: bool = False
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray]:
         """Helper to get handle pose using vision detection + GraspNet for orientation.
 
         Args:
@@ -302,6 +344,21 @@ class FrankaTwoArmLiftApi(ApiBase):
         segmentation = self._get_segmentation_map(obs, rgb, box=box, text_prompt=object_name)
         queried_instance_idx, seg_crop = self._select_instance_from_box(segmentation, box)
 
+        grasp_position = None
+        grasp_quaternion_wxyz = None
+        if plan_grasp:
+            grasp_samples, grasp_scores, _ = self.grasp_net_plan_fn(
+                depth[:, :, 0] if depth.ndim == 3 else depth,
+                obs["agentview"]["intrinsics"],
+                segmentation[:, :, 0],
+                queried_instance_idx,
+            )
+            grasp_position, grasp_quaternion_wxyz = _best_grasp_pose_world(
+                grasp_samples,
+                grasp_scores,
+                camera_pose=obs["agentview"]["pose"],
+            )
+
         # Calculate bbox center using actual 3D points from segmentation
         # This is more accurate than using a single pixel depth
         if depth.ndim == 3:
@@ -344,7 +401,7 @@ class FrankaTwoArmLiftApi(ApiBase):
         bbox_center_world_tf = cam_extr_tf @ bbox_center_cam_tf
         bbox_center_world = bbox_center_world_tf.translation()
 
-        return None, None, bbox_center_world
+        return grasp_position, grasp_quaternion_wxyz, bbox_center_world
 
     # ----------------------- Pose Getters -----------------------
 
@@ -384,6 +441,24 @@ class FrankaTwoArmLiftApi(ApiBase):
         # Use vision detection to get handle bbox center
         _, _, bbox_center = self._get_handle_pose_with_graspnet("The blue square", index=0)
         return bbox_center
+
+    def get_handle0_grasp_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return the best Contact-GraspNet world-frame pose for handle 0."""
+        position, quaternion_wxyz, _ = self._get_handle_pose_with_graspnet(
+            "The green square frame", index=0, plan_grasp=True
+        )
+        if position is None or quaternion_wxyz is None:
+            raise RuntimeError("Contact-GraspNet did not return a pose for handle 0.")
+        return position, quaternion_wxyz
+
+    def get_handle1_grasp_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return the best Contact-GraspNet world-frame pose for handle 1."""
+        position, quaternion_wxyz, _ = self._get_handle_pose_with_graspnet(
+            "The blue square", index=0, plan_grasp=True
+        )
+        if position is None or quaternion_wxyz is None:
+            raise RuntimeError("Contact-GraspNet did not return a pose for handle 1.")
+        return position, quaternion_wxyz
 
     def get_arm0_gripper_pose(self) -> tuple[np.ndarray, np.ndarray]:
         """Get the pose of the gripper for arm 0.

@@ -757,6 +757,9 @@ def _run_capsule_trial(
     side_effect_calls = collect_side_effect_calls(getattr(env, "_apis", {}).values())
     if not side_effect_calls:
         side_effect_calls = ROBOT_SIDE_EFFECT_CALLS
+    recovery_observation_functions = _collect_recovery_observation_functions(
+        getattr(env, "_apis", {}).values()
+    )
     initial_syntax_error: SyntaxError | None = None
     try:
         regions = segment_python_code(source)
@@ -819,6 +822,7 @@ def _run_capsule_trial(
             groups=groups if use_semantic_groups else None,
             history=history,
             trace_summary=executor.trace.summary() if executor.trace is not None else {},
+            recovery_observation_functions=recovery_observation_functions,
         )
         prompts.append(prompt)
 
@@ -850,6 +854,7 @@ def _run_capsule_trial(
                 action,
                 executed_side_effect_regions,
                 executed_side_effect_groups,
+                recovery_observation_functions=recovery_observation_functions,
             )
             if event is None:
                 event = _reward_drop_guard_event(
@@ -861,6 +866,7 @@ def _run_capsule_trial(
                     recovery_side_effect_budget=recovery_side_effect_budget,
                     min_best_reward=reward_drop_guard_min_best_reward,
                     drop_threshold=reward_drop_guard_threshold,
+                    recovery_observation_functions=recovery_observation_functions,
                 )
             if event is None:
                 consumes_recovery_side_effect = (
@@ -877,6 +883,7 @@ def _run_capsule_trial(
                     source,
                     region_by_id,
                     group_by_id,
+                    recovery_observation_functions=recovery_observation_functions,
                 )
                 if consumes_recovery_side_effect:
                     recovery_side_effect_budget -= 1
@@ -1046,6 +1053,7 @@ def _execute_runtime_action(
     source: str,
     region_by_id: dict[str, Any],
     group_by_id: dict[str, Any] | None = None,
+    recovery_observation_functions: set[str] | None = None,
 ) -> RuntimeEvent:
     group_by_id = group_by_id or {}
     if action.action == "finish":
@@ -1177,11 +1185,26 @@ def _execute_runtime_action(
                 message=f"append_recovery source must parse as Python: {exc.msg}",
                 evidence={"exception_type": type(exc).__name__},
             )
-        if not _ast_calls_function(recovery_tree, "get_observation"):
+        fresh_state_functions = (
+            {"get_observation"}
+            if recovery_observation_functions is None
+            else recovery_observation_functions
+        )
+        if not fresh_state_functions:
             return RuntimeEvent(
                 action=action.action,
                 status="invalid",
-                message="append_recovery source must call get_observation().",
+                message=(
+                    "append_recovery is unavailable because the active API does not declare "
+                    "a fresh-state observation function."
+                ),
+            )
+        if not any(_ast_calls_function(recovery_tree, name) for name in fresh_state_functions):
+            allowed_calls = ", ".join(f"{name}()" for name in sorted(fresh_state_functions))
+            return RuntimeEvent(
+                action=action.action,
+                status="invalid",
+                message=f"append_recovery source must call at least one of: {allowed_calls}.",
             )
         patched = _append_recovery_source(source, recovery_source)
         return RuntimeEvent(
@@ -1219,11 +1242,10 @@ def _no_rollback_guard_event(
     action: RuntimeAction,
     executed_side_effect_regions: set[str],
     executed_side_effect_groups: set[str],
+    *,
+    recovery_observation_functions: set[str] | None = None,
 ) -> RuntimeEvent | None:
-    recovery_hint = (
-        "Use append_recovery with a fresh get_observation() to continue from the "
-        "current physical state."
-    )
+    recovery_hint = _recovery_instruction(recovery_observation_functions)
     if action.action in {"run_group", "patch_group"}:
         group_id = str(action.args.get("group_id", ""))
         if group_id in executed_side_effect_groups:
@@ -1249,6 +1271,7 @@ def _reward_drop_guard_event(
     recovery_side_effect_budget: int,
     min_best_reward: float,
     drop_threshold: float,
+    recovery_observation_functions: set[str] | None = None,
 ) -> RuntimeEvent | None:
     if recovery_side_effect_budget > 0:
         return None
@@ -1264,15 +1287,15 @@ def _reward_drop_guard_event(
         return None
 
     unit_id = _runtime_action_unit_id(action)
+    recovery_hint = _recovery_instruction(recovery_observation_functions)
     return RuntimeEvent(
         action=action.action,
         status="invalid",
         region_id=unit_id,
         message=(
             f"Current reward dropped from best_reward={best_reward_so_far:.3f} "
-            f"to {current_reward:.3f}. Rollback is disabled. Use append_recovery "
-            "with a fresh get_observation() before executing more robot-side-effect "
-            "code, or finish if the task is complete."
+            f"to {current_reward:.3f}. Rollback is disabled. {recovery_hint} "
+            "Finish instead if the task is complete."
         ),
         evidence={
             "best_reward_so_far": best_reward_so_far,
@@ -1345,6 +1368,31 @@ def _ast_calls_function(tree: ast.AST, function_name: str) -> bool:
         if isinstance(func, ast.Attribute) and func.attr == function_name:
             return True
     return False
+
+
+def _recovery_instruction(recovery_observation_functions: set[str] | None) -> str:
+    functions = (
+        {"get_observation"}
+        if recovery_observation_functions is None
+        else recovery_observation_functions
+    )
+    if not functions:
+        return "append_recovery is unavailable because no fresh-state function is declared."
+    calls = ", ".join(f"{name}()" for name in sorted(functions))
+    return (
+        f"Use append_recovery that calls at least one fresh-state function ({calls}) "
+        "before executing more robot-side-effect code from the current physical state."
+    )
+
+
+def _collect_recovery_observation_functions(apis: Any) -> set[str]:
+    functions: set[str] = set()
+    for api in apis:
+        public_functions = set(api.functions())
+        capability = getattr(api, "recovery_observation_functions", None)
+        declared = set(capability()) if callable(capability) else {"get_observation"}
+        functions.update(declared & public_functions)
+    return functions
 
 
 def _region_has_robot_side_effect(region: Any) -> bool:
@@ -1459,6 +1507,7 @@ def _capsule_step_metric(
         "recovery_execution_improved": (
             recovery_execution_reward_improved or recovery_execution_trace_improved
         ),
+        "recovery_execution_effective": recovery_execution_reward_improved,
         "task_completed_before": before_state.get("task_completed"),
         "task_completed_after": after_state.get("task_completed"),
         "state_before": before_state,
@@ -1528,7 +1577,10 @@ def _safe_task_completed(env: CodeExecutionEnvBase) -> bool | None:
 def _summarize_runtime_value(value: Any) -> dict[str, Any]:
     shape = getattr(value, "shape", None)
     if shape is not None:
-        return {"type": type(value).__name__, "shape": list(shape)}
+        summary = {"type": type(value).__name__, "shape": list(shape)}
+        if isinstance(value, np.ndarray) and value.size <= 32 and value.dtype.kind in "biuf":
+            summary["value"] = value.tolist()
+        return summary
     return {"type": type(value).__name__, "repr": repr(value)[:200]}
 
 

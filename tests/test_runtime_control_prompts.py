@@ -95,3 +95,34 @@ def test_capsule_prompt_documents_append_recovery():
     assert '{"action": "append_recovery", "args": {"source":' in text
     assert "get_observation()" in text
     assert "current physical state" in text
+
+
+def test_capsule_prompt_documents_task_specific_recovery_observation_functions():
+    prompt = build_capsule_prompt(
+        task="lift pot",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=[],
+        trace_summary={},
+        recovery_observation_functions={"get_handle0_pos", "get_handle1_pos"},
+    )
+    text = str(prompt)
+
+    assert "get_handle0_pos()" in text
+    assert "get_handle1_pos()" in text
+    assert "must call at least one" in text
+
+
+def test_capsule_prompt_marks_recovery_unavailable_without_fresh_state_function():
+    prompt = build_capsule_prompt(
+        task="unknown task",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=[],
+        trace_summary={},
+        recovery_observation_functions=set(),
+    )
+
+    text = prompt[1]["content"][0]["text"]
+    allowed_actions = next(line for line in text.splitlines() if line.startswith("Allowed actions:"))
+
+    assert "append_recovery is unavailable" in text
+    assert "append_recovery" not in allowed_actions

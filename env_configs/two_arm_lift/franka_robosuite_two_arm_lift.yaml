@@ -38,3 +38,8 @@ output_dir: ./outputs/franka_robosuite_two_arm_lift
 trials: 100
 num_workers: 12
 use_oracle_code: false
+
+# Two Arm Lift uses a low-range dense reward before task success. Keep this
+# override task-local so other Capsule experiments retain their existing guard.
+capsule_reward_drop_guard_min_best_reward: 0.05
+capsule_reward_drop_guard_threshold: 0.03

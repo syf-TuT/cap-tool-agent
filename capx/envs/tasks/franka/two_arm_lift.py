@@ -9,6 +9,8 @@ Guidance:
 - You may want to slightly lift both arms first to avoid occluding the pot and handles.
 - Use `get_handle0_pos()` to get the bounding box center position of handle 0 (returns a single 3D array).
 - Use `get_handle1_pos()` to get the bounding box center position of handle 1 (returns a single 3D array).
+- Use `get_handle0_grasp_pose()` and `get_handle1_grasp_pose()` when Contact-GraspNet position
+  and orientation estimates are needed; each returns `(position, quaternion_wxyz)`.
 - Avoid using top-down grasps, i.e. avoid using quaternion wxyz [0, 0, 1, 0] for the approach.
 - Sideways grasps are preferred with the y-axis of the gripper aligned with the world z-axis.
 - Coordinate system: All pose functions accept/return positions in robot0's base frame.

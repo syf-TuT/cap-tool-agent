@@ -35,7 +35,47 @@ def build_capsule_prompt(
     groups: list[CodeRegionGroup] | None = None,
     history: list[dict[str, Any]],
     trace_summary: dict[str, Any],
+    recovery_observation_functions: set[str] | None = None,
 ) -> list[dict[str, Any]]:
+    recovery_functions = sorted(
+        {"get_observation"}
+        if recovery_observation_functions is None
+        else recovery_observation_functions
+    )
+    if recovery_functions:
+        recovery_calls = ", ".join(f"{name}()" for name in recovery_functions)
+        recovery_guidance = (
+            "For recovery after robot side effects, prefer appending new recovery code with "
+            "append_recovery; the appended code must call at least one fresh-state function "
+            f"({recovery_calls}) so it starts from the current physical state."
+        )
+        recovery_example_line = (
+            '{"action": "append_recovery", "args": {"source": '
+            f'"state = {recovery_functions[0]}()\\n# recover from the current physical state"}}\n'
+        )
+        recovery_rule = (
+            "For append_recovery, args.source must be executable Python code that includes "
+            f"at least one of {recovery_calls} and continues from the current physical state."
+        )
+    else:
+        recovery_guidance = (
+            "append_recovery is unavailable because the active API does not declare a "
+            "fresh-state observation function."
+        )
+        recovery_example_line = ""
+        recovery_rule = recovery_guidance
+    allowed_actions = [
+        "run_group",
+        "run_region",
+        "inspect_trace",
+        "inspect_variables",
+        "patch_group",
+        "patch_region",
+    ]
+    if recovery_functions:
+        allowed_actions.append("append_recovery")
+    allowed_actions.extend(["resume_from_region", "finish"])
+    allowed_actions_text = ", ".join(allowed_actions)
     region_data = [region.to_dict() for region in regions]
     group_data = [group.to_dict() for group in groups or []]
     group_text = ""
@@ -61,11 +101,9 @@ def build_capsule_prompt(
         "changed the current physical state, so repairs must continue from that state. "
         "Use a fresh observation and patch or resume code as current-state recovery; do "
         "not assume earlier robot actions can be undone or replayed from their original "
-        "preconditions. For recovery after robot side effects, prefer appending new "
-        "recovery code with append_recovery; the appended code must call "
-        "get_observation() so it starts from the current physical state.\n\n"
-        "Allowed actions: run_group, run_region, inspect_trace, inspect_variables, "
-        "patch_group, patch_region, append_recovery, resume_from_region, finish.\n\n"
+        "preconditions. "
+        f"{recovery_guidance}\n\n"
+        f"Allowed actions: {allowed_actions_text}.\n\n"
         "Prefer run_group over run_region when code groups are available. A group is a "
         "semantic source chunk that may include setup plus one robot side effect. Use "
         "patch_group for local repairs unless a single atomic region is clearly "
@@ -78,8 +116,7 @@ def build_capsule_prompt(
         '"source": "replacement Python source for the complete group_1 source span"}}\n'
         '{"action": "patch_region", "args": {"region_id": "region_1", '
         '"source": "replacement Python source for only region_1"}}\n'
-        '{"action": "append_recovery", "args": {"source": '
-        '"obs = get_observation()\\n# recover from the current physical state"}}\n'
+        f"{recovery_example_line}"
         "For inspect_variables, args.names must be a non-empty list of Python variable "
         "names to inspect. Do not pass region_id to inspect_variables.\n"
         "For patch_group, args.source must be the complete replacement Python source "
@@ -87,8 +124,8 @@ def build_capsule_prompt(
         "For patch_region, args.source must be the complete replacement Python source "
         "for only the requested source region. Do not use new_source or patch for "
         "patch_region replacement text.\n"
-        "For append_recovery, args.source must be executable Python code that includes "
-        "get_observation() and continues from the current physical state. Do not ask "
+        f"{recovery_rule} "
+        "Do not ask "
         "for robot primitives as tools."
     )
     return [
