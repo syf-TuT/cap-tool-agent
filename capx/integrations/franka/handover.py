@@ -35,6 +35,7 @@ class FrankaHandoverApi(ApiBase):
     """Robot control API for two-arm hammer handover task.
 
     Functions:
+      - get_observation() -> dict[str, Any]
       - get_object_pose(object_name: str, return_bbox_extent: bool = False) -> (position: np.ndarray, quaternion_wxyz: np.ndarray, bbox_extent: np.ndarray | None)
       - goto_pose_arm0(position: np.ndarray, quaternion_wxyz: np.ndarray, z_approach: float = 0.0) -> None
       - goto_pose_arm1(position: np.ndarray, quaternion_wxyz: np.ndarray, z_approach: float = 0.0) -> None
@@ -63,6 +64,7 @@ class FrankaHandoverApi(ApiBase):
 
     def functions(self) -> dict[str, Any]:
         return {
+            "get_observation": self.get_observation,
             "get_object_pose": self.get_object_pose,
             # "sample_grasp_pose": self.sample_grasp_pose,
             # "get_arm0_gripper_pose": self.get_arm0_gripper_pose,
@@ -74,6 +76,10 @@ class FrankaHandoverApi(ApiBase):
             "close_gripper_arm0": self.close_gripper_arm0,
             "close_gripper_arm1": self.close_gripper_arm1,
         }
+
+    def get_observation(self) -> dict[str, Any]:
+        """Return the current non-privileged environment observation."""
+        return self._env.get_observation()
 
     def side_effect_functions(self) -> set[str]:
         return {

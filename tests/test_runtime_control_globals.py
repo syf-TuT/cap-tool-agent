@@ -1,5 +1,6 @@
 from capx.envs.tasks.base import CodeExecutionEnvBase
 from capx.integrations.franka.control import FrankaControlApi
+from capx.integrations.franka.handover import FrankaHandoverApi
 from capx.runtime_control.trace import RuntimeTrace
 
 
@@ -27,4 +28,18 @@ def test_cube_lift_api_keeps_get_observation_recovery_contract():
     api = FrankaControlApi.__new__(FrankaControlApi)
     api.real = False
 
+    assert api.recovery_observation_functions() == {"get_observation"}
+
+
+def test_handover_api_exposes_environment_observation_for_recovery():
+    observation = {"agentview": {"images": {"rgb": "frame"}}}
+
+    class FakeEnv:
+        def get_observation(self):
+            return observation
+
+    api = FrankaHandoverApi.__new__(FrankaHandoverApi)
+    api._env = FakeEnv()
+
+    assert api.functions()["get_observation"]() is observation
     assert api.recovery_observation_functions() == {"get_observation"}
