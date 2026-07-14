@@ -49,6 +49,7 @@ class FrankaRobosuiteSpillWipeLowLevel(RobosuiteBaseEnv):
                 self.render_camera_names = []
                 self.robosuite_env = suite.environments.manipulation.wipe.Wipe(
                     robots=["Panda"],
+                    use_object_obs=privileged,
                     use_camera_obs=False,
                     has_renderer=False,
                     has_offscreen_renderer=False,
@@ -65,6 +66,7 @@ class FrankaRobosuiteSpillWipeLowLevel(RobosuiteBaseEnv):
             else:
                 self.robosuite_env = suite.environments.manipulation.wipe.Wipe(
                     robots=["Panda"],
+                    use_object_obs=privileged,
                     has_renderer=False,
                     has_offscreen_renderer=True,
                     camera_names=self.render_camera_names,
@@ -81,6 +83,7 @@ class FrankaRobosuiteSpillWipeLowLevel(RobosuiteBaseEnv):
         else:
             self.robosuite_env = suite.environments.manipulation.wipe.Wipe(
                 robots=["Panda"],
+                use_object_obs=privileged,
                 has_renderer=True,
                 has_offscreen_renderer=True,
                 camera_names=self.render_camera_names,

@@ -50,6 +50,7 @@ class RobosuiteBaseEnv(BaseEnv):
         super().__init__()
         self.controller_cfg = controller_cfg
         self.max_steps = max_steps
+        self.privileged = privileged
         self.save_camera_name = "robot0_robotview"
         self.render_camera_names = [self.save_camera_name]
         self.segmentation_level = "instance"

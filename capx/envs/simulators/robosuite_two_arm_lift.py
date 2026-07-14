@@ -41,6 +41,7 @@ class RobosuiteTwoArmLiftEnv(BaseEnv):
         super().__init__()
         self.controller_cfg = controller_cfg
         self.max_steps = max_steps
+        self.privileged = privileged
         self.save_camera_name = "agentview"  # Scene-level camera to show both arms
         self.render_camera_names = ["agentview"]  # Scene-level camera for observations
         self.segmentation_level = "instance"
@@ -69,7 +70,7 @@ class RobosuiteTwoArmLiftEnv(BaseEnv):
                     camera_widths=self._render_width,
                     controller_configs=[controller_config, controller_config],
                     horizon=max_steps,
-                    use_object_obs=True,
+                    use_object_obs=privileged,
                     reward_shaping=True,
                 )
             else:
@@ -85,7 +86,7 @@ class RobosuiteTwoArmLiftEnv(BaseEnv):
                     camera_widths=self._render_width,
                     controller_configs=[controller_config, controller_config],
                     horizon=max_steps,
-                    use_object_obs=True,
+                    use_object_obs=privileged,
                     use_camera_obs=True,
                     camera_depths=True,
                     reward_shaping=True,
@@ -103,7 +104,7 @@ class RobosuiteTwoArmLiftEnv(BaseEnv):
                 camera_widths=self._render_width,
                 controller_configs=[controller_config, controller_config],
                 horizon=max_steps,
-                use_object_obs=True,
+                use_object_obs=privileged,
                 use_camera_obs=True,
                 camera_depths=True,
                 reward_shaping=True,

@@ -44,6 +44,7 @@ class RobosuiteHandoverEnv(BaseEnv):
         super().__init__()
         self.controller_cfg = controller_cfg
         self.max_steps = max_steps
+        self.privileged = privileged
         self.save_camera_name = "agentview"  # Scene-level camera to show both arms
         self.render_camera_names = ["agentview"]  # Scene-level camera for observations
         self.segmentation_level = "instance"
@@ -73,7 +74,7 @@ class RobosuiteHandoverEnv(BaseEnv):
                     horizon=max_steps,
                     prehensile=True,
                     reward_shaping=True,
-                    use_object_obs=True,
+                    use_object_obs=privileged,
                 )
             else:
                 self.robosuite_env = suite.environments.manipulation.two_arm_handover.TwoArmHandover(
@@ -90,7 +91,7 @@ class RobosuiteHandoverEnv(BaseEnv):
                     horizon=max_steps,
                     prehensile=True,
                     reward_shaping=True,
-                    use_object_obs=True,
+                    use_object_obs=privileged,
                     use_camera_obs=True,
                 )
         else:
@@ -109,7 +110,7 @@ class RobosuiteHandoverEnv(BaseEnv):
                 horizon=max_steps,
                 prehensile=True,  # Hammer starts on table
                 reward_shaping=True,  # Use sparse reward (2.0 for success)
-                use_object_obs=True,  # Required for hammer_pos, hammer_quat, handle_xpos observations
+                use_object_obs=privileged,
                 use_camera_obs=True,  # Required for camera observations
             )
 

@@ -61,6 +61,7 @@ class FrankaRobosuiteNutAssembly(RobosuiteBaseEnv):
                 self.render_camera_names = []
                 self.robosuite_env = suite.environments.manipulation.nut_assembly.NutAssemblySquare(
                     robots=["Panda"],
+                    use_object_obs=privileged,
                     use_camera_obs=False,
                     has_renderer=False,
                     has_offscreen_renderer=False,
@@ -77,6 +78,7 @@ class FrankaRobosuiteNutAssembly(RobosuiteBaseEnv):
             else:
                 self.robosuite_env = suite.environments.manipulation.nut_assembly.NutAssemblySquare(
                     robots=["Panda"],
+                    use_object_obs=privileged,
                     has_renderer=False,
                     has_offscreen_renderer=True,
                     camera_names=self.render_camera_names,
@@ -93,6 +95,7 @@ class FrankaRobosuiteNutAssembly(RobosuiteBaseEnv):
         else:
             self.robosuite_env = suite.environments.manipulation.nut_assembly.NutAssemblySquare(
                 robots=["Panda"],
+                use_object_obs=privileged,
                 has_renderer=True,
                 has_offscreen_renderer=True,
                 camera_names=self.render_camera_names,
