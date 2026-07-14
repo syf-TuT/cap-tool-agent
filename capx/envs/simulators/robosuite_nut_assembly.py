@@ -444,25 +444,26 @@ class FrankaRobosuiteNutAssembly(RobosuiteBaseEnv):
                         point_shape="square",
                     )
 
-            if "square_nut" in obs["nut_poses"]:
+            nut_poses = obs.get("nut_poses")
+            if nut_poses is not None and "square_nut" in nut_poses:
                 self.viser_server.scene.add_frame(
                     "square_nut_frame",
-                    position=obs["nut_poses"]["square_nut"][:3],
-                    wxyz=obs["nut_poses"]["square_nut"][3:],
+                    position=nut_poses["square_nut"][:3],
+                    wxyz=nut_poses["square_nut"][3:],
                     axes_length=0.05,
                     axes_radius=0.005,
                 )
                 self.viser_server.scene.add_frame(
                     "square_nut_handle_frame",
-                    position=obs["nut_poses"]["square_nut_handle"][:3],
-                    wxyz=obs["nut_poses"]["square_nut_handle"][3:],
+                    position=nut_poses["square_nut_handle"][:3],
+                    wxyz=nut_poses["square_nut_handle"][3:],
                     axes_length=0.05,
                     axes_radius=0.005,
                 )
                 self.viser_server.scene.add_frame(
                     "peg_frame",
-                    position=obs["nut_poses"]["square_peg"][:3],
-                    wxyz=obs["nut_poses"]["square_peg"][3:],
+                    position=nut_poses["square_peg"][:3],
+                    wxyz=nut_poses["square_peg"][3:],
                     axes_length=0.05,
                     axes_radius=0.005,
                 )

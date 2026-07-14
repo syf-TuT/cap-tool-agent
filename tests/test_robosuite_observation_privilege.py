@@ -315,3 +315,68 @@ def test_privileged_nut_observation_keeps_derived_poses() -> None:
     observation = env.get_observation()
 
     assert "square_nut" in observation["nut_poses"]
+
+
+class FakeRestackEvaluationEnv:
+    def __init__(self, *, cube_heights: tuple[float, float]) -> None:
+        body_xpos = np.zeros((2, 3), dtype=np.float64)
+        body_xpos[:, 2] = cube_heights
+        self.sim = SimpleNamespace(data=SimpleNamespace(body_xpos=body_xpos))
+        self.cubeA_body_id = 0
+        self.cubeB_body_id = 1
+
+    def reward(self, action: Any = None) -> float:
+        return 0.5
+
+    def _check_success(self) -> bool:
+        return True
+
+    def _get_observations(self) -> dict[str, Any]:
+        pytest.fail("evaluation requested public Robosuite object observations")
+
+
+@pytest.mark.parametrize(
+    ("cube_heights", "expected_reward", "expected_completed"),
+    (
+        ((0.03, 0.08), 0.5, True),
+        ((0.05, 0.06), 0.0, False),
+    ),
+)
+def test_restack_evaluation_uses_internal_simulator_state(
+    cube_heights: tuple[float, float],
+    expected_reward: float,
+    expected_completed: bool,
+) -> None:
+    env = robosuite_cubes_restack.FrankaRobosuiteCubesRestackLowLevel.__new__(
+        robosuite_cubes_restack.FrankaRobosuiteCubesRestackLowLevel
+    )
+    env.privileged = False
+    env.robosuite_env = FakeRestackEvaluationEnv(cube_heights=cube_heights)
+
+    assert env.compute_reward() == expected_reward
+    assert env.task_completed() is expected_completed
+
+
+def test_non_privileged_nut_viser_tolerates_missing_ground_truth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = robosuite_nut_assembly.FrankaRobosuiteNutAssembly.__new__(
+        robosuite_nut_assembly.FrankaRobosuiteNutAssembly
+    )
+    env.viser_debug = True
+    env.gripper_metric_length = 0.04
+    env.get_observation = lambda: {
+        "robot_cartesian_pos": np.zeros(8),
+        "robot_joint_pos": np.zeros(8),
+    }
+    env._viser_init_check = lambda: None
+    env.urdf_vis = SimpleNamespace(update_cfg=lambda _: None)
+    env.cube_center = None
+    env.cube_rot = None
+    env.cube_points = None
+    env.cube_color = None
+    env.grasp_frame_position = None
+    env.grasp_frame_orientation = None
+    monkeypatch.setattr(robosuite_nut_assembly, "obs_get_rgb", lambda _: {})
+
+    env._update_viser_server()

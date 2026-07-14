@@ -436,45 +436,25 @@ class FrankaRobosuiteCubesRestackLowLevel(RobosuiteBaseEnv):
             ],
         }
 
+    def _both_cubes_airborne(self) -> bool:
+        """Check the anti-cheat condition directly from private simulator state."""
+        body_xpos = self.robosuite_env.sim.data.body_xpos
+        cube_a_height = body_xpos[self.robosuite_env.cubeA_body_id, 2]
+        cube_b_height = body_xpos[self.robosuite_env.cubeB_body_id, 2]
+        return bool(cube_a_height > 0.04 and cube_b_height > 0.04)
+
     def compute_reward(self) -> float:
         """Compute dense stacking reward."""
-        if self.robosuite_env.reward(action=None) > 0.4:
-            # Secondary check to make sure both cubes are not up in the air
-            robosuite_obs = self.robosuite_env._get_observations()
-            pose_dict = self._cube_pose_dict(robosuite_obs)
-            cube_pose_array = np.stack(
-                [
-                    np.asarray(pose_dict["primary"], dtype=np.float32),
-                    np.asarray(pose_dict["secondary"], dtype=np.float32),
-                ],
-                axis=0,
-            )
-            if cube_pose_array[0, 2] > 0.04 and cube_pose_array[1, 2] > 0.04:
-                return 0.0
-            else:
-                return self.robosuite_env.reward(action=None)
-        else:
-            return self.robosuite_env.reward(action=None)
+        reward = self.robosuite_env.reward(action=None)
+        if reward > 0.4 and self._both_cubes_airborne():
+            return 0.0
+        return reward
 
     def task_completed(self) -> bool:
         """Compute if the task is completed."""
         if self.robosuite_env._check_success():
-            # Secondary check to make sure both cubes are not up in the air
-            robosuite_obs = self.robosuite_env._get_observations()
-            pose_dict = self._cube_pose_dict(robosuite_obs)
-            cube_pose_array = np.stack(
-                [
-                    np.asarray(pose_dict["primary"], dtype=np.float32),
-                    np.asarray(pose_dict["secondary"], dtype=np.float32),
-                ],
-                axis=0,
-            )
-            if cube_pose_array[0, 2] > 0.04 and cube_pose_array[1, 2] > 0.04:
-                return False
-            else:
-                return True
-        else:
-            return False
+            return not self._both_cubes_airborne()
+        return False
 
     def get_observation(self) -> dict[str, Any]:
         """Get observation in FrankaPickPlaceLowLevel format."""
