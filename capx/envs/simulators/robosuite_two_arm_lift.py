@@ -462,23 +462,24 @@ class RobosuiteTwoArmLiftEnv(BaseEnv):
     def get_observation(self) -> dict[str, Any]:
         """Get observation in FrankaPickPlaceLowLevel format."""
         robosuite_obs = self.robosuite_env._get_observations()
-        pose_dict = self._pot_pose_dict(robosuite_obs)
+        if self.privileged:
+            pose_dict = self._pot_pose_dict(robosuite_obs)
 
-        # Store pot poses explicitly
-        pot_pose_array = np.stack(
-            [
-                np.asarray(pose_dict["pot"], dtype=np.float32),
-                np.asarray(pose_dict["handle0"], dtype=np.float32),
-                np.asarray(pose_dict["handle1"], dtype=np.float32),
-            ],
-            axis=0,
-        )
+            # Store pot poses explicitly
+            pot_pose_array = np.stack(
+                [
+                    np.asarray(pose_dict["pot"], dtype=np.float32),
+                    np.asarray(pose_dict["handle0"], dtype=np.float32),
+                    np.asarray(pose_dict["handle1"], dtype=np.float32),
+                ],
+                axis=0,
+            )
 
-        robosuite_obs["pot_poses"] = {
-            "pot": pot_pose_array[0],
-            "handle0": pot_pose_array[1],
-            "handle1": pot_pose_array[2],
-        }
+            robosuite_obs["pot_poses"] = {
+                "pot": pot_pose_array[0],
+                "handle0": pot_pose_array[1],
+                "handle1": pot_pose_array[2],
+            }
 
         for camera_name in self.render_camera_names:
             if camera_name not in robosuite_obs:

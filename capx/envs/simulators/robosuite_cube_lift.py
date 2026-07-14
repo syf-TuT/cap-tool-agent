@@ -176,17 +176,18 @@ class FrankaRobosuiteCubeLiftLowLevel(RobosuiteBaseEnv):
     def get_observation(self) -> dict[str, Any]:
         """Get observation in FrankaPickPlaceLowLevel format."""
         robosuite_obs = self.robosuite_env._get_observations()
-        pose_dict = self._cube_pose_dict(robosuite_obs)
-        cube_pose_array = np.stack(
-            [
-                np.asarray(pose_dict["primary"], dtype=np.float32),
-            ],
-            axis=0,
-        )
+        if self.privileged:
+            pose_dict = self._cube_pose_dict(robosuite_obs)
+            cube_pose_array = np.stack(
+                [
+                    np.asarray(pose_dict["primary"], dtype=np.float32),
+                ],
+                axis=0,
+            )
 
-        robosuite_obs["cube_poses"] = {
-            "primary": cube_pose_array[0],
-        }
+            robosuite_obs["cube_poses"] = {
+                "primary": cube_pose_array[0],
+            }
 
         self._process_camera_observations(robosuite_obs)
         self._compute_gripper_obs(robosuite_obs)

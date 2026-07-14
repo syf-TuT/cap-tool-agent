@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 
 from capx.envs.simulators import robosuite_cube_lift
@@ -105,3 +107,211 @@ def test_two_arm_lift_selects_object_observations_at_robosuite_source(
         robosuite_two_arm_lift.RobosuiteTwoArmLiftEnv(privileged=privileged)
 
     assert captured_kwargs["use_object_obs"] is privileged
+
+
+class FakeRobosuiteEnv:
+    def __init__(self, observation: dict[str, Any], *, with_sim: bool = False) -> None:
+        self.observation = observation
+        if with_sim:
+            self.sim = FakeSim()
+
+    def _get_observations(self, *, force_update: bool = False) -> dict[str, Any]:
+        return self.observation.copy()
+
+
+class FakeModel:
+    def __init__(self) -> None:
+        self.cam_pos = np.zeros((1, 3), dtype=np.float64)
+        self.cam_quat = np.zeros((1, 4), dtype=np.float64)
+        self.cam_fovy = np.array([45.0], dtype=np.float64)
+
+    def camera_name2id(self, _: str) -> int:
+        return 0
+
+
+class FakeData:
+    def __init__(self) -> None:
+        self.xquat = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (4, 1))
+        self.xpos = np.zeros((4, 3), dtype=np.float64)
+
+    def get_camera_xmat(self, _: str) -> np.ndarray:
+        return np.eye(3)
+
+    def get_camera_xpos(self, _: str) -> np.ndarray:
+        return np.zeros(3)
+
+
+class FakeSim:
+    def __init__(self) -> None:
+        self.model = FakeModel()
+        self.data = FakeData()
+
+    def forward(self) -> None:
+        pass
+
+
+CUBE_OBSERVATION_CASES = (
+    (robosuite_cubes.FrankaRobosuiteCubesLowLevel, "_cube_pose_dict"),
+    (robosuite_cube_lift.FrankaRobosuiteCubeLiftLowLevel, "_cube_pose_dict"),
+    (robosuite_cubes_restack.FrankaRobosuiteCubesRestackLowLevel, "_cube_pose_dict"),
+)
+
+
+@pytest.mark.parametrize(("wrapper_cls", "pose_method_name"), CUBE_OBSERVATION_CASES)
+def test_non_privileged_cube_observation_does_not_require_object_state(
+    wrapper_cls: type[Any],
+    pose_method_name: str,
+) -> None:
+    env = wrapper_cls.__new__(wrapper_cls)
+    env.privileged = False
+    env.robosuite_env = FakeRobosuiteEnv({"camera": "frame", "robot0_joint_pos": "joints"})
+    env._process_camera_observations = lambda _: None
+    env._compute_gripper_obs = lambda _: None
+    setattr(
+        env,
+        pose_method_name,
+        lambda _: pytest.fail("non-privileged observation requested cube ground truth"),
+    )
+
+    observation = env.get_observation()
+
+    assert observation["camera"] == "frame"
+    assert observation["robot0_joint_pos"] == "joints"
+    assert "cube_poses" not in observation
+
+
+@pytest.mark.parametrize(("wrapper_cls", "pose_method_name"), CUBE_OBSERVATION_CASES)
+def test_privileged_cube_observation_keeps_derived_poses(
+    wrapper_cls: type[Any],
+    pose_method_name: str,
+) -> None:
+    env = wrapper_cls.__new__(wrapper_cls)
+    env.privileged = True
+    env.robosuite_env = FakeRobosuiteEnv({})
+    env._process_camera_observations = lambda _: None
+    env._compute_gripper_obs = lambda _: None
+    setattr(
+        env,
+        pose_method_name,
+        lambda _: {
+            "primary": np.zeros(7, dtype=np.float32),
+            "secondary": np.ones(7, dtype=np.float32),
+        },
+    )
+
+    observation = env.get_observation()
+
+    assert "cube_poses" in observation
+    assert "primary" in observation["cube_poses"]
+
+
+def _make_two_arm_wrapper(wrapper_cls: type[Any], *, privileged: bool) -> Any:
+    env = wrapper_cls.__new__(wrapper_cls)
+    env.privileged = privileged
+    env.render_camera_names = ["agentview"]
+    env.segmentation_level = "instance"
+    env._render_width = 8
+    env._render_height = 8
+    env.base_link_wxyz_xyz_0 = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    env.base_link_wxyz_xyz_1 = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    env.base_link_idx_0 = 0
+    env.gripper_link_idx_0 = 1
+    env.gripper_link_idx_1 = 2
+    env.gripper_metric_length = 0.04
+    env.robosuite_env = FakeRobosuiteEnv(
+        {
+            "robot0_gripper_qpos": np.array([0.0]),
+            "robot1_gripper_qpos": np.array([0.0]),
+        },
+        with_sim=True,
+    )
+    return env
+
+
+@pytest.mark.parametrize(
+    ("wrapper_cls", "pose_method_name", "derived_key"),
+    (
+        (robosuite_handover.RobosuiteHandoverEnv, "_hammer_pose_dict", "hammer_poses"),
+        (robosuite_two_arm_lift.RobosuiteTwoArmLiftEnv, "_pot_pose_dict", "pot_poses"),
+    ),
+)
+def test_non_privileged_two_arm_observation_does_not_require_object_state(
+    wrapper_cls: type[Any],
+    pose_method_name: str,
+    derived_key: str,
+) -> None:
+    env = _make_two_arm_wrapper(wrapper_cls, privileged=False)
+    setattr(
+        env,
+        pose_method_name,
+        lambda _: pytest.fail("non-privileged observation requested object ground truth"),
+    )
+
+    observation = env.get_observation()
+
+    assert derived_key not in observation
+    assert "robot0_cartesian_pos" in observation
+
+
+@pytest.mark.parametrize(
+    ("wrapper_cls", "pose_method_name", "derived_key", "pose_names"),
+    (
+        (
+            robosuite_handover.RobosuiteHandoverEnv,
+            "_hammer_pose_dict",
+            "hammer_poses",
+            ("hammer", "handle"),
+        ),
+        (
+            robosuite_two_arm_lift.RobosuiteTwoArmLiftEnv,
+            "_pot_pose_dict",
+            "pot_poses",
+            ("pot", "handle0", "handle1"),
+        ),
+    ),
+)
+def test_privileged_two_arm_observation_keeps_derived_poses(
+    wrapper_cls: type[Any],
+    pose_method_name: str,
+    derived_key: str,
+    pose_names: tuple[str, ...],
+) -> None:
+    env = _make_two_arm_wrapper(wrapper_cls, privileged=True)
+    setattr(env, pose_method_name, lambda _: {name: np.zeros(7) for name in pose_names})
+
+    observation = env.get_observation()
+
+    assert set(observation[derived_key]) == set(pose_names)
+
+
+def test_non_privileged_nut_observation_does_not_require_object_state() -> None:
+    env = robosuite_nut_assembly.FrankaRobosuiteNutAssembly.__new__(
+        robosuite_nut_assembly.FrankaRobosuiteNutAssembly
+    )
+    env.privileged = False
+    env.render_camera_names = []
+    env.robosuite_env = FakeRobosuiteEnv({"robot0_joint_pos": "joints"})
+    env._compute_gripper_obs = lambda _: None
+    env._get_nut_pose = lambda _: pytest.fail(
+        "non-privileged observation requested nut ground truth"
+    )
+
+    observation = env.get_observation()
+
+    assert observation["robot0_joint_pos"] == "joints"
+    assert "nut_poses" not in observation
+
+
+def test_privileged_nut_observation_keeps_derived_poses() -> None:
+    env = robosuite_nut_assembly.FrankaRobosuiteNutAssembly.__new__(
+        robosuite_nut_assembly.FrankaRobosuiteNutAssembly
+    )
+    env.privileged = True
+    env.render_camera_names = []
+    env.robosuite_env = FakeRobosuiteEnv({})
+    env._compute_gripper_obs = lambda _: None
+    env._get_nut_pose = lambda _: {"square_nut": np.zeros(7)}
+
+    observation = env.get_observation()
+
+    assert "square_nut" in observation["nut_poses"]

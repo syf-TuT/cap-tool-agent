@@ -338,9 +338,8 @@ class FrankaRobosuiteNutAssembly(RobosuiteBaseEnv):
     def get_observation(self) -> dict[str, Any]:
         """Get observation in FrankaRobosuiteNutAssembly format."""
         robosuite_obs = self.robosuite_env._get_observations(force_update=True)
-        pose_dict = self._get_nut_pose(robosuite_obs)
-
-        robosuite_obs["nut_poses"] = pose_dict
+        if self.privileged:
+            robosuite_obs["nut_poses"] = self._get_nut_pose(robosuite_obs)
 
         # Nut assembly uses birdview camera but stores results under "robot0_robotview" key
         for camera_name in self.render_camera_names:

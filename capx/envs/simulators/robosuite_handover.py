@@ -479,21 +479,22 @@ class RobosuiteHandoverEnv(BaseEnv):
         self.robosuite_env.sim.forward()
         # Force update to ensure fresh camera images are captured with the new camera position
         robosuite_obs = self.robosuite_env._get_observations(force_update=True)
-        pose_dict = self._hammer_pose_dict(robosuite_obs)
+        if self.privileged:
+            pose_dict = self._hammer_pose_dict(robosuite_obs)
 
-        # Store hammer poses explicitly for hammer-specific API
-        hammer_pose_array = np.stack(
-            [
-                np.asarray(pose_dict["hammer"], dtype=np.float32),
-                np.asarray(pose_dict["handle"], dtype=np.float32),
-            ],
-            axis=0,
-        )
+            # Store hammer poses explicitly for hammer-specific API
+            hammer_pose_array = np.stack(
+                [
+                    np.asarray(pose_dict["hammer"], dtype=np.float32),
+                    np.asarray(pose_dict["handle"], dtype=np.float32),
+                ],
+                axis=0,
+            )
 
-        robosuite_obs["hammer_poses"] = {
-            "hammer": hammer_pose_array[0],
-            "handle": hammer_pose_array[1],
-        }
+            robosuite_obs["hammer_poses"] = {
+                "hammer": hammer_pose_array[0],
+                "handle": hammer_pose_array[1],
+            }
 
         for camera_name in self.render_camera_names:
             if camera_name not in robosuite_obs:
