@@ -711,13 +711,12 @@ class FrankaStateControlApi(FrankaControlApiReduced):
         }
 
     def get_observation(self) -> dict[str, Any]:
-        """Get the simulator observation, including true state keys when available.
+        """Get the simulator observation for the active privilege mode.
 
         Returns:
             observation:
-                A dictionary containing camera data, robot state, and task state
-                values exposed by the simulator. Cube-stack observations include
-                true object pose keys such as ``cubeA_pos``, ``cubeA_quat``,
-                ``cubeB_pos``, and ``cubeB_quat``.
+                A dictionary containing camera and robot state. Privileged
+                environments may also expose simulator task state. Non-privileged
+                environments omit true object pose keys.
         """
         return super().get_observation()

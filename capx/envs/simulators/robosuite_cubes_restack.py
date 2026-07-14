@@ -438,9 +438,20 @@ class FrankaRobosuiteCubesRestackLowLevel(RobosuiteBaseEnv):
 
     def _both_cubes_airborne(self) -> bool:
         """Check the anti-cheat condition directly from private simulator state."""
-        body_xpos = self.robosuite_env.sim.data.body_xpos
-        cube_a_height = body_xpos[self.robosuite_env.cubeA_body_id, 2]
-        cube_b_height = body_xpos[self.robosuite_env.cubeB_body_id, 2]
+        sim_data = self.robosuite_env.sim.data
+        base_world = vtf.SE3(
+            wxyz_xyz=np.concatenate(
+                [sim_data.xquat[self.base_link_idx], sim_data.xpos[self.base_link_idx]]
+            )
+        )
+        base_from_world = base_world.inverse()
+
+        def height_in_robot_base(body_id: int) -> float:
+            body_world = vtf.SE3.from_translation(sim_data.body_xpos[body_id])
+            return float((base_from_world @ body_world).translation()[2])
+
+        cube_a_height = height_in_robot_base(self.robosuite_env.cubeA_body_id)
+        cube_b_height = height_in_robot_base(self.robosuite_env.cubeB_body_id)
         return bool(cube_a_height > 0.04 and cube_b_height > 0.04)
 
     def compute_reward(self) -> float:

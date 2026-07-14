@@ -15,8 +15,10 @@ from capx.envs.simulators import robosuite_spill_wipe
 from capx.envs.simulators import robosuite_two_arm_lift
 from capx.envs.simulators.robosuite_base import RobosuiteBaseEnv
 from capx.envs.tasks.base import CodeExecutionEnvBase
+from capx.integrations.franka import nut_assembly_visual
 from capx.integrations.franka.control import FrankaControlApi
 from capx.integrations.franka.handover import FrankaHandoverApi
+from capx.integrations.franka.nut_assembly_visual import FrankaControlNutAssemblyVisualApi
 
 
 class ConstructorCaptured(Exception):
@@ -69,12 +71,14 @@ CONSTRUCTOR_CASES: tuple[ConstructorCase, ...] = (
     ("wrapper_cls", "constructor_owner", "constructor_name"), CONSTRUCTOR_CASES
 )
 @pytest.mark.parametrize("privileged", [False, True])
+@pytest.mark.parametrize("enable_render", [False, True])
 def test_wrapper_selects_object_observations_at_robosuite_source(
     monkeypatch: pytest.MonkeyPatch,
     wrapper_cls: type[Any],
     constructor_owner: Any,
     constructor_name: str,
     privileged: bool,
+    enable_render: bool,
 ) -> None:
     captured_kwargs: dict[str, Any] = {}
 
@@ -87,15 +91,17 @@ def test_wrapper_selects_object_observations_at_robosuite_source(
     monkeypatch.setattr(module, "load_composite_controller_config", lambda **_: {})
 
     with pytest.raises(ConstructorCaptured):
-        wrapper_cls(privileged=privileged)
+        wrapper_cls(privileged=privileged, enable_render=enable_render)
 
     assert captured_kwargs["use_object_obs"] is privileged
 
 
 @pytest.mark.parametrize("privileged", [False, True])
+@pytest.mark.parametrize("enable_render", [False, True])
 def test_two_arm_lift_selects_object_observations_at_robosuite_source(
     monkeypatch: pytest.MonkeyPatch,
     privileged: bool,
+    enable_render: bool,
 ) -> None:
     captured_kwargs: dict[str, Any] = {}
 
@@ -109,7 +115,9 @@ def test_two_arm_lift_selects_object_observations_at_robosuite_source(
     )
 
     with pytest.raises(ConstructorCaptured):
-        robosuite_two_arm_lift.RobosuiteTwoArmLiftEnv(privileged=privileged)
+        robosuite_two_arm_lift.RobosuiteTwoArmLiftEnv(
+            privileged=privileged, enable_render=enable_render
+        )
 
     assert captured_kwargs["use_object_obs"] is privileged
 
@@ -322,11 +330,32 @@ def test_privileged_nut_observation_keeps_derived_poses() -> None:
     assert "square_nut" in observation["nut_poses"]
 
 
+def test_spill_wipe_observation_works_without_object_state() -> None:
+    env = robosuite_spill_wipe.FrankaRobosuiteSpillWipeLowLevel.__new__(
+        robosuite_spill_wipe.FrankaRobosuiteSpillWipeLowLevel
+    )
+    env.privileged = False
+    env.base_link_wxyz_xyz = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    env.gripper_link_wxyz_xyz = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    env.robosuite_env = FakeRobosuiteEnv({"robot0_joint_pos": np.zeros(7)})
+    env._process_camera_observations = lambda _: None
+
+    observation = env.get_observation()
+
+    assert "robot_joint_pos" in observation
+    assert "robot_cartesian_pos" in observation
+
+
 class FakeRestackEvaluationEnv:
     def __init__(self, *, cube_heights: tuple[float, float]) -> None:
+        base_height = 0.8
         body_xpos = np.zeros((2, 3), dtype=np.float64)
-        body_xpos[:, 2] = cube_heights
-        self.sim = SimpleNamespace(data=SimpleNamespace(body_xpos=body_xpos))
+        body_xpos[:, 2] = base_height + np.asarray(cube_heights)
+        xquat = np.array([[1.0, 0.0, 0.0, 0.0]])
+        xpos = np.array([[0.0, 0.0, base_height]])
+        self.sim = SimpleNamespace(
+            data=SimpleNamespace(body_xpos=body_xpos, xquat=xquat, xpos=xpos)
+        )
         self.cubeA_body_id = 0
         self.cubeB_body_id = 1
 
@@ -356,6 +385,7 @@ def test_restack_evaluation_uses_internal_simulator_state(
         robosuite_cubes_restack.FrankaRobosuiteCubesRestackLowLevel
     )
     env.privileged = False
+    env.base_link_idx = 0
     env.robosuite_env = FakeRestackEvaluationEnv(cube_heights=cube_heights)
 
     assert env.compute_reward() == expected_reward
@@ -385,6 +415,49 @@ def test_non_privileged_nut_viser_tolerates_missing_ground_truth(
     monkeypatch.setattr(robosuite_nut_assembly, "obs_get_rgb", lambda _: {})
 
     env._update_viser_server()
+
+
+def test_visual_nut_pose_uses_non_privileged_observation_for_square_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observation = {
+        "robot0_robotview": {
+            "images": {
+                "rgb": np.zeros((1, 1, 3), dtype=np.uint8),
+                "depth": np.ones((1, 1, 1), dtype=np.float64),
+            },
+            "intrinsics": np.eye(3),
+            "pose": np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+        }
+    }
+    low_level_env = SimpleNamespace(
+        get_observation=lambda: observation,
+        viser_debug=False,
+        viser_server=None,
+    )
+    api = FrankaControlNutAssemblyVisualApi.__new__(FrankaControlNutAssemblyVisualApi)
+    api._env = low_level_env
+    api.camera_name = "robot0_robotview"
+    api._segment_object_from_language = lambda *_: (
+        np.ones((1, 1), dtype=bool),
+        (0, 0),
+        [1.0],
+    )
+    fake_obb = SimpleNamespace(center=np.zeros(3), R=np.eye(3))
+    fake_point_cloud = SimpleNamespace(
+        points=None,
+        get_oriented_bounding_box=lambda: fake_obb,
+    )
+    monkeypatch.setattr(
+        nut_assembly_visual.o3d.geometry, "PointCloud", lambda: fake_point_cloud
+    )
+    monkeypatch.setattr(
+        nut_assembly_visual.o3d.utility, "Vector3dVector", lambda points: points
+    )
+
+    _, quaternion_wxyz = api.get_object_pose("square block")
+
+    np.testing.assert_allclose(quaternion_wxyz, np.array([0.0, 1.0, 0.0, 0.0]))
 
 
 class SafeLowLevelEnv:

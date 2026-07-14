@@ -38,6 +38,7 @@ class FrankaControlNutAssemblyVisualApi(ApiBase):
     """
 
     _TCP_OFFSET = np.array([0.0, 0.0, -0.107], dtype=np.float64)
+    _SQUARE_PEG_ROTATION_WXYZ = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64)
 
     def __init__(self, env: BaseEnv) -> None:
         super().__init__(env)
@@ -94,7 +95,7 @@ class FrankaControlNutAssemblyVisualApi(ApiBase):
 
         fixed_rotation = None
         if all(i in object_name for i in ["square", "block"]):
-            fixed_rotation = obs["nut_poses"]["square_peg"][3:]
+            fixed_rotation = self._SQUARE_PEG_ROTATION_WXYZ.copy()
 
         rgb_imgs = obs_get_rgb(obs)
         assert len(rgb_imgs.keys()) > 0, "No RGB images in obs"
