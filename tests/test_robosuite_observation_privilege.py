@@ -14,6 +14,9 @@ from capx.envs.simulators import robosuite_nut_assembly
 from capx.envs.simulators import robosuite_spill_wipe
 from capx.envs.simulators import robosuite_two_arm_lift
 from capx.envs.simulators.robosuite_base import RobosuiteBaseEnv
+from capx.envs.tasks.base import CodeExecutionEnvBase
+from capx.integrations.franka.control import FrankaControlApi
+from capx.integrations.franka.handover import FrankaHandoverApi
 
 
 class ConstructorCaptured(Exception):
@@ -380,3 +383,58 @@ def test_non_privileged_nut_viser_tolerates_missing_ground_truth(
     monkeypatch.setattr(robosuite_nut_assembly, "obs_get_rgb", lambda _: {})
 
     env._update_viser_server()
+
+
+class SafeLowLevelEnv:
+    def __init__(self) -> None:
+        self.internal_state = {"cube_poses": {"primary": "ground-truth"}}
+
+    def get_observation(self) -> dict[str, Any]:
+        return {"camera": "frame", "robot_joint_pos": "joints"}
+
+    def reset(self, **_: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        return self.get_observation(), {}
+
+    def compute_reward(self) -> float:
+        return 0.0
+
+    def task_completed(self) -> bool:
+        return False
+
+
+def _make_code_execution_env(low_level_env: SafeLowLevelEnv) -> CodeExecutionEnvBase:
+    env = CodeExecutionEnvBase.__new__(CodeExecutionEnvBase)
+    env.low_level_env = low_level_env
+    env._apis = {}
+    env._full_prompt = []
+    env._task_prompt = "task"
+    env._step_count = 0
+    env._init_exec_globals()
+    return env
+
+
+def test_high_level_observation_paths_do_not_reintroduce_internal_ground_truth() -> None:
+    low_level_env = SafeLowLevelEnv()
+    env = _make_code_execution_env(low_level_env)
+
+    reset_observation, _ = env.reset()
+    step_observation, *_ = env.step("RESULT = obs")
+
+    assert "cube_poses" not in reset_observation
+    assert "cube_poses" not in env._exec_globals["INPUTS"]
+    assert "cube_poses" not in step_observation
+    assert "cube_poses" not in env._exec_globals["obs"]
+
+
+@pytest.mark.parametrize("api_cls", [FrankaControlApi, FrankaHandoverApi])
+def test_non_privileged_api_get_observation_delegates_to_safe_low_level_contract(
+    api_cls: type[Any],
+) -> None:
+    low_level_env = SafeLowLevelEnv()
+    api = api_cls.__new__(api_cls)
+    api._env = low_level_env
+
+    observation = api.get_observation()
+
+    assert observation == {"camera": "frame", "robot_joint_pos": "joints"}
+    assert "cube_poses" not in observation
