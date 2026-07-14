@@ -65,7 +65,9 @@ CONSTRUCTOR_CASES: tuple[ConstructorCase, ...] = (
 )
 
 
-@pytest.mark.parametrize(("wrapper_cls", "constructor_owner", "constructor_name"), CONSTRUCTOR_CASES)
+@pytest.mark.parametrize(
+    ("wrapper_cls", "constructor_owner", "constructor_name"), CONSTRUCTOR_CASES
+)
 @pytest.mark.parametrize("privileged", [False, True])
 def test_wrapper_selects_object_observations_at_robosuite_source(
     monkeypatch: pytest.MonkeyPatch,
