@@ -683,8 +683,59 @@ def test_capsule_auto_forward_append_recovery_runs_before_future_groups(
         "append_recovery",
         "run_group",
     ]
-    assert trace[3]["action"]["args"]["group_id"] == "group_4"
-    assert "group_3" not in [
+    assert trace[3]["action"]["args"]["group_id"] == "group_3"
+    assert "future" not in env.api.moves
+    assert _telemetry_stages(telemetry_path) == ["capsule_recovery"]
+
+
+def test_capsule_auto_forward_append_recovery_isolated_from_bounded_future_groups(
+    tmp_path, monkeypatch
+):
+    telemetry_path = tmp_path / "auto_forward_append_recovery_bounded_future.jsonl"
+    env = FakeRewardDropCapsuleEnv()
+    future_source = "\n".join(f'move_to("future_{idx}")' for idx in range(10))
+
+    def fake_query(args, prompt):
+        _record_current_stage()
+        return {
+            "content": (
+                '{"action": "append_recovery", "args": {"source": '
+                '"state = get_observation()\\nmove_to(\\"recover\\")"}}'
+            ),
+            "reasoning": None,
+        }
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query)
+
+    with trial_llm_context(trial=1, telemetry_path=telemetry_path):
+        summary = _run_capsule_trial(
+            env=env,
+            trial=1,
+            args=SimpleNamespace(model="test", use_oracle_code=False, max_tokens=100),
+            config={
+                "output_dir": str(tmp_path),
+                "use_runtime_control": True,
+                "capsule_control_mode": "auto_forward",
+                "max_capsule_steps": 6,
+                "capsule_max_regions_per_group": 1,
+                "use_parallel_ensemble": False,
+                "use_multimodel": False,
+            },
+            initial_code=(
+                'move_to("good")\n'
+                'raise RuntimeError("boom")\n'
+                f"{future_source}\n"
+            ),
+        )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 0
+    assert env.api.observed is True
+    assert env.api.moves == ["good", "recover"]
+    assert not any(str(move).startswith("future_") for move in env.api.moves)
+    assert trace[3]["action"]["args"]["group_id"] == "group_3"
+    assert "group_3" in [
         entry["action"]["args"].get("group_id")
         for entry in trace
         if entry["event"]["action"] == "run_group"

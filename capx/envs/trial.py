@@ -1022,6 +1022,7 @@ def _run_capsule_auto_forward_loop(
                         region_by_id,
                         group_by_id,
                         recovery_observation_functions=recovery_observation_functions,
+                        append_recovery_insert_after_line=group.end_line,
                     )
                     if recovery_consumes_side_effect:
                         recovery_side_effect_budget -= 1
@@ -1077,7 +1078,6 @@ def _run_capsule_auto_forward_loop(
                 recovery_action_name = recovery_action.action
                 recovery_group_id = str(recovery_action.args.get("group_id", ""))
                 recovery_region_id = str(recovery_action.args.get("region_id", ""))
-                previous_source = source
                 source = str(recovery_event.evidence["source"])
                 regions = segment_python_code(source)
                 groups = segment_python_code_groups(
@@ -1089,9 +1089,9 @@ def _run_capsule_auto_forward_loop(
                 region_by_id = {region.region_id: region for region in regions}
                 group_by_id = {group.group_id: group for group in groups}
                 if recovery_action_name == "append_recovery":
-                    group_index = _first_group_index_starting_after_source(
+                    group_index = _first_group_index_starting_after_line(
                         groups,
-                        previous_source,
+                        group.end_line,
                         default=len(groups) - 1,
                     )
                 elif recovery_action_name == "patch_group":
@@ -1549,6 +1549,7 @@ def _execute_runtime_action(
     region_by_id: dict[str, Any],
     group_by_id: dict[str, Any] | None = None,
     recovery_observation_functions: set[str] | None = None,
+    append_recovery_insert_after_line: int | None = None,
 ) -> RuntimeEvent:
     group_by_id = group_by_id or {}
     if action.action == "finish":
@@ -1701,7 +1702,11 @@ def _execute_runtime_action(
                 status="invalid",
                 message=f"append_recovery source must call at least one of: {allowed_calls}.",
             )
-        patched = _append_recovery_source(source, recovery_source)
+        patched = _append_recovery_source(
+            source,
+            recovery_source,
+            insert_after_line=append_recovery_insert_after_line,
+        )
         return RuntimeEvent(
             action=action.action,
             status="success",
@@ -1966,17 +1971,14 @@ def _next_group_index_after_group(groups: list[CodeRegionGroup], group_id: str) 
     return _group_index_by_id(groups, group_id, default=len(groups) - 1) + 1
 
 
-def _first_group_index_starting_after_source(
+def _first_group_index_starting_after_line(
     groups: list[CodeRegionGroup],
-    previous_source: str,
+    line_number: int,
     *,
     default: int,
 ) -> int:
-    previous_end_line = len(previous_source.rstrip("\n").splitlines())
-    if previous_end_line == 1 and not previous_source.rstrip("\n"):
-        previous_end_line = 0
     for idx, group in enumerate(groups):
-        if group.start_line > previous_end_line:
+        if group.start_line > line_number:
             return idx
     return default
 
@@ -2015,12 +2017,37 @@ def _runtime_patch_replacement(args: dict[str, Any]) -> Any:
     return None
 
 
-def _append_recovery_source(source: str, recovery_source: str) -> str:
+def _append_recovery_source(
+    source: str,
+    recovery_source: str,
+    *,
+    insert_after_line: int | None = None,
+) -> str:
     base = source.rstrip("\n")
     recovery = recovery_source.strip("\n")
+    if insert_after_line is not None:
+        return _insert_recovery_source_after_line(source, recovery, insert_after_line)
     if not base:
         return f"{recovery}\n"
     return f"{base}\n\n{recovery}\n"
+
+
+def _insert_recovery_source_after_line(
+    source: str,
+    recovery_source: str,
+    insert_after_line: int,
+) -> str:
+    lines = source.splitlines()
+    insert_at = max(0, min(insert_after_line, len(lines)))
+    barrier_name = "__capsule_recovery_barrier"
+    # The duplicate definition prevents bounded grouping from merging recovery with future effects.
+    recovery_block = [
+        f"{barrier_name} = None",
+        *recovery_source.splitlines(),
+        f"{barrier_name} = {barrier_name}",
+    ]
+    patched_lines = [*lines[:insert_at], *recovery_block, *lines[insert_at:]]
+    return "\n".join(patched_lines) + "\n"
 
 
 def _ast_calls_function(tree: ast.AST, function_name: str) -> bool:
