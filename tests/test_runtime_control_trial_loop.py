@@ -327,6 +327,95 @@ def test_capsule_auto_forward_runs_groups_without_capsule_action_llm(tmp_path, m
     assert "capsule_action" not in telemetry_stages
 
 
+def test_capsule_auto_forward_initial_code_query_does_not_query_capsule_action(
+    tmp_path, monkeypatch
+):
+    telemetry_path = tmp_path / "auto_forward_initial.jsonl"
+    env = FakeCapsuleEnv()
+
+    def fake_query(args, prompt):
+        _record_current_stage()
+        return {
+            "content": '```python\nmove_to([1, 2, 3])\n```',
+            "reasoning": None,
+        }
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query)
+
+    with trial_llm_context(trial=1, telemetry_path=telemetry_path):
+        summary = _run_capsule_trial(
+            env=env,
+            trial=1,
+            args=SimpleNamespace(model="test", use_oracle_code=False, max_tokens=100),
+            config={
+                "output_dir": str(tmp_path),
+                "use_runtime_control": True,
+                "capsule_control_mode": "auto_forward",
+                "max_capsule_steps": 4,
+                "use_parallel_ensemble": False,
+                "use_multimodel": False,
+            },
+        )
+
+    assert summary.sandbox_rc == 0
+    assert env.api.moved is True
+    assert _telemetry_stages(telemetry_path) == ["initial_code"]
+
+
+def test_capsule_auto_forward_stops_after_failed_group(tmp_path):
+    env = FakeRewardDropCapsuleEnv()
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "use_runtime_control": True,
+            "capsule_control_mode": "auto_forward",
+            "max_capsule_steps": 4,
+            "capsule_max_regions_per_group": 1,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='raise RuntimeError("boom")\nmove_to("recover")\n',
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 1
+    assert env.api.moves == []
+    assert [entry["event"]["action"] for entry in trace] == ["run_group"]
+    assert trace[0]["event"]["status"] == "failed"
+
+
+def test_capsule_auto_forward_stops_after_reward_success(tmp_path):
+    env = FakeRewardDropCapsuleEnv()
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "use_runtime_control": True,
+            "capsule_control_mode": "auto_forward",
+            "max_capsule_steps": 4,
+            "capsule_max_regions_per_group": 1,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='move_to("recover")\nmove_to("bad")\n',
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 0
+    assert env.api.moves == ["recover"]
+    assert [entry["event"]["action"] for entry in trace] == ["run_group"]
+    assert trace[0]["state_after"]["reward"] == 1.0
+
+
 def test_capsule_llm_step_mode_keeps_existing_action_loop(tmp_path):
     env = FakeCapsuleEnv()
 

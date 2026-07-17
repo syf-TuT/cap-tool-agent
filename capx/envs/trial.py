@@ -808,6 +808,8 @@ def _run_capsule_auto_forward_loop(
         config=forward_config,
         initial_code=source,
         scripted_actions=scripted_forward_actions,
+        stop_after_failed_event=True,
+        stop_after_task_success=True,
     )
 
 
@@ -819,6 +821,8 @@ def _run_capsule_llm_step_loop(
     *,
     initial_code: str | None = None,
     scripted_actions: list[dict[str, Any]] | None = None,
+    stop_after_failed_event: bool = False,
+    stop_after_task_success: bool = False,
 ) -> TrialSummary:
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
     output_dir = config.get("output_dir")
@@ -1059,6 +1063,14 @@ def _run_capsule_llm_step_loop(
             region_by_id = {region.region_id: region for region in regions}
             group_by_id = {group.group_id: group for group in groups}
 
+        if stop_after_failed_event and event.status in {"failed", "invalid"}:
+            break
+        reward_after = _state_reward(after_state)
+        if stop_after_task_success and (
+            bool(after_state.get("task_completed"))
+            or (reward_after is not None and reward_after >= 1.0)
+        ):
+            break
         if event.action == "finish" or (action.action == "finish" if action is not None else False):
             finished = True
             break
