@@ -165,16 +165,21 @@ def build_capsule_recovery_prompt(
             f"at least one fresh-state function ({recovery_calls}) and continues from the "
             "current physical state."
         )
-        append_recovery_example = (
-            '{"action": "append_recovery", "args": {"source": '
-            f'"state = {recovery_functions[0]}()\\n# recover from the current state"}}}}\n'
-        )
+        append_recovery_example = {
+            "action": "append_recovery",
+            "args": {
+                "source": (
+                    f"state = {recovery_functions[0]}()\n"
+                    "# recover from the current state"
+                )
+            },
+        }
     else:
         append_recovery_rule = (
             "append_recovery is unavailable because the active API does not declare a "
             "fresh-state observation function."
         )
-        append_recovery_example = ""
+        append_recovery_example = None
 
     failed_unit_kind = "group" if isinstance(failed_unit, CodeRegionGroup) else "region"
     failed_unit_data = failed_unit.to_dict()
@@ -185,6 +190,33 @@ def build_capsule_recovery_prompt(
         example_region_id = failed_unit.region_ids[0] if failed_unit.region_ids else "region_id"
     else:
         example_region_id = failed_unit.region_id
+    examples = [
+        {"action": "inspect_trace", "args": {}},
+        {"action": "inspect_variables", "args": {"names": ["variable_name"]}},
+        {
+            "action": "patch_group",
+            "args": {
+                "group_id": example_group_id,
+                "source": "replacement Python source for only that group",
+            },
+        },
+        {
+            "action": "patch_region",
+            "args": {
+                "region_id": example_region_id,
+                "source": "replacement Python source for only that region",
+            },
+        },
+    ]
+    if append_recovery_example is not None:
+        examples.append(append_recovery_example)
+    examples.extend(
+        [
+            {"action": "resume_from_region", "args": {"region_id": example_region_id}},
+            {"action": "finish", "args": {}},
+        ]
+    )
+    example_text = "\n".join(json.dumps(example) for example in examples)
     bounded_history = history_tail[-4:]
     bounded_trace_summary = _bound_trace_summary(trace_summary, max_events=5)
     prompt_text = (
@@ -206,15 +238,7 @@ def build_capsule_recovery_prompt(
         "Use a fresh observation before appending recovery code.\n\n"
         f"Allowed actions: {', '.join(allowed_actions)}.\n\n"
         "Respond with exactly one JSON object. Examples:\n"
-        '{"action": "inspect_trace", "args": {}}\n'
-        '{"action": "inspect_variables", "args": {"names": ["variable_name"]}}\n'
-        f'{{"action": "patch_group", "args": {{"group_id": "{example_group_id}", '
-        '"source": "replacement Python source for only that group"}}\n'
-        f'{{"action": "patch_region", "args": {{"region_id": "{example_region_id}", '
-        '"source": "replacement Python source for only that region"}}\n'
-        f"{append_recovery_example}"
-        f'{{"action": "resume_from_region", "args": {{"region_id": "{example_region_id}"}}}}\n'
-        '{"action": "finish", "args": {}}\n'
+        f"{example_text}\n"
         "For inspect_variables, args.names must be a non-empty list of Python variable "
         "names to inspect. "
         f"{append_recovery_rule} "

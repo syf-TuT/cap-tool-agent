@@ -1099,6 +1099,63 @@ def test_capsule_llm_step_marks_failed_dynamic_side_effect_region(
     assert "already executed robot-side-effect code" in trace[1]["event"]["message"]
 
 
+def test_capsule_llm_step_rejects_patch_after_successful_dynamic_side_effect_group(
+    tmp_path, monkeypatch
+):
+    env = FakeCustomMoveCapsuleEnv()
+
+    def single_dynamic_side_effect_region(source):
+        return [CodeRegion(region_id="region_1", start_line=1, end_line=1, source=source)]
+
+    def single_dynamic_side_effect_group(source, regions, **kwargs):
+        return [
+            CodeRegionGroup(
+                group_id="group_1",
+                start_line=1,
+                end_line=1,
+                source=source,
+                region_ids=[region.region_id for region in regions],
+                primitive_calls=["custom_move"],
+                defined_names=[],
+                used_names=["custom_move"],
+                has_robot_side_effect=True,
+            )
+        ]
+
+    monkeypatch.setattr("capx.envs.trial.segment_python_code", single_dynamic_side_effect_region)
+    monkeypatch.setattr(
+        "capx.envs.trial.segment_python_code_groups",
+        single_dynamic_side_effect_group,
+    )
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "use_runtime_control": True,
+            "capsule_control_mode": "llm_step",
+            "scripted_actions": [
+                {"action": "run_group", "args": {"group_id": "group_1"}},
+                {"action": "patch_region", "args": {"region_id": "region_1", "source": "x = 1"}},
+            ],
+            "max_capsule_steps": 3,
+            "capsule_max_regions_per_group": 2,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='custom_move("good")\n',
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 1
+    assert env.api.moves == ["good"]
+    assert [entry["event"]["status"] for entry in trace] == ["success", "invalid", "success"]
+    assert "already executed robot-side-effect code" in trace[1]["event"]["message"]
+
+
 class FakeMultiTurnEnv:
     def __init__(self):
         self.steps = []
