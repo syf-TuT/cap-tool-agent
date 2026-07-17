@@ -656,6 +656,150 @@ def test_capsule_auto_forward_stops_when_recovery_action_is_invalid(tmp_path, mo
     assert _telemetry_stages(telemetry_path) == ["capsule_recovery"]
 
 
+def test_capsule_auto_forward_rejects_recovery_run_group_action(tmp_path, monkeypatch):
+    telemetry_path = tmp_path / "auto_forward_recovery_run_group.jsonl"
+    env = FakeRewardDropCapsuleEnv()
+
+    def fake_query(args, prompt):
+        _record_current_stage()
+        return {
+            "content": '{"action": "run_group", "args": {"group_id": "group_2"}}',
+            "reasoning": None,
+        }
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query)
+
+    with trial_llm_context(trial=1, telemetry_path=telemetry_path):
+        summary = _run_capsule_trial(
+            env=env,
+            trial=1,
+            args=SimpleNamespace(model="test", use_oracle_code=False, max_tokens=100),
+            config={
+                "output_dir": str(tmp_path),
+                "use_runtime_control": True,
+                "capsule_control_mode": "auto_forward",
+                "max_capsule_steps": 6,
+                "capsule_max_regions_per_group": 1,
+                "use_parallel_ensemble": False,
+                "use_multimodel": False,
+            },
+            initial_code='raise RuntimeError("boom")\nmove_to("recover")\n',
+        )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 1
+    assert env.api.moves == []
+    assert [entry["event"]["status"] for entry in trace] == ["failed", "invalid"]
+    assert "not allowed during recovery" in trace[1]["event"]["message"]
+    assert _telemetry_stages(telemetry_path) == ["capsule_recovery"]
+
+
+def test_capsule_auto_forward_recovery_cannot_replay_failed_side_effect_group(
+    tmp_path, monkeypatch
+):
+    telemetry_path = tmp_path / "auto_forward_recovery_replay_failed_side_effect.jsonl"
+    env = FakeRewardDropCapsuleEnv()
+
+    def single_failing_side_effect_group(source, regions, **kwargs):
+        return [
+            CodeRegionGroup(
+                group_id="group_1",
+                start_line=1,
+                end_line=2,
+                source=source,
+                region_ids=[region.region_id for region in regions],
+                primitive_calls=["move_to"],
+                defined_names=[],
+                used_names=["move_to"],
+                has_robot_side_effect=True,
+            )
+        ]
+
+    def fake_query(args, prompt):
+        _record_current_stage()
+        return {
+            "content": (
+                '{"action": "patch_group", "args": {"group_id": "group_1", '
+                '"source": "move_to(\\"recover\\")"}}'
+            ),
+            "reasoning": None,
+        }
+
+    monkeypatch.setattr(
+        "capx.envs.trial.segment_python_code_groups",
+        single_failing_side_effect_group,
+    )
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query)
+
+    with trial_llm_context(trial=1, telemetry_path=telemetry_path):
+        summary = _run_capsule_trial(
+            env=env,
+            trial=1,
+            args=SimpleNamespace(model="test", use_oracle_code=False, max_tokens=100),
+            config={
+                "output_dir": str(tmp_path),
+                "use_runtime_control": True,
+                "capsule_control_mode": "auto_forward",
+                "max_capsule_steps": 6,
+                "capsule_max_regions_per_group": 2,
+                "use_parallel_ensemble": False,
+                "use_multimodel": False,
+            },
+            initial_code='move_to("good")\nraise RuntimeError("boom")\n',
+        )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 1
+    assert env.api.moves == ["good"]
+    assert [entry["event"]["status"] for entry in trace] == ["failed", "invalid"]
+    assert "already executed robot-side-effect code" in trace[1]["event"]["message"]
+    assert _telemetry_stages(telemetry_path) == ["capsule_recovery"]
+
+
+def test_capsule_auto_forward_recovery_cannot_patch_future_group(tmp_path, monkeypatch):
+    telemetry_path = tmp_path / "auto_forward_recovery_future_patch.jsonl"
+    env = FakeRewardDropCapsuleEnv()
+
+    def fake_query(args, prompt):
+        _record_current_stage()
+        return {
+            "content": (
+                '{"action": "patch_group", "args": {"group_id": "group_2", '
+                '"source": "move_to(\\"recover\\")"}}'
+            ),
+            "reasoning": None,
+        }
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query)
+
+    with trial_llm_context(trial=1, telemetry_path=telemetry_path):
+        summary = _run_capsule_trial(
+            env=env,
+            trial=1,
+            args=SimpleNamespace(model="test", use_oracle_code=False, max_tokens=100),
+            config={
+                "output_dir": str(tmp_path),
+                "use_runtime_control": True,
+                "capsule_control_mode": "auto_forward",
+                "max_capsule_steps": 6,
+                "capsule_max_regions_per_group": 1,
+                "use_parallel_ensemble": False,
+                "use_multimodel": False,
+            },
+            initial_code='raise RuntimeError("boom")\nmove_to("recover")\n',
+        )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 1
+    assert env.api.moves == []
+    assert [entry["event"]["status"] for entry in trace] == ["failed", "invalid"]
+    assert "must target the failed group" in trace[1]["event"]["message"]
+    assert _telemetry_stages(telemetry_path) == ["capsule_recovery"]
+
+
 def test_capsule_auto_forward_stops_after_reward_success(tmp_path):
     env = FakeRewardDropCapsuleEnv()
 

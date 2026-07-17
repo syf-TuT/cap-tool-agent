@@ -1,3 +1,5 @@
+import json
+
 from capx.runtime_control.prompts import (
     build_capsule_prompt,
     build_capsule_recovery_prompt,
@@ -190,3 +192,37 @@ def test_recovery_prompt_is_local_and_bounded():
     assert "run_region" not in allowed_actions
     assert "append_recovery" in allowed_actions
     assert "resume_from_region" in allowed_actions
+
+
+def test_recovery_prompt_examples_are_valid_json():
+    failed_group = CodeRegionGroup(
+        group_id="group_2",
+        start_line=2,
+        end_line=3,
+        source='raise RuntimeError("boom")',
+        region_ids=["region_2"],
+        primitive_calls=[],
+        defined_names=[],
+        used_names=[],
+        has_robot_side_effect=False,
+    )
+
+    prompt = build_capsule_recovery_prompt(
+        task="stack cubes",
+        failed_unit=failed_group,
+        history_tail=[],
+        trace_summary={},
+        side_effect_ledger={},
+        recovery_observation_functions={"get_observation"},
+    )
+
+    text = prompt[1]["content"][0]["text"]
+    example_lines = [
+        line for line in text.splitlines() if line.startswith('{"action":')
+    ]
+
+    assert example_lines
+    for line in example_lines:
+        parsed = json.loads(line)
+        assert "action" in parsed
+        assert isinstance(parsed.get("args"), dict)

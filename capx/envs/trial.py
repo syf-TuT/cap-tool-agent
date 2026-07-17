@@ -884,7 +884,16 @@ def _run_capsule_auto_forward_loop(
             if consumes_recovery_side_effect:
                 recovery_side_effect_budget -= 1
 
-        if event.status not in {"failed", "invalid"} and group.has_robot_side_effect:
+        if event.status in {"failed", "invalid"}:
+            _mark_executed_side_effects_from_trace(
+                event,
+                group,
+                region_by_id,
+                executed_side_effect_regions,
+                executed_side_effect_groups,
+                side_effect_calls,
+            )
+        elif group.has_robot_side_effect:
             executed_side_effect_groups.add(group.group_id)
             for member_region_id in group.region_ids:
                 member_region = region_by_id.get(member_region_id)
@@ -965,12 +974,19 @@ def _run_capsule_auto_forward_loop(
                 recovery_source_unit = region_by_id.get(recovery_region_id) or group_by_id.get(
                     recovery_group_id
                 )
-                recovery_event = _no_rollback_guard_event(
+                recovery_event = _validate_recovery_action(
                     recovery_action,
-                    executed_side_effect_regions,
-                    executed_side_effect_groups,
-                    recovery_observation_functions=recovery_observation_functions,
+                    failed_unit=group,
+                    region_by_id=region_by_id,
+                    group_by_id=group_by_id,
                 )
+                if recovery_event is None:
+                    recovery_event = _no_rollback_guard_event(
+                        recovery_action,
+                        executed_side_effect_regions,
+                        executed_side_effect_groups,
+                        recovery_observation_functions=recovery_observation_functions,
+                    )
                 if recovery_event is None:
                     recovery_event = _reward_drop_guard_event(
                         recovery_action,
@@ -1772,6 +1788,92 @@ def _runtime_action_targets_side_effect_unit(
 def _runtime_action_unit_id(action: RuntimeAction) -> str | None:
     unit_id = action.args.get("group_id") or action.args.get("region_id")
     return str(unit_id) if unit_id else None
+
+
+RECOVERY_ACTIONS: set[str] = {
+    "inspect_trace",
+    "inspect_variables",
+    "patch_group",
+    "patch_region",
+    "append_recovery",
+    "resume_from_region",
+    "finish",
+}
+
+
+def _validate_recovery_action(
+    action: RuntimeAction,
+    *,
+    failed_unit: CodeRegion | CodeRegionGroup,
+    region_by_id: dict[str, Any],
+    group_by_id: dict[str, Any],
+) -> RuntimeEvent | None:
+    if action.action not in RECOVERY_ACTIONS:
+        return RuntimeEvent(
+            action=action.action,
+            status="invalid",
+            region_id=_runtime_action_unit_id(action),
+            message=f"{action.action} is not allowed during recovery.",
+        )
+
+    if action.action in {"patch_group"}:
+        group_id = str(action.args.get("group_id", ""))
+        if not isinstance(failed_unit, CodeRegionGroup) or group_id != failed_unit.group_id:
+            return RuntimeEvent(
+                action=action.action,
+                status="invalid",
+                region_id=group_id,
+                message="Recovery patch_group must target the failed group.",
+            )
+        if group_id not in group_by_id:
+            return None
+
+    if action.action in {"patch_region", "resume_from_region"}:
+        region_id = str(action.args.get("region_id", ""))
+        if not _recovery_region_is_local(failed_unit, region_id):
+            return RuntimeEvent(
+                action=action.action,
+                status="invalid",
+                region_id=region_id,
+                message=(
+                    "Recovery patch_region/resume_from_region must target the failed "
+                    "region or a member region of the failed group."
+                ),
+            )
+        if region_id not in region_by_id:
+            return None
+
+    return None
+
+
+def _recovery_region_is_local(
+    failed_unit: CodeRegion | CodeRegionGroup,
+    region_id: str,
+) -> bool:
+    if isinstance(failed_unit, CodeRegionGroup):
+        return region_id in failed_unit.region_ids
+    return region_id == failed_unit.region_id
+
+
+def _mark_executed_side_effects_from_trace(
+    event: RuntimeEvent,
+    group: CodeRegionGroup,
+    region_by_id: dict[str, Any],
+    executed_side_effect_regions: set[str],
+    executed_side_effect_groups: set[str],
+    side_effect_calls: set[str],
+) -> None:
+    trace_events = event.evidence.get("trace_events", [])
+    if not isinstance(trace_events, list):
+        return
+    if not any(trace_event.get("name") in side_effect_calls for trace_event in trace_events):
+        return
+
+    executed_side_effect_groups.add(group.group_id)
+    for member_region_id in group.region_ids:
+        member_region = region_by_id.get(member_region_id)
+        if member_region is not None and _region_has_robot_side_effect(member_region):
+            executed_side_effect_regions.add(member_region_id)
 
 
 def _group_index_by_id(

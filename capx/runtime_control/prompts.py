@@ -167,7 +167,7 @@ def build_capsule_recovery_prompt(
         )
         append_recovery_example = (
             '{"action": "append_recovery", "args": {"source": '
-            f'"state = {recovery_functions[0]}()\\n# recover from the current state"}}\n'
+            f'"state = {recovery_functions[0]}()\\n# recover from the current state"}}}}\n'
         )
     else:
         append_recovery_rule = (
