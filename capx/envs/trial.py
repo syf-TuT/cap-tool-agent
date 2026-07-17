@@ -41,6 +41,7 @@ from capx.runtime_control import (
     segment_python_code,
     segment_python_code_groups,
 )
+from capx.runtime_control.prompts import build_capsule_recovery_prompt
 from capx.runtime_control.segmenter import ROBOT_SIDE_EFFECT_CALLS
 from capx.runtime_control.side_effects import collect_side_effect_calls
 
@@ -811,15 +812,22 @@ def _run_capsule_auto_forward_loop(
         trace=trace,
     )
     max_steps = int(config.get("max_capsule_steps", 12))
+    action_query_args = copy.copy(args)
+    default_action_max_tokens = getattr(args, "max_tokens", 2048 * 10)
+    action_query_args.max_tokens = int(
+        config.get("capsule_action_max_tokens", default_action_max_tokens)
+    )
     history: list[dict[str, Any]] = []
     if initial_syntax_error is not None:
         history.append(_initial_syntax_error_history_entry(initial_syntax_error))
     step_metrics: list[dict[str, Any]] = []
+    prompts: list[list[dict[str, Any]]] = []
     failed = False
     executed_regions = 0
     best_reward_so_far: float | None = None
     executed_side_effect_regions: set[str] = set()
     executed_side_effect_groups: set[str] = set()
+    recovery_side_effect_budget = 0
     reward_drop_guard_min_best_reward = float(
         config.get("capsule_reward_drop_guard_min_best_reward", 0.6)
     )
@@ -831,6 +839,7 @@ def _run_capsule_auto_forward_loop(
         action = RuntimeAction("run_group", {"group_id": group.group_id})
         action.step_id = step_id
         before_state = _capsule_state_snapshot(env)
+        consumes_recovery_side_effect = False
 
         event = _no_rollback_guard_event(
             action,
@@ -845,12 +854,20 @@ def _run_capsule_auto_forward_loop(
                 best_reward_so_far,
                 region_by_id,
                 group_by_id,
-                recovery_side_effect_budget=0,
+                recovery_side_effect_budget=recovery_side_effect_budget,
                 min_best_reward=reward_drop_guard_min_best_reward,
                 drop_threshold=reward_drop_guard_threshold,
                 recovery_observation_functions=recovery_observation_functions,
             )
         if event is None:
+            consumes_recovery_side_effect = (
+                recovery_side_effect_budget > 0
+                and _runtime_action_targets_side_effect_unit(
+                    action,
+                    region_by_id,
+                    group_by_id,
+                )
+            )
             event = _execute_runtime_action(
                 action,
                 executor,
@@ -859,6 +876,8 @@ def _run_capsule_auto_forward_loop(
                 group_by_id,
                 recovery_observation_functions=recovery_observation_functions,
             )
+            if consumes_recovery_side_effect:
+                recovery_side_effect_budget -= 1
 
         if event.status in {"failed", "invalid"}:
             failed = True
@@ -902,9 +921,148 @@ def _run_capsule_auto_forward_loop(
             after_state=after_state,
             executed_regions=executed_regions,
             best_reward_so_far=best_reward_so_far,
-            recovery_execution_attempt=False,
+            recovery_execution_attempt=consumes_recovery_side_effect,
         )
         step_metrics.append(metric)
+
+        if event.status in {"failed", "invalid"}:
+            recovery_step_id = len(history) + 1
+            recovery_before_state = after_state
+            recovery_action: RuntimeAction | None = None
+            recovery_source_unit = None
+            recovery_consumes_side_effect = False
+            recovery_prompt = build_capsule_recovery_prompt(
+                task=_task_text_from_obs(obs),
+                failed_unit=group,
+                history_tail=history,
+                trace_summary=executor.trace.summary() if executor.trace is not None else {},
+                side_effect_ledger={
+                    "executed_side_effect_regions": sorted(executed_side_effect_regions),
+                    "executed_side_effect_groups": sorted(executed_side_effect_groups),
+                },
+                recovery_observation_functions=recovery_observation_functions,
+            )
+            prompts.append(recovery_prompt)
+            try:
+                with llm_call_stage("capsule_recovery"):
+                    response = _query_model(action_query_args, recovery_prompt)
+                recovery_action = parse_runtime_action_response(response["content"])
+                recovery_action.step_id = recovery_step_id
+            except ValueError as exc:
+                recovery_event = RuntimeEvent(
+                    action="invalid",
+                    status="invalid",
+                    message=str(exc),
+                    evidence={"exception_type": type(exc).__name__},
+                )
+            else:
+                recovery_region_id = str(recovery_action.args.get("region_id", ""))
+                recovery_group_id = str(recovery_action.args.get("group_id", ""))
+                recovery_source_unit = region_by_id.get(recovery_region_id) or group_by_id.get(
+                    recovery_group_id
+                )
+                recovery_event = _no_rollback_guard_event(
+                    recovery_action,
+                    executed_side_effect_regions,
+                    executed_side_effect_groups,
+                    recovery_observation_functions=recovery_observation_functions,
+                )
+                if recovery_event is None:
+                    recovery_event = _reward_drop_guard_event(
+                        recovery_action,
+                        recovery_before_state,
+                        best_reward_so_far,
+                        region_by_id,
+                        group_by_id,
+                        recovery_side_effect_budget=recovery_side_effect_budget,
+                        min_best_reward=reward_drop_guard_min_best_reward,
+                        drop_threshold=reward_drop_guard_threshold,
+                        recovery_observation_functions=recovery_observation_functions,
+                    )
+                if recovery_event is None:
+                    recovery_consumes_side_effect = (
+                        recovery_side_effect_budget > 0
+                        and _runtime_action_targets_side_effect_unit(
+                            recovery_action,
+                            region_by_id,
+                            group_by_id,
+                        )
+                    )
+                    recovery_event = _execute_runtime_action(
+                        recovery_action,
+                        executor,
+                        source,
+                        region_by_id,
+                        group_by_id,
+                        recovery_observation_functions=recovery_observation_functions,
+                    )
+                    if recovery_consumes_side_effect:
+                        recovery_side_effect_budget -= 1
+                if (
+                    recovery_action.action == "append_recovery"
+                    and recovery_event.status == "success"
+                ):
+                    recovery_side_effect_budget = 1
+
+            recovery_after_state = _capsule_state_snapshot(env)
+            recovery_trace_events = recovery_event.evidence.get("trace_events", [])
+            recovery_feedback_action = recovery_action or RuntimeAction("invalid", {})
+            recovery_feedback = build_runtime_feedback(
+                step_id=recovery_step_id,
+                action=recovery_feedback_action,
+                event=recovery_event,
+                region=recovery_source_unit,
+                trace_events=recovery_trace_events,
+                before_state=recovery_before_state,
+                after_state=recovery_after_state,
+            )
+            history.append(
+                {
+                    "step_id": recovery_step_id,
+                    "action": (
+                        recovery_action.to_dict()
+                        if recovery_action is not None
+                        else {"action": "invalid"}
+                    ),
+                    "event": recovery_event.to_dict(),
+                    "feedback": recovery_feedback.to_dict(),
+                    "trace_events": recovery_trace_events,
+                    "state_before": recovery_before_state,
+                    "state_after": recovery_after_state,
+                }
+            )
+            recovery_metric, best_reward_so_far = _capsule_step_metric(
+                step_id=recovery_step_id,
+                action=recovery_action,
+                event=recovery_event,
+                before_state=recovery_before_state,
+                after_state=recovery_after_state,
+                executed_regions=executed_regions,
+                best_reward_so_far=best_reward_so_far,
+                recovery_execution_attempt=recovery_consumes_side_effect,
+            )
+            step_metrics.append(recovery_metric)
+            if (
+                recovery_action is not None
+                and recovery_action.action in {"patch_region", "patch_group", "append_recovery"}
+                and recovery_event.status == "success"
+            ):
+                source = str(recovery_event.evidence["source"])
+                regions = segment_python_code(source)
+                groups = segment_python_code_groups(
+                    source,
+                    regions,
+                    max_regions_per_group=max_regions_per_group,
+                    side_effect_calls=side_effect_calls,
+                )
+                region_by_id = {region.region_id: region for region in regions}
+                group_by_id = {group.group_id: group for group in groups}
+            if recovery_event.status in {"failed", "invalid"}:
+                failed = True
+            if recovery_event.action == "finish" or (
+                recovery_action.action == "finish" if recovery_action is not None else False
+            ):
+                break
 
         reward_after = _state_reward(after_state)
         if (
@@ -926,7 +1084,7 @@ def _run_capsule_auto_forward_loop(
         with open(os.path.join(output_dir, f"capsule_trace_trial_{trial:02d}.json"), "w") as f:
             json.dump(history, f, indent=2, default=str)
         with open(os.path.join(output_dir, f"capsule_prompts_trial_{trial:02d}.json"), "w") as f:
-            json.dump([], f, indent=2, default=str)
+            json.dump(prompts, f, indent=2, default=str)
         metrics_path = os.path.join(output_dir, f"capsule_step_metrics_trial_{trial:02d}.jsonl")
         with open(metrics_path, "w") as f:
             for metric in step_metrics:

@@ -1,4 +1,8 @@
-from capx.runtime_control.prompts import build_capsule_prompt, parse_runtime_action_response
+from capx.runtime_control.prompts import (
+    build_capsule_prompt,
+    build_capsule_recovery_prompt,
+    parse_runtime_action_response,
+)
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup
 
 
@@ -126,3 +130,63 @@ def test_capsule_prompt_marks_recovery_unavailable_without_fresh_state_function(
 
     assert "append_recovery is unavailable" in text
     assert "append_recovery" not in allowed_actions
+
+
+def test_recovery_prompt_is_local_and_bounded():
+    groups = [
+        CodeRegionGroup(
+            group_id=f"group_{idx}",
+            start_line=idx,
+            end_line=idx,
+            source=f"value_{idx} = {idx}",
+            region_ids=[f"region_{idx}"],
+            primitive_calls=[],
+            defined_names=[f"value_{idx}"],
+            used_names=[],
+            has_robot_side_effect=False,
+        )
+        for idx in range(1, 12)
+    ]
+    history = [
+        {
+            "step_id": idx,
+            "event": {"status": "success", "region_id": f"group_{idx}"},
+            "feedback": {"message": f"history-{idx}"},
+        }
+        for idx in range(1, 12)
+    ]
+    trace_summary = {
+        "events": [
+            {"name": f"trace_{idx}", "args": [idx], "result": idx}
+            for idx in range(1, 12)
+        ]
+    }
+
+    prompt = build_capsule_recovery_prompt(
+        task="stack cubes",
+        failed_unit=groups[7],
+        history_tail=history,
+        trace_summary=trace_summary,
+        side_effect_ledger={
+            "executed_side_effect_groups": ["group_1"],
+            "executed_side_effect_regions": ["region_1"],
+        },
+        recovery_observation_functions={"get_observation"},
+    )
+
+    text = prompt[1]["content"][0]["text"]
+    allowed_actions = next(
+        line for line in text.splitlines() if line.startswith("Allowed actions:")
+    )
+
+    assert "group_8" in text
+    assert "value_8 = 8" in text
+    assert "trace_11" in text
+    assert '"name": "trace_1"' not in text
+    assert "value_1 = 1" not in text
+    assert '"message": "history-1"' not in text
+    assert "history-11" in text
+    assert "run_group" not in allowed_actions
+    assert "run_region" not in allowed_actions
+    assert "append_recovery" in allowed_actions
+    assert "resume_from_region" in allowed_actions

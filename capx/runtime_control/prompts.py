@@ -134,6 +134,110 @@ def build_capsule_prompt(
     ]
 
 
+def build_capsule_recovery_prompt(
+    *,
+    task: str,
+    failed_unit: CodeRegion | CodeRegionGroup,
+    history_tail: list[dict[str, Any]],
+    trace_summary: dict[str, Any],
+    side_effect_ledger: dict[str, Any],
+    recovery_observation_functions: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    recovery_functions = sorted(
+        {"get_observation"}
+        if recovery_observation_functions is None
+        else recovery_observation_functions
+    )
+    allowed_actions = [
+        "inspect_trace",
+        "inspect_variables",
+        "patch_group",
+        "patch_region",
+    ]
+    if recovery_functions:
+        allowed_actions.append("append_recovery")
+    allowed_actions.extend(["resume_from_region", "finish"])
+
+    if recovery_functions:
+        recovery_calls = ", ".join(f"{name}()" for name in recovery_functions)
+        append_recovery_rule = (
+            "For append_recovery, args.source must be executable Python code that calls "
+            f"at least one fresh-state function ({recovery_calls}) and continues from the "
+            "current physical state."
+        )
+        append_recovery_example = (
+            '{"action": "append_recovery", "args": {"source": '
+            f'"state = {recovery_functions[0]}()\\n# recover from the current state"}}\n'
+        )
+    else:
+        append_recovery_rule = (
+            "append_recovery is unavailable because the active API does not declare a "
+            "fresh-state observation function."
+        )
+        append_recovery_example = ""
+
+    failed_unit_kind = "group" if isinstance(failed_unit, CodeRegionGroup) else "region"
+    failed_unit_data = failed_unit.to_dict()
+    example_group_id = (
+        failed_unit.group_id if isinstance(failed_unit, CodeRegionGroup) else "group_id"
+    )
+    if isinstance(failed_unit, CodeRegionGroup):
+        example_region_id = failed_unit.region_ids[0] if failed_unit.region_ids else "region_id"
+    else:
+        example_region_id = failed_unit.region_id
+    bounded_history = history_tail[-4:]
+    bounded_trace_summary = _bound_trace_summary(trace_summary, max_events=5)
+    prompt_text = (
+        "Task:\n"
+        f"{task}\n\n"
+        f"Current failed {failed_unit_kind}:\n"
+        f"{json.dumps(failed_unit_data, indent=2, default=str)}\n\n"
+        "Recent runtime history after the failure:\n"
+        f"{json.dumps(bounded_history, indent=2, default=str)}\n\n"
+        "Recent primitive call trace summary:\n"
+        f"{json.dumps(bounded_trace_summary, indent=2, default=str)}\n\n"
+        "Side-effect ledger:\n"
+        f"{json.dumps(side_effect_ledger, indent=2, default=str)}\n\n"
+        "Choose exactly one bounded recovery action. Do not request normal forward "
+        "execution actions here; recovery is local to the failed unit and current "
+        "physical state.\n\n"
+        "Rollback is unavailable. Previously executed robot-side-effect code may have "
+        "changed the current physical state, so repairs must continue from that state. "
+        "Use a fresh observation before appending recovery code.\n\n"
+        f"Allowed actions: {', '.join(allowed_actions)}.\n\n"
+        "Respond with exactly one JSON object. Examples:\n"
+        '{"action": "inspect_trace", "args": {}}\n'
+        '{"action": "inspect_variables", "args": {"names": ["variable_name"]}}\n'
+        f'{{"action": "patch_group", "args": {{"group_id": "{example_group_id}", '
+        '"source": "replacement Python source for only that group"}}\n'
+        f'{{"action": "patch_region", "args": {{"region_id": "{example_region_id}", '
+        '"source": "replacement Python source for only that region"}}\n'
+        f"{append_recovery_example}"
+        f'{{"action": "resume_from_region", "args": {{"region_id": "{example_region_id}"}}}}\n'
+        '{"action": "finish", "args": {}}\n'
+        "For inspect_variables, args.names must be a non-empty list of Python variable "
+        "names to inspect. "
+        f"{append_recovery_rule} "
+        "Do not include rollback actions, robot primitive tool calls, or unrelated "
+        "source groups."
+    )
+    return [
+        {
+            "role": "system",
+            "content": "You choose one local recovery action after generated Python failed.",
+        },
+        {"role": "user", "content": [{"type": "text", "text": prompt_text}]},
+    ]
+
+
+def _bound_trace_summary(trace_summary: dict[str, Any], *, max_events: int) -> dict[str, Any]:
+    bounded = dict(trace_summary)
+    events = bounded.get("events")
+    if isinstance(events, list):
+        bounded["events"] = events[-max_events:]
+    return bounded
+
+
 def _extract_json_object(text: str) -> Any | None:
     decoder = json.JSONDecoder()
     for idx, char in enumerate(text):

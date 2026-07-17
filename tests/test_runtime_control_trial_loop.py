@@ -382,8 +382,12 @@ def test_capsule_auto_forward_never_replays_successful_side_effect_group(
     def fail_if_prompted(*args, **kwargs):
         raise AssertionError("auto_forward should not build capsule action prompts")
 
+    def fake_query(args, prompt):
+        return {"content": '{"action": "finish", "args": {}}', "reasoning": None}
+
     monkeypatch.setattr("capx.envs.trial.segment_python_code_groups", duplicated_first_group)
     monkeypatch.setattr("capx.envs.trial.build_capsule_prompt", fail_if_prompted)
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query)
 
     summary = _run_capsule_trial(
         env=env,
@@ -406,10 +410,10 @@ def test_capsule_auto_forward_never_replays_successful_side_effect_group(
 
     assert summary.sandbox_rc == 1
     assert env.api.moves == ["good"]
-    assert [entry["event"]["status"] for entry in trace] == ["success", "invalid"]
+    assert [entry["event"]["status"] for entry in trace] == ["success", "invalid", "success"]
     assert trace[1]["event"]["region_id"] == "group_1"
     assert "already executed robot-side-effect code" in trace[1]["event"]["message"]
-    assert [row["event_status"] for row in metrics] == ["success", "invalid"]
+    assert [row["event_status"] for row in metrics] == ["success", "invalid", "success"]
 
 
 def test_capsule_auto_forward_rejects_region_granularity(tmp_path):
@@ -471,8 +475,13 @@ def test_capsule_auto_forward_initial_code_query_does_not_query_capsule_action(
     assert _telemetry_stages(telemetry_path) == ["initial_code"]
 
 
-def test_capsule_auto_forward_stops_after_failed_group(tmp_path):
+def test_capsule_auto_forward_stops_after_failed_group(tmp_path, monkeypatch):
     env = FakeRewardDropCapsuleEnv()
+
+    def fake_query(args, prompt):
+        return {"content": '{"action": "finish", "args": {}}', "reasoning": None}
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query)
 
     summary = _run_capsule_trial(
         env=env,
@@ -494,8 +503,57 @@ def test_capsule_auto_forward_stops_after_failed_group(tmp_path):
 
     assert summary.sandbox_rc == 1
     assert env.api.moves == []
-    assert [entry["event"]["action"] for entry in trace] == ["run_group"]
+    assert [entry["event"]["action"] for entry in trace] == ["run_group", "finish"]
     assert trace[0]["event"]["status"] == "failed"
+
+
+def test_capsule_auto_forward_calls_llm_only_after_group_failure(tmp_path, monkeypatch):
+    telemetry_path = tmp_path / "auto_forward_recovery.jsonl"
+    prompts = []
+    queries = []
+
+    def fail_if_action_prompted(*args, **kwargs):
+        raise AssertionError("auto_forward should not build capsule action prompts")
+
+    def fake_recovery_prompt(**kwargs):
+        prompts.append(kwargs)
+        return [{"role": "user", "content": [{"type": "text", "text": "recover"}]}]
+
+    def fake_query(args, prompt):
+        _record_current_stage()
+        queries.append(prompt)
+        return {"content": '{"action": "finish", "args": {}}', "reasoning": None}
+
+    monkeypatch.setattr("capx.envs.trial.build_capsule_prompt", fail_if_action_prompted)
+    monkeypatch.setattr("capx.envs.trial.build_capsule_recovery_prompt", fake_recovery_prompt)
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query)
+
+    with trial_llm_context(trial=1, telemetry_path=telemetry_path):
+        summary = _run_capsule_trial(
+            env=FakeRewardDropCapsuleEnv(),
+            trial=1,
+            args=SimpleNamespace(model="test", use_oracle_code=False, max_tokens=100),
+            config={
+                "output_dir": str(tmp_path),
+                "use_runtime_control": True,
+                "capsule_control_mode": "auto_forward",
+                "max_capsule_steps": 4,
+                "capsule_max_regions_per_group": 1,
+                "use_parallel_ensemble": False,
+                "use_multimodel": False,
+            },
+            initial_code='move_to("good")\nraise RuntimeError("boom")\n',
+        )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 1
+    assert [entry["event"]["status"] for entry in trace] == ["success", "failed", "success"]
+    assert [entry["event"]["action"] for entry in trace] == ["run_group", "run_group", "finish"]
+    assert len(prompts) == 1
+    assert prompts[0]["failed_unit"].group_id == "group_2"
+    assert len(queries) == 1
+    assert _telemetry_stages(telemetry_path) == ["capsule_recovery"]
 
 
 def test_capsule_auto_forward_stops_after_reward_success(tmp_path):
@@ -525,8 +583,13 @@ def test_capsule_auto_forward_stops_after_reward_success(tmp_path):
     assert trace[0]["state_after"]["reward"] == 1.0
 
 
-def test_capsule_auto_forward_blocks_side_effect_after_reward_drop_from_best(tmp_path):
+def test_capsule_auto_forward_blocks_side_effect_after_reward_drop_from_best(tmp_path, monkeypatch):
     env = FakeRewardDropCapsuleEnv()
+
+    def fake_query(args, prompt):
+        return {"content": '{"action": "finish", "args": {}}', "reasoning": None}
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query)
 
     summary = _run_capsule_trial(
         env=env,
