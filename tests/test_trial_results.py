@@ -30,6 +30,7 @@ def _finished_result(**overrides):
             "call_count": 2,
             "attempt_count": 3,
             "retry_count": 1,
+            "token_count": 11,
             "elapsed_seconds": 4.25,
             "last_call_index": 2,
         },
@@ -61,6 +62,7 @@ def test_writer_creates_running_result_before_trial_work(tmp_path):
             "call_count": 0,
             "attempt_count": 0,
             "retry_count": 0,
+            "token_count": 0,
             "elapsed_seconds": 0.0,
             "last_call_index": 0,
         },
@@ -111,6 +113,7 @@ def test_writer_persists_sanitized_llm_failure_and_accounting(tmp_path):
         "call_count": 2,
         "attempt_count": 3,
         "retry_count": 1,
+        "token_count": 11,
         "elapsed_seconds": 4.25,
         "last_call_index": 2,
     }

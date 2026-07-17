@@ -416,6 +416,7 @@ def _llm_accounting(context: TrialLLMContext | None) -> dict[str, int | float]:
         "call_count": int(snapshot.get("logical_call_count", 0)),
         "attempt_count": int(snapshot.get("attempt_count", 0)),
         "retry_count": int(snapshot.get("retry_count", 0)),
+        "token_count": int(snapshot.get("token_count", 0)),
         "elapsed_seconds": float(snapshot.get("elapsed_seconds", 0.0)),
         "last_call_index": int(snapshot.get("last_call_index", 0)),
     }

@@ -121,6 +121,10 @@ def _retry_aware_summary(results: list[Mapping[str, Any]]) -> dict[str, Any]:
         "provider_failure_count": sum(_is_provider_failure(result) for result in results),
         "algorithm_failure_count": sum(_is_algorithm_failure(result) for result in results),
         "budget_exhausted_count": sum(_is_budget_exhausted(result) for result in results),
+        "experiment_infrastructure_failure_count": sum(
+            _is_experiment_infrastructure_failure(result) for result in results
+        ),
+        "unclassified_failure_count": sum(_is_unclassified_failure(result) for result in results),
     }
 
 
@@ -221,12 +225,40 @@ def _is_budget_exhausted(result: Mapping[str, Any]) -> bool:
 
 
 def _is_algorithm_failure(result: Mapping[str, Any]) -> bool:
-    if _is_provider_failure(result) or _is_budget_exhausted(result):
+    if (
+        _is_provider_failure(result)
+        or _is_budget_exhausted(result)
+        or _is_experiment_infrastructure_failure(result)
+    ):
         return False
     outcome = result.get("run_outcome")
-    if outcome in {RunOutcome.EXECUTION_FAILED.value, "unknown_legacy_failure"}:
+    if outcome == RunOutcome.EXECUTION_FAILED.value:
+        return True
+    if result.get("failure_kind") == "unknown_legacy_failure":
         return True
     return outcome == RunOutcome.FINISHED.value and not bool(result.get("task_completed"))
+
+
+def _is_experiment_infrastructure_failure(result: Mapping[str, Any]) -> bool:
+    outcome = result.get("run_outcome")
+    return outcome in {
+        RunOutcome.PARENT_GUARD_KILLED.value,
+        RunOutcome.CANCELLED.value,
+        "missing_result",
+        "invalid_result",
+    } and result.get("failure_kind") != "unknown_legacy_failure"
+
+
+def _is_unclassified_failure(result: Mapping[str, Any]) -> bool:
+    outcome = result.get("run_outcome")
+    if outcome == RunOutcome.FINISHED.value:
+        return False
+    return not (
+        _is_provider_failure(result)
+        or _is_algorithm_failure(result)
+        or _is_budget_exhausted(result)
+        or _is_experiment_infrastructure_failure(result)
+    )
 
 
 def _load_structured_result(path: Path, trial: int) -> dict[str, Any]:

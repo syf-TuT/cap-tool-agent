@@ -142,6 +142,7 @@ def test_terminal_result_without_finished_timestamp_is_invalid_schema(tmp_path):
                     "call_count": 0,
                     "attempt_count": 0,
                     "retry_count": 0,
+                    "token_count": 0,
                     "elapsed_seconds": 0.0,
                     "last_call_index": 0,
                 },
@@ -155,6 +156,31 @@ def test_terminal_result_without_finished_timestamp_is_invalid_schema(tmp_path):
     assert result["run_outcome"] == "invalid_result"
     assert result["result_source"] == "invalid_schema"
     assert "finished_at" in result["diagnostic"]
+
+
+def test_load_structured_result_accepts_llm_token_count(tmp_path):
+    writer = TrialResultWriter(tmp_path)
+    path = writer.start(trial=16, started_at=datetime(2026, 7, 10, tzinfo=timezone.utc))
+    writer.finalize(
+        {
+            "run_outcome": RunOutcome.FINISHED,
+            "finished_at": datetime(2026, 7, 10, 0, 1, tzinfo=timezone.utc),
+            "elapsed_seconds": 60.0,
+            "reward": 1.0,
+            "task_completed": True,
+            "sandbox_rc": 0,
+            "llm": {
+                "call_count": 1,
+                "attempt_count": 1,
+                "retry_count": 0,
+                "token_count": 123,
+                "elapsed_seconds": 2.0,
+                "last_call_index": 1,
+            },
+        }
+    )
+
+    assert load_trial_result(path.parent, 16)["llm"]["token_count"] == 123
 
 
 def test_parent_guard_finalizes_only_residual_running_result(tmp_path):
@@ -336,3 +362,33 @@ def test_aggregate_reports_first_attempt_and_retry_aware_metrics():
     assert summary["provider_failure_count"] == 1
     assert summary["algorithm_failure_count"] == 1
     assert summary["budget_exhausted_count"] == 1
+    assert summary["experiment_infrastructure_failure_count"] == 0
+    assert summary["unclassified_failure_count"] == 0
+
+
+def test_aggregate_failure_taxonomy_covers_infrastructure_and_legacy_unknowns():
+    summary = aggregate_trial_results(
+        [
+            {
+                "trial": 1,
+                "run_outcome": "invalid_result",
+                "failure_kind": "unknown_legacy_failure",
+            },
+            {
+                "trial": 2,
+                "run_outcome": "parent_guard_killed",
+                "failure_kind": "parent_guard_killed",
+            },
+            {
+                "trial": 3,
+                "run_outcome": "cancelled",
+                "failure_kind": "cancelled",
+            },
+        ]
+    )
+
+    assert summary["algorithm_failure_count"] == 1
+    assert summary["experiment_infrastructure_failure_count"] == 2
+    assert summary["provider_failure_count"] == 0
+    assert summary["budget_exhausted_count"] == 0
+    assert summary["unclassified_failure_count"] == 0

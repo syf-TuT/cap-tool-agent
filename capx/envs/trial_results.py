@@ -50,6 +50,7 @@ _LLM_FIELDS = {
     "call_count",
     "attempt_count",
     "retry_count",
+    "token_count",
     "elapsed_seconds",
     "last_call_index",
 }
@@ -108,6 +109,7 @@ def _empty_llm_accounting() -> dict[str, int | float]:
         "call_count": 0,
         "attempt_count": 0,
         "retry_count": 0,
+        "token_count": 0,
         "elapsed_seconds": 0.0,
         "last_call_index": 0,
     }
@@ -130,6 +132,7 @@ def _normalize_llm_accounting(value: Mapping[str, Any]) -> dict[str, int | float
             merged["attempt_count"], field="llm.attempt_count"
         ),
         "retry_count": _nonnegative_int(merged["retry_count"], field="llm.retry_count"),
+        "token_count": _nonnegative_int(merged["token_count"], field="llm.token_count"),
         "elapsed_seconds": _nonnegative_float(
             merged["elapsed_seconds"], field="llm.elapsed_seconds"
         ),
