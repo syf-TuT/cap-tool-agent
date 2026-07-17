@@ -1352,6 +1352,13 @@ def _run_capsule_llm_step_loop(
                     and _region_has_robot_side_effect(region)
                 ):
                     executed_side_effect_regions.add(region_id)
+                elif event.status == "failed" and region is not None:
+                    _mark_executed_side_effect_region_from_trace(
+                        event,
+                        region,
+                        executed_side_effect_regions,
+                        side_effect_calls,
+                    )
             elif action.action == "run_group":
                 group = group_by_id.get(group_id)
                 if event.status != "invalid":
@@ -1362,6 +1369,15 @@ def _run_capsule_llm_step_loop(
                         member_region = region_by_id.get(member_region_id)
                         if member_region is not None and _region_has_robot_side_effect(member_region):
                             executed_side_effect_regions.add(member_region_id)
+                elif event.status == "failed" and group is not None:
+                    _mark_executed_side_effects_from_trace(
+                        event,
+                        group,
+                        region_by_id,
+                        executed_side_effect_regions,
+                        executed_side_effect_groups,
+                        side_effect_calls,
+                    )
             elif action.action == "append_recovery" and event.status == "success":
                 recovery_side_effect_budget = 1
 
@@ -1863,10 +1879,7 @@ def _mark_executed_side_effects_from_trace(
     executed_side_effect_groups: set[str],
     side_effect_calls: set[str],
 ) -> None:
-    trace_events = event.evidence.get("trace_events", [])
-    if not isinstance(trace_events, list):
-        return
-    if not any(trace_event.get("name") in side_effect_calls for trace_event in trace_events):
+    if not _event_has_side_effect_trace(event, side_effect_calls):
         return
 
     executed_side_effect_groups.add(group.group_id)
@@ -1874,6 +1887,25 @@ def _mark_executed_side_effects_from_trace(
         member_region = region_by_id.get(member_region_id)
         if member_region is not None and _region_has_robot_side_effect(member_region):
             executed_side_effect_regions.add(member_region_id)
+
+
+def _mark_executed_side_effect_region_from_trace(
+    event: RuntimeEvent,
+    region: CodeRegion,
+    executed_side_effect_regions: set[str],
+    side_effect_calls: set[str],
+) -> None:
+    if not _event_has_side_effect_trace(event, side_effect_calls):
+        return
+    if _region_has_robot_side_effect(region):
+        executed_side_effect_regions.add(region.region_id)
+
+
+def _event_has_side_effect_trace(event: RuntimeEvent, side_effect_calls: set[str]) -> bool:
+    trace_events = event.evidence.get("trace_events", [])
+    if not isinstance(trace_events, list):
+        return False
+    return any(trace_event.get("name") in side_effect_calls for trace_event in trace_events)
 
 
 def _group_index_by_id(
