@@ -290,6 +290,72 @@ def test_capsule_action_query_uses_capsule_action_stage(tmp_path, monkeypatch):
     assert _telemetry_stages(telemetry_path) == ["capsule_action"]
 
 
+def test_capsule_auto_forward_runs_groups_without_capsule_action_llm(tmp_path, monkeypatch):
+    telemetry_path = tmp_path / "auto_forward.jsonl"
+    env = FakeRewardDropCapsuleEnv()
+
+    def fake_query(args, prompt):
+        _record_current_stage()
+        return {"content": '{"action": "finish", "args": {}}', "reasoning": None}
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query)
+
+    with trial_llm_context(trial=1, telemetry_path=telemetry_path):
+        summary = _run_capsule_trial(
+            env=env,
+            trial=1,
+            args=SimpleNamespace(model="test", use_oracle_code=False, max_tokens=100),
+            config={
+                "output_dir": str(tmp_path),
+                "use_runtime_control": True,
+                "capsule_control_mode": "auto_forward",
+                "max_capsule_steps": 8,
+                "capsule_max_regions_per_group": 1,
+                "use_parallel_ensemble": False,
+                "use_multimodel": False,
+            },
+            initial_code='move_to("good")\nmove_to("recover")\n',
+        )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+    telemetry_stages = _telemetry_stages(telemetry_path) if telemetry_path.exists() else []
+
+    assert summary.sandbox_rc == 0
+    assert env.api.moves == ["good", "recover"]
+    assert [entry["event"]["action"] for entry in trace] == ["run_group", "run_group"]
+    assert [entry["event"]["region_id"] for entry in trace] == ["group_1", "group_2"]
+    assert "capsule_action" not in telemetry_stages
+
+
+def test_capsule_llm_step_mode_keeps_existing_action_loop(tmp_path):
+    env = FakeCapsuleEnv()
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "use_runtime_control": True,
+            "capsule_control_mode": "llm_step",
+            "scripted_actions": [
+                {"action": "run_group", "args": {"group_id": "group_1"}},
+                {"action": "finish", "args": {}},
+            ],
+            "max_capsule_steps": 3,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='pose = get_pose("cube")\nmove_to(pose)\n',
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 0
+    assert env.api.moved is True
+    assert [entry["event"]["action"] for entry in trace] == ["run_group", "finish"]
+
+
 class FakeMultiTurnEnv:
     def __init__(self):
         self.steps = []

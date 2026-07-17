@@ -728,6 +728,98 @@ def _run_capsule_trial(
     initial_code: str | None = None,
     scripted_actions: list[dict[str, Any]] | None = None,
 ) -> TrialSummary:
+    mode = str(config.get("capsule_control_mode", "llm_step"))
+    if mode == "auto_forward":
+        return _run_capsule_auto_forward_loop(
+            env=env,
+            trial=trial,
+            args=args,
+            config=config,
+            initial_code=initial_code,
+        )
+    if mode == "llm_step":
+        return _run_capsule_llm_step_loop(
+            env=env,
+            trial=trial,
+            args=args,
+            config=config,
+            initial_code=initial_code,
+            scripted_actions=scripted_actions,
+        )
+    raise ValueError(f"Unsupported capsule_control_mode: {mode}")
+
+
+def _run_capsule_auto_forward_loop(
+    env: CodeExecutionEnvBase,
+    trial: int,
+    args: LaunchArgs,
+    config: dict[str, Any],
+    *,
+    initial_code: str | None = None,
+) -> TrialSummary:
+    output_dir = config.get("output_dir")
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    if initial_code is not None:
+        source = initial_code
+    elif config.get("use_oracle_code", False):
+        source = env.oracle_code
+    else:
+        obs, _ = env.reset(options={"trial": trial}, seed=trial)
+        raw_code, _, _ = _query_initial_code(args, config, obs)
+        source = "\n\n".join(_extract_code(raw_code))
+
+    max_regions_per_group = int(config.get("capsule_max_regions_per_group", 20))
+    use_semantic_groups = (
+        config.get("capsule_execution_granularity", "semantic_group") == "semantic_group"
+    )
+    side_effect_calls = collect_side_effect_calls(getattr(env, "_apis", {}).values())
+    if not side_effect_calls:
+        side_effect_calls = ROBOT_SIDE_EFFECT_CALLS
+    try:
+        regions = segment_python_code(source)
+        groups = (
+            segment_python_code_groups(
+                source,
+                regions,
+                max_regions_per_group=max_regions_per_group,
+                side_effect_calls=side_effect_calls,
+            )
+            if use_semantic_groups
+            else []
+        )
+    except SyntaxError:
+        groups = []
+
+    scripted_forward_actions = [
+        {"action": "run_group", "args": {"group_id": group.group_id}}
+        for group in groups
+    ]
+    forward_config = dict(config)
+    forward_config["max_capsule_steps"] = min(
+        int(config.get("max_capsule_steps", 12)),
+        len(scripted_forward_actions),
+    )
+    return _run_capsule_llm_step_loop(
+        env=env,
+        trial=trial,
+        args=args,
+        config=forward_config,
+        initial_code=source,
+        scripted_actions=scripted_forward_actions,
+    )
+
+
+def _run_capsule_llm_step_loop(
+    env: CodeExecutionEnvBase,
+    trial: int,
+    args: LaunchArgs,
+    config: dict[str, Any],
+    *,
+    initial_code: str | None = None,
+    scripted_actions: list[dict[str, Any]] | None = None,
+) -> TrialSummary:
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
     output_dir = config.get("output_dir")
     if output_dir:
