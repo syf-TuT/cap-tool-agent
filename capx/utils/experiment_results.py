@@ -82,7 +82,151 @@ def aggregate_trial_results(results: Iterable[Mapping[str, Any]]) -> dict[str, A
         "average_reward": sum(rewards) / len(rewards) if rewards else None,
         "task_completion_rate": sum(completed) / len(completed) if completed else None,
         "infrastructure_failure_counts": infrastructure_failure_counts,
+        **_retry_aware_summary(materialized),
     }
+
+
+def _retry_aware_summary(results: list[Mapping[str, Any]]) -> dict[str, Any]:
+    attempts_by_trial = _attempts_by_trial(results)
+    first_attempts = [
+        attempts[0] for attempts in attempts_by_trial.values() if attempts
+    ]
+    latest_attempts = [
+        attempts[-1] for attempts in attempts_by_trial.values() if attempts
+    ]
+    unique_trial_count = len(attempts_by_trial)
+    first_attempt_success_count = sum(_attempt_succeeded(result) for result in first_attempts)
+    latest_attempt_success_count = sum(_attempt_succeeded(result) for result in latest_attempts)
+
+    return {
+        "selection_policy": "all_attempts_grouped_by_trial",
+        "unique_trial_count": unique_trial_count,
+        "total_attempt_count": len(results),
+        "first_attempt_success_count": first_attempt_success_count,
+        "first_attempt_success_rate": (
+            first_attempt_success_count / unique_trial_count if unique_trial_count else None
+        ),
+        "latest_attempt_success_count": latest_attempt_success_count,
+        "latest_attempt_success_rate": (
+            latest_attempt_success_count / unique_trial_count if unique_trial_count else None
+        ),
+        "success_by_retry_budget": _success_by_retry_budget(attempts_by_trial),
+        "llm_logical_call_count": sum(_llm_int(result, "call_count") for result in results),
+        "llm_attempt_count": sum(_llm_int(result, "attempt_count") for result in results),
+        "llm_retry_count": sum(_llm_int(result, "retry_count") for result in results),
+        "llm_token_count": sum(_llm_int(result, "token_count") for result in results),
+        "llm_elapsed_seconds": sum(_llm_float(result, "elapsed_seconds") for result in results),
+        "trial_elapsed_seconds": sum(_nonnegative_number(result.get("elapsed_seconds")) for result in results),
+        "robot_execution_count": sum(_nonnegative_int_value(result.get("robot_execution_count")) for result in results),
+        "provider_failure_count": sum(_is_provider_failure(result) for result in results),
+        "algorithm_failure_count": sum(_is_algorithm_failure(result) for result in results),
+        "budget_exhausted_count": sum(_is_budget_exhausted(result) for result in results),
+    }
+
+
+def _attempts_by_trial(results: list[Mapping[str, Any]]) -> dict[str, list[Mapping[str, Any]]]:
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for index, result in enumerate(results):
+        trial_id = str(result.get("trial", index + 1))
+        grouped.setdefault(trial_id, []).append(result)
+    for attempts in grouped.values():
+        attempts.sort(key=_attempt_sort_key)
+    return dict(sorted(grouped.items()))
+
+
+def _attempt_sort_key(result: Mapping[str, Any]) -> tuple[int, int]:
+    attempt_index = result.get("attempt_index", result.get("attempt", 1))
+    try:
+        normalized_attempt = int(attempt_index)
+    except (TypeError, ValueError):
+        normalized_attempt = 1
+    llm = result.get("llm")
+    last_call_index = (
+        _nonnegative_int_value(llm.get("last_call_index"))
+        if isinstance(llm, Mapping)
+        else 0
+    )
+    return normalized_attempt, last_call_index
+
+
+def _success_by_retry_budget(
+    attempts_by_trial: dict[str, list[Mapping[str, Any]]],
+) -> dict[str, dict[str, float | int | None]]:
+    budgets: dict[str, dict[str, float | int | None]] = {}
+    if not attempts_by_trial:
+        return budgets
+    max_retry_budget = max(max(len(attempts) - 1, 0) for attempts in attempts_by_trial.values())
+    trial_count = len(attempts_by_trial)
+    for budget in range(max_retry_budget + 1):
+        success_count = 0
+        for attempts in attempts_by_trial.values():
+            visible_attempts = attempts[: budget + 1]
+            success_count += int(any(_attempt_succeeded(attempt) for attempt in visible_attempts))
+        budgets[str(budget)] = {
+            "success_count": success_count,
+            "success_rate": success_count / trial_count if trial_count else None,
+        }
+    return budgets
+
+
+def _attempt_succeeded(result: Mapping[str, Any]) -> bool:
+    return (
+        result.get("run_outcome") == RunOutcome.FINISHED.value
+        and bool(result.get("task_completed"))
+    )
+
+
+def _llm_int(result: Mapping[str, Any], field: str) -> int:
+    llm = result.get("llm")
+    if not isinstance(llm, Mapping):
+        return 0
+    return _nonnegative_int_value(llm.get(field))
+
+
+def _llm_float(result: Mapping[str, Any], field: str) -> float:
+    llm = result.get("llm")
+    if not isinstance(llm, Mapping):
+        return 0.0
+    return _nonnegative_number(llm.get(field))
+
+
+def _nonnegative_int_value(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(number, 0)
+
+
+def _nonnegative_number(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(number, 0.0)
+
+
+def _is_provider_failure(result: Mapping[str, Any]) -> bool:
+    if result.get("run_outcome") == RunOutcome.LLM_FAILED.value:
+        return True
+    failure_kind = str(result.get("failure_kind") or "")
+    return failure_kind.startswith(("http_", "rate_limit", "timeout", "provider"))
+
+
+def _is_budget_exhausted(result: Mapping[str, Any]) -> bool:
+    return (
+        result.get("run_outcome") == RunOutcome.TRIAL_BUDGET_EXHAUSTED.value
+        or result.get("failure_kind") == RunOutcome.TRIAL_BUDGET_EXHAUSTED.value
+    )
+
+
+def _is_algorithm_failure(result: Mapping[str, Any]) -> bool:
+    if _is_provider_failure(result) or _is_budget_exhausted(result):
+        return False
+    outcome = result.get("run_outcome")
+    if outcome in {RunOutcome.EXECUTION_FAILED.value, "unknown_legacy_failure"}:
+        return True
+    return outcome == RunOutcome.FINISHED.value and not bool(result.get("task_completed"))
 
 
 def _load_structured_result(path: Path, trial: int) -> dict[str, Any]:

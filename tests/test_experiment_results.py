@@ -229,3 +229,110 @@ def test_aggregate_counts_outcomes_and_uses_finished_only_denominators():
         "llm_failed": 1,
         "unknown_legacy_failure": 1,
     }
+
+
+def test_aggregate_reports_first_attempt_and_retry_aware_metrics():
+    summary = aggregate_trial_results(
+        [
+            {
+                "trial": 1,
+                "attempt_index": 1,
+                "run_outcome": "execution_failed",
+                "failure_kind": "sandbox_rc_nonzero",
+                "reward": 0.0,
+                "task_completed": False,
+                "elapsed_seconds": 10.0,
+                "robot_execution_count": 1,
+                "llm": {
+                    "call_count": 2,
+                    "attempt_count": 2,
+                    "retry_count": 0,
+                    "elapsed_seconds": 7.0,
+                    "token_count": 100,
+                },
+            },
+            {
+                "trial": 1,
+                "attempt_index": 2,
+                "run_outcome": "finished",
+                "failure_kind": None,
+                "reward": 1.0,
+                "task_completed": True,
+                "elapsed_seconds": 12.0,
+                "robot_execution_count": 2,
+                "llm": {
+                    "call_count": 1,
+                    "attempt_count": 1,
+                    "retry_count": 0,
+                    "elapsed_seconds": 5.0,
+                    "token_count": 80,
+                },
+            },
+            {
+                "trial": 2,
+                "attempt_index": 1,
+                "run_outcome": "llm_failed",
+                "failure_kind": "http_5xx",
+                "elapsed_seconds": 3.0,
+                "llm": {
+                    "call_count": 1,
+                    "attempt_count": 3,
+                    "retry_count": 2,
+                    "elapsed_seconds": 3.0,
+                    "token_count": 0,
+                },
+            },
+            {
+                "trial": 2,
+                "attempt_index": 2,
+                "run_outcome": "finished",
+                "failure_kind": None,
+                "reward": 1.0,
+                "task_completed": True,
+                "elapsed_seconds": 11.0,
+                "robot_execution_count": 1,
+                "llm": {
+                    "call_count": 1,
+                    "attempt_count": 1,
+                    "retry_count": 0,
+                    "elapsed_seconds": 4.0,
+                    "token_count": 60,
+                },
+            },
+            {
+                "trial": 3,
+                "attempt_index": 1,
+                "run_outcome": "trial_budget_exhausted",
+                "failure_kind": "trial_budget_exhausted",
+                "elapsed_seconds": 20.0,
+                "llm": {
+                    "call_count": 4,
+                    "attempt_count": 4,
+                    "retry_count": 0,
+                    "elapsed_seconds": 18.0,
+                    "token_count": 200,
+                },
+            },
+        ]
+    )
+
+    assert summary["selection_policy"] == "all_attempts_grouped_by_trial"
+    assert summary["unique_trial_count"] == 3
+    assert summary["total_attempt_count"] == 5
+    assert summary["first_attempt_success_count"] == 0
+    assert summary["first_attempt_success_rate"] == pytest.approx(0.0)
+    assert summary["latest_attempt_success_count"] == 2
+    assert summary["success_by_retry_budget"] == {
+        "0": {"success_count": 0, "success_rate": pytest.approx(0.0)},
+        "1": {"success_count": 2, "success_rate": pytest.approx(2 / 3)},
+    }
+    assert summary["llm_logical_call_count"] == 9
+    assert summary["llm_attempt_count"] == 11
+    assert summary["llm_retry_count"] == 2
+    assert summary["llm_token_count"] == 440
+    assert summary["llm_elapsed_seconds"] == pytest.approx(37.0)
+    assert summary["trial_elapsed_seconds"] == pytest.approx(56.0)
+    assert summary["robot_execution_count"] == 4
+    assert summary["provider_failure_count"] == 1
+    assert summary["algorithm_failure_count"] == 1
+    assert summary["budget_exhausted_count"] == 1
