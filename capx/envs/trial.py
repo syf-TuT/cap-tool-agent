@@ -835,7 +835,12 @@ def _run_capsule_auto_forward_loop(
         config.get("capsule_reward_drop_guard_threshold", 0.25)
     )
 
-    for step_id, group in enumerate(groups[:max_steps], 1):
+    group_index = 0
+    group_attempts = 0
+    while group_index < len(groups) and group_attempts < max_steps:
+        group = groups[group_index]
+        group_attempts += 1
+        step_id = len(history) + 1
         action = RuntimeAction("run_group", {"group_id": group.group_id})
         action.step_id = step_id
         before_state = _capsule_state_snapshot(env)
@@ -879,9 +884,7 @@ def _run_capsule_auto_forward_loop(
             if consumes_recovery_side_effect:
                 recovery_side_effect_budget -= 1
 
-        if event.status in {"failed", "invalid"}:
-            failed = True
-        elif group.has_robot_side_effect:
+        if event.status not in {"failed", "invalid"} and group.has_robot_side_effect:
             executed_side_effect_groups.add(group.group_id)
             for member_region_id in group.region_ids:
                 member_region = region_by_id.get(member_region_id)
@@ -925,6 +928,7 @@ def _run_capsule_auto_forward_loop(
         )
         step_metrics.append(metric)
 
+        recovery_continued = False
         if event.status in {"failed", "invalid"}:
             recovery_step_id = len(history) + 1
             recovery_before_state = after_state
@@ -1047,6 +1051,9 @@ def _run_capsule_auto_forward_loop(
                 and recovery_action.action in {"patch_region", "patch_group", "append_recovery"}
                 and recovery_event.status == "success"
             ):
+                recovery_action_name = recovery_action.action
+                recovery_group_id = str(recovery_action.args.get("group_id", ""))
+                recovery_region_id = str(recovery_action.args.get("region_id", ""))
                 source = str(recovery_event.evidence["source"])
                 regions = segment_python_code(source)
                 groups = segment_python_code_groups(
@@ -1057,12 +1064,32 @@ def _run_capsule_auto_forward_loop(
                 )
                 region_by_id = {region.region_id: region for region in regions}
                 group_by_id = {group.group_id: group for group in groups}
+                if recovery_action_name == "append_recovery":
+                    group_index = _next_group_index_after_group(groups, group.group_id)
+                elif recovery_action_name == "patch_group":
+                    group_index = _group_index_by_id(groups, recovery_group_id, default=group_index)
+                else:
+                    group_index = _group_index_for_region(
+                        groups,
+                        recovery_region_id,
+                        default=group_index,
+                    )
+                recovery_continued = True
             if recovery_event.status in {"failed", "invalid"}:
                 failed = True
+                break
             if recovery_event.action == "finish" or (
                 recovery_action.action == "finish" if recovery_action is not None else False
             ):
                 break
+            if not recovery_continued:
+                recovery_reward_after = _state_reward(recovery_after_state)
+                failed = not (
+                    bool(recovery_after_state.get("task_completed"))
+                    or (recovery_reward_after is not None and recovery_reward_after >= 1.0)
+                )
+                break
+            continue
 
         reward_after = _state_reward(after_state)
         if (
@@ -1071,6 +1098,7 @@ def _run_capsule_auto_forward_loop(
             or (reward_after is not None and reward_after >= 1.0)
         ):
             break
+        group_index += 1
 
     reward = _safe_compute_reward(env)
     task_completed = _safe_task_completed(env)
@@ -1744,6 +1772,34 @@ def _runtime_action_targets_side_effect_unit(
 def _runtime_action_unit_id(action: RuntimeAction) -> str | None:
     unit_id = action.args.get("group_id") or action.args.get("region_id")
     return str(unit_id) if unit_id else None
+
+
+def _group_index_by_id(
+    groups: list[CodeRegionGroup],
+    group_id: str,
+    *,
+    default: int,
+) -> int:
+    for idx, group in enumerate(groups):
+        if group.group_id == group_id:
+            return idx
+    return default
+
+
+def _next_group_index_after_group(groups: list[CodeRegionGroup], group_id: str) -> int:
+    return _group_index_by_id(groups, group_id, default=len(groups) - 1) + 1
+
+
+def _group_index_for_region(
+    groups: list[CodeRegionGroup],
+    region_id: str,
+    *,
+    default: int,
+) -> int:
+    for idx, group in enumerate(groups):
+        if region_id in group.region_ids:
+            return idx
+    return default
 
 
 def _already_executed_side_effect_event(
