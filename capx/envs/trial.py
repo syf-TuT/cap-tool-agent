@@ -1885,7 +1885,10 @@ def _mark_executed_side_effects_from_trace(
     executed_side_effect_groups.add(group.group_id)
     for member_region_id in group.region_ids:
         member_region = region_by_id.get(member_region_id)
-        if member_region is not None and _region_has_robot_side_effect(member_region):
+        if member_region is not None and _region_has_side_effect_call(
+            member_region,
+            side_effect_calls,
+        ):
             executed_side_effect_regions.add(member_region_id)
 
 
@@ -1897,7 +1900,7 @@ def _mark_executed_side_effect_region_from_trace(
 ) -> None:
     if not _event_has_side_effect_trace(event, side_effect_calls):
         return
-    if _region_has_robot_side_effect(region):
+    if _region_has_side_effect_call(region, side_effect_calls):
         executed_side_effect_regions.add(region.region_id)
 
 
@@ -1906,6 +1909,14 @@ def _event_has_side_effect_trace(event: RuntimeEvent, side_effect_calls: set[str
     if not isinstance(trace_events, list):
         return False
     return any(trace_event.get("name") in side_effect_calls for trace_event in trace_events)
+
+
+def _region_has_side_effect_call(region: CodeRegion, side_effect_calls: set[str]) -> bool:
+    try:
+        tree = ast.parse(region.source)
+    except SyntaxError:
+        return False
+    return any(_ast_calls_function(tree, name) for name in side_effect_calls)
 
 
 def _group_index_by_id(
