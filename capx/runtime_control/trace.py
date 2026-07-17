@@ -21,8 +21,24 @@ class RuntimeTrace:
     def events_since(self, index: int) -> list[dict[str, Any]]:
         return list(self.events[index:])
 
-    def summary(self) -> dict[str, Any]:
-        return {"events": list(self.events)}
+    def summary(self, *, max_events: int = 8, failed_only: bool = False) -> dict[str, Any]:
+        bounded_count = max(0, int(max_events))
+        failed_events = [
+            event for event in self.events if event.get("status") == "failed"
+        ]
+        visible_events = failed_events if failed_only else self.events
+        recent_events = list(visible_events[-bounded_count:]) if bounded_count else []
+        recent_failed_events = (
+            list(failed_events[-bounded_count:]) if bounded_count else []
+        )
+
+        return {
+            "event_count": len(self.events),
+            "primitive_call_counts": _primitive_call_counts(self.events),
+            "failed_event_count": len(failed_events),
+            "recent_events": recent_events,
+            "failed_events": recent_failed_events,
+        }
 
 
 def wrap_function_for_trace(name: str, fn: Callable[..., Any], trace: RuntimeTrace) -> Callable[..., Any]:
@@ -59,6 +75,15 @@ def wrap_function_for_trace(name: str, fn: Callable[..., Any], trace: RuntimeTra
         return result
 
     return wrapped
+
+
+def _primitive_call_counts(events: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for event in events:
+        name = event.get("name")
+        if isinstance(name, str):
+            counts[name] = counts.get(name, 0) + 1
+    return counts
 
 
 def _summarize_value(value: Any) -> dict[str, Any]:

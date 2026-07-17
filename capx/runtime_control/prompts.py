@@ -259,6 +259,12 @@ def _bound_trace_summary(trace_summary: dict[str, Any], *, max_events: int) -> d
     events = bounded.get("events")
     if isinstance(events, list):
         bounded["events"] = events[-max_events:]
+    recent_events = bounded.get("recent_events")
+    if isinstance(recent_events, list):
+        bounded["recent_events"] = recent_events[-max_events:]
+    failed_events = bounded.get("failed_events")
+    if isinstance(failed_events, list):
+        bounded["failed_events"] = failed_events[-max_events:]
     return bounded
 
 

@@ -151,6 +151,23 @@ class FakeCustomMoveCapsuleEnv(FakeIncompleteCapsuleEnv):
         self._apis = {"fake": self.api}
 
 
+class FakeTraceFailureApi(FakeApi):
+    def functions(self):
+        functions = dict(super().functions())
+        functions["fail_primitive"] = self.fail_primitive
+        return functions
+
+    def fail_primitive(self):
+        raise RuntimeError("primitive failed")
+
+
+class FakeTraceFailureEnv(FakeIncompleteCapsuleEnv):
+    def __init__(self):
+        self.api = FakeTraceFailureApi()
+        self.low_level_env = object()
+        self._apis = {"fake": self.api}
+
+
 class FakeVideoCapsuleEnv(FakeCapsuleEnv):
     def __init__(self):
         super().__init__()
@@ -2070,7 +2087,41 @@ def test_capsule_trial_writes_trace_and_feedback_artifact(tmp_path):
     trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
     assert trace[0]["feedback"]["region_id"] == "region_1"
     assert trace[0]["trace_events"][0]["name"] == "get_pose"
-    assert trace[2]["event"]["evidence"]["events"][0]["name"] == "get_pose"
+    assert trace[2]["event"]["evidence"]["recent_events"][0]["name"] == "get_pose"
+    assert trace[2]["event"]["evidence"]["event_count"] == 2
+    assert "events" not in trace[2]["event"]["evidence"]
+
+
+def test_inspect_trace_supports_last_n_and_failed_only(tmp_path):
+    _run_capsule_trial(
+        env=FakeTraceFailureEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code=(
+            'get_pose("cube")\n'
+            "fail_primitive()\n"
+        ),
+        scripted_actions=[
+            {"action": "run_region", "args": {"region_id": "region_1"}},
+            {"action": "run_region", "args": {"region_id": "region_2"}},
+            {"action": "inspect_trace", "args": {"last_n": 1, "failed_only": True}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+    evidence = trace[2]["event"]["evidence"]
+
+    assert evidence["event_count"] == 2
+    assert evidence["failed_event_count"] == 1
+    assert [event["name"] for event in evidence["recent_events"]] == ["fail_primitive"]
+    assert evidence["recent_events"][0]["status"] == "failed"
 
 
 def test_capsule_trial_writes_step_metrics_jsonl(tmp_path):
