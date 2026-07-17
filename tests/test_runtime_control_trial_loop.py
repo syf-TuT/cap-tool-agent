@@ -525,6 +525,34 @@ def test_capsule_auto_forward_stops_after_reward_success(tmp_path):
     assert trace[0]["state_after"]["reward"] == 1.0
 
 
+def test_capsule_auto_forward_blocks_side_effect_after_reward_drop_from_best(tmp_path):
+    env = FakeRewardDropCapsuleEnv()
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "use_runtime_control": True,
+            "capsule_control_mode": "auto_forward",
+            "max_capsule_steps": 4,
+            "capsule_max_regions_per_group": 1,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='move_to("good")\nmove_to("bad")\nmove_to("worse")\n',
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 1
+    assert env.api.moves == ["good", "bad"]
+    assert trace[2]["event"]["status"] == "invalid"
+    assert "reward dropped" in trace[2]["event"]["message"]
+    assert "append_recovery" in trace[2]["event"]["message"]
+
+
 def test_capsule_llm_step_mode_keeps_existing_action_loop(tmp_path):
     env = FakeCapsuleEnv()
 

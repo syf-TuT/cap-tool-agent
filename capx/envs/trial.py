@@ -820,6 +820,12 @@ def _run_capsule_auto_forward_loop(
     best_reward_so_far: float | None = None
     executed_side_effect_regions: set[str] = set()
     executed_side_effect_groups: set[str] = set()
+    reward_drop_guard_min_best_reward = float(
+        config.get("capsule_reward_drop_guard_min_best_reward", 0.6)
+    )
+    reward_drop_guard_threshold = float(
+        config.get("capsule_reward_drop_guard_threshold", 0.25)
+    )
 
     for step_id, group in enumerate(groups[:max_steps], 1):
         action = RuntimeAction("run_group", {"group_id": group.group_id})
@@ -832,6 +838,18 @@ def _run_capsule_auto_forward_loop(
             executed_side_effect_groups,
             recovery_observation_functions=recovery_observation_functions,
         )
+        if event is None:
+            event = _reward_drop_guard_event(
+                action,
+                before_state,
+                best_reward_so_far,
+                region_by_id,
+                group_by_id,
+                recovery_side_effect_budget=0,
+                min_best_reward=reward_drop_guard_min_best_reward,
+                drop_threshold=reward_drop_guard_threshold,
+                recovery_observation_functions=recovery_observation_functions,
+            )
         if event is None:
             event = _execute_runtime_action(
                 action,
