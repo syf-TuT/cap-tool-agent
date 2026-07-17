@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import capx.envs.trial as trial_module
 from capx.envs.trial import (
     _describe_initial_scene,
     _execute_runtime_action,
@@ -172,6 +173,10 @@ def _telemetry_stages(path):
     return [json.loads(line)["stage"] for line in path.read_text().splitlines()]
 
 
+def _capsule_step_metrics(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
 def test_initial_generation_query_uses_initial_code_stage(tmp_path, monkeypatch):
     telemetry_path = tmp_path / "initial.jsonl"
     monkeypatch.setattr(
@@ -325,6 +330,110 @@ def test_capsule_auto_forward_runs_groups_without_capsule_action_llm(tmp_path, m
     assert [entry["event"]["action"] for entry in trace] == ["run_group", "run_group"]
     assert [entry["event"]["region_id"] for entry in trace] == ["group_1", "group_2"]
     assert "capsule_action" not in telemetry_stages
+
+
+def test_capsule_auto_forward_executes_effect_bounded_groups_in_source_order(
+    tmp_path, monkeypatch
+):
+    env = FakeRewardDropCapsuleEnv()
+
+    def fail_if_prompted(*args, **kwargs):
+        raise AssertionError("auto_forward should not build capsule action prompts")
+
+    monkeypatch.setattr("capx.envs.trial.build_capsule_prompt", fail_if_prompted)
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "use_runtime_control": True,
+            "capsule_control_mode": "auto_forward",
+            "max_capsule_steps": 8,
+            "capsule_max_regions_per_group": 1,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='move_to("good")\nmove_to("recover")\n',
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_01.jsonl")
+
+    assert summary.sandbox_rc == 0
+    assert env.api.moves == ["good", "recover"]
+    assert [entry["event"]["region_id"] for entry in trace] == ["group_1", "group_2"]
+    assert [row["action"] for row in metrics] == ["run_group", "run_group"]
+    assert [row["region_id"] for row in metrics] == ["group_1", "group_2"]
+    assert [row["event_status"] for row in metrics] == ["success", "success"]
+
+
+def test_capsule_auto_forward_never_replays_successful_side_effect_group(
+    tmp_path, monkeypatch
+):
+    env = FakeRewardDropCapsuleEnv()
+    original_segment_groups = trial_module.segment_python_code_groups
+
+    def duplicated_first_group(*args, **kwargs):
+        groups = original_segment_groups(*args, **kwargs)
+        return [groups[0], groups[0]]
+
+    def fail_if_prompted(*args, **kwargs):
+        raise AssertionError("auto_forward should not build capsule action prompts")
+
+    monkeypatch.setattr("capx.envs.trial.segment_python_code_groups", duplicated_first_group)
+    monkeypatch.setattr("capx.envs.trial.build_capsule_prompt", fail_if_prompted)
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "use_runtime_control": True,
+            "capsule_control_mode": "auto_forward",
+            "max_capsule_steps": 8,
+            "capsule_max_regions_per_group": 1,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='move_to("good")\n',
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_01.jsonl")
+
+    assert summary.sandbox_rc == 1
+    assert env.api.moves == ["good"]
+    assert [entry["event"]["status"] for entry in trace] == ["success", "invalid"]
+    assert trace[1]["event"]["region_id"] == "group_1"
+    assert "already executed robot-side-effect code" in trace[1]["event"]["message"]
+    assert [row["event_status"] for row in metrics] == ["success", "invalid"]
+
+
+def test_capsule_auto_forward_rejects_region_granularity(tmp_path):
+    try:
+        _run_capsule_trial(
+            env=FakeCapsuleEnv(),
+            trial=1,
+            args=SimpleNamespace(model="test", use_oracle_code=False),
+            config={
+                "output_dir": str(tmp_path),
+                "use_runtime_control": True,
+                "capsule_control_mode": "auto_forward",
+                "capsule_execution_granularity": "region",
+                "max_capsule_steps": 4,
+                "use_parallel_ensemble": False,
+                "use_multimodel": False,
+            },
+            initial_code='move_to([1, 2, 3])\n',
+        )
+    except ValueError as exc:
+        assert "auto_forward" in str(exc)
+        assert "semantic_group" in str(exc)
+    else:
+        raise AssertionError("auto_forward should reject non-semantic group granularity")
 
 
 def test_capsule_auto_forward_initial_code_query_does_not_query_capsule_action(

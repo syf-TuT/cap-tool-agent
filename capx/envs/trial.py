@@ -761,55 +761,193 @@ def _run_capsule_auto_forward_loop(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    if config.get("capsule_execution_granularity", "semantic_group") != "semantic_group":
+        raise ValueError(
+            "capsule_control_mode='auto_forward' only supports "
+            "capsule_execution_granularity='semantic_group'"
+        )
+
+    obs, _ = env.reset(options={"trial": trial}, seed=trial)
+    if config.get("record_video") and hasattr(env, "enable_video_capture"):
+        env.enable_video_capture(
+            True,
+            clear=True,
+            wrist_camera=config.get("use_wrist_camera", False),
+        )
+
     if initial_code is not None:
         source = initial_code
     elif config.get("use_oracle_code", False):
         source = env.oracle_code
     else:
-        obs, _ = env.reset(options={"trial": trial}, seed=trial)
         raw_code, _, _ = _query_initial_code(args, config, obs)
         source = "\n\n".join(_extract_code(raw_code))
 
     max_regions_per_group = int(config.get("capsule_max_regions_per_group", 20))
-    use_semantic_groups = (
-        config.get("capsule_execution_granularity", "semantic_group") == "semantic_group"
-    )
     side_effect_calls = collect_side_effect_calls(getattr(env, "_apis", {}).values())
     if not side_effect_calls:
         side_effect_calls = ROBOT_SIDE_EFFECT_CALLS
+    recovery_observation_functions = _collect_recovery_observation_functions(
+        getattr(env, "_apis", {}).values()
+    )
+    initial_syntax_error: SyntaxError | None = None
     try:
         regions = segment_python_code(source)
-        groups = (
-            segment_python_code_groups(
-                source,
-                regions,
-                max_regions_per_group=max_regions_per_group,
-                side_effect_calls=side_effect_calls,
-            )
-            if use_semantic_groups
-            else []
+        groups = segment_python_code_groups(
+            source,
+            regions,
+            max_regions_per_group=max_regions_per_group,
+            side_effect_calls=side_effect_calls,
         )
-    except SyntaxError:
-        groups = []
+    except SyntaxError as exc:
+        initial_syntax_error = exc
+        regions, groups = _whole_source_fallback_units(source)
+    region_by_id = {region.region_id: region for region in regions}
+    group_by_id = {group.group_id: group for group in groups}
 
-    scripted_forward_actions = [
-        {"action": "run_group", "args": {"group_id": group.group_id}}
-        for group in groups
-    ]
-    forward_config = dict(config)
-    forward_config["max_capsule_steps"] = min(
-        int(config.get("max_capsule_steps", 12)),
-        len(scripted_forward_actions),
+    trace = RuntimeTrace()
+    executor = CapsuleExecutor(
+        base_globals=env._build_capsule_globals(trace=trace),
+        trace=trace,
     )
-    return _run_capsule_llm_step_loop(
-        env=env,
+    max_steps = int(config.get("max_capsule_steps", 12))
+    history: list[dict[str, Any]] = []
+    if initial_syntax_error is not None:
+        history.append(_initial_syntax_error_history_entry(initial_syntax_error))
+    step_metrics: list[dict[str, Any]] = []
+    failed = False
+    executed_regions = 0
+    best_reward_so_far: float | None = None
+    executed_side_effect_regions: set[str] = set()
+    executed_side_effect_groups: set[str] = set()
+
+    for step_id, group in enumerate(groups[:max_steps], 1):
+        action = RuntimeAction("run_group", {"group_id": group.group_id})
+        action.step_id = step_id
+        before_state = _capsule_state_snapshot(env)
+
+        event = _no_rollback_guard_event(
+            action,
+            executed_side_effect_regions,
+            executed_side_effect_groups,
+            recovery_observation_functions=recovery_observation_functions,
+        )
+        if event is None:
+            event = _execute_runtime_action(
+                action,
+                executor,
+                source,
+                region_by_id,
+                group_by_id,
+                recovery_observation_functions=recovery_observation_functions,
+            )
+
+        if event.status in {"failed", "invalid"}:
+            failed = True
+        elif group.has_robot_side_effect:
+            executed_side_effect_groups.add(group.group_id)
+            for member_region_id in group.region_ids:
+                member_region = region_by_id.get(member_region_id)
+                if member_region is not None and _region_has_robot_side_effect(member_region):
+                    executed_side_effect_regions.add(member_region_id)
+
+        if event.status != "invalid":
+            executed_regions += len(group.region_ids)
+
+        after_state = _capsule_state_snapshot(env)
+        trace_events = event.evidence.get("trace_events", [])
+        feedback = build_runtime_feedback(
+            step_id=step_id,
+            action=action,
+            event=event,
+            region=group,
+            trace_events=trace_events,
+            before_state=before_state,
+            after_state=after_state,
+        )
+        history.append(
+            {
+                "step_id": step_id,
+                "action": action.to_dict(),
+                "event": event.to_dict(),
+                "feedback": feedback.to_dict(),
+                "trace_events": trace_events,
+                "state_before": before_state,
+                "state_after": after_state,
+            }
+        )
+        metric, best_reward_so_far = _capsule_step_metric(
+            step_id=step_id,
+            action=action,
+            event=event,
+            before_state=before_state,
+            after_state=after_state,
+            executed_regions=executed_regions,
+            best_reward_so_far=best_reward_so_far,
+            recovery_execution_attempt=False,
+        )
+        step_metrics.append(metric)
+
+        reward_after = _state_reward(after_state)
+        if (
+            event.status in {"failed", "invalid"}
+            or bool(after_state.get("task_completed"))
+            or (reward_after is not None and reward_after >= 1.0)
+        ):
+            break
+
+    reward = _safe_compute_reward(env)
+    task_completed = _safe_task_completed(env)
+    task_succeeded = bool(task_completed) or reward >= 1.0
+    sandbox_rc = 0 if task_succeeded and not failed else 1
+    code_path = None
+    if output_dir:
+        code_path = os.path.join(output_dir, f"capsule_code_trial_{trial:02d}.py")
+        with open(code_path, "w") as f:
+            f.write(source)
+        with open(os.path.join(output_dir, f"capsule_trace_trial_{trial:02d}.json"), "w") as f:
+            json.dump(history, f, indent=2, default=str)
+        with open(os.path.join(output_dir, f"capsule_prompts_trial_{trial:02d}.json"), "w") as f:
+            json.dump([], f, indent=2, default=str)
+        metrics_path = os.path.join(output_dir, f"capsule_step_metrics_trial_{trial:02d}.jsonl")
+        with open(metrics_path, "w") as f:
+            for metric in step_metrics:
+                f.write(json.dumps(metric, default=str) + "\n")
+
+    if config.get("record_video"):
+        info_step = {
+            "sandbox_rc": sandbox_rc,
+            "task_completed": bool(task_completed),
+        }
+        _save_trial_video(
+            env,
+            config,
+            trial,
+            info_step,
+            reward,
+            executed_regions,
+            suffix_extra="capsule",
+        )
+
+    log = (
+        f"Capsule actions: {len(history)}\n"
+        f"Executed regions: {executed_regions}\n"
+        f"Reward: {reward}\n"
+        f"Task Completed: {task_completed}"
+    )
+    return TrialSummary(
         trial=trial,
-        args=args,
-        config=forward_config,
-        initial_code=source,
-        scripted_actions=scripted_forward_actions,
-        stop_after_failed_event=True,
-        stop_after_task_success=True,
+        success=sandbox_rc == 0,
+        reward=reward,
+        terminated=bool(task_completed) or reward >= 1.0,
+        truncated=False,
+        sandbox_rc=sandbox_rc,
+        log=log,
+        task_completed=task_completed,
+        code_path=code_path,
+        num_regenerations=0,
+        num_finishes=0,
+        num_code_blocks=executed_regions,
     )
 
 
