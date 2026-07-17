@@ -1077,6 +1077,7 @@ def _run_capsule_auto_forward_loop(
                 recovery_action_name = recovery_action.action
                 recovery_group_id = str(recovery_action.args.get("group_id", ""))
                 recovery_region_id = str(recovery_action.args.get("region_id", ""))
+                previous_source = source
                 source = str(recovery_event.evidence["source"])
                 regions = segment_python_code(source)
                 groups = segment_python_code_groups(
@@ -1088,7 +1089,11 @@ def _run_capsule_auto_forward_loop(
                 region_by_id = {region.region_id: region for region in regions}
                 group_by_id = {group.group_id: group for group in groups}
                 if recovery_action_name == "append_recovery":
-                    group_index = _next_group_index_after_group(groups, group.group_id)
+                    group_index = _first_group_index_starting_after_source(
+                        groups,
+                        previous_source,
+                        default=len(groups) - 1,
+                    )
                 elif recovery_action_name == "patch_group":
                     group_index = _group_index_by_id(groups, recovery_group_id, default=group_index)
                 else:
@@ -1959,6 +1964,21 @@ def _group_index_by_id(
 
 def _next_group_index_after_group(groups: list[CodeRegionGroup], group_id: str) -> int:
     return _group_index_by_id(groups, group_id, default=len(groups) - 1) + 1
+
+
+def _first_group_index_starting_after_source(
+    groups: list[CodeRegionGroup],
+    previous_source: str,
+    *,
+    default: int,
+) -> int:
+    previous_end_line = len(previous_source.rstrip("\n").splitlines())
+    if previous_end_line == 1 and not previous_source.rstrip("\n"):
+        previous_end_line = 0
+    for idx, group in enumerate(groups):
+        if group.start_line > previous_end_line:
+            return idx
+    return default
 
 
 def _group_index_for_region(
