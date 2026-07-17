@@ -67,10 +67,12 @@ def test_capsule_prompt_prefers_group_actions_when_groups_are_available():
     )
     text = str(prompt)
 
-    assert "Generated code groups" in text
+    assert "Effect-bounded execution units" in text
+    assert "semantic source chunk" not in text
     assert '{"action": "run_group", "args": {"group_id": "group_1"}}' in text
     assert '{"action": "patch_group", "args": {"group_id": "group_1", "source":' in text
     assert "Prefer run_group over run_region" in text
+    assert "effect-bounded execution unit" in text
 
 
 def test_capsule_prompt_uses_no_rollback_forward_recovery_semantics():

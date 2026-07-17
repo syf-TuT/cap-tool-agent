@@ -60,6 +60,11 @@ def test_groups_preserve_original_source_bytes():
     assert "".join(group.source for group in groups) == source
 
 
+def test_grouping_docstring_uses_effect_bounded_unit_language():
+    assert "effect-bounded execution units" in segment_python_code_groups.__doc__
+    assert "semantic group" not in segment_python_code_groups.__doc__
+
+
 def test_groups_partition_regions_without_gaps_or_reordering():
     source = _source_with_spacing()
 

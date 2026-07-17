@@ -81,7 +81,7 @@ def build_capsule_prompt(
     group_text = ""
     if group_data:
         group_text = (
-            "Generated code groups (preferred execution units):\n"
+            "Effect-bounded execution units (preferred run_group targets):\n"
             f"{json.dumps(group_data, indent=2, default=str)}\n\n"
         )
     prompt_text = (
@@ -104,10 +104,10 @@ def build_capsule_prompt(
         "preconditions. "
         f"{recovery_guidance}\n\n"
         f"Allowed actions: {allowed_actions_text}.\n\n"
-        "Prefer run_group over run_region when code groups are available. A group is a "
-        "semantic source chunk that may include setup plus one robot side effect. Use "
-        "patch_group for local repairs unless a single atomic region is clearly "
-        "self-contained.\n\n"
+        "Prefer run_group over run_region when effect-bounded execution units are "
+        "available. A group is an effect-bounded source unit that may include setup "
+        "plus one robot side effect. Use patch_group for local repairs unless a "
+        "single atomic region is clearly self-contained.\n\n"
         "Respond with exactly one JSON object. Examples:\n"
         '{"action": "run_group", "args": {"group_id": "group_1"}}\n'
         '{"action": "run_region", "args": {"region_id": "region_1"}}\n'

@@ -764,8 +764,8 @@ def _run_capsule_auto_forward_loop(
 
     if config.get("capsule_execution_granularity", "semantic_group") != "semantic_group":
         raise ValueError(
-            "capsule_control_mode='auto_forward' only supports "
-            "capsule_execution_granularity='semantic_group'"
+            "capsule_control_mode='auto_forward' only supports effect-bounded "
+            "execution units via capsule_execution_granularity='semantic_group'"
         )
 
     obs, _ = env.reset(options={"trial": trial}, seed=trial)

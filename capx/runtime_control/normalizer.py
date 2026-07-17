@@ -36,7 +36,7 @@ def segment_python_code_groups(
     max_regions_per_group: int = 20,
     side_effect_calls: set[str] | None = None,
 ) -> list[CodeRegionGroup]:
-    """Normalize structural regions into sense->act execution groups."""
+    """Normalize structural regions into effect-bounded execution units."""
     if regions is None:
         regions = segment_python_code(source)
     if side_effect_calls is None:
@@ -58,11 +58,11 @@ def normalize_python_code_groups(
     *,
     policy: GroupingPolicy,
 ) -> list[CodeRegionGroup]:
-    """Apply group-boundary policy to already-segmented code regions.
+    """Apply effect-boundary policy to already-segmented code regions.
 
     This layer only builds grouping metadata. It never rewrites executable
-    source; each group source is the byte-for-byte concatenation of its member
-    region sources.
+    source; each execution-unit source is the byte-for-byte concatenation of
+    its member region sources.
     """
     _validate_normalizer_inputs(source, regions, analyses)
     if not regions:

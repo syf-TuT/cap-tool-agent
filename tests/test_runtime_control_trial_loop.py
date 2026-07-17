@@ -456,9 +456,11 @@ def test_capsule_auto_forward_rejects_region_granularity(tmp_path):
         )
     except ValueError as exc:
         assert "auto_forward" in str(exc)
-        assert "semantic_group" in str(exc)
+        assert "effect-bounded execution units" in str(exc)
     else:
-        raise AssertionError("auto_forward should reject non-semantic group granularity")
+        raise AssertionError(
+            "auto_forward should reject non-effect-bounded execution granularity"
+        )
 
 
 def test_capsule_auto_forward_initial_code_query_does_not_query_capsule_action(
