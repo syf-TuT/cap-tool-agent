@@ -371,7 +371,7 @@ def test_aggregate_failure_taxonomy_covers_infrastructure_and_legacy_unknowns():
         [
             {
                 "trial": 1,
-                "run_outcome": "invalid_result",
+                "run_outcome": "execution_failed",
                 "failure_kind": "unknown_legacy_failure",
             },
             {
@@ -391,4 +391,21 @@ def test_aggregate_failure_taxonomy_covers_infrastructure_and_legacy_unknowns():
     assert summary["experiment_infrastructure_failure_count"] == 2
     assert summary["provider_failure_count"] == 0
     assert summary["budget_exhausted_count"] == 0
+    assert summary["unclassified_failure_count"] == 0
+
+
+def test_aggregate_loaded_missing_and_invalid_results_as_infrastructure(tmp_path):
+    invalid_dir = tmp_path / "invalid"
+    invalid_dir.mkdir()
+    (invalid_dir / "trial_2_result.json").write_text("{not json", encoding="utf-8")
+
+    summary = aggregate_trial_results(
+        [
+            load_trial_result(tmp_path / "missing", 1),
+            load_trial_result(invalid_dir, 2),
+        ]
+    )
+
+    assert summary["experiment_infrastructure_failure_count"] == 2
+    assert summary["algorithm_failure_count"] == 0
     assert summary["unclassified_failure_count"] == 0

@@ -234,7 +234,10 @@ def _is_algorithm_failure(result: Mapping[str, Any]) -> bool:
     outcome = result.get("run_outcome")
     if outcome == RunOutcome.EXECUTION_FAILED.value:
         return True
-    if result.get("failure_kind") == "unknown_legacy_failure":
+    if (
+        result.get("failure_kind") == "unknown_legacy_failure"
+        and outcome not in {"missing_result", "invalid_result"}
+    ):
         return True
     return outcome == RunOutcome.FINISHED.value and not bool(result.get("task_completed"))
 
@@ -246,7 +249,7 @@ def _is_experiment_infrastructure_failure(result: Mapping[str, Any]) -> bool:
         RunOutcome.CANCELLED.value,
         "missing_result",
         "invalid_result",
-    } and result.get("failure_kind") != "unknown_legacy_failure"
+    }
 
 
 def _is_unclassified_failure(result: Mapping[str, Any]) -> bool:
