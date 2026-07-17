@@ -409,3 +409,26 @@ def test_aggregate_loaded_missing_and_invalid_results_as_infrastructure(tmp_path
     assert summary["experiment_infrastructure_failure_count"] == 2
     assert summary["algorithm_failure_count"] == 0
     assert summary["unclassified_failure_count"] == 0
+
+
+def test_failure_taxonomy_uses_single_priority_bucket_per_attempt():
+    summary = aggregate_trial_results(
+        [
+            {
+                "trial": 1,
+                "run_outcome": "trial_budget_exhausted",
+                "failure_kind": "timeout",
+            },
+            {
+                "trial": 2,
+                "run_outcome": "parent_guard_killed",
+                "failure_kind": "http_5xx",
+            },
+        ]
+    )
+
+    assert summary["budget_exhausted_count"] == 1
+    assert summary["experiment_infrastructure_failure_count"] == 1
+    assert summary["provider_failure_count"] == 0
+    assert summary["algorithm_failure_count"] == 0
+    assert summary["unclassified_failure_count"] == 0

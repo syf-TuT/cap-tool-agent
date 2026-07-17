@@ -88,6 +88,7 @@ def aggregate_trial_results(results: Iterable[Mapping[str, Any]]) -> dict[str, A
 
 def _retry_aware_summary(results: list[Mapping[str, Any]]) -> dict[str, Any]:
     attempts_by_trial = _attempts_by_trial(results)
+    failure_counts = _failure_bucket_counts(results)
     first_attempts = [
         attempts[0] for attempts in attempts_by_trial.values() if attempts
     ]
@@ -118,13 +119,11 @@ def _retry_aware_summary(results: list[Mapping[str, Any]]) -> dict[str, Any]:
         "llm_elapsed_seconds": sum(_llm_float(result, "elapsed_seconds") for result in results),
         "trial_elapsed_seconds": sum(_nonnegative_number(result.get("elapsed_seconds")) for result in results),
         "robot_execution_count": sum(_nonnegative_int_value(result.get("robot_execution_count")) for result in results),
-        "provider_failure_count": sum(_is_provider_failure(result) for result in results),
-        "algorithm_failure_count": sum(_is_algorithm_failure(result) for result in results),
-        "budget_exhausted_count": sum(_is_budget_exhausted(result) for result in results),
-        "experiment_infrastructure_failure_count": sum(
-            _is_experiment_infrastructure_failure(result) for result in results
-        ),
-        "unclassified_failure_count": sum(_is_unclassified_failure(result) for result in results),
+        "provider_failure_count": failure_counts["provider"],
+        "algorithm_failure_count": failure_counts["algorithm"],
+        "budget_exhausted_count": failure_counts["budget_exhausted"],
+        "experiment_infrastructure_failure_count": failure_counts["infrastructure"],
+        "unclassified_failure_count": failure_counts["unclassified"],
     }
 
 
@@ -217,6 +216,28 @@ def _is_provider_failure(result: Mapping[str, Any]) -> bool:
     return failure_kind.startswith(("http_", "rate_limit", "timeout", "provider"))
 
 
+def _failure_bucket_counts(results: list[Mapping[str, Any]]) -> Counter[str]:
+    return Counter(
+        bucket
+        for result in results
+        if (bucket := _failure_bucket(result)) is not None
+    )
+
+
+def _failure_bucket(result: Mapping[str, Any]) -> str | None:
+    if result.get("run_outcome") == RunOutcome.FINISHED.value:
+        return None
+    if _is_budget_exhausted(result):
+        return "budget_exhausted"
+    if _is_experiment_infrastructure_failure(result):
+        return "infrastructure"
+    if _is_provider_failure(result):
+        return "provider"
+    if _is_algorithm_failure(result):
+        return "algorithm"
+    return "unclassified"
+
+
 def _is_budget_exhausted(result: Mapping[str, Any]) -> bool:
     return (
         result.get("run_outcome") == RunOutcome.TRIAL_BUDGET_EXHAUSTED.value
@@ -225,12 +246,6 @@ def _is_budget_exhausted(result: Mapping[str, Any]) -> bool:
 
 
 def _is_algorithm_failure(result: Mapping[str, Any]) -> bool:
-    if (
-        _is_provider_failure(result)
-        or _is_budget_exhausted(result)
-        or _is_experiment_infrastructure_failure(result)
-    ):
-        return False
     outcome = result.get("run_outcome")
     if outcome == RunOutcome.EXECUTION_FAILED.value:
         return True
@@ -250,18 +265,6 @@ def _is_experiment_infrastructure_failure(result: Mapping[str, Any]) -> bool:
         "missing_result",
         "invalid_result",
     }
-
-
-def _is_unclassified_failure(result: Mapping[str, Any]) -> bool:
-    outcome = result.get("run_outcome")
-    if outcome == RunOutcome.FINISHED.value:
-        return False
-    return not (
-        _is_provider_failure(result)
-        or _is_algorithm_failure(result)
-        or _is_budget_exhausted(result)
-        or _is_experiment_infrastructure_failure(result)
-    )
 
 
 def _load_structured_result(path: Path, trial: int) -> dict[str, Any]:
