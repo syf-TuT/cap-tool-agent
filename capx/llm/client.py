@@ -750,6 +750,47 @@ def _query_model_non_streaming(
                 **error_fields,
             )
 
+        if not content.strip():
+            finished = time.monotonic()
+            can_retry = attempt < final_attempt
+            delay = _retry_delay(response, policy) if can_retry else 0.0
+            remaining = context.remaining_seconds() if context is not None else None
+            budget_allows_retry = _retry_fits_budget(remaining, delay, policy)
+            retry_scheduled = can_retry and budget_allows_retry
+            if context is not None:
+                context.record_attempt(
+                    call_index=call_index,
+                    attempt=attempt,
+                    mode="non_streaming",
+                    http_status=status_code,
+                    ttfb_ms=ttfb_ms,
+                    first_content_ms=None,
+                    started_monotonic=started,
+                    finished_monotonic=finished,
+                    remaining_before_ms=remaining_before_ms,
+                    outcome="no_content",
+                    error_kind=LLMErrorKind.NO_CONTENT.value,
+                    retry_scheduled=retry_scheduled,
+                )
+            if retry_scheduled:
+                time.sleep(delay)
+                continue
+            if can_retry and not budget_allows_retry:
+                _raise_query_error(
+                    kind=LLMErrorKind.TRIAL_BUDGET_EXHAUSTED,
+                    attempt=attempt,
+                    status_code=status_code,
+                    message="Trial budget cannot cover the minimum retry budget and delay",
+                    **error_fields,
+                )
+            _raise_query_error(
+                kind=LLMErrorKind.NO_CONTENT,
+                attempt=attempt,
+                status_code=status_code,
+                message="Non-streaming model query returned no usable content",
+                **error_fields,
+            )
+
         finished = time.monotonic()
         if context is not None:
             context.record_attempt(

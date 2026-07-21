@@ -1143,6 +1143,46 @@ def test_non_streaming_invalid_response_is_typed_and_not_retried(monkeypatch, bo
     assert len(calls) == 1
 
 
+def test_non_streaming_empty_content_is_retried_and_typed(monkeypatch, tmp_path):
+    _non_streaming_policy(monkeypatch, attempts=2)
+    responses = [
+        _NonStreamingResponse(200, body={"choices": [{"message": {"content": ""}}]}),
+        _NonStreamingResponse(200, body={"choices": [{"message": {"content": "ok"}}]}),
+    ]
+    monkeypatch.setattr("capx.llm.client.requests.post", lambda *args, **kwargs: responses.pop(0))
+    monkeypatch.setattr("capx.llm.client.random.uniform", lambda *args: 0.0)
+    telemetry = tmp_path / "calls.jsonl"
+
+    with trial_llm_context(trial=1, telemetry_path=telemetry):
+        result = query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    records = [json.loads(line) for line in telemetry.read_text().splitlines()]
+    assert result["content"] == "ok"
+    assert [record["attempt"] for record in records] == [1, 2]
+    assert records[0]["outcome"] == "no_content"
+    assert records[0]["error_kind"] == LLMErrorKind.NO_CONTENT.value
+    assert records[0]["retry_scheduled"] is True
+    assert records[1]["outcome"] == "success"
+    assert records[1]["error_kind"] is None
+
+
+def test_non_streaming_empty_content_exhaustion_raises_no_content(monkeypatch):
+    _non_streaming_policy(monkeypatch, attempts=1)
+    monkeypatch.setattr(
+        "capx.llm.client.requests.post",
+        lambda *args, **kwargs: _NonStreamingResponse(
+            200,
+            body={"choices": [{"message": {"content": "   "}}]},
+        ),
+    )
+
+    with pytest.raises(LLMQueryError) as raised:
+        query_model(_args(), [{"role": "user", "content": "hi"}])
+
+    assert raised.value.kind is LLMErrorKind.NO_CONTENT
+    assert raised.value.attempt == 1
+
+
 def test_non_streaming_without_context_uses_safe_call_index(monkeypatch):
     _non_streaming_policy(monkeypatch, attempts=1)
     monkeypatch.setattr(

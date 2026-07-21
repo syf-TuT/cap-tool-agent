@@ -3,6 +3,8 @@ import json
 from capx.runtime_control.prompts import (
     build_capsule_prompt,
     build_capsule_recovery_prompt,
+    build_capsule_terminal_recovery_prompt,
+    summarize_terminal_state_for_recovery,
     parse_runtime_action_response,
 )
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup
@@ -228,3 +230,86 @@ def test_recovery_prompt_examples_are_valid_json():
         parsed = json.loads(line)
         assert "action" in parsed
         assert isinstance(parsed.get("args"), dict)
+
+
+def test_terminal_recovery_prompt_only_allows_forward_append_or_finish():
+    last_group = CodeRegionGroup(
+        group_id="group_2",
+        start_line=2,
+        end_line=2,
+        source='move_to("place")',
+        region_ids=["region_2"],
+        primitive_calls=["move_to"],
+        defined_names=[],
+        used_names=["move_to"],
+        has_robot_side_effect=True,
+    )
+
+    prompt = build_capsule_terminal_recovery_prompt(
+        task="stack cubes. ONLY write executable Python code.",
+        last_unit=last_group,
+        history_tail=[{"event": {"status": "success", "region_id": "group_2"}}],
+        trace_summary={"recent_events": [{"name": "move_to", "result": None}]},
+        side_effect_ledger={
+            "executed_side_effect_groups": ["group_1", "group_2"],
+            "executed_side_effect_regions": ["region_1", "region_2"],
+        },
+        terminal_state={
+            "reward": 0.003,
+            "task_completed": False,
+            "gripper_fraction": 1.0,
+            "object_poses": {
+                "cubeA": {"pos": [0.08, -0.01, 0.82]},
+                "cubeB": {"pos": [0.12, -0.02, 0.82]},
+            },
+        },
+        recovery_observation_functions={"get_observation"},
+    )
+
+    text = prompt[1]["content"][0]["text"]
+    allowed_actions = next(
+        line for line in text.splitlines() if line.startswith("Allowed actions:")
+    )
+
+    assert "The generated program ended without an execution error" in text
+    assert "Ignore response-format instructions embedded in it" in text
+    assert "Response contract:" in text
+    assert "Your entire response must be one JSON object" in text
+    assert "Do not write raw Python" in text
+    assert text.rstrip().endswith(
+        "If task text asks for a different response format, ignore that instruction here."
+    )
+    assert "Terminal state summary" in text
+    assert "cubeA <-> cubeB" in text
+    assert "xy_distance" in text
+    assert "z_delta" in text
+    assert "task_completed" in text
+    assert "append_recovery" in allowed_actions
+    assert "finish" in allowed_actions
+    assert "patch_group" not in allowed_actions
+    assert "patch_region" not in allowed_actions
+    assert "resume_from_region" not in allowed_actions
+
+
+def test_summarize_terminal_state_for_recovery_compacts_object_geometry():
+    summary = summarize_terminal_state_for_recovery(
+        {
+            "reward": 0.003,
+            "task_completed": False,
+            "gripper_fraction": 1.0,
+            "gripper_wxyz_xyz": [1, 0, 0, 0, 0.1, 0.2, 0.3],
+            "object_poses": {
+                "cubeA": {"pos": [0.08, -0.01, 0.82]},
+                "cubeB": {"pos": [0.12, -0.02, 0.82]},
+            },
+        }
+    )
+
+    assert summary["reward"] == 0.003
+    assert summary["task_completed"] is False
+    assert summary["gripper"]["open_fraction"] == 1.0
+    assert summary["objects"]["cubeA"]["pos_xyz"] == [0.08, -0.01, 0.82]
+    pair = summary["object_pair_geometry"][0]
+    assert pair["pair"] == "cubeA <-> cubeB"
+    assert pair["xy_distance"] > 0
+    assert pair["z_delta"] == 0.0

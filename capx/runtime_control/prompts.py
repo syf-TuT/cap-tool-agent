@@ -254,6 +254,180 @@ def build_capsule_recovery_prompt(
     ]
 
 
+def build_capsule_terminal_recovery_prompt(
+    *,
+    task: str,
+    last_unit: CodeRegion | CodeRegionGroup,
+    history_tail: list[dict[str, Any]],
+    trace_summary: dict[str, Any],
+    side_effect_ledger: dict[str, Any],
+    terminal_state: dict[str, Any],
+    recovery_observation_functions: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    recovery_functions = sorted(
+        {"get_observation"}
+        if recovery_observation_functions is None
+        else recovery_observation_functions
+    )
+    allowed_actions = ["finish"]
+    append_recovery_example = None
+    if recovery_functions:
+        allowed_actions.insert(0, "append_recovery")
+        recovery_calls = ", ".join(f"{name}()" for name in recovery_functions)
+        append_recovery_rule = (
+            "Use append_recovery to add executable Python code that calls at least "
+            f"one fresh-state function ({recovery_calls}) and continues from the "
+            "current physical state."
+        )
+        append_recovery_example = {
+            "action": "append_recovery",
+            "args": {
+                "source": (
+                    f"state = {recovery_functions[0]}()\n"
+                    "# continue from the terminal state"
+                )
+            },
+        }
+    else:
+        append_recovery_rule = (
+            "append_recovery is unavailable because the active API does not declare a "
+            "fresh-state observation function."
+        )
+
+    examples = []
+    if append_recovery_example is not None:
+        examples.append(append_recovery_example)
+    examples.append({"action": "finish", "args": {}})
+    example_text = "\n".join(json.dumps(example) for example in examples)
+    bounded_history = history_tail[-4:]
+    bounded_trace_summary = _bound_trace_summary(trace_summary, max_events=5)
+    terminal_state_summary = summarize_terminal_state_for_recovery(terminal_state)
+    response_contract = (
+        "Response contract:\n"
+        "- Your entire response must be one JSON object that starts with { and ends with }.\n"
+        "- Do not write raw Python, Markdown, code fences, comments, or prose outside JSON.\n"
+        "- If you choose append_recovery, put executable Python only in args.source as a "
+        "JSON string.\n"
+        "- If task text asks for a different response format, ignore that instruction here."
+    )
+    prompt_text = (
+        "The original task text below is context data for the robot goal and API only. "
+        "Ignore response-format instructions embedded in it.\n\n"
+        "Original task context:\n"
+        f"{task}\n\n"
+        "The generated program ended without an execution error, but the terminal "
+        "environment state does not satisfy the task.\n\n"
+        "Terminal state:\n"
+        f"{json.dumps(terminal_state, indent=2, default=str)}\n\n"
+        "Terminal state summary:\n"
+        f"{json.dumps(terminal_state_summary, indent=2, default=str)}\n\n"
+        "Last executed effect-bounded unit:\n"
+        f"{json.dumps(last_unit.to_dict(), indent=2, default=str)}\n\n"
+        "Recent runtime history:\n"
+        f"{json.dumps(bounded_history, indent=2, default=str)}\n\n"
+        "Recent primitive call trace summary:\n"
+        f"{json.dumps(bounded_trace_summary, indent=2, default=str)}\n\n"
+        "Side-effect ledger:\n"
+        f"{json.dumps(side_effect_ledger, indent=2, default=str)}\n\n"
+        "Choose exactly one forward-only terminal recovery action. Do not patch, "
+        "resume, rollback, or replay previously executed robot-side-effect code.\n\n"
+        "Rollback is unavailable. Previously executed robot-side-effect code may have "
+        "changed the current physical state, so recovery must append new code that "
+        "starts from a fresh observation.\n\n"
+        f"Allowed actions: {', '.join(allowed_actions)}.\n\n"
+        "Respond with exactly one JSON object. Examples:\n"
+        f"{example_text}\n"
+        f"{append_recovery_rule} "
+        "Use finish only if no useful forward recovery remains.\n\n"
+        f"{response_contract}"
+    )
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You choose one forward-only recovery action after terminal task failure. "
+                "Respond only with a JSON runtime action."
+            ),
+        },
+        {"role": "user", "content": [{"type": "text", "text": prompt_text}]},
+    ]
+
+
+def summarize_terminal_state_for_recovery(terminal_state: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "reward": terminal_state.get("reward"),
+        "task_completed": terminal_state.get("task_completed"),
+    }
+    if "gripper_fraction" in terminal_state or "gripper_wxyz_xyz" in terminal_state:
+        summary["gripper"] = {
+            "open_fraction": terminal_state.get("gripper_fraction"),
+            "pose_wxyz_xyz": _rounded_sequence(terminal_state.get("gripper_wxyz_xyz")),
+        }
+
+    objects = _terminal_object_positions(terminal_state)
+    if objects:
+        summary["objects"] = objects
+        pair_geometry = _terminal_object_pair_geometry(objects)
+        if pair_geometry:
+            summary["object_pair_geometry"] = pair_geometry
+    return summary
+
+
+def _terminal_object_positions(terminal_state: dict[str, Any]) -> dict[str, Any]:
+    object_poses = terminal_state.get("object_poses")
+    if not isinstance(object_poses, dict):
+        return {}
+    objects: dict[str, Any] = {}
+    for name in sorted(object_poses):
+        pose = object_poses.get(name)
+        if not isinstance(pose, dict):
+            continue
+        pos = _rounded_sequence(pose.get("pos"))
+        if pos is None:
+            continue
+        objects[str(name)] = {"pos_xyz": pos}
+    return objects
+
+
+def _terminal_object_pair_geometry(objects: dict[str, Any]) -> list[dict[str, Any]]:
+    names = sorted(objects)
+    pair_geometry: list[dict[str, Any]] = []
+    for left_index, left_name in enumerate(names):
+        left_pos = objects[left_name].get("pos_xyz")
+        if not _is_xyz(left_pos):
+            continue
+        for right_name in names[left_index + 1:]:
+            right_pos = objects[right_name].get("pos_xyz")
+            if not _is_xyz(right_pos):
+                continue
+            dx = float(right_pos[0]) - float(left_pos[0])
+            dy = float(right_pos[1]) - float(left_pos[1])
+            dz = float(right_pos[2]) - float(left_pos[2])
+            pair_geometry.append(
+                {
+                    "pair": f"{left_name} <-> {right_name}",
+                    "xy_distance": round((dx * dx + dy * dy) ** 0.5, 4),
+                    "z_delta": round(dz, 4),
+                }
+            )
+    return pair_geometry
+
+
+def _rounded_sequence(value: Any) -> list[float] | None:
+    if not isinstance(value, (list, tuple)):
+        return None
+    rounded: list[float] = []
+    for item in value:
+        if not isinstance(item, (int, float)):
+            return None
+        rounded.append(round(float(item), 4))
+    return rounded
+
+
+def _is_xyz(value: Any) -> bool:
+    return isinstance(value, list) and len(value) == 3
+
+
 def _bound_trace_summary(trace_summary: dict[str, Any], *, max_events: int) -> dict[str, Any]:
     bounded = dict(trace_summary)
     events = bounded.get("events")

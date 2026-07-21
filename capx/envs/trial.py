@@ -41,7 +41,10 @@ from capx.runtime_control import (
     segment_python_code,
     segment_python_code_groups,
 )
-from capx.runtime_control.prompts import build_capsule_recovery_prompt
+from capx.runtime_control.prompts import (
+    build_capsule_recovery_prompt,
+    build_capsule_terminal_recovery_prompt,
+)
 from capx.runtime_control.segmenter import ROBOT_SIDE_EFFECT_CALLS
 from capx.runtime_control.side_effects import collect_side_effect_calls
 
@@ -834,10 +837,154 @@ def _run_capsule_auto_forward_loop(
     reward_drop_guard_threshold = float(
         config.get("capsule_reward_drop_guard_threshold", 0.25)
     )
+    terminal_recovery_attempted = False
 
     group_index = 0
     group_attempts = 0
-    while group_index < len(groups) and group_attempts < max_steps:
+    while group_attempts < max_steps:
+        if group_index >= len(groups):
+            terminal_state = _capsule_state_snapshot(env)
+            terminal_reward = _state_reward(terminal_state)
+            terminal_succeeded = bool(terminal_state.get("task_completed")) or (
+                terminal_reward is not None and terminal_reward >= 1.0
+            )
+            if terminal_succeeded or terminal_recovery_attempted or not groups:
+                break
+
+            terminal_recovery_attempted = True
+            last_unit = groups[-1]
+            recovery_step_id = len(history) + 1
+            recovery_action: RuntimeAction | None = None
+            recovery_prompt = build_capsule_terminal_recovery_prompt(
+                task=_task_text_from_obs(obs),
+                last_unit=last_unit,
+                history_tail=history,
+                trace_summary=executor.trace.summary() if executor.trace is not None else {},
+                side_effect_ledger={
+                    "executed_side_effect_regions": sorted(executed_side_effect_regions),
+                    "executed_side_effect_groups": sorted(executed_side_effect_groups),
+                },
+                terminal_state=terminal_state,
+                recovery_observation_functions=recovery_observation_functions,
+            )
+            prompts.append(recovery_prompt)
+            try:
+                with llm_call_stage("capsule_recovery"):
+                    response = _query_model(action_query_args, recovery_prompt)
+                response_content = response["content"]
+                try:
+                    recovery_action = parse_runtime_action_response(response_content)
+                except ValueError:
+                    recovery_action = _coerce_terminal_append_recovery_action(
+                        response_content,
+                        recovery_observation_functions=recovery_observation_functions,
+                    )
+                    if recovery_action is None:
+                        raise
+                recovery_action.step_id = recovery_step_id
+            except ValueError as exc:
+                recovery_event = RuntimeEvent(
+                    action="invalid",
+                    status="invalid",
+                    message=str(exc),
+                    evidence={"exception_type": type(exc).__name__},
+                )
+            else:
+                if recovery_action.action not in {"append_recovery", "finish"}:
+                    recovery_event = RuntimeEvent(
+                        action=recovery_action.action,
+                        status="invalid",
+                        region_id=_runtime_action_unit_id(recovery_action),
+                        message=(
+                            f"{recovery_action.action} is not allowed during terminal "
+                            "recovery."
+                        ),
+                    )
+                else:
+                    recovery_event = _no_rollback_guard_event(
+                        recovery_action,
+                        executed_side_effect_regions,
+                        executed_side_effect_groups,
+                        recovery_observation_functions=recovery_observation_functions,
+                    )
+                    if recovery_event is None:
+                        recovery_event = _execute_runtime_action(
+                            recovery_action,
+                            executor,
+                            source,
+                            region_by_id,
+                            group_by_id,
+                            recovery_observation_functions=recovery_observation_functions,
+                            append_recovery_insert_after_line=last_unit.end_line,
+                        )
+                    if (
+                        recovery_action.action == "append_recovery"
+                        and recovery_event.status == "success"
+                    ):
+                        recovery_side_effect_budget = 1
+
+            recovery_after_state = _capsule_state_snapshot(env)
+            recovery_trace_events = recovery_event.evidence.get("trace_events", [])
+            recovery_feedback_action = recovery_action or RuntimeAction("invalid", {})
+            recovery_feedback = build_runtime_feedback(
+                step_id=recovery_step_id,
+                action=recovery_feedback_action,
+                event=recovery_event,
+                region=None,
+                trace_events=recovery_trace_events,
+                before_state=terminal_state,
+                after_state=recovery_after_state,
+            )
+            history.append(
+                {
+                    "step_id": recovery_step_id,
+                    "action": (
+                        recovery_action.to_dict()
+                        if recovery_action is not None
+                        else {"action": "invalid"}
+                    ),
+                    "event": recovery_event.to_dict(),
+                    "feedback": recovery_feedback.to_dict(),
+                    "trace_events": recovery_trace_events,
+                    "state_before": terminal_state,
+                    "state_after": recovery_after_state,
+                }
+            )
+            recovery_metric, best_reward_so_far = _capsule_step_metric(
+                step_id=recovery_step_id,
+                action=recovery_action,
+                event=recovery_event,
+                before_state=terminal_state,
+                after_state=recovery_after_state,
+                executed_regions=executed_regions,
+                best_reward_so_far=best_reward_so_far,
+                recovery_execution_attempt=False,
+            )
+            step_metrics.append(recovery_metric)
+            if recovery_event.status in {"failed", "invalid"}:
+                failed = True
+                break
+            if recovery_action is None or recovery_action.action == "finish":
+                break
+            if recovery_action.action == "append_recovery":
+                source = str(recovery_event.evidence["source"])
+                regions = segment_python_code(source)
+                groups = segment_python_code_groups(
+                    source,
+                    regions,
+                    max_regions_per_group=max_regions_per_group,
+                    side_effect_calls=side_effect_calls,
+                )
+                region_by_id = {region.region_id: region for region in regions}
+                group_by_id = {group.group_id: group for group in groups}
+                group_index = _first_group_index_starting_after_line(
+                    groups,
+                    last_unit.end_line,
+                    default=len(groups),
+                )
+                continue
+            break
+
         group = groups[group_index]
         group_attempts += 1
         step_id = len(history) + 1
@@ -1540,6 +1687,46 @@ def _validate_patched_source(
             },
         )
     return None
+
+
+def _coerce_terminal_append_recovery_action(
+    content: str,
+    *,
+    recovery_observation_functions: set[str] | None,
+) -> RuntimeAction | None:
+    source = _terminal_python_payload(content)
+    if source is None:
+        return None
+    try:
+        recovery_tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    fresh_state_functions = (
+        {"get_observation"}
+        if recovery_observation_functions is None
+        else recovery_observation_functions
+    )
+    if not fresh_state_functions:
+        return None
+    if not any(_ast_calls_function(recovery_tree, name) for name in fresh_state_functions):
+        return None
+    return RuntimeAction("append_recovery", {"source": source})
+
+
+def _terminal_python_payload(content: str) -> str | None:
+    text = content.strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        lines = text.splitlines()
+        language = lines[0].strip("`").strip().lower()
+        if language not in {"", "python", "py"}:
+            return None
+        if len(lines) < 3 or not lines[-1].strip().startswith("```"):
+            return None
+        text = "\n".join(lines[1:-1]).strip()
+    return text or None
 
 
 def _execute_runtime_action(
