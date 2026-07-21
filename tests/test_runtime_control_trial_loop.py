@@ -322,6 +322,7 @@ def test_capsule_action_query_uses_capsule_action_stage(tmp_path, monkeypatch):
             trial=1,
             args=SimpleNamespace(model="test", use_oracle_code=False, max_tokens=100),
             config={
+                "capsule_control_mode": "llm_step",
                 "output_dir": str(tmp_path),
                 "max_capsule_steps": 1,
                 "use_parallel_ensemble": False,
@@ -331,6 +332,29 @@ def test_capsule_action_query_uses_capsule_action_stage(tmp_path, monkeypatch):
         )
 
     assert _telemetry_stages(telemetry_path) == ["capsule_action"]
+
+
+def test_capsule_trial_defaults_to_auto_forward(monkeypatch):
+    expected = object()
+
+    def fake_auto_forward(**kwargs):
+        return expected
+
+    def fail_llm_step(**kwargs):
+        raise AssertionError("omitting capsule_control_mode should use auto_forward")
+
+    monkeypatch.setattr(trial_module, "_run_capsule_auto_forward_loop", fake_auto_forward)
+    monkeypatch.setattr(trial_module, "_run_capsule_llm_step_loop", fail_llm_step)
+
+    result = _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(),
+        config={},
+        initial_code="x = 1\n",
+    )
+
+    assert result is expected
 
 
 def test_capsule_auto_forward_runs_groups_without_capsule_action_llm(tmp_path, monkeypatch):
@@ -1411,6 +1435,7 @@ def test_capsule_trial_runs_scripted_regions(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 4,
             "use_parallel_ensemble": False,
@@ -1437,6 +1462,7 @@ def test_capsule_trial_runs_scripted_group(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 3,
             "use_parallel_ensemble": False,
@@ -1466,6 +1492,7 @@ def test_capsule_trial_defaults_to_loose_group_cap(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 2,
             "use_parallel_ensemble": False,
@@ -1497,6 +1524,7 @@ def test_capsule_trial_writes_original_source_after_group_normalization(tmp_path
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 2,
             "use_parallel_ensemble": False,
@@ -1518,6 +1546,7 @@ def test_capsule_trial_patches_group_and_regroups(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 4,
             "use_parallel_ensemble": False,
@@ -1552,6 +1581,7 @@ def test_capsule_repairs_invalid_initial_source_with_patch_group(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 4,
             "use_parallel_ensemble": False,
@@ -1586,6 +1616,7 @@ def test_capsule_retries_after_syntax_error_in_group_patch(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 4,
             "use_parallel_ensemble": False,
@@ -1628,6 +1659,7 @@ def test_capsule_trial_appends_recovery_and_regroups(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 4,
             "use_parallel_ensemble": False,
@@ -1661,6 +1693,7 @@ def test_append_recovery_requires_fresh_observation(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 2,
             "use_parallel_ensemble": False,
@@ -1687,6 +1720,7 @@ def test_append_recovery_accepts_api_declared_fresh_state_function(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 3,
             "use_parallel_ensemble": False,
@@ -1714,6 +1748,7 @@ def test_append_recovery_rejects_blind_code_for_task_specific_observation_api(tm
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 2,
             "use_parallel_ensemble": False,
@@ -1751,6 +1786,7 @@ def test_capsule_trial_rejects_rerun_of_executed_side_effect_group(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 3,
             "use_parallel_ensemble": False,
@@ -1827,6 +1863,7 @@ def test_capsule_action_query_uses_separate_max_tokens(tmp_path, monkeypatch):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False, max_tokens=8192),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 1,
             "capsule_action_max_tokens": 512,
@@ -1845,6 +1882,7 @@ def test_capsule_trial_rejects_patch_of_executed_side_effect_group(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 3,
             "use_parallel_ensemble": False,
@@ -1877,6 +1915,7 @@ def test_capsule_trial_blocks_side_effect_after_reward_drop_from_best(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 4,
             "capsule_max_regions_per_group": 1,
@@ -1909,6 +1948,7 @@ def test_capsule_trial_allows_recovery_side_effect_after_append_recovery(tmp_pat
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 6,
             "capsule_max_regions_per_group": 1,
@@ -1943,6 +1983,7 @@ def test_capsule_metrics_split_append_source_from_recovery_execution(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 5,
             "capsule_max_regions_per_group": 1,
@@ -2008,6 +2049,7 @@ def test_capsule_trial_allows_patch_of_executed_non_side_effect_group(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 4,
             "use_parallel_ensemble": False,
@@ -2086,6 +2128,7 @@ def test_capsule_trial_marks_exhausted_budget_as_failed(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 2,
             "use_parallel_ensemble": False,
@@ -2109,6 +2152,7 @@ def test_capsule_trial_finish_without_completion_is_failed(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 1,
             "use_parallel_ensemble": False,
@@ -2138,6 +2182,7 @@ def test_capsule_trial_records_video_when_requested(tmp_path, monkeypatch):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "record_video": True,
             "use_wrist_camera": False,
@@ -2170,6 +2215,7 @@ def test_capsule_trial_writes_trace_and_feedback_artifact(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 4,
             "use_parallel_ensemble": False,
@@ -2198,6 +2244,7 @@ def test_inspect_trace_supports_last_n_and_failed_only(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 4,
             "use_parallel_ensemble": False,
@@ -2230,6 +2277,7 @@ def test_capsule_trial_writes_step_metrics_jsonl(tmp_path):
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
+            "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 3,
             "use_parallel_ensemble": False,

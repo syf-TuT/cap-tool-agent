@@ -169,7 +169,7 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "agent_mode": configs_dict.get("agent_mode", "code"),
         "max_regenerations": configs_dict.get("max_regenerations", None),
         "max_capsule_steps": configs_dict.get("max_capsule_steps", 12),
-        "capsule_control_mode": configs_dict.get("capsule_control_mode", "llm_step"),
+        "capsule_control_mode": configs_dict.get("capsule_control_mode", "auto_forward"),
         "capsule_execution_granularity": configs_dict.get(
             "capsule_execution_granularity", "semantic_group"
         ),

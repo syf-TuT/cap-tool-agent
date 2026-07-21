@@ -63,6 +63,7 @@ def test_load_config_reads_capsule_fields():
     assert config["agent_mode"] == "capsule"
     assert config["max_capsule_steps"] == 12
     assert config["max_regenerations"] is None
+    assert config["capsule_control_mode"] == "auto_forward"
     assert config["checkpoint_policy"] == "region"
     assert config["rollback_policy"] == "none"
     assert config["capsule_execution_granularity"] == "semantic_group"

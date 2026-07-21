@@ -732,7 +732,7 @@ def _run_capsule_trial(
     initial_code: str | None = None,
     scripted_actions: list[dict[str, Any]] | None = None,
 ) -> TrialSummary:
-    mode = str(config.get("capsule_control_mode", "llm_step"))
+    mode = str(config.get("capsule_control_mode", "auto_forward"))
     if mode == "auto_forward":
         return _run_capsule_auto_forward_loop(
             env=env,
