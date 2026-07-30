@@ -30,6 +30,36 @@ def test_robosuite_base_retains_privilege_mode() -> None:
     assert RobosuiteBaseEnv(privileged=True).privileged is True
 
 
+class FakeSampler:
+    def __init__(self, samplers: Any = None) -> None:
+        self.rng = np.random.default_rng(0)
+        if samplers is not None:
+            self.samplers = samplers
+
+
+def test_robosuite_base_reseeds_environment_and_nested_placement_samplers() -> None:
+    sequence_child = FakeSampler()
+    mapping_child = FakeSampler([sequence_child])
+    placement_initializer = FakeSampler({"mapping-child": mapping_child})
+    robosuite_env = SimpleNamespace(
+        seed=None,
+        rng=np.random.default_rng(1),
+        placement_initializer=placement_initializer,
+    )
+    env = RobosuiteBaseEnv(seed=2)
+    env.robosuite_env = robosuite_env
+
+    env._reseed_robosuite(17)
+
+    assert robosuite_env.seed == 17
+    assert env._rng is robosuite_env.rng
+    assert placement_initializer.rng is env._rng
+    assert mapping_child.rng is env._rng
+    assert sequence_child.rng is env._rng
+    expected_rng = np.random.default_rng(17)
+    np.testing.assert_array_equal(env._rng.integers(0, 100, 5), expected_rng.integers(0, 100, 5))
+
+
 ConstructorCase = tuple[type[Any], Any, str]
 
 
@@ -94,6 +124,66 @@ def test_wrapper_selects_object_observations_at_robosuite_source(
         wrapper_cls(privileged=privileged, enable_render=enable_render)
 
     assert captured_kwargs["use_object_obs"] is privileged
+
+
+@pytest.mark.parametrize("privileged", [False, True])
+@pytest.mark.parametrize("enable_render", [False, True])
+def test_cube_restack_passes_seed_to_robosuite_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+    privileged: bool,
+    enable_render: bool,
+) -> None:
+    captured_kwargs: dict[str, Any] = {}
+
+    def capture_constructor(**kwargs: Any) -> None:
+        captured_kwargs.update(kwargs)
+        raise ConstructorCaptured
+
+    monkeypatch.setattr(
+        robosuite_cubes_restack.suite.environments.manipulation.stack,
+        "Stack",
+        capture_constructor,
+    )
+    monkeypatch.setattr(
+        robosuite_cubes_restack, "load_composite_controller_config", lambda **_: {}
+    )
+
+    with pytest.raises(ConstructorCaptured):
+        robosuite_cubes_restack.FrankaRobosuiteCubesRestackLowLevel(
+            seed=1234,
+            privileged=privileged,
+            enable_render=enable_render,
+        )
+
+    assert captured_kwargs["seed"] == 1234
+
+
+def test_cube_restack_reseeds_before_underlying_reset() -> None:
+    seed = 23
+    placement_initializer = FakeSampler()
+
+    class ResetObserved(Exception):
+        pass
+
+    class FakeResetEnv:
+        def __init__(self) -> None:
+            self.seed = None
+            self.rng = np.random.default_rng(0)
+            self.placement_initializer = placement_initializer
+
+        def reset(self) -> None:
+            assert self.seed == seed
+            assert self.rng is placement_initializer.rng
+            raise ResetObserved
+
+    env = object.__new__(robosuite_cubes_restack.FrankaRobosuiteCubesRestackLowLevel)
+    env._rng = np.random.default_rng(1)
+    env.robosuite_env = FakeResetEnv()
+
+    with pytest.raises(ResetObserved):
+        env.reset(seed=seed)
+
+    assert env._rng is env.robosuite_env.rng
 
 
 @pytest.mark.parametrize("privileged", [False, True])
