@@ -281,6 +281,7 @@ class FrankaRobosuiteCubesRestackLowLevel(RobosuiteBaseEnv):
                     reward_shaping=True,
                     camera_heights=self._render_height,
                     camera_widths=self._render_width,
+                    seed=seed,
                     controller_configs=load_composite_controller_config(
                         controller=self.controller_cfg
                     ),
@@ -299,6 +300,7 @@ class FrankaRobosuiteCubesRestackLowLevel(RobosuiteBaseEnv):
                     renderer="mujoco",
                     camera_heights=self._render_height,
                     camera_widths=self._render_width,
+                    seed=seed,
                     controller_configs=load_composite_controller_config(
                         controller=self.controller_cfg
                     ),
@@ -319,6 +321,7 @@ class FrankaRobosuiteCubesRestackLowLevel(RobosuiteBaseEnv):
                 renderer="mujoco",
                 camera_heights=self._render_height,
                 camera_widths=self._render_width,
+                seed=seed,
                 controller_configs=load_composite_controller_config(controller=self.controller_cfg),
                 horizon=max_steps,
                 reward_shaping=True,
@@ -358,7 +361,7 @@ class FrankaRobosuiteCubesRestackLowLevel(RobosuiteBaseEnv):
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if seed is not None:
-            self._rng = np.random.default_rng(seed)
+            self._reseed_robosuite(seed)
 
         self.robosuite_env.reset()
         # Adjust initial orientation
