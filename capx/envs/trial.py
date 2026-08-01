@@ -1457,6 +1457,10 @@ def _run_capsule_llm_step_loop(
                     groups=groups if use_semantic_groups else None,
                     history=history,
                     trace_summary=executor.trace.summary() if executor.trace is not None else {},
+                    side_effect_ledger={
+                        "executed_side_effect_groups": sorted(executed_side_effect_groups),
+                        "executed_side_effect_regions": sorted(executed_side_effect_regions),
+                    },
                     recovery_observation_functions=recovery_observation_functions,
                     compact_context=llm_step_compact_context,
                     history_max_entries=action_history_max_entries,

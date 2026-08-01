@@ -1995,6 +1995,35 @@ def test_capsule_trial_rejects_rerun_of_executed_side_effect_group(tmp_path):
     assert "append_recovery" in trace[1]["event"]["message"]
 
 
+def test_capsule_llm_step_prompt_includes_executed_side_effect_ledger(tmp_path):
+    _run_capsule_trial(
+        env=FakeIncompleteCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "capsule_control_mode": "llm_step",
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='pose = get_pose("cube")\nmove_to(pose)\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    prompts = json.loads((tmp_path / "capsule_prompts_trial_01.json").read_text())
+    second_prompt_text = prompts[1][1]["content"][0]["text"]
+
+    assert "Side-effect execution ledger" in second_prompt_text
+    assert '"executed_side_effect_groups": [\n    "group_1"\n  ]' in second_prompt_text
+    assert '"execution_state": "executed_side_effect"' in second_prompt_text
+    assert '"run_allowed": false' in second_prompt_text
+    assert '{"action": "run_group", "args": {"group_id": "group_1"}}' not in second_prompt_text
+
+
 def test_no_rollback_guard_uses_task_specific_recovery_function():
     event = _no_rollback_guard_event(
         RuntimeAction("run_group", {"group_id": "group_1"}),

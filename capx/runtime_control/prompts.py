@@ -35,6 +35,7 @@ def build_capsule_prompt(
     groups: list[CodeRegionGroup] | None = None,
     history: list[dict[str, Any]],
     trace_summary: dict[str, Any],
+    side_effect_ledger: dict[str, Any] | None = None,
     recovery_observation_functions: set[str] | None = None,
     compact_context: bool = False,
     history_max_entries: int = 8,
@@ -82,6 +83,13 @@ def build_capsule_prompt(
         allowed_actions.append("append_recovery")
     allowed_actions.extend(["resume_from_region", "finish"])
     allowed_actions_text = ", ".join(allowed_actions)
+    normalized_side_effect_ledger = _normalize_side_effect_ledger(side_effect_ledger)
+    run_group_example_id = _example_group_id(
+        groups or [], normalized_side_effect_ledger
+    )
+    run_region_example_id = _example_region_id(
+        regions, normalized_side_effect_ledger
+    )
 
     prompt_text = _build_capsule_prompt_text(
         task=task,
@@ -89,6 +97,7 @@ def build_capsule_prompt(
         groups=groups,
         history=history,
         trace_summary=trace_summary,
+        side_effect_ledger=normalized_side_effect_ledger,
         compact_context=compact_context,
         history_max_entries=history_max_entries,
         trace_max_events=trace_max_events,
@@ -98,6 +107,8 @@ def build_capsule_prompt(
         allowed_actions_text=allowed_actions_text,
         recovery_example_line=recovery_example_line,
         recovery_rule=recovery_rule,
+        run_group_example_id=run_group_example_id,
+        run_region_example_id=run_region_example_id,
     )
     if compact_context and _prompt_text_over_budget(prompt_text, prompt_char_budget):
         prompt_text = _build_capsule_prompt_text(
@@ -106,6 +117,7 @@ def build_capsule_prompt(
             groups=groups,
             history=history,
             trace_summary=trace_summary,
+            side_effect_ledger=normalized_side_effect_ledger,
             compact_context=True,
             history_max_entries=min(history_max_entries, 2),
             trace_max_events=min(trace_max_events, 2),
@@ -115,6 +127,8 @@ def build_capsule_prompt(
             allowed_actions_text=allowed_actions_text,
             recovery_example_line=recovery_example_line,
             recovery_rule=recovery_rule,
+            run_group_example_id=run_group_example_id,
+            run_region_example_id=run_region_example_id,
         )
     return _capsule_prompt_messages(prompt_text)
 
@@ -133,6 +147,7 @@ def _build_capsule_prompt_text(
     groups: list[CodeRegionGroup] | None,
     history: list[dict[str, Any]],
     trace_summary: dict[str, Any],
+    side_effect_ledger: dict[str, Any],
     compact_context: bool,
     history_max_entries: int,
     trace_max_events: int,
@@ -142,6 +157,8 @@ def _build_capsule_prompt_text(
     allowed_actions_text: str,
     recovery_example_line: str,
     recovery_rule: str,
+    run_group_example_id: str,
+    run_region_example_id: str,
 ) -> str:
     if compact_context:
         region_data = [
@@ -177,6 +194,16 @@ def _build_capsule_prompt_text(
         history_heading = "Recent runtime history"
         trace_heading = "Primitive call trace summary"
 
+    region_data = _annotate_execution_state_for_prompt(
+        region_data,
+        id_key="region_id",
+        executed_ids=set(side_effect_ledger["executed_side_effect_regions"]),
+    )
+    group_data = _annotate_execution_state_for_prompt(
+        group_data,
+        id_key="group_id",
+        executed_ids=set(side_effect_ledger["executed_side_effect_groups"]),
+    )
     group_text = ""
     if group_data:
         group_text = (
@@ -199,6 +226,8 @@ def _build_capsule_prompt_text(
         f"{json.dumps(history_data, indent=2, default=str)}\n\n"
         f"{trace_heading}:\n"
         f"{json.dumps(trace_data, indent=2, default=str)}\n\n"
+        "Side-effect execution ledger:\n"
+        f"{json.dumps(side_effect_ledger, indent=2, default=str)}\n\n"
         f"{focused_source_text}"
         "Choose exactly one runtime-control action. These actions control source-code "
         "execution, inspection, and local source patches. They do "
@@ -209,19 +238,27 @@ def _build_capsule_prompt_text(
         "not assume earlier robot actions can be undone or replayed from their original "
         "preconditions. "
         f"{recovery_guidance}\n\n"
+        "Execution constraints:\n"
+        "- Do not choose run_group, run_region, patch_group, or patch_region for units "
+        "marked execution_state=executed_side_effect or listed in the side-effect "
+        "execution ledger; rollback is unavailable and those actions will be invalid.\n"
+        "- If additional robot-side-effect motion is needed after an executed side-effect "
+        "unit, use append_recovery with a fresh-state function and continue from the "
+        "current physical state.\n\n"
         f"Allowed actions: {allowed_actions_text}.\n\n"
         "Prefer run_group over run_region when effect-bounded execution units are "
         "available. A group is an effect-bounded source unit that may include setup "
         "plus one robot side effect. Use patch_group for local repairs unless a "
         "single atomic region is clearly self-contained.\n\n"
         "Respond with exactly one JSON object. Examples:\n"
-        '{"action": "run_group", "args": {"group_id": "group_1"}}\n'
-        '{"action": "run_region", "args": {"region_id": "region_1"}}\n'
+        f'{{"action": "run_group", "args": {{"group_id": "{run_group_example_id}"}}}}\n'
+        f'{{"action": "run_region", "args": {{"region_id": "{run_region_example_id}"}}}}\n'
         '{"action": "inspect_variables", "args": {"names": ["variable_name"]}}\n'
-        '{"action": "patch_group", "args": {"group_id": "group_1", '
-        '"source": "replacement Python source for the complete group_1 source span"}}\n'
-        '{"action": "patch_region", "args": {"region_id": "region_1", '
-        '"source": "replacement Python source for only region_1"}}\n'
+        f'{{"action": "patch_group", "args": {{"group_id": "{run_group_example_id}", '
+        f'"source": "replacement Python source for the complete {run_group_example_id} '
+        'source span"}}\n'
+        f'{{"action": "patch_region", "args": {{"region_id": "{run_region_example_id}", '
+        f'"source": "replacement Python source for only {run_region_example_id}"}}\n'
         f"{recovery_example_line}"
         "For inspect_variables, args.names must be a non-empty list of Python variable "
         "names to inspect. Do not pass region_id to inspect_variables.\n"
@@ -508,6 +545,72 @@ def _compact_group_for_prompt(
         "used_names": list(group.used_names),
         "has_robot_side_effect": group.has_robot_side_effect,
     }
+
+
+def _normalize_side_effect_ledger(
+    side_effect_ledger: dict[str, Any] | None,
+) -> dict[str, list[str]]:
+    ledger = side_effect_ledger if isinstance(side_effect_ledger, dict) else {}
+    return {
+        "executed_side_effect_groups": _string_list_for_prompt(
+            ledger.get("executed_side_effect_groups")
+        ),
+        "executed_side_effect_regions": _string_list_for_prompt(
+            ledger.get("executed_side_effect_regions")
+        ),
+    }
+
+
+def _string_list_for_prompt(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return sorted(str(item) for item in value)
+
+
+def _example_group_id(
+    groups: list[CodeRegionGroup],
+    side_effect_ledger: dict[str, list[str]],
+) -> str:
+    executed_groups = set(side_effect_ledger["executed_side_effect_groups"])
+    for group in groups:
+        if group.group_id not in executed_groups:
+            return group.group_id
+    return "new_unexecuted_group_id"
+
+
+def _example_region_id(
+    regions: list[CodeRegion],
+    side_effect_ledger: dict[str, list[str]],
+) -> str:
+    executed_regions = set(side_effect_ledger["executed_side_effect_regions"])
+    for region in regions:
+        if region.region_id not in executed_regions:
+            return region.region_id
+    return "new_unexecuted_region_id"
+
+
+def _annotate_execution_state_for_prompt(
+    units: list[dict[str, Any]],
+    *,
+    id_key: str,
+    executed_ids: set[str],
+) -> list[dict[str, Any]]:
+    annotated: list[dict[str, Any]] = []
+    for unit in units:
+        unit_data = dict(unit)
+        unit_id = unit_data.get(id_key)
+        if isinstance(unit_id, str) and unit_id in executed_ids:
+            unit_data.update(
+                {
+                    "unit_id": unit_id,
+                    "execution_state": "executed_side_effect",
+                    "run_allowed": False,
+                    "patch_allowed": False,
+                    "recovery_required": "append_recovery",
+                }
+            )
+        annotated.append(unit_data)
+    return annotated
 
 
 def _action_unit_id(

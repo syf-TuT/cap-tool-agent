@@ -77,6 +77,69 @@ def test_capsule_prompt_prefers_group_actions_when_groups_are_available():
     assert "effect-bounded execution unit" in text
 
 
+def test_capsule_prompt_marks_executed_side_effect_units_unrunnable():
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[
+            CodeRegion(
+                region_id="region_1",
+                start_line=1,
+                end_line=1,
+                source='pose = get_pose("cube")',
+            ),
+            CodeRegion(
+                region_id="region_2",
+                start_line=2,
+                end_line=2,
+                source="move_to(pose)",
+            ),
+        ],
+        groups=[
+            CodeRegionGroup(
+                group_id="group_1",
+                start_line=1,
+                end_line=2,
+                source='pose = get_pose("cube")\nmove_to(pose)',
+                region_ids=["region_1", "region_2"],
+                primitive_calls=["get_pose", "move_to"],
+                defined_names=["pose"],
+                used_names=["get_pose", "move_to"],
+                has_robot_side_effect=True,
+            ),
+            CodeRegionGroup(
+                group_id="group_2",
+                start_line=3,
+                end_line=3,
+                source='move_to("next")',
+                region_ids=["region_3"],
+                primitive_calls=["move_to"],
+                defined_names=[],
+                used_names=["move_to"],
+                has_robot_side_effect=True,
+            ),
+        ],
+        history=[],
+        trace_summary={},
+        side_effect_ledger={
+            "executed_side_effect_groups": ["group_1"],
+            "executed_side_effect_regions": ["region_2"],
+        },
+        compact_context=True,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert "Side-effect execution ledger" in text
+    assert '"executed_side_effect_groups": [\n    "group_1"\n  ]' in text
+    assert '"unit_id": "group_1"' in text
+    assert '"execution_state": "executed_side_effect"' in text
+    assert '"run_allowed": false' in text
+    assert '"patch_allowed": false' in text
+    assert "Do not choose run_group, run_region, patch_group, or patch_region" in text
+    assert '{"action": "run_group", "args": {"group_id": "group_1"}}' not in text
+    assert '{"action": "run_group", "args": {"group_id": "group_2"}}' in text
+
+
 def test_capsule_prompt_uses_no_rollback_forward_recovery_semantics():
     prompt = build_capsule_prompt(
         task="stack cubes",
