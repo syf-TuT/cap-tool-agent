@@ -1261,6 +1261,37 @@ def test_capsule_llm_step_treats_string_false_as_non_compact_context(
     assert rows[0]["action_prompt_compact_context"] is False
 
 
+def test_capsule_llm_step_records_prompt_budget_overflow_after_fallback(
+    tmp_path, monkeypatch
+):
+    prompts = []
+    source = "\n".join(f"value_{idx} = {idx}" for idx in range(100))
+
+    def fake_query_model(args, prompt):
+        prompts.append(prompt)
+        return {"content": '{"action": "finish", "args": {}}'}
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query_model)
+
+    trial_module._run_capsule_llm_step_loop(
+        FakeCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "capsule_control_mode": "llm_step",
+            "max_capsule_steps": 1,
+            "capsule_action_prompt_char_budget": 1,
+        },
+        initial_code=source,
+    )
+
+    rows = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    assert rows[0]["action_prompt_chars"] == len(json.dumps(prompts[0], default=str))
+    assert rows[0]["action_prompt_char_budget"] == 1
+    assert rows[0]["action_prompt_over_budget"] is True
+
+
 def test_capsule_llm_step_compact_prompt_does_not_replay_full_patched_source(
     tmp_path, monkeypatch
 ):

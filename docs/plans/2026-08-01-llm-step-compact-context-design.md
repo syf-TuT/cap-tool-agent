@@ -136,6 +136,11 @@ Add conservative optional settings:
 - `capsule_action_source_preview_chars`: default `240`.
 - `capsule_action_prompt_char_budget`: default `60000`.
 
+`capsule_action_prompt_char_budget` is a fallback threshold for compacting prompt
+context, not a hard truncation limit. Step metrics should record the serialized
+prompt size, configured threshold, and whether the final prompt remains over
+threshold after fallback.
+
 The settings should affect only `llm_step` action prompts unless explicitly
 reused by recovery prompt builders later.
 

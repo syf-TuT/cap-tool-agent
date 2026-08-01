@@ -327,6 +327,75 @@ def test_capsule_prompt_compact_context_includes_focused_failed_unit_source():
     assert failed_source in text or _json_string_payload(failed_source) in text
 
 
+def test_capsule_prompt_compact_focused_source_ignores_resolved_failure():
+    patched_body = "\n".join(f"resolved_patch_line_{idx} = {idx}" for idx in range(200))
+    patched_source = f"PATCHED_SOURCE = {patched_body!r}\n"
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[
+            CodeRegion(
+                region_id="region_1",
+                start_line=1,
+                end_line=1,
+                source=patched_source,
+            )
+        ],
+        groups=[
+            CodeRegionGroup(
+                group_id="group_1",
+                start_line=1,
+                end_line=1,
+                source=patched_source,
+                region_ids=["region_1"],
+                primitive_calls=["move_to"],
+                defined_names=["PATCHED_SOURCE"],
+                used_names=["move_to"],
+                has_robot_side_effect=True,
+            )
+        ],
+        history=[
+            {
+                "step_id": 1,
+                "action": {"action": "run_group", "args": {"group_id": "group_1"}},
+                "event": {
+                    "action": "run_group",
+                    "status": "failed",
+                    "region_id": "group_1",
+                    "evidence": {"exception_type": "RuntimeError"},
+                },
+            },
+            {
+                "step_id": 2,
+                "action": {
+                    "action": "patch_group",
+                    "args": {"group_id": "group_1", "source": patched_source},
+                },
+                "event": {
+                    "action": "patch_group",
+                    "status": "success",
+                    "region_id": "group_1",
+                    "evidence": {"source": patched_source},
+                },
+                "feedback": {"status": "success", "region_id": "group_1"},
+            },
+        ],
+        trace_summary={},
+        compact_context=True,
+        focused_source_max_units=1,
+        source_preview_chars=8,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert "Recent runtime history summary" in text
+    assert "patch_group" in text
+    assert "success" in text
+    assert "Focused source for recent failed or invalid units" not in text
+    assert patched_source not in text
+    assert _json_string_payload(patched_source) not in text
+    assert "resolved_patch_line_199 = 199" not in text
+
+
 def test_capsule_prompt_budget_fallback_omits_large_focused_failed_source():
     unique_tail = "budget_fallback_tail_marker = 424242"
     failed_source = "\n".join(

@@ -116,6 +116,10 @@ def build_capsule_prompt(
             recovery_example_line=recovery_example_line,
             recovery_rule=recovery_rule,
         )
+    return _capsule_prompt_messages(prompt_text)
+
+
+def _capsule_prompt_messages(prompt_text: str) -> list[dict[str, Any]]:
     return [
         {"role": "system", "content": "You control execution of generated Python code regions."},
         {"role": "user", "content": [{"type": "text", "text": prompt_text}]},
@@ -595,9 +599,9 @@ def _focused_failed_units_for_prompt(
     for entry in reversed(history):
         event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
         feedback = entry.get("feedback") if isinstance(entry.get("feedback"), dict) else {}
-        status = event.get("status") or feedback.get("status")
+        status = feedback.get("status") or event.get("status")
         if status not in {"failed", "invalid"}:
-            continue
+            break
         action = entry.get("action") if isinstance(entry.get("action"), dict) else {}
         unit_id = _action_unit_id(action, event, feedback)
         if not isinstance(unit_id, str) or unit_id in seen:
@@ -616,7 +620,8 @@ def _prompt_text_over_budget(prompt_text: str, prompt_char_budget: int | None) -
     return (
         prompt_char_budget is not None
         and prompt_char_budget > 0
-        and len(prompt_text) > prompt_char_budget
+        and len(json.dumps(_capsule_prompt_messages(prompt_text), default=str))
+        > prompt_char_budget
     )
 
 

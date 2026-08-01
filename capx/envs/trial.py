@@ -1455,6 +1455,14 @@ def _run_capsule_llm_step_loop(
             prompt_char_budget=action_prompt_char_budget if llm_step_compact_context else None,
         )
         action_prompt_chars = len(json.dumps(prompt, default=str))
+        action_prompt_char_budget_metric = (
+            action_prompt_char_budget if llm_step_compact_context else None
+        )
+        action_prompt_over_budget = (
+            action_prompt_char_budget_metric is not None
+            and action_prompt_char_budget_metric > 0
+            and action_prompt_chars > action_prompt_char_budget_metric
+        )
         prompts.append(prompt)
 
         try:
@@ -1599,6 +1607,8 @@ def _run_capsule_llm_step_loop(
         )
         metric["action_prompt_chars"] = action_prompt_chars
         metric["action_prompt_compact_context"] = llm_step_compact_context
+        metric["action_prompt_char_budget"] = action_prompt_char_budget_metric
+        metric["action_prompt_over_budget"] = action_prompt_over_budget
         step_metrics.append(metric)
 
         if (
