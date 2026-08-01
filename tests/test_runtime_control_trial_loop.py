@@ -215,6 +215,10 @@ def _capsule_step_metrics(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+def _json_string_payload(value: str) -> str:
+    return json.dumps(value)[1:-1]
+
+
 def test_initial_generation_query_uses_initial_code_stage(tmp_path, monkeypatch):
     telemetry_path = tmp_path / "initial.jsonl"
     monkeypatch.setattr(
@@ -1157,6 +1161,71 @@ def test_capsule_llm_step_mode_keeps_existing_action_loop(tmp_path):
     assert summary.sandbox_rc == 0
     assert env.api.moved is True
     assert [entry["event"]["action"] for entry in trace] == ["run_group", "finish"]
+
+
+def test_capsule_llm_step_uses_compact_action_prompt_by_default(tmp_path, monkeypatch):
+    prompts = []
+    long_source = "\n".join(f"value_{idx} = {idx}" for idx in range(100))
+
+    def fake_query_model(args, prompt):
+        prompts.append(prompt)
+        return {"content": '{"action": "finish", "args": {}}'}
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query_model)
+
+    summary = trial_module._run_capsule_llm_step_loop(
+        FakeCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "capsule_control_mode": "llm_step",
+            "max_capsule_steps": 1,
+        },
+        initial_code=long_source,
+    )
+
+    assert summary.num_finishes == 1
+    text = prompts[0][1]["content"][0]["text"]
+    assert "Compact generated code regions" in text
+    assert long_source not in text
+    assert _json_string_payload(long_source) not in text
+
+    rows = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    assert rows[0]["action_prompt_chars"] == len(json.dumps(prompts[0], default=str))
+    assert rows[0]["action_prompt_compact_context"] is True
+
+
+def test_capsule_llm_step_can_disable_compact_action_prompt(tmp_path, monkeypatch):
+    prompts = []
+    source = "x = 1"
+
+    def fake_query_model(args, prompt):
+        prompts.append(prompt)
+        return {"content": '{"action": "finish", "args": {}}'}
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query_model)
+
+    trial_module._run_capsule_llm_step_loop(
+        FakeCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "capsule_control_mode": "llm_step",
+            "max_capsule_steps": 1,
+            "capsule_llm_step_compact_context": False,
+        },
+        initial_code=source,
+    )
+
+    text = prompts[0][1]["content"][0]["text"]
+    assert "Generated code regions" in text
+    assert "Compact generated code regions" not in text
+
+    rows = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    assert rows[0]["action_prompt_chars"] == len(json.dumps(prompts[0], default=str))
+    assert rows[0]["action_prompt_compact_context"] is False
 
 
 def test_capsule_llm_step_rejects_patch_after_failed_side_effect_group(

@@ -1423,6 +1423,17 @@ def _run_capsule_llm_step_loop(
     reward_drop_guard_threshold = float(
         config.get("capsule_reward_drop_guard_threshold", 0.25)
     )
+    llm_step_compact_context = bool(
+        config.get("capsule_llm_step_compact_context", True)
+    )
+    action_history_max_entries = int(config.get("capsule_action_history_max_entries", 4))
+    action_trace_max_events = int(config.get("capsule_action_trace_max_events", 5))
+    action_source_preview_chars = int(
+        config.get("capsule_action_source_preview_chars", 240)
+    )
+    action_prompt_char_budget = int(
+        config.get("capsule_action_prompt_char_budget", 60000)
+    )
 
     for step_id in range(1, max_steps + 1):
         action: RuntimeAction | None = None
@@ -1436,7 +1447,14 @@ def _run_capsule_llm_step_loop(
             history=history,
             trace_summary=executor.trace.summary() if executor.trace is not None else {},
             recovery_observation_functions=recovery_observation_functions,
+            compact_context=llm_step_compact_context,
+            history_max_entries=action_history_max_entries,
+            trace_max_events=action_trace_max_events,
+            source_preview_chars=action_source_preview_chars,
+            focused_source_max_units=1 if llm_step_compact_context else 0,
+            prompt_char_budget=action_prompt_char_budget if llm_step_compact_context else None,
         )
+        action_prompt_chars = len(json.dumps(prompt, default=str))
         prompts.append(prompt)
 
         try:
@@ -1579,6 +1597,8 @@ def _run_capsule_llm_step_loop(
             best_reward_so_far=best_reward_so_far,
             recovery_execution_attempt=consumes_recovery_side_effect,
         )
+        metric["action_prompt_chars"] = action_prompt_chars
+        metric["action_prompt_compact_context"] = llm_step_compact_context
         step_metrics.append(metric)
 
         if (
