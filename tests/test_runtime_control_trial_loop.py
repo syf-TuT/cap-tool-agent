@@ -1265,7 +1265,8 @@ def test_capsule_llm_step_compact_prompt_does_not_replay_full_patched_source(
     tmp_path, monkeypatch
 ):
     prompts = []
-    patched_source = "\n".join(f"patched_{idx} = {idx}" for idx in range(200))
+    patched_body = "\n".join(f"patched_{idx} = {idx}" for idx in range(200))
+    patched_source = f"PATCHED_SOURCE = {patched_body!r}\n"
     responses = iter(
         [
             {
@@ -1303,11 +1304,16 @@ def test_capsule_llm_step_compact_prompt_does_not_replay_full_patched_source(
     assert trace[0]["event"]["action"] == "patch_group"
     assert trace[0]["event"]["status"] == "success"
     assert patched_source in trace[0]["event"]["evidence"]["source"]
+    assert trace[1]["event"]["action"] == "finish"
     assert len(prompts) == 2
     second_prompt_text = prompts[1][1]["content"][0]["text"]
     assert "Recent runtime history summary" in second_prompt_text
+    assert "patch_group" in second_prompt_text
+    assert "group_1" in second_prompt_text
+    assert "success" in second_prompt_text
     assert patched_source not in second_prompt_text
     assert _json_string_payload(patched_source) not in second_prompt_text
+    assert "patched_199 = 199" not in second_prompt_text
 
 
 def test_capsule_llm_step_rejects_patch_after_failed_side_effect_group(
