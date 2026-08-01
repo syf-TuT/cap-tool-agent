@@ -68,6 +68,11 @@ def test_load_config_reads_capsule_fields():
     assert config["rollback_policy"] == "none"
     assert config["capsule_execution_granularity"] == "semantic_group"
     assert config["capsule_max_regions_per_group"] == 20
+    assert config["capsule_llm_step_compact_context"] is True
+    assert config["capsule_action_history_max_entries"] == 4
+    assert config["capsule_action_trace_max_events"] == 5
+    assert config["capsule_action_source_preview_chars"] == 240
+    assert config["capsule_action_prompt_char_budget"] == 60000
 
 
 def test_load_config_reads_max_regenerations(tmp_path):
@@ -216,3 +221,50 @@ capsule_control_mode: auto_forward
     _, config, _ = _load_config(args)
 
     assert config["capsule_control_mode"] == "auto_forward"
+
+
+def test_load_config_reads_compact_llm_step_prompt_fields(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+env:
+  _target_: tests.fake.Env
+trials: 1
+agent_mode: capsule
+capsule_llm_step_compact_context: false
+capsule_action_history_max_entries: 2
+capsule_action_trace_max_events: 3
+capsule_action_source_preview_chars: 80
+capsule_action_prompt_char_budget: 12000
+"""
+    )
+    args = SimpleNamespace(
+        config_path=str(config_path),
+        total_trials=None,
+        num_workers=None,
+        record_video=None,
+        output_dir=None,
+        use_oracle_code=None,
+        use_visual_feedback=None,
+        use_img_differencing=None,
+        use_video_differencing=None,
+        use_parallel_ensemble=None,
+        use_wrist_camera=None,
+        use_multimodel=None,
+        use_multi_turn=None,
+        use_runtime_control=None,
+        web_ui=None,
+        web_ui_port=None,
+        server_url="http://127.0.0.1:8110/chat/completions",
+        visual_differencing_model="google/gemini-3.1-pro-preview",
+        visual_differencing_model_server_url="http://127.0.0.1:8110/chat/completions",
+        visual_differencing_model_api_key=None,
+    )
+
+    _, config, _ = _load_config(args)
+
+    assert config["capsule_llm_step_compact_context"] is False
+    assert config["capsule_action_history_max_entries"] == 2
+    assert config["capsule_action_trace_max_events"] == 3
+    assert config["capsule_action_source_preview_chars"] == 80
+    assert config["capsule_action_prompt_char_budget"] == 12000

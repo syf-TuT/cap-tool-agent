@@ -1423,7 +1423,7 @@ def _run_capsule_llm_step_loop(
     reward_drop_guard_threshold = float(
         config.get("capsule_reward_drop_guard_threshold", 0.25)
     )
-    llm_step_compact_context = bool(
+    llm_step_compact_context = _coerce_config_bool(
         config.get("capsule_llm_step_compact_context", True)
     )
     action_history_max_entries = int(config.get("capsule_action_history_max_entries", 4))
@@ -2242,6 +2242,18 @@ def _runtime_trace_last_n(value: Any) -> int:
     except (TypeError, ValueError):
         return 8
     return max(0, min(parsed, 50))
+
+
+def _coerce_config_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+    return bool(value)
 
 
 def _append_recovery_source(

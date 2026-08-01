@@ -170,6 +170,21 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "max_regenerations": configs_dict.get("max_regenerations", None),
         "max_capsule_steps": configs_dict.get("max_capsule_steps", 12),
         "capsule_control_mode": configs_dict.get("capsule_control_mode", "auto_forward"),
+        "capsule_llm_step_compact_context": configs_dict.get(
+            "capsule_llm_step_compact_context", True
+        ),
+        "capsule_action_history_max_entries": configs_dict.get(
+            "capsule_action_history_max_entries", 4
+        ),
+        "capsule_action_trace_max_events": configs_dict.get(
+            "capsule_action_trace_max_events", 5
+        ),
+        "capsule_action_source_preview_chars": configs_dict.get(
+            "capsule_action_source_preview_chars", 240
+        ),
+        "capsule_action_prompt_char_budget": configs_dict.get(
+            "capsule_action_prompt_char_budget", 60000
+        ),
         "capsule_execution_granularity": configs_dict.get(
             "capsule_execution_granularity", "semantic_group"
         ),
