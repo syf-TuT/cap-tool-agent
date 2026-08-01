@@ -1261,6 +1261,55 @@ def test_capsule_llm_step_treats_string_false_as_non_compact_context(
     assert rows[0]["action_prompt_compact_context"] is False
 
 
+def test_capsule_llm_step_compact_prompt_does_not_replay_full_patched_source(
+    tmp_path, monkeypatch
+):
+    prompts = []
+    patched_source = "\n".join(f"patched_{idx} = {idx}" for idx in range(200))
+    responses = iter(
+        [
+            {
+                "content": json.dumps(
+                    {
+                        "action": "patch_group",
+                        "args": {"group_id": "group_1", "source": patched_source},
+                    }
+                )
+            },
+            {"content": '{"action": "finish", "args": {}}'},
+        ]
+    )
+
+    def fake_query_model(args, prompt):
+        prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query_model)
+
+    trial_module._run_capsule_llm_step_loop(
+        FakeCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "capsule_control_mode": "llm_step",
+            "max_capsule_steps": 2,
+        },
+        initial_code="x = 1\n",
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert trace[0]["event"]["action"] == "patch_group"
+    assert trace[0]["event"]["status"] == "success"
+    assert patched_source in trace[0]["event"]["evidence"]["source"]
+    assert len(prompts) == 2
+    second_prompt_text = prompts[1][1]["content"][0]["text"]
+    assert "Recent runtime history summary" in second_prompt_text
+    assert patched_source not in second_prompt_text
+    assert _json_string_payload(patched_source) not in second_prompt_text
+
+
 def test_capsule_llm_step_rejects_patch_after_failed_side_effect_group(
     tmp_path, monkeypatch
 ):
