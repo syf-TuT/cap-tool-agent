@@ -234,6 +234,40 @@ def test_capsule_prompt_compact_history_strips_full_patched_source():
     assert "move_to" in text
 
 
+def test_capsule_prompt_compact_history_prefers_warning_feedback_status():
+    history = [
+        {
+            "step_id": 1,
+            "action": {"action": "run_group", "args": {"group_id": "group_1"}},
+            "event": {
+                "action": "run_group",
+                "status": "success",
+                "region_id": "group_1",
+                "message": "execution succeeded",
+            },
+            "feedback": {
+                "status": "warning",
+                "region_id": "group_1",
+                "message": "no progress observed",
+            },
+        }
+    ]
+
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=history,
+        trace_summary={},
+        compact_context=True,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert '"status": "warning"' in text
+    assert '"event_status": "success"' in text
+    assert '"feedback_status": "warning"' in text
+
+
 def test_capsule_prompt_compact_context_includes_focused_failed_unit_source():
     unique_tail = "focused_tail_marker_final_line = 8675309"
     failed_source = "\n".join(
@@ -291,6 +325,57 @@ def test_capsule_prompt_compact_context_includes_focused_failed_unit_source():
     assert "Focused source for recent failed or invalid units" in text
     assert unique_tail in text
     assert failed_source in text or _json_string_payload(failed_source) in text
+
+
+def test_capsule_prompt_budget_fallback_omits_large_focused_failed_source():
+    unique_tail = "budget_fallback_tail_marker = 424242"
+    failed_source = "\n".join(
+        [f"oversized_failed_line_{idx} = {idx}" for idx in range(400)] + [unique_tail]
+    )
+
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[
+            CodeRegion(
+                region_id="region_1",
+                start_line=1,
+                end_line=401,
+                source=failed_source,
+            )
+        ],
+        groups=[
+            CodeRegionGroup(
+                group_id="group_1",
+                start_line=1,
+                end_line=401,
+                source=failed_source,
+                region_ids=["region_1"],
+                primitive_calls=["move_to"],
+                defined_names=[],
+                used_names=["move_to"],
+                has_robot_side_effect=True,
+            )
+        ],
+        history=[
+            {
+                "step_id": 1,
+                "action": {"action": "run_group", "args": {"group_id": "group_1"}},
+                "event": {"action": "run_group", "status": "failed", "region_id": "group_1"},
+            }
+        ],
+        trace_summary={},
+        compact_context=True,
+        focused_source_max_units=1,
+        source_preview_chars=0,
+        prompt_char_budget=1,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert "Focused source for recent failed or invalid units" not in text
+    assert unique_tail not in text
+    assert failed_source not in text
+    assert _json_string_payload(failed_source) not in text
 
 
 def test_recovery_prompt_is_local_and_bounded():

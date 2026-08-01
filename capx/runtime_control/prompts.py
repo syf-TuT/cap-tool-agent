@@ -110,7 +110,7 @@ def build_capsule_prompt(
             history_max_entries=min(history_max_entries, 2),
             trace_max_events=min(trace_max_events, 2),
             source_preview_chars=min(source_preview_chars, 80),
-            focused_source_max_units=min(focused_source_max_units, 1),
+            focused_source_max_units=0,
             recovery_guidance=recovery_guidance,
             allowed_actions_text=allowed_actions_text,
             recovery_example_line=recovery_example_line,
@@ -473,8 +473,10 @@ def summarize_terminal_state_for_recovery(terminal_state: dict[str, Any]) -> dic
 
 
 def _source_preview(source: str, *, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
     normalized = " ".join(source.strip().split())
-    if max_chars <= 0 or len(normalized) <= max_chars:
+    if len(normalized) <= max_chars:
         return normalized
     return normalized[: max(0, max_chars - 4)].rstrip() + " ..."
 
@@ -550,12 +552,16 @@ def _summarize_history_for_prompt(
         event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
         feedback = entry.get("feedback") if isinstance(entry.get("feedback"), dict) else {}
         evidence = event.get("evidence") if isinstance(event.get("evidence"), dict) else {}
+        event_status = event.get("status")
+        feedback_status = feedback.get("status")
         summary = {
             "step_id": entry.get("step_id"),
             "action": action.get("action") or event.get("action"),
             "unit_id": _action_unit_id(action, event, feedback),
-            "status": event.get("status") or feedback.get("status"),
-            "message": event.get("message") or feedback.get("message"),
+            "status": feedback_status or event_status,
+            "event_status": event_status,
+            "feedback_status": feedback_status,
+            "message": feedback.get("message") or event.get("message"),
             "exception_type": evidence.get("exception_type"),
             "reward_before": _history_state_value(entry, "state_before", "reward"),
             "reward_after": _history_state_value(entry, "state_after", "reward"),
