@@ -2151,8 +2151,6 @@ def test_capsule_trial_allows_recovery_side_effect_after_append_recovery(tmp_pat
                 "action": "append_recovery",
                 "args": {"source": 'obs = get_observation()\nmove_to("recover")'},
             },
-            {"action": "run_group", "args": {"group_id": "group_3"}},
-            {"action": "run_group", "args": {"group_id": "group_4"}},
             {"action": "finish", "args": {}},
         ],
     )
@@ -2163,6 +2161,101 @@ def test_capsule_trial_allows_recovery_side_effect_after_append_recovery(tmp_pat
     assert env.api.observed is True
     assert env.api.moves == ["good", "bad", "recover"]
     assert trace[4]["event"]["status"] == "success"
+
+
+def test_capsule_llm_step_auto_executes_appended_recovery_before_next_action(tmp_path):
+    env = FakeRewardDropCapsuleEnv()
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "capsule_control_mode": "llm_step",
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 6,
+            "capsule_max_regions_per_group": 1,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='move_to("good")\nmove_to("bad")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {
+                "action": "append_recovery",
+                "args": {"source": 'obs = get_observation()\nmove_to("recover")'},
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 0
+    assert env.api.observed is True
+    assert env.api.moves == ["good", "bad", "recover"]
+    assert [entry["event"]["action"] for entry in trace] == [
+        "run_group",
+        "run_group",
+        "append_recovery",
+        "run_group",
+        "run_group",
+        "finish",
+    ]
+    assert trace[3]["action"]["args"]["group_id"] == "group_3"
+    assert trace[4]["action"]["args"]["group_id"] == "group_4"
+
+
+def test_capsule_llm_step_allows_entire_appended_recovery_block_after_reward_drop(
+    tmp_path,
+):
+    env = FakeRewardDropCapsuleEnv()
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "capsule_control_mode": "llm_step",
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 7,
+            "capsule_max_regions_per_group": 1,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='move_to("good")\nmove_to("bad")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": (
+                        'obs = get_observation()\nmove_to("hold")\nmove_to("recover")'
+                    )
+                },
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 0
+    assert env.api.observed is True
+    assert env.api.moves == ["good", "bad", "hold", "recover"]
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "success",
+        "success",
+        "success",
+        "success",
+        "success",
+        "success",
+    ]
+    assert trace[4]["action"]["args"]["group_id"] == "group_4"
+    assert trace[5]["action"]["args"]["group_id"] == "group_5"
 
 
 def test_capsule_metrics_split_append_source_from_recovery_execution(tmp_path):
@@ -2186,8 +2279,6 @@ def test_capsule_metrics_split_append_source_from_recovery_execution(tmp_path):
                 "action": "append_recovery",
                 "args": {"source": 'obs = get_observation()\nmove_to("recover")'},
             },
-            {"action": "run_group", "args": {"group_id": "group_3"}},
-            {"action": "run_group", "args": {"group_id": "group_4"}},
         ],
     )
 

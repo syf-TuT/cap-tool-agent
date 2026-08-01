@@ -1417,6 +1417,7 @@ def _run_capsule_llm_step_loop(
     executed_side_effect_regions: set[str] = set()
     executed_side_effect_groups: set[str] = set()
     recovery_side_effect_budget = 0
+    pending_recovery_actions: list[RuntimeAction] = []
     reward_drop_guard_min_best_reward = float(
         config.get("capsule_reward_drop_guard_min_best_reward", 0.6)
     )
@@ -1440,39 +1441,50 @@ def _run_capsule_llm_step_loop(
         before_state = _capsule_state_snapshot(env)
         source_unit_for_feedback = None
         consumes_recovery_side_effect = False
-        prompt = build_capsule_prompt(
-            task=_task_text_from_obs(obs),
-            regions=regions,
-            groups=groups if use_semantic_groups else None,
-            history=history,
-            trace_summary=executor.trace.summary() if executor.trace is not None else {},
-            recovery_observation_functions=recovery_observation_functions,
-            compact_context=llm_step_compact_context,
-            history_max_entries=action_history_max_entries,
-            trace_max_events=action_trace_max_events,
-            source_preview_chars=action_source_preview_chars,
-            focused_source_max_units=1 if llm_step_compact_context else 0,
-            prompt_char_budget=action_prompt_char_budget if llm_step_compact_context else None,
-        )
-        action_prompt_chars = len(json.dumps(prompt, default=str))
-        action_prompt_char_budget_metric = (
-            action_prompt_char_budget if llm_step_compact_context else None
-        )
-        action_prompt_over_budget = (
-            action_prompt_char_budget_metric is not None
-            and action_prompt_char_budget_metric > 0
-            and action_prompt_chars > action_prompt_char_budget_metric
-        )
-        prompts.append(prompt)
+        forced_recovery_action = False
+        action_prompt_chars = 0
+        action_prompt_char_budget_metric = None
+        action_prompt_over_budget = False
 
         try:
-            if script is not None:
+            if pending_recovery_actions:
+                forced_recovery_action = True
+                action = pending_recovery_actions.pop(0)
+            else:
+                prompt = build_capsule_prompt(
+                    task=_task_text_from_obs(obs),
+                    regions=regions,
+                    groups=groups if use_semantic_groups else None,
+                    history=history,
+                    trace_summary=executor.trace.summary() if executor.trace is not None else {},
+                    recovery_observation_functions=recovery_observation_functions,
+                    compact_context=llm_step_compact_context,
+                    history_max_entries=action_history_max_entries,
+                    trace_max_events=action_trace_max_events,
+                    source_preview_chars=action_source_preview_chars,
+                    focused_source_max_units=1 if llm_step_compact_context else 0,
+                    prompt_char_budget=(
+                        action_prompt_char_budget if llm_step_compact_context else None
+                    ),
+                )
+                action_prompt_chars = len(json.dumps(prompt, default=str))
+                action_prompt_char_budget_metric = (
+                    action_prompt_char_budget if llm_step_compact_context else None
+                )
+                action_prompt_over_budget = (
+                    action_prompt_char_budget_metric is not None
+                    and action_prompt_char_budget_metric > 0
+                    and action_prompt_chars > action_prompt_char_budget_metric
+                )
+                prompts.append(prompt)
+
+            if action is None and script is not None:
                 if script_idx >= len(script):
                     action = RuntimeAction(action="finish", args={})
                 else:
                     action = RuntimeAction.from_mapping(script[script_idx])
                     script_idx += 1
-            else:
+            elif action is None:
                 with llm_call_stage("capsule_action"):
                     response = _query_model(action_query_args, prompt)
                 action = parse_runtime_action_response(response["content"])
@@ -1530,6 +1542,8 @@ def _run_capsule_llm_step_loop(
                     recovery_side_effect_budget -= 1
             if event.status in {"failed", "invalid"}:
                 failed = True
+                if forced_recovery_action:
+                    pending_recovery_actions.clear()
             if action.action == "run_region" and event.status != "invalid":
                 executed_regions += 1
                 region = region_by_id.get(region_id)
@@ -1616,6 +1630,7 @@ def _run_capsule_llm_step_loop(
             and action.action in {"patch_region", "patch_group", "append_recovery"}
             and event.status == "success"
         ):
+            previous_source_line_count = len(source.splitlines())
             source = str(event.evidence["source"])
             regions = segment_python_code(source)
             groups = (
@@ -1630,6 +1645,22 @@ def _run_capsule_llm_step_loop(
             )
             region_by_id = {region.region_id: region for region in regions}
             group_by_id = {group.group_id: group for group in groups}
+            if action.action == "append_recovery":
+                pending_recovery_actions = _runtime_actions_for_appended_recovery(
+                    regions,
+                    groups,
+                    use_semantic_groups=use_semantic_groups,
+                    insert_after_line=previous_source_line_count,
+                )
+                recovery_side_effect_budget = max(
+                    recovery_side_effect_budget,
+                    _count_side_effect_runtime_actions(
+                        pending_recovery_actions,
+                        region_by_id,
+                        group_by_id,
+                        side_effect_calls,
+                    ),
+                )
 
         if stop_after_failed_event and event.status in {"failed", "invalid"}:
             break
@@ -2210,6 +2241,44 @@ def _first_group_index_starting_after_line(
         if group.start_line > line_number:
             return idx
     return default
+
+
+def _runtime_actions_for_appended_recovery(
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup],
+    *,
+    use_semantic_groups: bool,
+    insert_after_line: int,
+) -> list[RuntimeAction]:
+    if use_semantic_groups:
+        return [
+            RuntimeAction("run_group", {"group_id": group.group_id})
+            for group in groups
+            if group.start_line > insert_after_line
+        ]
+    return [
+        RuntimeAction("run_region", {"region_id": region.region_id})
+        for region in regions
+        if region.start_line > insert_after_line
+    ]
+
+
+def _count_side_effect_runtime_actions(
+    actions: list[RuntimeAction],
+    region_by_id: dict[str, Any],
+    group_by_id: dict[str, Any],
+    side_effect_calls: set[str],
+) -> int:
+    return sum(
+        1
+        for action in actions
+        if _runtime_action_targets_side_effect_unit(
+            action,
+            region_by_id,
+            group_by_id,
+            side_effect_calls,
+        )
+    )
 
 
 def _group_index_for_region(
