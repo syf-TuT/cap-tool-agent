@@ -138,6 +138,161 @@ def test_capsule_prompt_marks_recovery_unavailable_without_fresh_state_function(
     assert "append_recovery" not in allowed_actions
 
 
+def _json_string_payload(value: str) -> str:
+    return json.dumps(value)[1:-1]
+
+
+def test_capsule_prompt_compact_context_omits_full_region_and_group_source():
+    long_region_source = "x = 1\n" + "\n".join(f"value_{idx} = {idx}" for idx in range(80))
+    long_group_source = long_region_source + "\nmove_to(value_79)"
+
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[
+            CodeRegion(
+                region_id="region_1",
+                start_line=1,
+                end_line=81,
+                source=long_region_source,
+            )
+        ],
+        groups=[
+            CodeRegionGroup(
+                group_id="group_1",
+                start_line=1,
+                end_line=82,
+                source=long_group_source,
+                region_ids=["region_1"],
+                primitive_calls=["move_to"],
+                defined_names=["x", "value_79"],
+                used_names=["move_to"],
+                has_robot_side_effect=True,
+            )
+        ],
+        history=[],
+        trace_summary={},
+        compact_context=True,
+        source_preview_chars=80,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert "Compact generated code regions" in text
+    assert "Compact effect-bounded execution units" in text
+    assert "source_preview" in text
+    assert "region_1" in text
+    assert "group_1" in text
+    assert "value_79" in text
+    assert long_region_source not in text
+    assert _json_string_payload(long_region_source) not in text
+    assert long_group_source not in text
+    assert _json_string_payload(long_group_source) not in text
+
+
+def test_capsule_prompt_compact_history_strips_full_patched_source():
+    patched_source = "\n".join(f"line_{idx} = {idx}" for idx in range(120))
+    history = [
+        {
+            "step_id": 1,
+            "action": {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": patched_source},
+            },
+            "event": {
+                "action": "patch_group",
+                "status": "success",
+                "region_id": "group_1",
+                "evidence": {"source": patched_source},
+            },
+            "feedback": {
+                "status": "success",
+                "region_id": "group_1",
+                "evidence": {"trace_events": [{"name": "move_to"}]},
+            },
+            "trace_events": [{"name": "move_to"}],
+            "state_before": {"reward": 0.0, "task_completed": False},
+            "state_after": {"reward": 0.1, "task_completed": False},
+        }
+    ]
+
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=history,
+        trace_summary={},
+        compact_context=True,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert "Recent runtime history summary" in text
+    assert patched_source not in text
+    assert _json_string_payload(patched_source) not in text
+    assert "reward_before" in text
+    assert "reward_after" in text
+    assert "primitive_calls" in text
+    assert "move_to" in text
+
+
+def test_capsule_prompt_compact_context_includes_focused_failed_unit_source():
+    unique_tail = "focused_tail_marker_final_line = 8675309"
+    failed_source = "\n".join(
+        [
+            'pose = get_pose("cube")',
+            "adjusted_pose = pose",
+            "move_to(adjusted_pose)",
+            unique_tail,
+        ]
+    )
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[
+            CodeRegion(
+                region_id="region_1",
+                start_line=1,
+                end_line=4,
+                source=failed_source,
+            )
+        ],
+        groups=[
+            CodeRegionGroup(
+                group_id="group_1",
+                start_line=1,
+                end_line=4,
+                source=failed_source,
+                region_ids=["region_1"],
+                primitive_calls=["get_pose", "move_to"],
+                defined_names=["adjusted_pose", "focused_tail_marker_final_line", "pose"],
+                used_names=["get_pose", "move_to"],
+                has_robot_side_effect=True,
+            )
+        ],
+        history=[
+            {
+                "step_id": 1,
+                "action": {"action": "run_group", "args": {"group_id": "group_1"}},
+                "event": {
+                    "action": "run_group",
+                    "status": "failed",
+                    "region_id": "group_1",
+                    "message": "boom",
+                    "evidence": {"exception_type": "RuntimeError"},
+                },
+            }
+        ],
+        trace_summary={},
+        compact_context=True,
+        focused_source_max_units=1,
+        source_preview_chars=8,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert "Focused source for recent failed or invalid units" in text
+    assert unique_tail in text
+    assert failed_source in text or _json_string_payload(failed_source) in text
+
+
 def test_recovery_prompt_is_local_and_bounded():
     groups = [
         CodeRegionGroup(

@@ -36,6 +36,12 @@ def build_capsule_prompt(
     history: list[dict[str, Any]],
     trace_summary: dict[str, Any],
     recovery_observation_functions: set[str] | None = None,
+    compact_context: bool = False,
+    history_max_entries: int = 8,
+    trace_max_events: int = 8,
+    source_preview_chars: int = 240,
+    focused_source_max_units: int = 0,
+    prompt_char_budget: int | None = None,
 ) -> list[dict[str, Any]]:
     recovery_functions = sorted(
         {"get_observation"}
@@ -76,24 +82,120 @@ def build_capsule_prompt(
         allowed_actions.append("append_recovery")
     allowed_actions.extend(["resume_from_region", "finish"])
     allowed_actions_text = ", ".join(allowed_actions)
-    region_data = [region.to_dict() for region in regions]
-    group_data = [group.to_dict() for group in groups or []]
+
+    prompt_text = _build_capsule_prompt_text(
+        task=task,
+        regions=regions,
+        groups=groups,
+        history=history,
+        trace_summary=trace_summary,
+        compact_context=compact_context,
+        history_max_entries=history_max_entries,
+        trace_max_events=trace_max_events,
+        source_preview_chars=source_preview_chars,
+        focused_source_max_units=focused_source_max_units,
+        recovery_guidance=recovery_guidance,
+        allowed_actions_text=allowed_actions_text,
+        recovery_example_line=recovery_example_line,
+        recovery_rule=recovery_rule,
+    )
+    if compact_context and _prompt_text_over_budget(prompt_text, prompt_char_budget):
+        prompt_text = _build_capsule_prompt_text(
+            task=task,
+            regions=regions,
+            groups=groups,
+            history=history,
+            trace_summary=trace_summary,
+            compact_context=True,
+            history_max_entries=min(history_max_entries, 2),
+            trace_max_events=min(trace_max_events, 2),
+            source_preview_chars=min(source_preview_chars, 80),
+            focused_source_max_units=min(focused_source_max_units, 1),
+            recovery_guidance=recovery_guidance,
+            allowed_actions_text=allowed_actions_text,
+            recovery_example_line=recovery_example_line,
+            recovery_rule=recovery_rule,
+        )
+    return [
+        {"role": "system", "content": "You control execution of generated Python code regions."},
+        {"role": "user", "content": [{"type": "text", "text": prompt_text}]},
+    ]
+
+
+def _build_capsule_prompt_text(
+    *,
+    task: str,
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup] | None,
+    history: list[dict[str, Any]],
+    trace_summary: dict[str, Any],
+    compact_context: bool,
+    history_max_entries: int,
+    trace_max_events: int,
+    source_preview_chars: int,
+    focused_source_max_units: int,
+    recovery_guidance: str,
+    allowed_actions_text: str,
+    recovery_example_line: str,
+    recovery_rule: str,
+) -> str:
+    if compact_context:
+        region_data = [
+            _compact_region_for_prompt(region, source_preview_chars=source_preview_chars)
+            for region in regions
+        ]
+        group_data = [
+            _compact_group_for_prompt(group, source_preview_chars=source_preview_chars)
+            for group in groups or []
+        ]
+        history_data = _summarize_history_for_prompt(
+            history, max_entries=history_max_entries
+        )
+        trace_data = _bound_trace_summary(trace_summary, max_events=trace_max_events)
+        focused_source_data = _focused_failed_units_for_prompt(
+            history=history,
+            regions=regions,
+            groups=groups,
+            max_units=focused_source_max_units,
+        )
+        region_heading = "Compact generated code regions"
+        group_heading = "Compact effect-bounded execution units (preferred run_group targets)"
+        history_heading = "Recent runtime history summary"
+        trace_heading = "Recent primitive call trace summary"
+    else:
+        region_data = [region.to_dict() for region in regions]
+        group_data = [group.to_dict() for group in groups or []]
+        history_data = history[-8:]
+        trace_data = trace_summary
+        focused_source_data = []
+        region_heading = "Generated code regions"
+        group_heading = "Effect-bounded execution units (preferred run_group targets)"
+        history_heading = "Recent runtime history"
+        trace_heading = "Primitive call trace summary"
+
     group_text = ""
     if group_data:
         group_text = (
-            "Effect-bounded execution units (preferred run_group targets):\n"
+            f"{group_heading}:\n"
             f"{json.dumps(group_data, indent=2, default=str)}\n\n"
+        )
+    focused_source_text = ""
+    if focused_source_data:
+        focused_source_text = (
+            "Focused source for recent failed or invalid units:\n"
+            f"{json.dumps(focused_source_data, indent=2, default=str)}\n\n"
         )
     prompt_text = (
         "Task:\n"
         f"{task}\n\n"
         f"{group_text}"
-        "Generated code regions:\n"
+        f"{region_heading}:\n"
         f"{json.dumps(region_data, indent=2, default=str)}\n\n"
-        "Recent runtime history:\n"
-        f"{json.dumps(history[-8:], indent=2, default=str)}\n\n"
-        "Primitive call trace summary:\n"
-        f"{json.dumps(trace_summary, indent=2, default=str)}\n\n"
+        f"{history_heading}:\n"
+        f"{json.dumps(history_data, indent=2, default=str)}\n\n"
+        f"{trace_heading}:\n"
+        f"{json.dumps(trace_data, indent=2, default=str)}\n\n"
+        f"{focused_source_text}"
         "Choose exactly one runtime-control action. These actions control source-code "
         "execution, inspection, and local source patches. They do "
         "not directly perform robot manipulation.\n\n"
@@ -128,10 +230,7 @@ def build_capsule_prompt(
         "Do not ask "
         "for robot primitives as tools."
     )
-    return [
-        {"role": "system", "content": "You control execution of generated Python code regions."},
-        {"role": "user", "content": [{"type": "text", "text": prompt_text}]},
-    ]
+    return prompt_text
 
 
 def build_capsule_recovery_prompt(
@@ -373,6 +472,148 @@ def summarize_terminal_state_for_recovery(terminal_state: dict[str, Any]) -> dic
     return summary
 
 
+def _source_preview(source: str, *, max_chars: int) -> str:
+    normalized = " ".join(source.strip().split())
+    if max_chars <= 0 or len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max(0, max_chars - 4)].rstrip() + " ..."
+
+
+def _compact_region_for_prompt(
+    region: CodeRegion, *, source_preview_chars: int
+) -> dict[str, Any]:
+    return {
+        "region_id": region.region_id,
+        "source_span": {"start_line": region.start_line, "end_line": region.end_line},
+        "source_preview": _source_preview(region.source, max_chars=source_preview_chars),
+    }
+
+
+def _compact_group_for_prompt(
+    group: CodeRegionGroup, *, source_preview_chars: int
+) -> dict[str, Any]:
+    return {
+        "group_id": group.group_id,
+        "source_span": {"start_line": group.start_line, "end_line": group.end_line},
+        "source_preview": _source_preview(group.source, max_chars=source_preview_chars),
+        "region_ids": list(group.region_ids),
+        "primitive_calls": list(group.primitive_calls),
+        "defined_names": list(group.defined_names),
+        "used_names": list(group.used_names),
+        "has_robot_side_effect": group.has_robot_side_effect,
+    }
+
+
+def _action_unit_id(
+    action: dict[str, Any], event: dict[str, Any], feedback: dict[str, Any]
+) -> str | None:
+    args = action.get("args") if isinstance(action.get("args"), dict) else {}
+    return (
+        args.get("group_id")
+        or args.get("region_id")
+        or event.get("region_id")
+        or feedback.get("region_id")
+    )
+
+
+def _history_state_value(entry: dict[str, Any], state_key: str, value_key: str) -> Any:
+    state = entry.get(state_key)
+    if isinstance(state, dict):
+        return state.get(value_key)
+    return None
+
+
+def _primitive_calls_from_history(entry: dict[str, Any]) -> list[str]:
+    feedback = entry.get("feedback")
+    if isinstance(feedback, dict):
+        evidence = feedback.get("evidence")
+        if isinstance(evidence, dict) and isinstance(evidence.get("primitive_calls"), list):
+            return [str(name) for name in evidence["primitive_calls"]]
+    trace_events = entry.get("trace_events")
+    if isinstance(trace_events, list):
+        return [
+            str(event["name"])
+            for event in trace_events
+            if isinstance(event, dict) and "name" in event
+        ]
+    return []
+
+
+def _summarize_history_for_prompt(
+    history: list[dict[str, Any]], *, max_entries: int
+) -> list[dict[str, Any]]:
+    bounded_count = max(0, int(max_entries))
+    bounded = history[-bounded_count:] if bounded_count else []
+    summaries: list[dict[str, Any]] = []
+    for entry in bounded:
+        action = entry.get("action") if isinstance(entry.get("action"), dict) else {}
+        event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
+        feedback = entry.get("feedback") if isinstance(entry.get("feedback"), dict) else {}
+        evidence = event.get("evidence") if isinstance(event.get("evidence"), dict) else {}
+        summary = {
+            "step_id": entry.get("step_id"),
+            "action": action.get("action") or event.get("action"),
+            "unit_id": _action_unit_id(action, event, feedback),
+            "status": event.get("status") or feedback.get("status"),
+            "message": event.get("message") or feedback.get("message"),
+            "exception_type": evidence.get("exception_type"),
+            "reward_before": _history_state_value(entry, "state_before", "reward"),
+            "reward_after": _history_state_value(entry, "state_after", "reward"),
+            "task_completed_before": _history_state_value(
+                entry, "state_before", "task_completed"
+            ),
+            "task_completed_after": _history_state_value(
+                entry, "state_after", "task_completed"
+            ),
+            "primitive_calls": _primitive_calls_from_history(entry),
+        }
+        summaries.append(
+            {key: value for key, value in summary.items() if value not in (None, [], "")}
+        )
+    return summaries
+
+
+def _focused_failed_units_for_prompt(
+    *,
+    history: list[dict[str, Any]],
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup] | None,
+    max_units: int,
+) -> list[dict[str, Any]]:
+    if max_units <= 0:
+        return []
+    region_by_id = {region.region_id: region for region in regions}
+    group_by_id = {group.group_id: group for group in groups or []}
+    focused: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in reversed(history):
+        event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
+        feedback = entry.get("feedback") if isinstance(entry.get("feedback"), dict) else {}
+        status = event.get("status") or feedback.get("status")
+        if status not in {"failed", "invalid"}:
+            continue
+        action = entry.get("action") if isinstance(entry.get("action"), dict) else {}
+        unit_id = _action_unit_id(action, event, feedback)
+        if not isinstance(unit_id, str) or unit_id in seen:
+            continue
+        unit = group_by_id.get(unit_id) or region_by_id.get(unit_id)
+        if unit is None:
+            continue
+        focused.append(unit.to_dict())
+        seen.add(unit_id)
+        if len(focused) >= max_units:
+            break
+    return list(reversed(focused))
+
+
+def _prompt_text_over_budget(prompt_text: str, prompt_char_budget: int | None) -> bool:
+    return (
+        prompt_char_budget is not None
+        and prompt_char_budget > 0
+        and len(prompt_text) > prompt_char_budget
+    )
+
+
 def _terminal_object_positions(terminal_state: dict[str, Any]) -> dict[str, Any]:
     object_poses = terminal_state.get("object_poses")
     if not isinstance(object_poses, dict):
@@ -430,15 +671,16 @@ def _is_xyz(value: Any) -> bool:
 
 def _bound_trace_summary(trace_summary: dict[str, Any], *, max_events: int) -> dict[str, Any]:
     bounded = dict(trace_summary)
+    bounded_count = max(0, int(max_events))
     events = bounded.get("events")
     if isinstance(events, list):
-        bounded["events"] = events[-max_events:]
+        bounded["events"] = events[-bounded_count:] if bounded_count else []
     recent_events = bounded.get("recent_events")
     if isinstance(recent_events, list):
-        bounded["recent_events"] = recent_events[-max_events:]
+        bounded["recent_events"] = recent_events[-bounded_count:] if bounded_count else []
     failed_events = bounded.get("failed_events")
     if isinstance(failed_events, list):
-        bounded["failed_events"] = failed_events[-max_events:]
+        bounded["failed_events"] = failed_events[-bounded_count:] if bounded_count else []
     return bounded
 
 
