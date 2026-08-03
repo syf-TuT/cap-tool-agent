@@ -101,6 +101,35 @@ def test_feedback_warns_for_side_effect_group_without_reward_progress():
     assert any("append_recovery" in hint for hint in feedback.repair_hints)
 
 
+def test_feedback_keeps_source_patch_successful_without_reward_progress():
+    group = CodeRegionGroup(
+        "group_1",
+        1,
+        2,
+        "joints = solve_ik(target)\nmove_to_joints(joints)",
+        region_ids=["region_1", "region_2"],
+        primitive_calls=["solve_ik", "move_to_joints"],
+        defined_names=["joints"],
+        used_names=["solve_ik", "target", "move_to_joints"],
+        has_robot_side_effect=True,
+    )
+
+    feedback = build_runtime_feedback(
+        step_id=1,
+        action=RuntimeAction("patch_group", {"group_id": "group_1", "source": "x = 1"}),
+        event=RuntimeEvent(action="patch_group", status="success", region_id="group_1"),
+        region=group,
+        trace_events=[],
+        before_state={"reward": 0.0, "task_completed": False},
+        after_state={"reward": 0.0, "task_completed": False},
+    )
+
+    assert feedback.status == "success"
+    assert feedback.patch_scope is None
+    assert "executed" not in feedback.message
+    assert "no local task progress" not in feedback.message
+
+
 def test_feedback_name_error_hint_mentions_missing_variable():
     group = CodeRegionGroup(
         "group_1",

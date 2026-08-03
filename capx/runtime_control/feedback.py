@@ -43,7 +43,7 @@ def build_runtime_feedback(
         if hasattr(region, "has_robot_side_effect"):
             evidence["has_robot_side_effect"] = bool(region.has_robot_side_effect)
 
-    status = _feedback_status(event, region, before_state, after_state)
+    status = _feedback_status(action, event, region, before_state, after_state)
     region_id = event.region_id or (region.region_id if region is not None else None)
 
     return RuntimeFeedback(
@@ -58,12 +58,15 @@ def build_runtime_feedback(
 
 
 def _feedback_status(
+    action: RuntimeAction,
     event: RuntimeEvent,
     region: CodeRegion | None,
     before_state: dict[str, Any],
     after_state: dict[str, Any],
 ) -> RuntimeStatus:
     if event.status in {"failed", "invalid", "warning", "skipped"}:
+        return event.status
+    if action.action in {"patch_group", "patch_region"}:
         return event.status
     if region is not None and not _made_task_progress(before_state, after_state):
         if getattr(region, "has_robot_side_effect", True) is False:
