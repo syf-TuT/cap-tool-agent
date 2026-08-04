@@ -1,75 +1,72 @@
-# LLM-Step Action Ablation Design
+# Cube-Stack Action Ablation Design
 
 ## Goal
 
-Add independently configurable patch and append-recovery permissions to Capsule's
-`llm_step` control mode, then provide non-VDM cube-stack configurations for the A2 and A3
-ablation groups.
+Make the cube-stack action ablation a controlled four-group experiment and remove geometric
+answer hints from the task's default prompt. The experiment should isolate one-shot generation,
+patching, and append-only recovery without changing the initial simulator state in this change.
 
 ## Experiment Groups
 
-| Group | `patch_group` / `patch_region` | `append_recovery` |
-| --- | --- | --- |
-| A2 | disabled | enabled |
-| A3 | enabled | disabled |
+| Group | Execution mode | Patch | `append_recovery` |
+| --- | --- | --- | --- |
+| A1 | one-shot `code` agent | unavailable | unavailable |
+| A2 | Capsule `llm_step` | disabled | enabled |
+| A3 | Capsule `llm_step` | enabled | disabled |
+| A4 | Capsule `llm_step` | enabled | enabled |
 
-The two groups use the same non-VDM cube-stack environment, API servers, trial count, and
-worker count. Their action permissions and output directories are the only intended
-differences.
+A1 must use `agent_mode: code`. Setting both permissions to `false` while retaining
+`agent_mode: capsule` would not be a one-shot baseline: the model would still receive Capsule
+action prompts, choose semantic groups to execute, and observe execution feedback. The ordinary
+code agent performs one initial model generation and has no multi-turn prompt in this config.
 
-## Configuration
+For a uniform, auditable matrix, A1 retains the Capsule-only keys with both permissions set to
+`false`; those keys are inert in code-agent mode. A2 through A4 are identical except for the two
+permission booleans and their output directories. Relative to those groups, A1 additionally
+differs in `agent_mode` and its output directory.
 
-Add two configuration fields:
+## Prompt
 
-- `capsule_llm_step_allow_patch`, defaulting to `true`;
-- `capsule_llm_step_allow_append_recovery`, defaulting to `true`.
+Restore the `FrankaPickPlaceCodeEnv` default prompt to the generic prompt used by the original
+comparison experiment. It states the task, the non-privileged perception and planning stack,
+and the required output format, but does not prescribe:
 
-Defaults preserve the existing `llm_step` behavior. Patch permission applies to both
-`patch_group` and `patch_region`. It does not disable `resume_from_region`, which executes
-existing source rather than replacing source text.
+- the stacking-height formula;
+- red or green cube half-height calculations;
+- grasp-quaternion reuse;
+- a minimum post-grasp lift distance.
 
-Create two runnable configurations based on the non-VDM
-`env_configs/cube_stack/franka_robosuite_cube_stack.yaml` setup:
+All four configurations inherit this same class-level prompt. No group-specific problem-solving
+hint is added to YAML.
 
-- `franka_robosuite_cube_stack_capsule_llm_step_a2_no_patch.yaml`;
-- `franka_robosuite_cube_stack_capsule_llm_step_a3_no_append_recovery.yaml`.
+## Shared Configuration
 
-Both explicitly select `agent_mode: capsule` and `capsule_control_mode: llm_step` and use
-separate output directories.
+All groups use the same:
 
-## Prompt Behavior
+- non-privileged `FrankaControlApi` environment;
+- local SAM3, Contact-GraspNet, and Pyroki servers;
+- disabled VDM, image differencing, and visual feedback;
+- video recording, trial count, worker count, and Capsule budget fields;
+- task prompt inherited from `FrankaPickPlaceCodeEnv`.
 
-The Capsule action prompt receives both permissions. Disabled actions are removed from the
-allowed-action list, JSON examples, recovery guidance, and action-specific rules. This avoids
-encouraging the model to select an action that the experiment forbids.
+The model endpoint, model name, temperature, seed selection, and per-run timeout remain launch
+parameters rather than group-specific YAML differences.
 
-When patching is disabled, neither `patch_group` nor `patch_region` is advertised. When
-append recovery is disabled, `append_recovery` is not advertised even if the active API
-provides fresh-state observation functions.
+## Scope
 
-## Runtime Enforcement
-
-Prompt filtering is not treated as enforcement. Before the existing no-rollback and reward-drop
-guards, the `llm_step` loop checks the selected action against the configured permissions.
-A forbidden action produces a structured `invalid` event and does not execute or modify the
-saved source. This also covers scripted actions and malformed model behavior while preserving
-the attempted action in the trace.
-
-The step metric records both resolved permission values so experiment artifacts can be audited.
-
-## Compatibility and Scope
-
-The global runtime-action schema remains unchanged because the actions are still valid in other
-Capsule configurations. `auto_forward` behavior is unchanged. Existing `llm_step`
-configurations continue to allow both action families through the default values.
+This change adds A1 and A4 YAML files, updates A2/A3 only as needed for exact matrix identity,
+and restores the prompt. It does not change runtime-control implementation, simulator reset
+behavior, object placement, seed handling, or the existing permission semantics.
 
 ## Testing
 
-Tests cover:
+Regression tests will:
 
-- default and explicit configuration loading;
-- prompt omission of disabled action names, examples, and instructions;
-- runtime rejection of forbidden patch and append-recovery actions;
-- continued execution of the action family that remains enabled in A2 and A3;
-- step-metric permission fields;
-- YAML group identity, non-VDM settings, and the exact A2/A3 permission matrix.
+- assert the default prompt equals the intended generic text and contains none of the leaked
+  geometric instructions;
+- assert the exact A1-A4 execution-mode and permission matrix;
+- assert every environment, API, perception, feedback, recording, budget, trial, and worker
+  setting is shared;
+- assert A2-A4 differ only in permission switches and output paths;
+- assert A1 differs from the shared Capsule configuration only in `agent_mode`, permission
+  switches, and output path.
