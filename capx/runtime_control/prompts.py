@@ -43,13 +43,16 @@ def build_capsule_prompt(
     source_preview_chars: int = 240,
     focused_source_max_units: int = 0,
     prompt_char_budget: int | None = None,
+    allow_patch: bool = True,
+    allow_append_recovery: bool = True,
 ) -> list[dict[str, Any]]:
     recovery_functions = sorted(
         {"get_observation"}
         if recovery_observation_functions is None
         else recovery_observation_functions
     )
-    if recovery_functions:
+    append_recovery_enabled = allow_append_recovery and bool(recovery_functions)
+    if append_recovery_enabled:
         recovery_calls = ", ".join(f"{name}()" for name in recovery_functions)
         recovery_guidance = (
             "For recovery after robot side effects, prefer appending new recovery code with "
@@ -64,22 +67,28 @@ def build_capsule_prompt(
             "For append_recovery, args.source must be executable Python code that includes "
             f"at least one of {recovery_calls} and continues from the current physical state."
         )
-    else:
+    elif allow_append_recovery:
         recovery_guidance = (
             "append_recovery is unavailable because the active API does not declare a "
             "fresh-state observation function."
         )
         recovery_example_line = ""
         recovery_rule = recovery_guidance
+    else:
+        recovery_guidance = (
+            "Continue recovery from the current physical state using only the allowed actions."
+        )
+        recovery_example_line = ""
+        recovery_rule = ""
     allowed_actions = [
         "run_group",
         "run_region",
         "inspect_trace",
         "inspect_variables",
-        "patch_group",
-        "patch_region",
     ]
-    if recovery_functions:
+    if allow_patch:
+        allowed_actions.extend(["patch_group", "patch_region"])
+    if append_recovery_enabled:
         allowed_actions.append("append_recovery")
     allowed_actions.extend(["resume_from_region", "finish"])
     allowed_actions_text = ", ".join(allowed_actions)
@@ -109,6 +118,8 @@ def build_capsule_prompt(
         recovery_rule=recovery_rule,
         run_group_example_id=run_group_example_id,
         run_region_example_id=run_region_example_id,
+        allow_patch=allow_patch,
+        append_recovery_enabled=append_recovery_enabled,
     )
     if compact_context and _prompt_text_over_budget(prompt_text, prompt_char_budget):
         prompt_text = _build_capsule_prompt_text(
@@ -129,6 +140,8 @@ def build_capsule_prompt(
             recovery_rule=recovery_rule,
             run_group_example_id=run_group_example_id,
             run_region_example_id=run_region_example_id,
+            allow_patch=allow_patch,
+            append_recovery_enabled=append_recovery_enabled,
         )
     return _capsule_prompt_messages(prompt_text)
 
@@ -159,6 +172,8 @@ def _build_capsule_prompt_text(
     recovery_rule: str,
     run_group_example_id: str,
     run_region_example_id: str,
+    allow_patch: bool,
+    append_recovery_enabled: bool,
 ) -> str:
     if compact_context:
         region_data = [
@@ -204,6 +219,9 @@ def _build_capsule_prompt_text(
         id_key="group_id",
         executed_ids=set(side_effect_ledger["executed_side_effect_groups"]),
     )
+    if not allow_patch:
+        for unit_data in [*region_data, *group_data]:
+            unit_data.pop("patch_allowed", None)
     group_text = ""
     if group_data:
         group_text = (
@@ -216,6 +234,56 @@ def _build_capsule_prompt_text(
             "Focused source for recent failed or invalid units:\n"
             f"{json.dumps(focused_source_data, indent=2, default=str)}\n\n"
         )
+    guarded_actions = (
+        "run_group, run_region, patch_group, or patch_region"
+        if allow_patch
+        else "run_group or run_region"
+    )
+    if allow_patch:
+        current_state_recovery = (
+            "Use a fresh observation and patch or resume code as current-state recovery; do "
+        )
+        patch_preference = (
+            " Use patch_group for local repairs unless a single atomic region is clearly "
+            "self-contained."
+        )
+        patch_examples = (
+            f'{{"action": "patch_group", "args": {{"group_id": "{run_group_example_id}", '
+            f'"source": "replacement Python source for the complete {run_group_example_id} '
+            'source span"}}}\n'
+            f'{{"action": "patch_region", "args": {{"region_id": "{run_region_example_id}", '
+            f'"source": "replacement Python source for only {run_region_example_id}"}}\n'
+        )
+        patch_rules = (
+            "For patch_group, args.source must be the complete replacement Python source "
+            "for only the requested source group.\n"
+            "For patch_region, args.source must be the complete replacement Python source "
+            "for only the requested source region. Do not use new_source or patch for "
+            "patch_region replacement text.\n"
+        )
+    else:
+        current_state_recovery = (
+            "Use a fresh observation and continue only through an allowed action; do "
+        )
+        patch_preference = ""
+        patch_examples = ""
+        patch_rules = ""
+    if append_recovery_enabled:
+        side_effect_recovery_rule = (
+            "- If additional robot-side-effect motion is needed after an executed side-effect "
+            "unit, use append_recovery with a fresh-state function and continue from the "
+            "current physical state.\n\n"
+        )
+    else:
+        side_effect_recovery_rule = (
+            "- Do not replay executed side-effect units; continue only with allowed actions "
+            "from the current physical state.\n\n"
+        )
+    action_scope = (
+        "execution, inspection, and local source patches"
+        if allow_patch
+        else "execution and inspection"
+    )
     prompt_text = (
         "Task:\n"
         f"{task}\n\n"
@@ -230,43 +298,32 @@ def _build_capsule_prompt_text(
         f"{json.dumps(side_effect_ledger, indent=2, default=str)}\n\n"
         f"{focused_source_text}"
         "Choose exactly one runtime-control action. These actions control source-code "
-        "execution, inspection, and local source patches. They do "
+        f"{action_scope}. They do "
         "not directly perform robot manipulation.\n\n"
         "Rollback is unavailable. Previously executed robot-side-effect code may have "
         "changed the current physical state, so repairs must continue from that state. "
-        "Use a fresh observation and patch or resume code as current-state recovery; do "
+        f"{current_state_recovery}"
         "not assume earlier robot actions can be undone or replayed from their original "
         "preconditions. "
         f"{recovery_guidance}\n\n"
         "Execution constraints:\n"
-        "- Do not choose run_group, run_region, patch_group, or patch_region for units "
+        f"- Do not choose {guarded_actions} for units "
         "marked execution_state=executed_side_effect or listed in the side-effect "
         "execution ledger; rollback is unavailable and those actions will be invalid.\n"
-        "- If additional robot-side-effect motion is needed after an executed side-effect "
-        "unit, use append_recovery with a fresh-state function and continue from the "
-        "current physical state.\n\n"
+        f"{side_effect_recovery_rule}"
         f"Allowed actions: {allowed_actions_text}.\n\n"
         "Prefer run_group over run_region when effect-bounded execution units are "
         "available. A group is an effect-bounded source unit that may include setup "
-        "plus one robot side effect. Use patch_group for local repairs unless a "
-        "single atomic region is clearly self-contained.\n\n"
+        f"plus one robot side effect.{patch_preference}\n\n"
         "Respond with exactly one JSON object. Examples:\n"
         f'{{"action": "run_group", "args": {{"group_id": "{run_group_example_id}"}}}}\n'
         f'{{"action": "run_region", "args": {{"region_id": "{run_region_example_id}"}}}}\n'
         '{"action": "inspect_variables", "args": {"names": ["variable_name"]}}\n'
-        f'{{"action": "patch_group", "args": {{"group_id": "{run_group_example_id}", '
-        f'"source": "replacement Python source for the complete {run_group_example_id} '
-        'source span"}}\n'
-        f'{{"action": "patch_region", "args": {{"region_id": "{run_region_example_id}", '
-        f'"source": "replacement Python source for only {run_region_example_id}"}}\n'
+        f"{patch_examples}"
         f"{recovery_example_line}"
         "For inspect_variables, args.names must be a non-empty list of Python variable "
         "names to inspect. Do not pass region_id to inspect_variables.\n"
-        "For patch_group, args.source must be the complete replacement Python source "
-        "for only the requested source group.\n"
-        "For patch_region, args.source must be the complete replacement Python source "
-        "for only the requested source region. Do not use new_source or patch for "
-        "patch_region replacement text.\n"
+        f"{patch_rules}"
         f"{recovery_rule} "
         "Do not ask "
         "for robot primitives as tools."

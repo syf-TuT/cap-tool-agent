@@ -170,6 +170,42 @@ def test_capsule_prompt_documents_append_recovery():
     assert "current physical state" in text
 
 
+def test_capsule_prompt_omits_patch_actions_when_disabled():
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=[],
+        trace_summary={},
+        allow_patch=False,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert "patch_group" not in text
+    assert "patch_region" not in text
+    assert "local source patches" not in text
+    assert "patch or resume" not in text
+    assert '"patch_allowed"' not in text
+    assert "append_recovery" in text
+
+
+def test_capsule_prompt_omits_append_recovery_when_disabled():
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=[],
+        trace_summary={},
+        recovery_observation_functions={"get_observation"},
+        allow_append_recovery=False,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert "append_recovery" not in text
+    assert "patch_group" in text
+    assert "patch_region" in text
+
+
 def test_capsule_prompt_documents_task_specific_recovery_observation_functions():
     prompt = build_capsule_prompt(
         task="lift pot",
