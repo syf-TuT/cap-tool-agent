@@ -1,204 +1,174 @@
-# LLM-Step Action Ablation Implementation Plan
+# Cube-Stack Four-Group Ablation Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add enforceable patch and append-recovery permission switches for Capsule `llm_step`
-and ship non-VDM cube-stack A2/A3 experiment configurations.
+**Goal:** Restore the generic cube-stack prompt and provide controlled A1-A4 configurations
+covering one-shot generation and every patch/append-recovery combination.
 
-**Architecture:** Resolve two backward-compatible booleans in config loading and at the start
-of the `llm_step` loop. Pass them into prompt construction so forbidden actions are not
-advertised, and apply a loop-local policy guard before the existing safety guards so model and
-scripted actions cannot bypass the experiment condition. Keep the global runtime schema and
-`auto_forward` behavior unchanged.
+**Architecture:** Keep the existing runtime permission implementation unchanged. Use the
+ordinary code-agent path for the true one-shot A1 baseline and Capsule `llm_step` for A2-A4;
+keep all shared YAML fields byte-for-byte equivalent apart from the documented group switches
+and output paths. Lock the generic prompt and configuration matrix with regression tests.
 
 **Tech Stack:** Python 3.10-3.12, pytest, YAML, Ruff, WSL2 Ubuntu runtime.
 
 ---
 
-### Task 1: Load the permission fields
+### Task 1: Add failing prompt and configuration regressions
 
 **Files:**
 - Modify: `tests/test_runtime_control_config.py`
-- Modify: `capx/utils/launch_utils.py`
 
-**Step 1: Write the failing tests**
+**Step 1: Write the failing prompt test**
 
-Extend the default config assertion with:
+Import `PROMPT` from `capx.envs.tasks.franka.franka_pick_place` and assert exact equality with
+the original generic prompt:
 
 ```python
-assert config["capsule_llm_step_allow_patch"] is True
-assert config["capsule_llm_step_allow_append_recovery"] is True
+expected = """
+You are controlling a Franka Emika robot with FrankaControlApi.
+Goal: pick up the red cube, place it on top of the green cube, then open the gripper.
+
+Use non-privileged camera observations, SAM3 segmentation, Contact-GraspNet grasp
+planning, Pyroki IK/planning, joint motion, and gripper commands. Do not use
+privileged object-state shortcuts.
+
+Write only executable Python code. Import numpy/scipy explicitly if needed. The
+runtime-control Capsule llm_step loop may execute, inspect, and repair semantic
+source groups after the initial program is generated.
+"""
+assert PROMPT == expected
 ```
 
-Add explicit YAML values to `test_load_config_reads_compact_llm_step_prompt_fields` and assert
-that both are loaded unchanged.
+Also assert the prompt does not contain the old answer-bearing phrases `half-height`,
+`reuse the grasp quaternion`, `at least +0.2m`, or `stacking height formula`.
 
-**Step 2: Verify RED in WSL**
+**Step 2: Write the failing A1-A4 matrix test**
 
-Sync the edited test to `/home/capx/code/cap-x` and run:
+Extend the current A2/A3 YAML test to load:
+
+- `env_configs/cube_stack/franka_robosuite_cube_stack_a1_one_shot.yaml`;
+- `env_configs/cube_stack/franka_robosuite_cube_stack_capsule_llm_step_a2_no_patch.yaml`;
+- `env_configs/cube_stack/franka_robosuite_cube_stack_capsule_llm_step_a3_no_append_recovery.yaml`;
+- `env_configs/cube_stack/franka_robosuite_cube_stack_capsule_llm_step_a4_full.yaml`.
+
+Assert the exact matrix:
+
+```python
+assert (a1["agent_mode"], a1["capsule_llm_step_allow_patch"],
+        a1["capsule_llm_step_allow_append_recovery"]) == ("code", False, False)
+assert (a2["agent_mode"], a2["capsule_llm_step_allow_patch"],
+        a2["capsule_llm_step_allow_append_recovery"]) == ("capsule", False, True)
+assert (a3["agent_mode"], a3["capsule_llm_step_allow_patch"],
+        a3["capsule_llm_step_allow_append_recovery"]) == ("capsule", True, False)
+assert (a4["agent_mode"], a4["capsule_llm_step_allow_patch"],
+        a4["capsule_llm_step_allow_append_recovery"]) == ("capsule", True, True)
+```
+
+Normalize A2-A4 by removing only the two permission keys and `output_dir`, then assert equality.
+Normalize all four by additionally removing `agent_mode`, then assert equality. Keep the shared
+non-VDM, API, recording, trial-count, and worker-count assertions.
+
+**Step 3: Sync only the changed test into WSL**
+
+Copy `tests/test_runtime_control_config.py` from the Windows checkout to
+`/home/capx/code/cap-x/tests/test_runtime_control_config.py`.
+
+**Step 4: Run the test to verify RED**
+
+Run in `/home/capx/code/cap-x`:
 
 ```bash
 uv run --no-sync pytest tests/test_runtime_control_config.py -q
 ```
 
-Expected: FAIL because the merged config lacks the two keys.
+Expected: FAIL because the prompt still leaks geometric instructions and A1/A4 do not exist.
 
-**Step 3: Implement minimal config loading**
-
-Add to `merged_config`:
-
-```python
-"capsule_llm_step_allow_patch": configs_dict.get(
-    "capsule_llm_step_allow_patch", True
-),
-"capsule_llm_step_allow_append_recovery": configs_dict.get(
-    "capsule_llm_step_allow_append_recovery", True
-),
-```
-
-**Step 4: Verify GREEN**
-
-Sync `capx/utils/launch_utils.py` and rerun the focused config test. Expected: PASS.
-
-### Task 2: Filter the Capsule prompt
+### Task 2: Restore the generic task prompt
 
 **Files:**
-- Modify: `tests/test_runtime_control_prompts.py`
-- Modify: `capx/runtime_control/prompts.py`
+- Modify: `capx/envs/tasks/franka/franka_pick_place.py`
+- Test: `tests/test_runtime_control_config.py`
 
-**Step 1: Write failing prompt tests**
+**Step 1: Replace only the class-level task prompt**
 
-Add one test with `allow_patch=False` asserting that `patch_group` and `patch_region` do not
-appear anywhere in the prompt while `append_recovery` remains advertised. Add another with
-`allow_append_recovery=False` asserting the inverse. Include an API recovery function in the
-second test so omission is caused by the switch rather than unavailable API support.
+Set `PROMPT` to the exact generic text asserted in Task 1. Do not modify `ORACLE_CODE`, runtime
+control, simulator state, or API implementations.
 
-**Step 2: Verify RED**
+**Step 2: Sync the prompt module into WSL**
 
-Run:
+Copy `capx/envs/tasks/franka/franka_pick_place.py` to the matching WSL project path.
+
+**Step 3: Run the prompt test**
+
+Run the prompt regression alone. Expected: PASS while the full configuration test file remains
+RED because A1/A4 are still absent.
+
+### Task 3: Add the A1 and A4 configurations
+
+**Files:**
+- Create: `env_configs/cube_stack/franka_robosuite_cube_stack_a1_one_shot.yaml`
+- Create: `env_configs/cube_stack/franka_robosuite_cube_stack_capsule_llm_step_a4_full.yaml`
+- Review: `env_configs/cube_stack/franka_robosuite_cube_stack_capsule_llm_step_a2_no_patch.yaml`
+- Review: `env_configs/cube_stack/franka_robosuite_cube_stack_capsule_llm_step_a3_no_append_recovery.yaml`
+- Test: `tests/test_runtime_control_config.py`
+
+**Step 1: Create A1 from the shared A2/A3 structure**
+
+Use `agent_mode: code`, retain `capsule_control_mode: llm_step` and all shared Capsule fields for
+matrix comparability, and set both permissions to `false`. Do not add `multi_turn_prompt`; this
+keeps code-agent execution to one initial model generation. Give A1 a unique output directory.
+
+**Step 2: Create A4 from the same structure**
+
+Use `agent_mode: capsule`, `capsule_control_mode: llm_step`, and set both permissions to `true`.
+Give A4 a unique output directory.
+
+**Step 3: Check A2 and A3 for exact shared-field identity**
+
+Change A2/A3 only if required to make every non-group field identical to A1/A4.
+
+**Step 4: Sync all four YAML files into WSL**
+
+Copy the YAML files to `/home/capx/code/cap-x/env_configs/cube_stack/`.
+
+**Step 5: Run the focused configuration tests**
 
 ```bash
-uv run --no-sync pytest \
-  tests/test_runtime_control_prompts.py::test_capsule_prompt_omits_patch_actions_when_disabled \
-  tests/test_runtime_control_prompts.py::test_capsule_prompt_omits_append_recovery_when_disabled \
-  -q
+uv run --no-sync pytest tests/test_runtime_control_config.py -q
 ```
 
-Expected: FAIL because `build_capsule_prompt` does not accept the switches.
+Expected: PASS.
 
-**Step 3: Implement prompt filtering**
-
-Add keyword arguments defaulting to `True`. Build allowed actions, recovery guidance, examples,
-constraints, preferences, and schema rules conditionally. Pass the resolved strings through both
-the normal and compact-budget fallback prompt builders. Do not change defaults.
-
-**Step 4: Verify GREEN and prompt regression coverage**
-
-Run all of `tests/test_runtime_control_prompts.py`. Expected: PASS.
-
-### Task 3: Enforce permissions in `llm_step`
+### Task 4: Verify and commit
 
 **Files:**
-- Modify: `tests/test_runtime_control_trial_loop.py`
-- Modify: `capx/envs/trial.py`
+- Review all changed prompt, YAML, test, and plan files.
 
-**Step 1: Write failing runtime tests**
-
-Add A2 tests showing:
-
-- a scripted `patch_group` produces an `invalid` event and leaves saved source unchanged;
-- a valid `append_recovery` succeeds when patch is disabled.
-
-Add A3 tests showing:
-
-- a scripted `append_recovery` produces an `invalid` event and leaves saved source unchanged;
-- a valid `patch_group` succeeds when append recovery is disabled.
-
-Assert trace messages name the disabled configuration field. Assert step metrics contain both
-resolved permission booleans.
-
-**Step 2: Verify RED**
-
-Run the four new focused tests. Expected: FAIL because forbidden actions still execute and metric
-fields do not exist.
-
-**Step 3: Implement the minimal policy guard**
-
-Resolve both fields with `_coerce_config_bool`. Pass them into `build_capsule_prompt`. Add a
-small helper returning an `invalid` `RuntimeEvent` for disabled `patch_group`/`patch_region` or
-`append_recovery`, and invoke it before `_no_rollback_guard_event`. Record both booleans on every
-step metric.
-
-**Step 4: Verify GREEN and loop regressions**
-
-Run the new tests, then all of `tests/test_runtime_control_trial_loop.py`. Expected: PASS.
-
-### Task 4: Add runnable non-VDM A2/A3 configurations
-
-**Files:**
-- Modify: `tests/test_runtime_control_config.py`
-- Create: `env_configs/cube_stack/franka_robosuite_cube_stack_capsule_llm_step_a2_no_patch.yaml`
-- Create: `env_configs/cube_stack/franka_robosuite_cube_stack_capsule_llm_step_a3_no_append_recovery.yaml`
-
-**Step 1: Write a failing configuration-matrix test**
-
-Load both YAML files and assert:
-
-```python
-assert a2["agent_mode"] == a3["agent_mode"] == "capsule"
-assert a2["capsule_control_mode"] == a3["capsule_control_mode"] == "llm_step"
-assert (a2["capsule_llm_step_allow_patch"], a2["capsule_llm_step_allow_append_recovery"]) == (False, True)
-assert (a3["capsule_llm_step_allow_patch"], a3["capsule_llm_step_allow_append_recovery"]) == (True, False)
-assert not a2.get("use_img_differencing", False)
-assert not a3.get("use_img_differencing", False)
-```
-
-Also compare the environment, API servers, trial count, worker count, and all shared Capsule
-settings; only permissions and output paths may differ.
-
-**Step 2: Verify RED**
-
-Run the new test. Expected: FAIL because both files are absent.
-
-**Step 3: Add both YAML files**
-
-Copy the non-VDM environment and server topology from
-`env_configs/cube_stack/franka_robosuite_cube_stack.yaml`. Add Capsule `llm_step` settings, the
-A2/A3 permission matrix, explicit `use_img_differencing: false`, and distinct output paths.
-
-**Step 4: Verify GREEN**
-
-Run `tests/test_runtime_control_config.py`. Expected: PASS.
-
-### Task 5: Refactor and verify
-
-**Files:**
-- Review all changed implementation, tests, YAML, and plan files.
-
-**Step 1: Simplify without changing behavior**
-
-Remove duplicated prompt fragments where a small conditional helper improves readability. Keep
-the runtime guard local to `llm_step` and avoid adding global schema state.
-
-**Step 2: Run focused verification in WSL**
+**Step 1: Run focused tests in WSL**
 
 ```bash
-uv run --no-sync pytest \
-  tests/test_runtime_control_config.py \
-  tests/test_runtime_control_prompts.py \
-  tests/test_runtime_control_trial_loop.py -q
+uv run --no-sync pytest tests/test_runtime_control_config.py -q
+```
+
+Expected: all tests pass.
+
+**Step 2: Run lint in WSL**
+
+```bash
 uv run --no-sync ruff check \
-  capx/utils/launch_utils.py \
-  capx/runtime_control/prompts.py \
-  capx/envs/trial.py \
-  tests/test_runtime_control_config.py \
-  tests/test_runtime_control_prompts.py \
-  tests/test_runtime_control_trial_loop.py
+  capx/envs/tasks/franka/franka_pick_place.py \
+  tests/test_runtime_control_config.py
 ```
 
-Expected: all tests pass and Ruff reports no errors.
+Expected: Ruff reports no errors.
 
-**Step 3: Inspect the final diff and status**
+**Step 3: Inspect the final diff**
 
-Confirm defaults remain permissive, `auto_forward` is untouched, the two YAML files are non-VDM,
-and no unrelated files changed.
+Run `git diff --check`, inspect the complete diff, and confirm no runtime implementation or
+initial-state code changed.
+
+**Step 4: Commit the implementation**
+
+Stage only the prompt module, A1-A4 configs, regression test, and implementation plan, then
+commit with an imperative subject describing the controlled four-group ablation.
