@@ -36,6 +36,55 @@ def test_cube_stack_capsule_benchmarks_use_loose_group_cap():
         assert data["capsule_max_regions_per_group"] == 20
 
 
+def test_cube_stack_llm_step_ablation_configs_are_non_vdm_and_differ_only_by_group():
+    base = yaml.safe_load(
+        Path("env_configs/cube_stack/franka_robosuite_cube_stack.yaml").read_text()
+    )
+    a2 = yaml.safe_load(
+        Path(
+            "env_configs/cube_stack/"
+            "franka_robosuite_cube_stack_capsule_llm_step_a2_no_patch.yaml"
+        ).read_text()
+    )
+    a3 = yaml.safe_load(
+        Path(
+            "env_configs/cube_stack/"
+            "franka_robosuite_cube_stack_capsule_llm_step_a3_no_append_recovery.yaml"
+        ).read_text()
+    )
+
+    assert a2["agent_mode"] == a3["agent_mode"] == "capsule"
+    assert a2["capsule_control_mode"] == a3["capsule_control_mode"] == "llm_step"
+    assert (
+        a2["capsule_llm_step_allow_patch"],
+        a2["capsule_llm_step_allow_append_recovery"],
+    ) == (False, True)
+    assert (
+        a3["capsule_llm_step_allow_patch"],
+        a3["capsule_llm_step_allow_append_recovery"],
+    ) == (True, False)
+
+    for config in (a2, a3):
+        assert config["env"] == base["env"]
+        assert config["api_servers"] == base["api_servers"]
+        assert config["trials"] == base["trials"]
+        assert config["num_workers"] == base["num_workers"]
+        assert config["record_video"] == base["record_video"]
+        assert config["use_visual_feedback"] is False
+        assert config["use_img_differencing"] is False
+        assert config["use_video_differencing"] is False
+        assert "visual_differencing_model" not in config
+
+    ignored_keys = {
+        "capsule_llm_step_allow_patch",
+        "capsule_llm_step_allow_append_recovery",
+        "output_dir",
+    }
+    assert {key: value for key, value in a2.items() if key not in ignored_keys} == {
+        key: value for key, value in a3.items() if key not in ignored_keys
+    }
+
+
 def test_load_config_reads_capsule_fields():
     args = SimpleNamespace(
         config_path="env_configs/cube_stack/franka_robosuite_cube_stack_capsule_vdm.yaml",

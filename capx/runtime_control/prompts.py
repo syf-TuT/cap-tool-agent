@@ -219,6 +219,9 @@ def _build_capsule_prompt_text(
         id_key="group_id",
         executed_ids=set(side_effect_ledger["executed_side_effect_groups"]),
     )
+    if not allow_patch:
+        for unit_data in [*region_data, *group_data]:
+            unit_data.pop("patch_allowed", None)
     group_text = ""
     if group_data:
         group_text = (
@@ -276,6 +279,11 @@ def _build_capsule_prompt_text(
             "- Do not replay executed side-effect units; continue only with allowed actions "
             "from the current physical state.\n\n"
         )
+    action_scope = (
+        "execution, inspection, and local source patches"
+        if allow_patch
+        else "execution and inspection"
+    )
     prompt_text = (
         "Task:\n"
         f"{task}\n\n"
@@ -290,7 +298,7 @@ def _build_capsule_prompt_text(
         f"{json.dumps(side_effect_ledger, indent=2, default=str)}\n\n"
         f"{focused_source_text}"
         "Choose exactly one runtime-control action. These actions control source-code "
-        "execution, inspection, and local source patches. They do "
+        f"{action_scope}. They do "
         "not directly perform robot manipulation.\n\n"
         "Rollback is unavailable. Previously executed robot-side-effect code may have "
         "changed the current physical state, so repairs must continue from that state. "

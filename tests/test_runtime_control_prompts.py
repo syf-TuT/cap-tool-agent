@@ -183,6 +183,9 @@ def test_capsule_prompt_omits_patch_actions_when_disabled():
 
     assert "patch_group" not in text
     assert "patch_region" not in text
+    assert "local source patches" not in text
+    assert "patch or resume" not in text
+    assert '"patch_allowed"' not in text
     assert "append_recovery" in text
 
 
