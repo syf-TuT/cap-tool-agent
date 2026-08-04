@@ -202,4 +202,3 @@ Expected: all tests pass and Ruff reports no errors.
 
 Confirm defaults remain permissive, `auto_forward` is untouched, the two YAML files are non-VDM,
 and no unrelated files changed.
-

@@ -73,4 +73,3 @@ Tests cover:
 - continued execution of the action family that remains enabled in A2 and A3;
 - step-metric permission fields;
 - YAML group identity, non-VDM settings, and the exact A2/A3 permission matrix.
-
