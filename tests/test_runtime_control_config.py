@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import yaml
 
+from capx.envs.tasks.franka.franka_pick_place import PROMPT
 from capx.utils.launch_utils import _load_config
 
 
@@ -36,9 +37,38 @@ def test_cube_stack_capsule_benchmarks_use_loose_group_cap():
         assert data["capsule_max_regions_per_group"] == 20
 
 
-def test_cube_stack_llm_step_ablation_configs_are_non_vdm_and_differ_only_by_group():
+def test_cube_stack_prompt_matches_original_generic_experiment_prompt():
+    expected = """
+You are controlling a Franka Emika robot with FrankaControlApi.
+Goal: pick up the red cube, place it on top of the green cube, then open the gripper.
+
+Use non-privileged camera observations, SAM3 segmentation, Contact-GraspNet grasp
+planning, Pyroki IK/planning, joint motion, and gripper commands. Do not use
+privileged object-state shortcuts.
+
+Write only executable Python code. Import numpy/scipy explicitly if needed. The
+runtime-control Capsule llm_step loop may execute, inspect, and repair semantic
+source groups after the initial program is generated.
+"""
+
+    assert PROMPT == expected
+    for leaked_instruction in (
+        "half-height",
+        "reuse the grasp quaternion",
+        "at least +0.2m",
+        "stacking height formula",
+    ):
+        assert leaked_instruction not in PROMPT
+
+
+def test_cube_stack_action_ablation_configs_form_controlled_a1_a4_matrix():
     base = yaml.safe_load(
         Path("env_configs/cube_stack/franka_robosuite_cube_stack.yaml").read_text()
+    )
+    a1 = yaml.safe_load(
+        Path(
+            "env_configs/cube_stack/franka_robosuite_cube_stack_a1_one_shot.yaml"
+        ).read_text()
     )
     a2 = yaml.safe_load(
         Path(
@@ -52,19 +82,31 @@ def test_cube_stack_llm_step_ablation_configs_are_non_vdm_and_differ_only_by_gro
             "franka_robosuite_cube_stack_capsule_llm_step_a3_no_append_recovery.yaml"
         ).read_text()
     )
+    a4 = yaml.safe_load(
+        Path(
+            "env_configs/cube_stack/"
+            "franka_robosuite_cube_stack_capsule_llm_step_a4_full.yaml"
+        ).read_text()
+    )
 
-    assert a2["agent_mode"] == a3["agent_mode"] == "capsule"
-    assert a2["capsule_control_mode"] == a3["capsule_control_mode"] == "llm_step"
-    assert (
-        a2["capsule_llm_step_allow_patch"],
-        a2["capsule_llm_step_allow_append_recovery"],
-    ) == (False, True)
-    assert (
-        a3["capsule_llm_step_allow_patch"],
-        a3["capsule_llm_step_allow_append_recovery"],
-    ) == (True, False)
+    configs = (a1, a2, a3, a4)
+    assert [
+        (
+            config["agent_mode"],
+            config["capsule_llm_step_allow_patch"],
+            config["capsule_llm_step_allow_append_recovery"],
+        )
+        for config in configs
+    ] == [
+        ("code", False, False),
+        ("capsule", False, True),
+        ("capsule", True, False),
+        ("capsule", True, True),
+    ]
+    assert all(config["capsule_control_mode"] == "llm_step" for config in configs)
+    assert "multi_turn_prompt" not in a1["env"]["cfg"]
 
-    for config in (a2, a3):
+    for config in configs:
         assert config["env"] == base["env"]
         assert config["api_servers"] == base["api_servers"]
         assert config["trials"] == base["trials"]
@@ -75,14 +117,26 @@ def test_cube_stack_llm_step_ablation_configs_are_non_vdm_and_differ_only_by_gro
         assert config["use_video_differencing"] is False
         assert "visual_differencing_model" not in config
 
-    ignored_keys = {
+    group_keys = {
         "capsule_llm_step_allow_patch",
         "capsule_llm_step_allow_append_recovery",
         "output_dir",
     }
-    assert {key: value for key, value in a2.items() if key not in ignored_keys} == {
-        key: value for key, value in a3.items() if key not in ignored_keys
-    }
+    normalized_capsule_configs = [
+        {key: value for key, value in config.items() if key not in group_keys}
+        for config in (a2, a3, a4)
+    ]
+    assert all(
+        config == normalized_capsule_configs[0]
+        for config in normalized_capsule_configs[1:]
+    )
+
+    all_group_keys = group_keys | {"agent_mode"}
+    normalized_configs = [
+        {key: value for key, value in config.items() if key not in all_group_keys}
+        for config in configs
+    ]
+    assert all(config == normalized_configs[0] for config in normalized_configs[1:])
 
 
 def test_load_config_reads_capsule_fields():

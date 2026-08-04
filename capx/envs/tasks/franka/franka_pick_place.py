@@ -1,18 +1,16 @@
 from capx.envs.tasks.base import CodeExecutionEnvBase
 
 PROMPT = """
-You are controlling a Franka Emika robot with the API described below.
-Goal: Pick up the red cube and gently stack it on top of the green cube, then release it.
+You are controlling a Franka Emika robot with FrankaControlApi.
+Goal: pick up the red cube, place it on top of the green cube, then open the gripper.
 
-Key rules:
-- The extent from get_object_pose(..., return_bbox_extent=True) is the FULL side length. Use extent[2]/2 for half-height.
-- For placement orientation, reuse the grasp quaternion from sample_grasp_pose. Do NOT use the quaternion from get_object_pose (it is unreliable for orientation).
-- Always use z_approach=0.1 when approaching an object for grasping or placing.
-- After grasping, lift the cube to a safe height (at least +0.2m in Z) before moving laterally to the placement location.
-- The stacking height formula is: place_z = green_center_z + green_extent[2]/2 + red_extent[2]/2
-- Nothing should be dropped from a height. Always approach with z_approach for controlled descent.
+Use non-privileged camera observations, SAM3 segmentation, Contact-GraspNet grasp
+planning, Pyroki IK/planning, joint motion, and gripper commands. Do not use
+privileged object-state shortcuts.
 
-Write ONLY executable Python code (no code fences). Import numpy if needed.
+Write only executable Python code. Import numpy/scipy explicitly if needed. The
+runtime-control Capsule llm_step loop may execute, inspect, and repair semantic
+source groups after the initial program is generated.
 """
 ORACLE_CODE = """
 import numpy as np
