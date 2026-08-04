@@ -173,6 +173,12 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "capsule_llm_step_compact_context": configs_dict.get(
             "capsule_llm_step_compact_context", True
         ),
+        "capsule_llm_step_allow_patch": configs_dict.get(
+            "capsule_llm_step_allow_patch", True
+        ),
+        "capsule_llm_step_allow_append_recovery": configs_dict.get(
+            "capsule_llm_step_allow_append_recovery", True
+        ),
         "capsule_action_history_max_entries": configs_dict.get(
             "capsule_action_history_max_entries", 4
         ),

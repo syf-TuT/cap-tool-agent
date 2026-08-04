@@ -1763,6 +1763,142 @@ def test_capsule_trial_patches_group_and_regroups(tmp_path):
     assert 'RESULT = "patched"' in patched_source
 
 
+def test_capsule_llm_step_a2_rejects_patch_group_and_records_permissions(tmp_path):
+    source = "x = 1\nRESULT = x\n"
+    summary = _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "capsule_control_mode": "llm_step",
+            "capsule_llm_step_allow_patch": False,
+            "capsule_llm_step_allow_append_recovery": True,
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code=source,
+        scripted_actions=[
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": "x = 2\nRESULT = x"},
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_01.jsonl")
+
+    assert summary.sandbox_rc == 1
+    assert trace[0]["event"]["status"] == "invalid"
+    assert "capsule_llm_step_allow_patch" in trace[0]["event"]["message"]
+    assert Path(summary.code_path).read_text() == source
+    assert metrics[0]["llm_step_allow_patch"] is False
+    assert metrics[0]["llm_step_allow_append_recovery"] is True
+
+
+def test_capsule_llm_step_a2_allows_append_recovery(tmp_path):
+    summary = _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "capsule_control_mode": "llm_step",
+            "capsule_llm_step_allow_patch": False,
+            "capsule_llm_step_allow_append_recovery": True,
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {"source": "obs = get_observation()"},
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 0
+    assert [entry["event"]["action"] for entry in trace] == ["append_recovery", "finish"]
+    assert all(entry["event"]["status"] == "success" for entry in trace)
+    assert "obs = get_observation()" in Path(summary.code_path).read_text()
+
+
+def test_capsule_llm_step_a3_rejects_append_recovery_and_records_permissions(tmp_path):
+    source = "x = 1\n"
+    summary = _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "capsule_control_mode": "llm_step",
+            "capsule_llm_step_allow_patch": True,
+            "capsule_llm_step_allow_append_recovery": False,
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code=source,
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {"source": "obs = get_observation()"},
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_01.jsonl")
+
+    assert summary.sandbox_rc == 1
+    assert trace[0]["event"]["status"] == "invalid"
+    assert "capsule_llm_step_allow_append_recovery" in trace[0]["event"]["message"]
+    assert Path(summary.code_path).read_text() == source
+    assert metrics[0]["llm_step_allow_patch"] is True
+    assert metrics[0]["llm_step_allow_append_recovery"] is False
+
+
+def test_capsule_llm_step_a3_allows_patch_group(tmp_path):
+    summary = _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "capsule_control_mode": "llm_step",
+            "capsule_llm_step_allow_patch": True,
+            "capsule_llm_step_allow_append_recovery": False,
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code="x = 1\nRESULT = x\n",
+        scripted_actions=[
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": "x = 2\nRESULT = x"},
+            },
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 0
+    assert trace[0]["event"]["status"] == "success"
+    assert "x = 2" in Path(summary.code_path).read_text()
+
+
 def test_capsule_repairs_invalid_initial_source_with_patch_group(tmp_path):
     summary = _run_capsule_trial(
         env=FakeCapsuleEnv(),

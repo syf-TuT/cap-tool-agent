@@ -69,6 +69,8 @@ def test_load_config_reads_capsule_fields():
     assert config["capsule_execution_granularity"] == "semantic_group"
     assert config["capsule_max_regions_per_group"] == 20
     assert config["capsule_llm_step_compact_context"] is True
+    assert config["capsule_llm_step_allow_patch"] is True
+    assert config["capsule_llm_step_allow_append_recovery"] is True
     assert config["capsule_action_history_max_entries"] == 4
     assert config["capsule_action_trace_max_events"] == 5
     assert config["capsule_action_source_preview_chars"] == 240
@@ -232,6 +234,8 @@ env:
 trials: 1
 agent_mode: capsule
 capsule_llm_step_compact_context: false
+capsule_llm_step_allow_patch: false
+capsule_llm_step_allow_append_recovery: false
 capsule_action_history_max_entries: 2
 capsule_action_trace_max_events: 3
 capsule_action_source_preview_chars: 80
@@ -264,6 +268,8 @@ capsule_action_prompt_char_budget: 12000
     _, config, _ = _load_config(args)
 
     assert config["capsule_llm_step_compact_context"] is False
+    assert config["capsule_llm_step_allow_patch"] is False
+    assert config["capsule_llm_step_allow_append_recovery"] is False
     assert config["capsule_action_history_max_entries"] == 2
     assert config["capsule_action_trace_max_events"] == 3
     assert config["capsule_action_source_preview_chars"] == 80
