@@ -158,3 +158,85 @@ def test_contract_types_are_exported_from_runtime_control_package():
         runtime_control.analyze_capsule_program_contract
         is analyze_capsule_program_contract
     )
+
+
+def test_duplicate_helper_definitions_do_not_hide_an_effectful_definition():
+    source = """\
+def move():
+    close_gripper()
+move()
+def move():
+    pass
+"""
+
+    violations = _analyze(source)
+
+    effectful_helpers = [
+        violation
+        for violation in violations
+        if violation.code == "effectful_helper"
+    ]
+    assert len(effectful_helpers) == 1
+    assert effectful_helpers[0].helper_name == "move"
+    assert effectful_helpers[0].start_line == 1
+    assert effectful_helpers[0].side_effect_calls == ("close_gripper",)
+
+
+def test_called_nested_helper_propagates_effect_to_its_top_level_helper():
+    source = """\
+def outer():
+    def nested():
+        close_gripper()
+    nested()
+outer()
+"""
+
+    violations = _analyze(source)
+
+    assert {
+        violation.helper_name
+        for violation in violations
+        if violation.code == "effectful_helper"
+    } == {"outer"}
+
+
+def test_function_definition_time_expressions_count_effect_occurrences():
+    source = """\
+@register(open_gripper())
+def prepare(a=close_gripper(), *, target=goto_pose([0, 0, 0], [1, 0, 0, 0])):
+    pass
+"""
+
+    violations = _analyze(source)
+
+    repeated = [
+        violation
+        for violation in violations
+        if violation.code == "multiple_effects_in_group"
+    ]
+    assert len(repeated) == 1
+    assert repeated[0].side_effect_calls == (
+        "open_gripper",
+        "close_gripper",
+        "goto_pose",
+    )
+
+
+def test_transitive_helper_effect_expansion_is_saturated():
+    definitions = ["def helper_0():\n    goto_pose(target, orientation)"]
+    for index in range(1, 11):
+        definitions.append(
+            f"def helper_{index}():\n"
+            f"    helper_{index - 1}()\n"
+            f"    helper_{index - 1}()"
+        )
+    source = "\n".join([*definitions, "helper_10()", ""])
+
+    violations = _analyze(source)
+
+    assert any(
+        violation.code == "multiple_effects_in_group"
+        and violation.side_effect_calls == ("goto_pose", "goto_pose")
+        for violation in violations
+    )
+    assert all(len(violation.side_effect_calls) <= 2 for violation in violations)
