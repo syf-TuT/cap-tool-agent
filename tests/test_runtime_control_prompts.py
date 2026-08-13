@@ -1,6 +1,7 @@
 import json
 
 from capx.runtime_control.prompts import (
+    _summarize_history_for_prompt,
     build_capsule_prompt,
     build_capsule_recovery_prompt,
     build_capsule_terminal_recovery_prompt,
@@ -455,6 +456,107 @@ def test_capsule_prompt_compact_history_bounds_inspected_variable_summaries():
     assert "base64," not in text
     assert "R" * 300 not in text
     assert len(text) < 20000
+
+
+def test_compact_history_bounds_all_text_and_primitive_call_lists():
+    payload = "data:image/png;base64," + "A" * 10000
+    history = [
+        {
+            "step_id": "S" * 1000,
+            "action": {
+                "action": "inspect_trace" + "X" * 1000,
+                "args": {"group_id": "G" * 1000},
+            },
+            "event": {
+                "status": "failed" + "Y" * 1000,
+                "message": "event failed: " + payload,
+                "evidence": {
+                    "exception_type": "VeryLongError" * 1000,
+                    "source": "FULL_SOURCE_MUST_NOT_APPEAR",
+                },
+            },
+            "feedback": {
+                "status": "warning" + "Z" * 1000,
+                "message": "feedback failed: " + payload,
+                "evidence": {
+                    "primitive_calls": ["primitive_" + str(index) + "P" * 1000 for index in range(500)],
+                },
+            },
+        }
+    ]
+
+    summary = _summarize_history_for_prompt(history, max_entries=1)[0]
+
+    assert len(summary["step_id"]) <= 120
+    assert len(summary["action"]) <= 120
+    assert len(summary["unit_id"]) <= 120
+    assert len(summary["status"]) <= 120
+    assert len(summary["event_status"]) <= 120
+    assert len(summary["feedback_status"]) <= 120
+    assert len(summary["message"]) <= 240
+    assert summary["message"].startswith("feedback failed:")
+    assert len(summary["exception_type"]) <= 120
+    assert len(summary["primitive_calls"]) <= 8
+    assert all(len(name) <= 80 for name in summary["primitive_calls"])
+    serialized = json.dumps(summary)
+    assert "data:image" not in serialized
+    assert "base64," not in serialized
+    assert "FULL_SOURCE_MUST_NOT_APPEAR" not in serialized
+    assert "A" * 300 not in serialized
+
+
+def test_capsule_prompt_compact_second_fallback_respects_serialized_budget():
+    payload = "data:image/png;base64," + "A" * 10000
+    history = []
+    for step_id in range(8):
+        feedback = {
+            "status": "warning",
+            "evidence": {
+                "primitive_calls": [
+                    f"primitive_{step_id}_{index}_" + "P" * 1000
+                    for index in range(500)
+                ],
+                "source": "FULL_FEEDBACK_SOURCE_MUST_NOT_APPEAR",
+            },
+        }
+        if step_id == 6:
+            feedback["message"] = "feedback failed: " + payload
+        history.append(
+            {
+                "step_id": step_id,
+                "action": {"action": "run_group", "args": {"group_id": "G" * 1000}},
+                "event": {
+                    "action": "run_group",
+                    "status": "success",
+                    "message": "event failed: " + payload,
+                    "evidence": {
+                        "exception_type": "VeryLongError" * 1000,
+                        "source": "FULL_EVENT_SOURCE_MUST_NOT_APPEAR",
+                    },
+                },
+                "feedback": feedback,
+            }
+        )
+
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=history,
+        trace_summary={},
+        compact_context=True,
+        prompt_char_budget=6500,
+    )
+
+    serialized = json.dumps(prompt, default=str)
+
+    assert len(serialized) <= 6500
+    assert "feedback failed:" in serialized
+    assert "event failed:" in serialized
+    assert "data:image" not in serialized
+    assert "base64," not in serialized
+    assert "FULL_FEEDBACK_SOURCE_MUST_NOT_APPEAR" not in serialized
+    assert "FULL_EVENT_SOURCE_MUST_NOT_APPEAR" not in serialized
+    assert "A" * 300 not in serialized
 
 
 def test_capsule_prompt_compact_context_includes_focused_failed_unit_source():

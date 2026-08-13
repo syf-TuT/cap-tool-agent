@@ -17,6 +17,10 @@ _HISTORY_INSPECT_MAX_LIST_ITEMS = 32
 _HISTORY_INSPECT_MAX_MAPPING_ITEMS = 8
 _HISTORY_INSPECT_MAX_DEPTH = 3
 _HISTORY_INSPECT_VALUE_KEYS = ("type", "shape", "value", "repr")
+_HISTORY_SCALAR_MAX_CHARS = 120
+_HISTORY_MESSAGE_MAX_CHARS = 240
+_HISTORY_PRIMITIVE_MAX_ITEMS = 8
+_HISTORY_PRIMITIVE_NAME_MAX_CHARS = 80
 _STRICT_CAPSULE_SOURCE_CONSTRAINTS = (
     "Strict Python subset for every generated or patched source:\n"
     "- Use no imports, classes, lambdas, try, while, async, dynamic or reflective "
@@ -743,22 +747,57 @@ def _primitive_calls_from_history(entry: dict[str, Any]) -> list[str]:
     if isinstance(feedback, dict):
         evidence = feedback.get("evidence")
         if isinstance(evidence, dict) and isinstance(evidence.get("primitive_calls"), list):
-            return [str(name) for name in evidence["primitive_calls"]]
+            return _bound_history_text_list(
+                evidence["primitive_calls"],
+                max_items=_HISTORY_PRIMITIVE_MAX_ITEMS,
+                max_chars=_HISTORY_PRIMITIVE_NAME_MAX_CHARS,
+            )
     trace_events = entry.get("trace_events")
     if isinstance(trace_events, list):
-        return [
-            str(event["name"])
-            for event in trace_events
-            if isinstance(event, dict) and "name" in event
-        ]
+        return _bound_history_text_list(
+            [event.get("name") for event in trace_events if isinstance(event, dict)],
+            max_items=_HISTORY_PRIMITIVE_MAX_ITEMS,
+            max_chars=_HISTORY_PRIMITIVE_NAME_MAX_CHARS,
+        )
     return []
 
 
 def _truncate_history_text(value: str, *, max_chars: int) -> str:
+    lowered = value.casefold()
+    binary_offsets = [
+        offset for offset in (lowered.find("data:"), lowered.find("base64,")) if offset >= 0
+    ]
+    if binary_offsets:
+        value = f"{value[: min(binary_offsets)]}<redacted binary data>"
     if len(value) <= max_chars:
         return value
     suffix = "...<truncated>"
     return value[: max(0, max_chars - len(suffix))] + suffix
+
+
+def _bound_history_scalar(value: Any, *, max_chars: int = _HISTORY_SCALAR_MAX_CHARS) -> Any:
+    if value is None or isinstance(value, (bool, float)):
+        return value
+    if isinstance(value, int):
+        return value if value.bit_length() <= 256 else "<large integer>"
+    if isinstance(value, str):
+        return _truncate_history_text(value, max_chars=max_chars)
+    return None
+
+
+def _bound_history_text_list(
+    values: Any,
+    *,
+    max_items: int,
+    max_chars: int,
+) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    return [
+        _truncate_history_text(value, max_chars=max_chars)
+        for value in islice(values, max_items)
+        if isinstance(value, str)
+    ]
 
 
 def _bound_history_runtime_value(value: Any, *, depth: int) -> Any:
@@ -767,9 +806,6 @@ def _bound_history_runtime_value(value: Any, *, depth: int) -> Any:
     if isinstance(value, int):
         return value if value.bit_length() <= 256 else "<large integer>"
     if isinstance(value, str):
-        lowered = value.casefold()
-        if lowered.startswith("data:") or "base64," in lowered:
-            return "<redacted binary data>"
         return _truncate_history_text(value, max_chars=_HISTORY_INSPECT_MAX_TEXT_CHARS)
     if depth >= _HISTORY_INSPECT_MAX_DEPTH:
         return "<max depth>"
@@ -826,18 +862,29 @@ def _summarize_history_for_prompt(
         feedback_status = feedback.get("status")
         action_name = action.get("action") or event.get("action")
         summary = {
-            "step_id": entry.get("step_id"),
-            "action": action_name,
-            "unit_id": _action_unit_id(action, event, feedback),
-            "status": feedback_status or event_status,
-            "event_status": event_status,
-            "feedback_status": feedback_status,
-            "message": feedback.get("message") or event.get("message"),
-            "exception_type": evidence.get("exception_type"),
-            "reward_before": _history_state_value(entry, "state_before", "reward"),
-            "reward_after": _history_state_value(entry, "state_after", "reward"),
-            "task_completed_before": _history_state_value(entry, "state_before", "task_completed"),
-            "task_completed_after": _history_state_value(entry, "state_after", "task_completed"),
+            "step_id": _bound_history_scalar(entry.get("step_id")),
+            "action": _bound_history_scalar(action_name),
+            "unit_id": _bound_history_scalar(_action_unit_id(action, event, feedback)),
+            "status": _bound_history_scalar(feedback_status or event_status),
+            "event_status": _bound_history_scalar(event_status),
+            "feedback_status": _bound_history_scalar(feedback_status),
+            "message": _bound_history_scalar(
+                feedback.get("message") or event.get("message"),
+                max_chars=_HISTORY_MESSAGE_MAX_CHARS,
+            ),
+            "exception_type": _bound_history_scalar(evidence.get("exception_type")),
+            "reward_before": _bound_history_scalar(
+                _history_state_value(entry, "state_before", "reward")
+            ),
+            "reward_after": _bound_history_scalar(
+                _history_state_value(entry, "state_after", "reward")
+            ),
+            "task_completed_before": _bound_history_scalar(
+                _history_state_value(entry, "state_before", "task_completed")
+            ),
+            "task_completed_after": _bound_history_scalar(
+                _history_state_value(entry, "state_after", "task_completed")
+            ),
             "primitive_calls": _primitive_calls_from_history(entry),
         }
         if feedback_evidence.get("terminal_progress_unverified") is True:
