@@ -6,6 +6,75 @@ import yaml
 from capx.utils.launch_utils import _load_config
 
 
+def _args_for_config(path):
+    return SimpleNamespace(
+        config_path=str(path),
+        total_trials=None,
+        num_workers=None,
+        record_video=None,
+        output_dir=None,
+        use_oracle_code=None,
+        use_visual_feedback=None,
+        use_img_differencing=None,
+        use_video_differencing=None,
+        use_wrist_camera=None,
+        use_parallel_ensemble=None,
+        use_multimodel=None,
+        web_ui=None,
+        web_ui_port=None,
+        server_url="http://127.0.0.1:8110/chat/completions",
+        visual_differencing_model="google/gemini-3.1-pro-preview",
+        visual_differencing_model_server_url="http://127.0.0.1:8110/chat/completions",
+        visual_differencing_model_api_key=None,
+    )
+
+
+def test_load_config_reads_libero_capsule_capabilities(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+env:
+  _target_: tests.fake.Env
+agent_mode: capsule
+capsule_progress_mode: sparse_terminal
+capsule_require_task_success_for_finish: true
+capsule_validate_program_contract: true
+capsule_action_visual_feedback: true
+capsule_prompt_state_level: proprioceptive
+capsule_diagnostic_state_level: full
+"""
+    )
+
+    _, config, _ = _load_config(_args_for_config(config_path))
+
+    assert config["capsule_progress_mode"] == "sparse_terminal"
+    assert config["capsule_require_task_success_for_finish"] is True
+    assert config["capsule_validate_program_contract"] is True
+    assert config["capsule_action_visual_feedback"] is True
+    assert config["capsule_prompt_state_level"] == "proprioceptive"
+    assert config["capsule_diagnostic_state_level"] == "full"
+
+
+def test_load_config_defaults_preserve_existing_capsule_behavior(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+env:
+  _target_: tests.fake.Env
+agent_mode: capsule
+"""
+    )
+
+    _, config, _ = _load_config(_args_for_config(config_path))
+
+    assert config["capsule_progress_mode"] == "dense"
+    assert config["capsule_require_task_success_for_finish"] is False
+    assert config["capsule_validate_program_contract"] is False
+    assert config["capsule_action_visual_feedback"] is False
+    assert config["capsule_prompt_state_level"] == "full"
+    assert config["capsule_diagnostic_state_level"] == "none"
+
+
 def test_capsule_yaml_uses_code_primitives_not_robot_tools():
     data = yaml.safe_load(
         Path("env_configs/cube_stack/franka_robosuite_cube_stack_capsule_vdm.yaml").read_text()

@@ -185,6 +185,20 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "capsule_action_prompt_char_budget": configs_dict.get(
             "capsule_action_prompt_char_budget", 60000
         ),
+        "capsule_progress_mode": configs_dict.get("capsule_progress_mode", "dense"),
+        "capsule_require_task_success_for_finish": configs_dict.get(
+            "capsule_require_task_success_for_finish", False
+        ),
+        "capsule_validate_program_contract": configs_dict.get(
+            "capsule_validate_program_contract", False
+        ),
+        "capsule_action_visual_feedback": configs_dict.get(
+            "capsule_action_visual_feedback", False
+        ),
+        "capsule_prompt_state_level": configs_dict.get("capsule_prompt_state_level", "full"),
+        "capsule_diagnostic_state_level": configs_dict.get(
+            "capsule_diagnostic_state_level", "none"
+        ),
         "capsule_execution_granularity": configs_dict.get(
             "capsule_execution_granularity", "semantic_group"
         ),
