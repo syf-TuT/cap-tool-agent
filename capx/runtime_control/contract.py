@@ -43,7 +43,9 @@ class ProgramContractAnalysis:
 
 
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
+_CallableNode = _FunctionNode | ast.Lambda
 _EFFECT_SUMMARY_LIMIT = 2
+_DYNAMIC_EFFECT_MARKER = "dynamic_effect_call"
 
 
 @dataclass(frozen=True)
@@ -51,7 +53,18 @@ class _CallOccurrence:
     name: str
     is_direct_name: bool
     line: int
+    end_line: int
     column: int
+    dynamic_code: str | None = None
+
+
+@dataclass(frozen=True)
+class _AliasBinding:
+    line: int
+    column: int
+    target_name: str | None = None
+    target_definition_id: int | None = None
+    is_dynamic: bool = False
 
 
 @dataclass
@@ -59,12 +72,15 @@ class _Scope:
     scope_id: int
     parent_scope_id: int | None
     bindings: dict[str, list[int]] = field(default_factory=dict)
+    aliases: dict[str, list[_AliasBinding]] = field(default_factory=dict)
+    dynamic_callable_names: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
 class _Definition:
     definition_id: int
-    node: _FunctionNode
+    node: _CallableNode
+    name: str
     defining_scope_id: int
     body_scope_id: int
     is_top_level: bool
@@ -81,9 +97,12 @@ class _DefinitionGraph:
 @dataclass(frozen=True)
 class _ResolvedCall:
     line: int
+    end_line: int
     column: int
     effect_name: str | None = None
     target_definition_ids: tuple[int, ...] = ()
+    via_alias: bool = False
+    dynamic_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +157,16 @@ def analyze_capsule_program_contract_details(
         definition_summaries,
         regions=regions,
         groups=groups,
+    )
+    violations.extend(
+        _call_contract_violations(
+            graph,
+            definition_analyses,
+            definition_summaries,
+            module_calls=module_calls,
+            regions=regions,
+            groups=groups,
+        )
     )
     violations.extend(
         _control_flow_violations(
@@ -197,6 +226,11 @@ class _DefinitionGraphBuilder:
             defining_scope_id=module_scope_id,
             is_top_level=True,
         )
+        self._register_aliases(
+            module.body,
+            scope_id=module_scope_id,
+            is_top_level=True,
+        )
         return _DefinitionGraph(
             module_scope_id=module_scope_id,
             scopes=self._scopes,
@@ -228,9 +262,13 @@ class _DefinitionGraphBuilder:
             self._definitions[definition_id] = _Definition(
                 definition_id=definition_id,
                 node=node,
+                name=node.name,
                 defining_scope_id=defining_scope_id,
                 body_scope_id=body_scope_id,
                 is_top_level=is_top_level,
+            )
+            self._scopes[body_scope_id].dynamic_callable_names.update(
+                _argument_names(node.args)
             )
             self._scopes[defining_scope_id].bindings.setdefault(
                 node.name, []
@@ -247,7 +285,66 @@ class _DefinitionGraphBuilder:
                 defining_scope_id=definition.body_scope_id,
                 is_top_level=False,
             )
+            self._register_aliases(
+                definition.node.body,
+                scope_id=definition.body_scope_id,
+                is_top_level=False,
+            )
         return definition_ids
+
+    def _register_aliases(
+        self,
+        statements: list[ast.stmt],
+        *,
+        scope_id: int,
+        is_top_level: bool,
+    ) -> None:
+        for name, value, line, column in _collect_scope_alias_assignments(statements):
+            target_definition_id: int | None = None
+            target_name: str | None = None
+            if isinstance(value, ast.Name):
+                target_name = value.id
+            elif isinstance(value, ast.Lambda):
+                target_definition_id = self._register_lambda(
+                    value,
+                    name=name,
+                    defining_scope_id=scope_id,
+                    is_top_level=is_top_level,
+                )
+            is_dynamic = not isinstance(value, (ast.Name, ast.Lambda))
+            self._scopes[scope_id].aliases.setdefault(name, []).append(
+                _AliasBinding(
+                    line=line,
+                    column=column,
+                    target_name=target_name,
+                    target_definition_id=target_definition_id,
+                    is_dynamic=is_dynamic,
+                )
+            )
+
+    def _register_lambda(
+        self,
+        node: ast.Lambda,
+        *,
+        name: str,
+        defining_scope_id: int,
+        is_top_level: bool,
+    ) -> int:
+        definition_id = self._next_definition_id
+        self._next_definition_id += 1
+        body_scope_id = self._new_scope(parent_scope_id=defining_scope_id)
+        self._definitions[definition_id] = _Definition(
+            definition_id=definition_id,
+            node=node,
+            name=name,
+            defining_scope_id=defining_scope_id,
+            body_scope_id=body_scope_id,
+            is_top_level=is_top_level,
+        )
+        self._scopes[body_scope_id].dynamic_callable_names.update(
+            _argument_names(node.args)
+        )
+        return definition_id
 
 
 def _collect_scope_function_definitions(
@@ -257,6 +354,22 @@ def _collect_scope_function_definitions(
     for statement in statements:
         visitor.visit(statement)
     return visitor.functions
+
+
+def _argument_names(arguments: ast.arguments) -> set[str]:
+    names = {
+        argument.arg
+        for argument in (
+            *arguments.posonlyargs,
+            *arguments.args,
+            *arguments.kwonlyargs,
+        )
+    }
+    if arguments.vararg is not None:
+        names.add(arguments.vararg.arg)
+    if arguments.kwarg is not None:
+        names.add(arguments.kwarg.arg)
+    return names
 
 
 class _ScopeFunctionDefinitionVisitor(ast.NodeVisitor):
@@ -276,6 +389,51 @@ class _ScopeFunctionDefinitionVisitor(ast.NodeVisitor):
         return
 
 
+def _collect_scope_alias_assignments(
+    statements: list[ast.stmt],
+) -> list[tuple[str, ast.expr | None, int, int]]:
+    visitor = _ScopeAliasAssignmentVisitor()
+    for statement in statements:
+        visitor.visit(statement)
+    return sorted(visitor.assignments, key=lambda item: (item[2], item[3], item[0]))
+
+
+class _ScopeAliasAssignmentVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.assignments: list[tuple[str, ast.expr | None, int, int]] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                self.assignments.append(
+                    (target.id, node.value, node.lineno, node.col_offset)
+                )
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if isinstance(node.target, ast.Name):
+            self.assignments.append(
+                (node.target.id, node.value, node.lineno, node.col_offset)
+            )
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        if isinstance(node.target, ast.Name):
+            self.assignments.append(
+                (node.target.id, None, node.lineno, node.col_offset)
+            )
+
+
 def _analyze_definitions(
     graph: _DefinitionGraph,
     *,
@@ -285,7 +443,7 @@ def _analyze_definitions(
         definition_id: _DefinitionAnalysis(
             calls=tuple(
                 _resolve_calls(
-                    _collect_calls(definition.node.body),
+                    _collect_calls(_definition_body_nodes(definition.node)),
                     graph,
                     scope_id=definition.body_scope_id,
                     side_effect_calls=side_effect_calls,
@@ -294,6 +452,12 @@ def _analyze_definitions(
         )
         for definition_id, definition in graph.definitions.items()
     }
+
+
+def _definition_body_nodes(node: _CallableNode) -> list[ast.stmt | ast.expr]:
+    if isinstance(node, ast.Lambda):
+        return [node.body]
+    return list(node.body)
 
 
 def _resolve_calls(
@@ -305,27 +469,124 @@ def _resolve_calls(
 ) -> list[_ResolvedCall]:
     resolved: list[_ResolvedCall] = []
     for call in calls:
-        if call.name in side_effect_calls:
+        if call.dynamic_code is not None:
             resolved.append(
                 _ResolvedCall(
                     line=call.line,
+                    end_line=call.end_line,
                     column=call.column,
-                    effect_name=call.name,
+                    effect_name=_DYNAMIC_EFFECT_MARKER,
+                    dynamic_code=call.dynamic_code,
                 )
             )
             continue
         if not call.is_direct_name:
             continue
-        targets = _resolve_binding(graph, scope_id=scope_id, name=call.name)
-        if targets:
+        effect_name, targets, via_alias, is_dynamic = _resolve_callable_binding(
+            graph,
+            scope_id=scope_id,
+            name=call.name,
+            line=call.line,
+            side_effect_calls=side_effect_calls,
+        )
+        if effect_name is not None or targets:
             resolved.append(
                 _ResolvedCall(
                     line=call.line,
+                    end_line=call.end_line,
                     column=call.column,
+                    effect_name=effect_name,
                     target_definition_ids=targets,
+                    via_alias=via_alias,
+                    dynamic_code=("dynamic_effect_call" if is_dynamic else None),
                 )
             )
     return resolved
+
+
+def _resolve_callable_binding(
+    graph: _DefinitionGraph,
+    *,
+    scope_id: int,
+    name: str,
+    line: int,
+    side_effect_calls: set[str],
+    visited: frozenset[tuple[int, str, int]] = frozenset(),
+) -> tuple[str | None, tuple[int, ...], bool, bool]:
+    binding = _resolve_alias_binding(
+        graph,
+        scope_id=scope_id,
+        name=name,
+        line=line,
+    )
+    if binding is not None:
+        marker = (scope_id, name, binding.line)
+        if marker in visited:
+            return _DYNAMIC_EFFECT_MARKER, (), True, True
+        if binding.is_dynamic:
+            return _DYNAMIC_EFFECT_MARKER, (), True, True
+        if binding.target_definition_id is not None:
+            return None, (binding.target_definition_id,), True, False
+        if binding.target_name is None:
+            return None, (), True, False
+        effect_name, targets, _, is_dynamic = _resolve_callable_binding(
+            graph,
+            scope_id=scope_id,
+            name=binding.target_name,
+            line=binding.line,
+            side_effect_calls=side_effect_calls,
+            visited=visited | {marker},
+        )
+        return effect_name, targets, True, is_dynamic
+
+    if _is_dynamic_callable_name(graph, scope_id=scope_id, name=name):
+        return _DYNAMIC_EFFECT_MARKER, (), False, True
+    if name in side_effect_calls:
+        return name, (), False, False
+    return (
+        None,
+        _resolve_binding(graph, scope_id=scope_id, name=name),
+        False,
+        False,
+    )
+
+
+def _is_dynamic_callable_name(
+    graph: _DefinitionGraph,
+    *,
+    scope_id: int,
+    name: str,
+) -> bool:
+    current_scope_id: int | None = scope_id
+    while current_scope_id is not None:
+        scope = graph.scopes[current_scope_id]
+        if name in scope.dynamic_callable_names:
+            return True
+        current_scope_id = scope.parent_scope_id
+    return False
+
+
+def _resolve_alias_binding(
+    graph: _DefinitionGraph,
+    *,
+    scope_id: int,
+    name: str,
+    line: int,
+) -> _AliasBinding | None:
+    current_scope_id: int | None = scope_id
+    maximum_line = line
+    while current_scope_id is not None:
+        scope = graph.scopes[current_scope_id]
+        applicable = [
+            binding
+            for binding in scope.aliases.get(name, ())
+            if binding.line <= maximum_line
+        ]
+        if applicable:
+            return max(applicable, key=lambda item: (item.line, item.column))
+        current_scope_id = scope.parent_scope_id
+        maximum_line = 2**31 - 1
+    return None
 
 
 def _resolve_binding(
@@ -478,20 +739,79 @@ def _helper_violations(
         effects = summaries[definition_id]
         if not effects:
             continue
-        node = graph.definitions[definition_id].node
+        definition = graph.definitions[definition_id]
+        node = definition.node
         start_line, end_line = _node_span(node)
         violations.append(
             _build_violation(
                 code="effectful_helper",
-                message=f"Helper '{node.name}' can execute a robot side effect",
+                message=(
+                    f"Helper '{definition.name}' can execute a robot side effect"
+                ),
                 start_line=start_line,
                 end_line=end_line,
                 regions=regions,
                 groups=groups,
                 side_effects=effects,
-                helper_name=node.name,
+                helper_name=definition.name,
             )
         )
+    return violations
+
+
+def _call_contract_violations(
+    graph: _DefinitionGraph,
+    analyses: dict[int, _DefinitionAnalysis],
+    summaries: dict[int, tuple[str, ...]],
+    *,
+    module_calls: list[_ResolvedCall],
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup],
+) -> list[ProgramContractViolation]:
+    root_ids = set(graph.top_level_definition_ids)
+    root_ids.update(
+        target_id
+        for call in module_calls
+        for target_id in call.target_definition_ids
+    )
+    reachable_ids = _reachable_definition_ids(tuple(sorted(root_ids)), analyses)
+    calls = list(module_calls)
+    for definition_id in reachable_ids:
+        calls.extend(analyses[definition_id].calls)
+
+    violations: list[ProgramContractViolation] = []
+    for call in calls:
+        effects = _materialize_effects([call], summaries, limit=_EFFECT_SUMMARY_LIMIT)
+        if call.dynamic_code is not None:
+            violations.append(
+                _build_violation(
+                    code=call.dynamic_code,
+                    message=(
+                        "Dynamic runtime access can bypass Capsule tracing and "
+                        "side-effect guards"
+                    ),
+                    start_line=call.line,
+                    end_line=call.end_line,
+                    regions=regions,
+                    groups=groups,
+                    side_effects=effects,
+                )
+            )
+        elif call.via_alias and effects:
+            violations.append(
+                _build_violation(
+                    code="aliased_effect_call",
+                    message=(
+                        "Callable alias can execute a robot side effect; invoke "
+                        "the public API function directly"
+                    ),
+                    start_line=call.line,
+                    end_line=call.end_line,
+                    regions=regions,
+                    groups=groups,
+                    side_effects=effects,
+                )
+            )
     return violations
 
 
@@ -516,7 +836,9 @@ def _control_flow_violations(
         definition = graph.definitions[definition_id]
         cases.extend(
             (node, definition.body_scope_id)
-            for node in _collect_control_flow_nodes(definition.node.body)
+            for node in _collect_control_flow_nodes(
+                _definition_body_nodes(definition.node)
+            )
         )
 
     violations: list[ProgramContractViolation] = []
@@ -666,7 +988,7 @@ def _extend_effects(
         destination.extend(values[:remaining])
 
 
-def _collect_calls(statements: list[ast.stmt]) -> list[_CallOccurrence]:
+def _collect_calls(statements: Iterable[ast.AST]) -> list[_CallOccurrence]:
     visitor = _ExecutableCallVisitor()
     for statement in statements:
         visitor.visit(statement)
@@ -676,6 +998,8 @@ def _collect_calls(statements: list[ast.stmt]) -> list[_CallOccurrence]:
 class _ExecutableCallVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.calls: list[_CallOccurrence] = []
+        self._dynamic_positions: set[tuple[int, int, str]] = set()
+        self._class_local_callable_names: list[set[str]] = []
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._visit_definition_time_expressions(node)
@@ -684,6 +1008,15 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
         self._visit_definition_time_expressions(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        local_names = {
+            name
+            for name, _, _, _ in _collect_scope_alias_assignments(node.body)
+        }
+        local_names.update(
+            definition.name
+            for definition in _collect_scope_function_definitions(node.body)
+        )
+        self._class_local_callable_names.append(local_names)
         for expression in sorted(
             [*node.decorator_list, *node.bases, *(item.value for item in node.keywords)],
             key=_source_position,
@@ -691,6 +1024,7 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
             self.visit(expression)
         for statement in node.body:
             self.visit(statement)
+        self._class_local_callable_names.pop()
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         for expression in sorted(
@@ -700,11 +1034,25 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
             self.visit(expression)
 
     def visit_Call(self, node: ast.Call) -> None:
-        self.visit(node.func)
         for argument in node.args:
             self.visit(argument)
         for keyword in node.keywords:
             self.visit(keyword.value)
+
+        if (
+            isinstance(node.func, ast.Name)
+            and self._class_local_callable_names
+            and node.func.id in self._class_local_callable_names[-1]
+        ):
+            self._record_dynamic(node, "dynamic_effect_call")
+            return
+
+        dynamic_code = _dynamic_call_code(node.func)
+        if dynamic_code is not None:
+            self._record_dynamic(node, dynamic_code)
+            return
+
+        self.visit(node.func)
 
         name = _callable_name(node.func)
         if name is not None:
@@ -713,9 +1061,41 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
                     name=name,
                     is_direct_name=isinstance(node.func, ast.Name),
                     line=node.lineno,
+                    end_line=int(node.end_lineno or node.lineno),
                     column=node.col_offset,
                 )
             )
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        if _is_dynamic_runtime_subscript(node):
+            self._record_dynamic(node, "dynamic_effect_call")
+            self.visit(node.slice)
+            return
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr == "__wrapped__":
+            self._record_dynamic(node, "forbidden_runtime_access")
+            return
+        self.generic_visit(node)
+
+    def _record_dynamic(self, node: ast.AST, code: str) -> None:
+        line = int(getattr(node, "lineno", 1))
+        column = int(getattr(node, "col_offset", 0))
+        key = (line, column, code)
+        if key in self._dynamic_positions:
+            return
+        self._dynamic_positions.add(key)
+        self.calls.append(
+            _CallOccurrence(
+                name=_DYNAMIC_EFFECT_MARKER,
+                is_direct_name=False,
+                line=line,
+                end_line=int(getattr(node, "end_lineno", line) or line),
+                column=column,
+                dynamic_code=code,
+            )
+        )
 
     def _visit_definition_time_expressions(self, node: _FunctionNode) -> None:
         expressions: list[ast.expr] = [
@@ -742,6 +1122,43 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
 
         for expression in sorted(expressions, key=_source_position):
             self.visit(expression)
+
+
+_FORBIDDEN_RUNTIME_CALLS = {"globals", "locals", "eval", "exec", "getattr"}
+
+
+def _dynamic_call_code(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name) and node.id in _FORBIDDEN_RUNTIME_CALLS:
+        return "forbidden_runtime_access"
+    if isinstance(node, ast.Attribute):
+        if node.attr == "__wrapped__":
+            return "forbidden_runtime_access"
+        if _contains_dynamic_runtime_root(node.value):
+            return "dynamic_effect_call"
+    if isinstance(node, ast.Subscript) and _is_dynamic_runtime_subscript(node):
+        return "dynamic_effect_call"
+    if isinstance(node, ast.Call):
+        inner_name = _callable_name(node.func)
+        if inner_name in _FORBIDDEN_RUNTIME_CALLS:
+            return "dynamic_effect_call"
+    return None
+
+
+def _is_dynamic_runtime_subscript(node: ast.Subscript) -> bool:
+    return _contains_dynamic_runtime_root(node.value)
+
+
+def _contains_dynamic_runtime_root(node: ast.AST) -> bool:
+    current = node
+    while isinstance(current, (ast.Attribute, ast.Subscript)):
+        current = current.value
+    if isinstance(current, ast.Name):
+        return current.id == "APIS"
+    return (
+        isinstance(current, ast.Call)
+        and isinstance(current.func, ast.Name)
+        and current.func.id in {"globals", "locals", "getattr"}
+    )
 
 
 def _source_position(node: ast.AST) -> tuple[int, int]:

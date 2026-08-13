@@ -24,6 +24,39 @@ def test_capsule_globals_can_bind_traced_api_functions():
     assert trace.events[0]["name"] == "get_pose"
 
 
+def test_public_capsule_globals_exclude_internal_handles_and_opaque_trace_callable():
+    env = object.__new__(CodeExecutionEnvBase)
+    env.low_level_env = object()
+    env._apis = {"fake": FakeApi()}
+
+    trace = RuntimeTrace()
+    globals_dict = env._build_capsule_globals(
+        trace=trace,
+        include_internal_handles=False,
+    )
+
+    assert set(globals_dict) == {
+        "__name__",
+        "INPUTS",
+        "RESULT",
+        "get_pose",
+    }
+    assert not hasattr(globals_dict["get_pose"], "__wrapped__")
+    assert globals_dict["get_pose"]("cube") == {"name": "cube"}
+    assert trace.events[0]["name"] == "get_pose"
+
+
+def test_legacy_capsule_globals_keep_internal_handles_by_default():
+    env = object.__new__(CodeExecutionEnvBase)
+    env.low_level_env = object()
+    env._apis = {"fake": FakeApi()}
+
+    globals_dict = env._build_capsule_globals()
+
+    assert globals_dict["env"] is env.low_level_env
+    assert globals_dict["APIS"] is env._apis
+
+
 def test_cube_lift_api_keeps_get_observation_recovery_contract():
     api = FrankaControlApi.__new__(FrankaControlApi)
     api.real = False

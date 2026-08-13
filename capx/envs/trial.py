@@ -1218,6 +1218,33 @@ def _run_capsule_trial(
     raise ValueError(f"Unsupported capsule_control_mode: {mode}")
 
 
+def _build_capsule_execution_globals(
+    env: CodeExecutionEnvBase,
+    trace: RuntimeTrace,
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a public namespace when Capsule safety boundaries are enabled."""
+    env_config = getattr(env, "cfg", None)
+    privileged = (
+        env_config.get("privileged")
+        if isinstance(env_config, Mapping)
+        else getattr(env_config, "privileged", None)
+    )
+    is_nonprivileged = privileged is False
+    public_only = is_nonprivileged or _coerce_config_bool(
+        config.get("capsule_validate_program_contract", False)
+    )
+    if public_only:
+        # Call the base implementation directly so a legacy subclass override cannot
+        # reintroduce raw environment/API handles into a guarded Capsule executor.
+        return CodeExecutionEnvBase._build_capsule_globals(
+            env,
+            trace=trace,
+            include_internal_handles=False,
+        )
+    return env._build_capsule_globals(trace=trace)
+
+
 def _run_capsule_auto_forward_loop(
     env: CodeExecutionEnvBase,
     trial: int,
@@ -1276,7 +1303,7 @@ def _run_capsule_auto_forward_loop(
 
     trace = RuntimeTrace()
     executor = CapsuleExecutor(
-        base_globals=env._build_capsule_globals(trace=trace),
+        base_globals=_build_capsule_execution_globals(env, trace, config),
         trace=trace,
     )
     max_steps = int(config.get("max_capsule_steps", 12))
@@ -1997,7 +2024,7 @@ def _run_capsule_llm_step_loop(
         contract_effectful_group_ids = set()
     trace = RuntimeTrace()
     executor = CapsuleExecutor(
-        base_globals=env._build_capsule_globals(trace=trace),
+        base_globals=_build_capsule_execution_globals(env, trace, config),
         trace=trace,
     )
     max_steps = int(config.get("max_capsule_steps", 12))

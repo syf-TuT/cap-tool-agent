@@ -184,6 +184,21 @@ class FakeGripperCapsuleEnv(FakeIncompleteCapsuleEnv):
         self._apis = {"fake": self.api}
 
 
+class FakeUnsafeNonPrivilegedCapsuleEnv(FakeGripperCapsuleEnv):
+    def __init__(self):
+        super().__init__()
+        self.cfg = SimpleNamespace(privileged=False)
+        self.low_level_env = SimpleNamespace(
+            _get_all_object_poses=lambda: {"secret_object": "SIM_TRUTH_SENTINEL"}
+        )
+
+    def _build_capsule_globals(self, trace=None):
+        globals_dict = super()._build_capsule_globals(trace=trace)
+        globals_dict["env"] = self.low_level_env
+        globals_dict["APIS"] = self._apis
+        return globals_dict
+
+
 class FakeTraceFailureApi(FakeApi):
     def functions(self):
         functions = dict(super().functions())
@@ -2495,6 +2510,106 @@ def test_capsule_llm_step_program_contract_flag_false_preserves_execution(tmp_pa
     assert metrics[0]["program_contract_valid"] is True
     assert metrics[0]["program_contract_violation_count"] == 0
     assert metrics[0]["program_contract_violation_codes"] == []
+
+
+def test_nonprivileged_capsule_globals_block_raw_env_truth_without_prompt_leak(
+    tmp_path,
+):
+    env = FakeUnsafeNonPrivilegedCapsuleEnv()
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_validate_program_contract": False,
+        },
+        initial_code="print(env._get_all_object_poses())\n",
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace_text = (tmp_path / "capsule_trace_trial_00.json").read_text()
+    prompt_text = (tmp_path / "capsule_prompts_trial_00.json").read_text()
+    trace = json.loads(trace_text)
+
+    assert trace[0]["event"]["status"] == "failed"
+    assert trace[0]["event"]["evidence"]["exception_type"] == "NameError"
+    assert trace[0]["event"]["message"] == "name 'env' is not defined"
+    assert "SIM_TRUTH_SENTINEL" not in trace_text
+    assert "SIM_TRUTH_SENTINEL" not in prompt_text
+    assert env.api.calls == []
+
+
+def test_nonprivileged_public_api_is_traced_and_no_replay_guarded(tmp_path):
+    env = FakeUnsafeNonPrivilegedCapsuleEnv()
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_validate_program_contract": False,
+        },
+        initial_code="close_gripper()\n",
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "invalid",
+    ]
+    assert trace[0]["trace_events"][0]["name"] == "close_gripper"
+    assert env.api.calls == ["close_gripper"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "alias = close_gripper\nalias()\n",
+        "alias = lambda: (close_gripper(), close_gripper())\nalias()\n",
+        'globals()["close_gripper"]()\n',
+        'APIS["fake"].close_gripper()\n',
+        "close_gripper.__wrapped__()\n",
+    ],
+)
+def test_capsule_contract_blocks_alias_and_dynamic_effects_before_execution(
+    tmp_path,
+    source,
+):
+    env = FakeUnsafeNonPrivilegedCapsuleEnv()
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "capsule_validate_program_contract": True,
+        },
+        initial_code=source,
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert trace[0]["event"]["status"] == "invalid"
+    assert trace[0]["event"]["evidence"]["program_contract_violations"]
+    assert env.api.calls == []
 
 
 def test_program_contract_guard_only_blocks_side_effect_execution_units():

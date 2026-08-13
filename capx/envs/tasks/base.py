@@ -205,18 +205,32 @@ class CodeExecutionEnvBase(Env):
                 g[fn_name] = fn
         self._exec_globals = g
 
-    def _build_capsule_globals(self, trace: RuntimeTrace | None = None) -> dict[str, Any]:
+    def _build_capsule_globals(
+        self,
+        trace: RuntimeTrace | None = None,
+        *,
+        include_internal_handles: bool = True,
+    ) -> dict[str, Any]:
         """Build a fresh namespace for region-based capsule execution."""
         g: dict[str, Any] = {
             "__name__": "__main__",
-            "env": self.low_level_env,
-            "APIS": self._apis,
             "INPUTS": {},
             "RESULT": None,
         }
+        if include_internal_handles:
+            g.update({"env": self.low_level_env, "APIS": self._apis})
         for api in self._apis.values():
             for fn_name, fn in api.functions().items():
-                g[fn_name] = wrap_function_for_trace(fn_name, fn, trace) if trace is not None else fn
+                g[fn_name] = (
+                    wrap_function_for_trace(
+                        fn_name,
+                        fn,
+                        trace,
+                        expose_wrapped=include_internal_handles,
+                    )
+                    if trace is not None
+                    else fn
+                )
         return g
 
     def _build_low_level(
