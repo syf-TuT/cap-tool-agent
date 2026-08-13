@@ -199,4 +199,3 @@ Confirm no saved prompt test contains simulator truth or embedded base64, then r
 git add env_configs/libero/franka_libero_object_0_capsule_llm_step.yaml docs/libero-tasks.md tests/test_runtime_control_config.py
 git commit -m "Document strict LIBERO Capsule execution"
 ```
-

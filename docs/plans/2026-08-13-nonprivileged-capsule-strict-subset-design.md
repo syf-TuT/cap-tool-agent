@@ -82,4 +82,3 @@ Tests must demonstrate that conditional rebinding, frame inspection, imports, di
 aliased dynamic calls, callable attributes, lambdas, and classes never call the fake
 robot API. Positive tests must cover direct public API calls, pure helpers, data attribute
 reads, safe builtins, patch-to-compliance, and default privileged compatibility.
-
