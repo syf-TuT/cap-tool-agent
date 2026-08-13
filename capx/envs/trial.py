@@ -262,21 +262,12 @@ class CapsuleVisual:
         }
 
 
-class _CapsuleCameraAdapter:
-    """Expose one alternate renderer through the existing visual helper protocol."""
-
-    def __init__(self, render):
-        self.render = render
-
-
 def _capsule_capture_error(camera: str, error: str) -> dict[str, str]:
     return {"camera": camera, "error": error}
 
 
-def _first_visual_payload(value: Any) -> Any:
-    if isinstance(value, (list, tuple)):
-        return value[0] if value else None
-    return value
+def _visual_payloads(value: Any) -> list[Any]:
+    return list(value) if isinstance(value, (list, tuple)) else [value]
 
 
 def _decode_image_data_url(data_url: str) -> tuple[str, bytes]:
@@ -292,8 +283,6 @@ def _capsule_visual_from_payload(
     data_url: Any,
     image: Any,
 ) -> CapsuleVisual:
-    data_url = _first_visual_payload(data_url)
-    image = _first_visual_payload(image)
     if not isinstance(data_url, str) or not isinstance(image, Image.Image):
         raise ValueError("visual capture returned no image")
     _, png_bytes = _decode_image_data_url(data_url)
@@ -309,37 +298,73 @@ def _capsule_visual_from_payload(
     )
 
 
+def _try_capsule_visual(
+    camera: str,
+    data_url: Any,
+    image: Any,
+) -> CapsuleVisual | None:
+    try:
+        return _capsule_visual_from_payload(camera, data_url, image)
+    except Exception:
+        return None
+
+
+def _capture_capsule_main(env: CodeExecutionEnvBase) -> CapsuleVisual | None:
+    try:
+        data_url, image = _get_visual_feedback(env, use_wrist_camera=False)
+    except Exception:
+        return None
+    return _try_capsule_visual("main", data_url, image)
+
+
 def _capture_capsule_visuals(
     env: CodeExecutionEnvBase,
     *,
     use_wrist_camera: bool = False,
 ) -> tuple[list[CapsuleVisual], list[dict[str, str]]]:
     """Capture current main/wrist observations without retaining stale frames."""
-    records: list[CapsuleVisual] = []
-    errors: list[dict[str, str]] = []
-
-    try:
-        main_data_url, main_image = _get_visual_feedback(env, use_wrist_camera=False)
-        records.append(_capsule_visual_from_payload("main", main_data_url, main_image))
-    except Exception:
-        errors.append(_capsule_capture_error("main", "capture_failed"))
-
     if not use_wrist_camera:
-        return records, errors
+        main_record = _capture_capsule_main(env)
+        if main_record is not None:
+            return [main_record], []
+        return [], [_capsule_capture_error("main", "capture_failed")]
 
-    render_wrist = getattr(env, "render_wrist", None)
-    if render_wrist is None:
-        errors.append(_capsule_capture_error("wrist", "camera_unavailable"))
-        return records, errors
-
+    combined_data_urls: list[Any] = []
+    combined_images: list[Any] = []
     try:
-        wrist_data_url, wrist_image = _get_visual_feedback(
-            _CapsuleCameraAdapter(render_wrist), use_wrist_camera=False
-        )
-        records.append(_capsule_visual_from_payload("wrist", wrist_data_url, wrist_image))
+        data_urls, images = _get_visual_feedback(env, use_wrist_camera=True)
+        combined_data_urls = _visual_payloads(data_urls)
+        combined_images = _visual_payloads(images)
     except Exception:
-        errors.append(_capsule_capture_error("wrist", "capture_failed"))
+        combined_data_urls = combined_images = []
 
+    if len(combined_data_urls) >= 2 and len(combined_images) >= 2:
+        main_record = _try_capsule_visual(
+            "main", combined_data_urls[0], combined_images[0]
+        )
+        wrist_record = _try_capsule_visual(
+            "wrist", combined_data_urls[1], combined_images[1]
+        )
+        if main_record is None:
+            main_record = _capture_capsule_main(env)
+
+        records = [record for record in (main_record, wrist_record) if record is not None]
+        errors = []
+        if main_record is None:
+            errors.append(_capsule_capture_error("main", "capture_failed"))
+        if wrist_record is None:
+            errors.append(_capsule_capture_error("wrist", "capture_failed"))
+        return records, errors
+
+    main_record = _capture_capsule_main(env)
+    records = [main_record] if main_record is not None else []
+    errors = []
+    if main_record is None:
+        errors.append(_capsule_capture_error("main", "capture_failed"))
+    wrist_error = (
+        "camera_unavailable" if not hasattr(env, "render_wrist") else "capture_failed"
+    )
+    errors.append(_capsule_capture_error("wrist", wrist_error))
     return records, errors
 
 

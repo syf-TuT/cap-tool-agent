@@ -479,6 +479,54 @@ def test_capture_capsule_visuals_returns_png_hashed_main_and_wrist_records():
         assert record.image.size == (record.width, record.height)
 
 
+def test_capture_capsule_visuals_prefers_combined_multiview_feedback(monkeypatch):
+    env = _FakeCapsuleVisualEnv()
+    combined_feedback = trial_module._get_visual_feedback(env, use_wrist_camera=True)
+    calls = []
+
+    def fake_visual_feedback(requested_env, use_wrist_camera=False):
+        calls.append((requested_env, use_wrist_camera))
+        return combined_feedback
+
+    monkeypatch.setattr(trial_module, "_get_visual_feedback", fake_visual_feedback)
+
+    records, errors = _capture_capsule_visuals(env, use_wrist_camera=True)
+
+    assert calls == [(env, True)]
+    assert errors == []
+    assert [record.camera for record in records] == ["main", "wrist"]
+    assert [(record.width, record.height) for record in records] == [(3, 2), (2, 1)]
+    for index, record in enumerate(records):
+        png_bytes = _decoded_data_url(combined_feedback[0][index])
+        assert record.sha256 == hashlib.sha256(png_bytes).hexdigest()
+
+
+def test_capture_capsule_visuals_falls_back_to_current_main_after_combined_failure(
+    monkeypatch,
+):
+    env = _FakeCapsuleVisualEnv()
+    get_visual_feedback = trial_module._get_visual_feedback
+    current_main = get_visual_feedback(env, use_wrist_camera=False)
+    calls = []
+
+    def fake_visual_feedback(requested_env, use_wrist_camera=False):
+        calls.append((requested_env, use_wrist_camera))
+        if use_wrist_camera:
+            raise RuntimeError("combined capture failed")
+        return current_main
+
+    monkeypatch.setattr(trial_module, "_get_visual_feedback", fake_visual_feedback)
+
+    records, errors = _capture_capsule_visuals(env, use_wrist_camera=True)
+
+    assert calls == [(env, True), (env, False)]
+    assert [record.camera for record in records] == ["main"]
+    assert records[0].sha256 == hashlib.sha256(
+        _decoded_data_url(current_main[0])
+    ).hexdigest()
+    assert errors == [{"camera": "wrist", "error": "capture_failed"}]
+
+
 def test_capture_capsule_visuals_keeps_current_main_when_wrist_capture_fails():
     records, errors = _capture_capsule_visuals(
         _FakeCapsuleVisualEnv(fail_wrist=True), use_wrist_camera=True
