@@ -53,18 +53,17 @@ def test_strict_subset_allows_bounded_python_and_direct_capabilities():
 def clamp(value, lower=0, upper=1):
     return min(max(value, lower), upper)
 def transform(values):
-    return [clamp(item + 0.25) for item in values]
+    return values[0] + values[1]
 values = [1, 2, 3]
-adjusted = transform(values)
+adjusted = [clamp(item + 0.25) for item in (1, 2, 3)]
+combined = transform(adjusted)
 mapping = {"first": adjusted[0]}
 position = pose.position
 index = 0
-for item in range(len(adjusted)):
+for item in range(3):
     index += item
-while index < 4:
-    index += 1
 try:
-    if any(value > 0 for value in adjusted):
+    if any(value > 0 for value in (1, 2, 3)):
         raise ValueError("positive")
 except ValueError:
     mapping["handled"] = True
@@ -417,6 +416,174 @@ result = prepare(-1.25, "bowl")
 """
 
     assert _strict_analyze(source) == []
+
+
+@pytest.mark.parametrize("callable_name", ["sorted", "min", "max"])
+def test_strict_subset_rejects_observation_method_as_key_callback(callable_name):
+    source = f"result = {callable_name}(values, key=observation.tofile)\n"
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        "callback" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_rejects_dynamic_keyword_callback_bypass():
+    source = 'result = sorted(values, **{"key": observation.tofile})\n'
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        "dynamic keyword" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_allows_numeric_ordering_without_callbacks():
+    source = """\
+ordered = sorted([3, 1, 2])
+smallest = min(3, 1, 2)
+largest = max([3, 1, 2])
+unchanged = sorted([3, 1, 2], key=None)
+"""
+
+    assert _strict_analyze(source) == []
+
+
+def test_strict_subset_allows_statically_bounded_loops_and_comprehensions():
+    source = """\
+total = 0
+for item in [1, 2, 3]:
+    total += item
+for index, item in enumerate((4, 5)):
+    total += index + item
+for left, right in zip(range(3), reversed([1, 2, 3])):
+    total += left + right
+for countdown in range(3, -1, -1):
+    total += countdown
+grid = [left + right for left in range(100) for right in range(100)]
+"""
+
+    assert _strict_analyze(source) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "for item in observations:\n    value = item\n",
+        "for item in range(limit):\n    value = item\n",
+        "for item in range(10 ** 100):\n    value = item\n",
+        "for item in range(10001):\n    value = item\n",
+        "for item in range(0, 2, 0):\n    value = item\n",
+        "values = [item for item in observations]\n",
+        "while False:\n    value = 1\n",
+    ],
+)
+def test_strict_subset_rejects_unbounded_control_flow(source):
+    violations = _strict_analyze(source)
+
+    assert any(
+        "bounded control flow" in violation.message.lower()
+        for violation in violations
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "for outer in range(101):\n    for inner in range(100):\n        value = inner\n",
+        "grid = [(x, y) for x in range(101) for y in range(100)]\n",
+    ],
+)
+def test_strict_subset_rejects_nested_iteration_products_over_budget(source):
+    violations = _strict_analyze(source)
+
+    assert any(
+        "iteration budget" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_resets_iteration_budget_for_sequential_loops():
+    source = """\
+for first in range(10000):
+    value = first
+for second in range(10000):
+    value = second
+"""
+
+    assert _strict_analyze(source) == []
+
+
+def test_strict_subset_rejects_excessive_helper_count_without_recursing():
+    source = "\n".join(
+        f"def helper_{index}():\n    return {index}"
+        for index in range(1200)
+    )
+
+    violations = _strict_analyze(source)
+
+    assert len(violations) == 1
+    assert violations[0].code == "strict_subset_violation"
+    assert "helper limit" in violations[0].message.lower()
+    assert violations[0].start_line == 1
+    assert violations[0].end_line == 2400
+
+
+def test_strict_subset_helper_limit_violation_binds_all_source_units():
+    source = "\n".join(
+        f"def helper_{index}():\n    return {index}"
+        for index in range(257)
+    )
+    regions = segment_python_code(source)
+    groups = segment_python_code_groups(
+        source,
+        regions,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    violations = analyze_capsule_strict_subset(
+        source,
+        regions,
+        groups,
+        public_api_calls=PUBLIC_API_CALLS,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    assert len(violations) == 1
+    assert violations[0].region_ids == tuple(
+        region.region_id for region in regions
+    )
+    assert violations[0].group_ids == tuple(
+        group.group_id for group in groups
+    )
+
+
+def test_strict_subset_allows_pure_helper_chain_at_complexity_limit():
+    definitions = ["def helper_0(value):\n    return value"]
+    for index in range(1, 256):
+        definitions.append(
+            f"def helper_{index}(value):\n"
+            f"    return helper_{index - 1}(value)"
+        )
+    source = "\n".join([*definitions, "result = helper_255(1)", ""])
+
+    assert _strict_analyze(source) == []
+
+
+def test_strict_subset_reports_async_comprehension_at_its_own_line():
+    source = "async def collect():\n    return [item async for item in stream]\n"
+
+    violations = _strict_analyze(source)
+
+    violation = next(
+        violation
+        for violation in violations
+        if "asynchronous comprehensions" in violation.message.lower()
+    )
+    assert (violation.start_line, violation.end_line) == (2, 2)
 
 
 def test_allows_pure_helpers_and_one_side_effect_per_top_level_group():

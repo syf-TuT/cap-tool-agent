@@ -75,6 +75,8 @@ STRICT_CAPSULE_SAFE_BUILTINS: frozenset[str] = frozenset(
         "zip",
     }
 )
+STRICT_CAPSULE_MAX_HELPERS = 256
+STRICT_CAPSULE_MAX_ITERATIONS = 10_000
 
 _STRICT_CAPSULE_FORBIDDEN_CALLABLES = frozenset(
     {
@@ -121,6 +123,10 @@ _STRICT_CAPSULE_SENSITIVE_NAMES = frozenset(
     }
 )
 _STRICT_CAPSULE_EXCEPTION_CLASSES = frozenset({"RuntimeError", "ValueError"})
+_STRICT_CAPSULE_KEY_CALLBACK_CALLS = frozenset({"max", "min", "sorted"})
+_STRICT_CAPSULE_BOUNDED_ITERABLE_WRAPPERS = frozenset(
+    {"dict", "enumerate", "list", "reversed", "set", "tuple"}
+)
 
 _STRICT_CAPSULE_ALLOWED_NODES = (
     ast.Module,
@@ -367,6 +373,23 @@ def analyze_capsule_strict_subset(
         for statement in module.body
         if isinstance(statement, ast.FunctionDef)
     )
+    if len(direct_helpers) > STRICT_CAPSULE_MAX_HELPERS:
+        start_line, _ = _node_span(direct_helpers[0])
+        _, end_line = _node_span(direct_helpers[-1])
+        return [
+            _build_violation(
+                code="strict_subset_violation",
+                message=(
+                    "Strict Capsule subset violation: helper limit exceeded "
+                    f"({len(direct_helpers)} > {STRICT_CAPSULE_MAX_HELPERS})"
+                ),
+                start_line=start_line,
+                end_line=end_line,
+                regions=regions,
+                groups=groups,
+                side_effects=(),
+            )
+        ]
     safe_calls = (
         set(STRICT_CAPSULE_SAFE_BUILTINS)
         if safe_builtin_calls is None
@@ -592,6 +615,7 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         )
         self.violations: list[ProgramContractViolation] = []
         self._helper_stack: list[str] = []
+        self._iteration_products: list[int] = [1]
 
     def _emit(
         self,
@@ -703,6 +727,8 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self._emit(node, "syntax 'AsyncFunctionDef' is not allowed")
+        for statement in node.body:
+            self.visit(statement)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._emit(node, "syntax 'ClassDef' is not allowed")
@@ -754,13 +780,23 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
             elif name not in self.allowed_calls:
                 self._emit(node, f"call to unknown callable '{name}' is not allowed")
 
+            if name in _STRICT_CAPSULE_KEY_CALLBACK_CALLS:
+                for keyword in node.keywords:
+                    if keyword.arg == "key" and not _is_none_literal(keyword.value):
+                        self._emit(
+                            keyword,
+                            f"callback argument 'key' is not allowed for '{name}'",
+                        )
+
         for argument in node.args:
             self.visit(argument)
         for keyword in node.keywords:
             self.visit(keyword)
 
     def visit_keyword(self, node: ast.keyword) -> None:
-        if node.arg is not None:
+        if node.arg is None:
+            self._emit(node, "dynamic keyword arguments are not allowed")
+        else:
             reason = self._identifier_violation(node.arg)
             if reason is not None:
                 self._emit(node, reason)
@@ -787,6 +823,101 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         if node.cause is not None:
             self.visit(node.cause)
 
+    def visit_While(self, node: ast.While) -> None:
+        self._emit(
+            node,
+            "bounded control flow does not allow while loops",
+        )
+        self.visit(node.test)
+        for statement in (*node.body, *node.orelse):
+            self.visit(statement)
+
+    def visit_For(self, node: ast.For) -> None:
+        self.visit(node.target)
+        self.visit(node.iter)
+        product = self._bounded_iteration_product(node.iter)
+        if product is not None:
+            self._iteration_products.append(product)
+        for statement in node.body:
+            self.visit(statement)
+        if product is not None:
+            self._iteration_products.pop()
+        for statement in node.orelse:
+            self.visit(statement)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self._emit(
+            node,
+            "bounded control flow does not allow asynchronous for loops",
+        )
+        self.visit(node.target)
+        self.visit(node.iter)
+        for statement in (*node.body, *node.orelse):
+            self.visit(statement)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension_expression(node.generators, (node.elt,))
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension_expression(node.generators, (node.elt,))
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension_expression(
+            node.generators,
+            (node.key, node.value),
+        )
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension_expression(node.generators, (node.elt,))
+
+    def _visit_comprehension_expression(
+        self,
+        generators: list[ast.comprehension],
+        result_expressions: tuple[ast.expr, ...],
+    ) -> None:
+        pushed_products = 0
+        for generator in generators:
+            self.visit(generator.target)
+            self.visit(generator.iter)
+            if generator.is_async:
+                self._emit(
+                    generator.target,
+                    "asynchronous comprehensions are not allowed",
+                )
+                product = None
+            else:
+                product = self._bounded_iteration_product(generator.iter)
+
+            if product is not None:
+                self._iteration_products.append(product)
+                pushed_products += 1
+            for condition in generator.ifs:
+                self.visit(condition)
+
+        for expression in result_expressions:
+            self.visit(expression)
+        for _ in range(pushed_products):
+            self._iteration_products.pop()
+
+    def _bounded_iteration_product(self, iterable: ast.expr) -> int | None:
+        bound = _static_iteration_bound(iterable)
+        if bound is None or bound > STRICT_CAPSULE_MAX_ITERATIONS:
+            self._emit(
+                iterable,
+                "bounded control flow requires a statically bounded iterable "
+                f"of at most {STRICT_CAPSULE_MAX_ITERATIONS} items",
+            )
+            return None
+        product = self._iteration_products[-1] * bound
+        if product > STRICT_CAPSULE_MAX_ITERATIONS:
+            self._emit(
+                iterable,
+                "nested iteration budget exceeds "
+                f"{STRICT_CAPSULE_MAX_ITERATIONS} items",
+            )
+            return None
+        return product
+
     def _visit_exception_type(self, node: ast.expr) -> None:
         if isinstance(node, ast.Name) and node.id in _STRICT_CAPSULE_EXCEPTION_CLASSES:
             return
@@ -795,16 +926,6 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
                 self._visit_exception_type(element)
             return
         self.visit(node)
-
-    def visit_comprehension(self, node: ast.comprehension) -> None:
-        if node.is_async:
-            self._emit(node, "asynchronous comprehensions are not allowed")
-            return
-        self.visit(node.target)
-        self.visit(node.iter)
-        for condition in node.ifs:
-            self.visit(condition)
-
 
 def _function_arguments(arguments: ast.arguments) -> tuple[ast.arg, ...]:
     return (
@@ -828,6 +949,80 @@ def _is_literal_expression(node: ast.expr) -> bool:
     except (ValueError, TypeError):
         return False
     return True
+
+
+def _is_none_literal(node: ast.expr) -> bool:
+    return isinstance(node, ast.Constant) and node.value is None
+
+
+def _static_iteration_bound(node: ast.expr) -> int | None:
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        if any(isinstance(element, ast.Starred) for element in node.elts):
+            return None
+        return len(node.elts)
+    if isinstance(node, ast.Dict):
+        if any(key is None for key in node.keys):
+            return None
+        return len(node.keys)
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+        return None
+    if node.keywords:
+        return None
+
+    callable_name = node.func.id
+    if callable_name == "range":
+        return _static_range_bound(node.args)
+    if callable_name in _STRICT_CAPSULE_BOUNDED_ITERABLE_WRAPPERS:
+        if len(node.args) != 1:
+            return None
+        return _static_iteration_bound(node.args[0])
+    if callable_name == "zip":
+        bounds = [_static_iteration_bound(argument) for argument in node.args]
+        if any(bound is None for bound in bounds):
+            return None
+        return min(bounds, default=0)
+    return None
+
+
+def _static_range_bound(arguments: list[ast.expr]) -> int | None:
+    if not 1 <= len(arguments) <= 3:
+        return None
+    values: list[int] = []
+    for argument in arguments:
+        value = _static_integer_literal(argument)
+        if value is None:
+            return None
+        values.append(value)
+
+    if len(values) == 1:
+        start, stop, step = 0, values[0], 1
+    elif len(values) == 2:
+        start, stop, step = values[0], values[1], 1
+    else:
+        start, stop, step = values
+    if step == 0:
+        return None
+    if step > 0:
+        return max(0, (stop - start + step - 1) // step)
+    positive_step = -step
+    return max(0, (start - stop + positive_step - 1) // positive_step)
+
+
+def _static_integer_literal(node: ast.expr) -> int | None:
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    if (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, (ast.UAdd, ast.USub))
+        and isinstance(node.operand, ast.Constant)
+        and type(node.operand.value) is int
+    ):
+        return (
+            node.operand.value
+            if isinstance(node.op, ast.UAdd)
+            else -node.operand.value
+        )
+    return None
 
 
 class _DefinitionGraphBuilder:
