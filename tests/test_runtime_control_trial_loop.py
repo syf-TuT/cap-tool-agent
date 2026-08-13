@@ -618,6 +618,23 @@ def test_sanitize_capsule_visual_prompt_removes_unstructured_base64_payload():
 
 
 @pytest.mark.parametrize(
+    "plain_text",
+    [
+        "The source data: values are tabular.",
+        "SSE data: [DONE]",
+        'payload = {"data": "data: ordinary value"}',
+        'config = {"label": "base64, is an encoding marker"}',
+    ],
+)
+def test_sanitize_capsule_visual_prompt_preserves_plain_data_text(plain_text):
+    prompt = ({"role": "user", "content": (plain_text,)},)
+
+    sanitized = _sanitize_multimodal_prompt(prompt, {})
+
+    assert sanitized == [{"role": "user", "content": [plain_text]}]
+
+
+@pytest.mark.parametrize(
     "unsafe_data_url",
     [
         "data:image/png;base64,U0VD-UkVU",

@@ -428,13 +428,19 @@ def _attach_capsule_visuals(
     return attached
 
 
-_SUSPICIOUS_BINARY_TEXT = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])(?:data:|base64,)"
+_DATA_URL_TEXT = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])data:(?:[-A-Za-z0-9.+]+/[-A-Za-z0-9.+]+)?"
+    r"(?:;[-A-Za-z0-9.+]+(?:=[-A-Za-z0-9.+]*)?)*;base64,"
+)
+_STANDALONE_BASE64_PAYLOAD = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])base64,(?=\s*[A-Za-z0-9+/_=-]{8})"
 )
 
 
 def _sanitize_text_data_urls(value: str) -> str:
-    match = _SUSPICIOUS_BINARY_TEXT.search(value)
+    match = _DATA_URL_TEXT.search(value)
+    if match is None:
+        match = _STANDALONE_BASE64_PAYLOAD.search(value)
     if match is None:
         return value
     return f"{value[:match.start()]}[binary_payload_redacted]"
