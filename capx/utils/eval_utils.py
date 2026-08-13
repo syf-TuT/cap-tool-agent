@@ -2,7 +2,6 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict
 
 from openai import OpenAI
 
@@ -27,6 +26,25 @@ Whenever you mention a type of model behavior, you must cite the trial and excer
 YOU MUST GUARANTEE THAT YOUR OUTPUTS ARE CORRECT AND DO NOT HALLUCINATE.
 """
 
+_TRIAL_PROMPT_PATTERN = re.compile(r"initial_prompt_trial_\d{2,}\.txt")
+
+
+def initial_prompt_path_for_trial(experiment_dir: Path, trial: int) -> Path:
+    """Return a trial-scoped prompt artifact when present, else the legacy artifact."""
+    trial_prompt = experiment_dir / f"initial_prompt_trial_{trial:02d}.txt"
+    if trial_prompt.is_file():
+        return trial_prompt
+    return experiment_dir / "initial_prompt.txt"
+
+
+def has_initial_prompt_artifact(path: Path) -> bool:
+    """Return whether an experiment directory contains any supported prompt artifact."""
+    if (path / "initial_prompt.txt").is_file():
+        return True
+    return any(
+        item.is_file() and _TRIAL_PROMPT_PATTERN.fullmatch(item.name) for item in path.iterdir()
+    )
+
 
 @dataclass
 class TrialData:
@@ -46,7 +64,8 @@ class ExperimentParser:
 
     The expected directory structure is:
     experiment_root/
-        initial_prompt.txt
+        initial_prompt_trial_{idx:02d}.txt  # preferred for that trial
+        initial_prompt.txt                  # legacy fallback
         trial_{idx}_sandboxrc_{rc}_reward_{rew}_taskcompleted_{comp}/
             all_responses.json
             ...
@@ -71,8 +90,6 @@ class ExperimentParser:
             Dict[int, TrialData]: A dictionary where keys are trial indices and values are TrialData objects.
         """
         results: dict[int, TrialData] = {}
-        initial_prompt_path = self.experiment_dir / "initial_prompt.txt"
-
         # Iterate over all items in the experiment directory
         for item in self.experiment_dir.iterdir():
             if not item.is_dir():
@@ -84,6 +101,10 @@ class ExperimentParser:
                 sandbox_rc = int(match.group(2))
                 reward = float(match.group(3))
                 task_completed = bool(int(match.group(4)))
+                initial_prompt_path = initial_prompt_path_for_trial(
+                    self.experiment_dir,
+                    trial_idx,
+                )
 
                 trial_data = TrialData(
                     trial_folder_path=item.absolute(),

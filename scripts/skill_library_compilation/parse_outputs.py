@@ -8,7 +8,13 @@ from typing import Any, Dict
 
 import tyro
 
-from capx.utils.eval_utils import ExperimentParser, analyze_failures, analyze_highlights, TrialData
+from capx.utils.eval_utils import (
+    ExperimentParser,
+    TrialData,
+    analyze_failures,
+    analyze_highlights,
+    has_initial_prompt_artifact,
+)
 
 # Regex to detect trial directories
 TRIAL_DIR_PATTERN = re.compile(
@@ -158,7 +164,7 @@ def is_experiment_dir(path: Path) -> bool:
     if not path.is_dir():
         return False
     # Check for initial_prompt.txt or any trial directories
-    if (path / "initial_prompt.txt").exists():
+    if has_initial_prompt_artifact(path):
         return True
     for item in path.iterdir():
         if item.is_dir() and TRIAL_DIR_PATTERN.match(item.name):

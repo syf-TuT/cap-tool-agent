@@ -9,6 +9,8 @@ from pathlib import Path
 import tyro
 from openai import OpenAI
 
+from capx.utils.eval_utils import has_initial_prompt_artifact
+
 # OpenRouter proxy runs locally — no API key needed for the proxy
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "not-needed-for-local-proxy")
 
@@ -81,7 +83,7 @@ def is_experiment_dir(path: Path) -> bool:
     """Check if a directory is an experiment directory."""
     if not path.is_dir():
         return False
-    if (path / "initial_prompt.txt").exists():
+    if has_initial_prompt_artifact(path):
         return True
     for item in path.iterdir():
         if item.is_dir() and TRIAL_DIR_PATTERN.match(item.name):
