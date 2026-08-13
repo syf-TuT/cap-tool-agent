@@ -745,6 +745,31 @@ def test_recovery_prompt_examples_are_valid_json():
         assert isinstance(parsed.get("args"), dict)
 
 
+def test_recovery_prompt_states_strict_python_subset_constraints():
+    failed_group = CodeRegionGroup(
+        group_id="group_1",
+        start_line=1,
+        end_line=1,
+        source='raise RuntimeError("boom")',
+        region_ids=["region_1"],
+    )
+
+    prompt = build_capsule_recovery_prompt(
+        task="close the gripper",
+        failed_unit=failed_group,
+        history_tail=[],
+        trace_summary={},
+        side_effect_ledger={},
+        recovery_observation_functions={"get_observation"},
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert "Strict Python subset" in text
+    assert "no imports, classes, lambdas, try, while, async" in text
+    assert "direct public API functions" in text
+
+
 def test_terminal_recovery_prompt_only_allows_forward_append_or_finish():
     last_group = CodeRegionGroup(
         group_id="group_2",
@@ -802,6 +827,9 @@ def test_terminal_recovery_prompt_only_allows_forward_append_or_finish():
     assert "patch_group" not in allowed_actions
     assert "patch_region" not in allowed_actions
     assert "resume_from_region" not in allowed_actions
+    assert "Strict Python subset" in text
+    assert "no imports, classes, lambdas, try, while, async" in text
+    assert "direct public API functions" in text
 
 
 def test_summarize_terminal_state_for_recovery_compacts_object_geometry():

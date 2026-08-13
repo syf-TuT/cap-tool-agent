@@ -9,6 +9,12 @@ _CONTRACT_SAFETY_MAX_CHARS = 12000
 _CONTRACT_TEXT_MAX_CHARS = 640
 _CONTRACT_ID_MAX_CHARS = 160
 _CONTRACT_LIST_MAX_ITEMS = 6
+_STRICT_CAPSULE_SOURCE_CONSTRAINTS = (
+    "Strict Python subset for every generated or patched source:\n"
+    "- Use no imports, classes, lambdas, try, while, async, dynamic or reflective "
+    "calls, callable aliases, or attribute calls. Call only direct public API "
+    "functions, safe builtins, and proven-pure helpers; use only bounded for loops."
+)
 
 
 def parse_runtime_action_response(content: str) -> RuntimeAction:
@@ -258,10 +264,7 @@ def _build_capsule_prompt_text(
         "preconditions. "
         f"{recovery_guidance}\n\n"
         "Execution constraints:\n"
-        "- Strict Python subset: no imports, classes, lambdas, try, while, async, "
-        "dynamic or reflective calls, callable aliases, or attribute calls. Call only "
-        "direct public API functions, safe builtins, and proven-pure helpers; use only "
-        "bounded for loops.\n"
+        f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n"
         "- Do not use callable introspection (__closure__, __self__, __globals__, "
         "__wrapped__, or related private attributes), globals()/eval()/exec(), "
         "vars()/dir(), inspect, gc, or dynamic API lookup. Use documented public "
@@ -481,6 +484,7 @@ def build_capsule_recovery_prompt(
         "Rollback is unavailable. Previously executed robot-side-effect code may have "
         "changed the current physical state, so repairs must continue from that state. "
         "Use a fresh observation before appending recovery code.\n\n"
+        f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n\n"
         f"Allowed actions: {', '.join(allowed_actions)}.\n\n"
         "Respond with exactly one JSON object. Examples:\n"
         f"{example_text}\n"
@@ -579,6 +583,7 @@ def build_capsule_terminal_recovery_prompt(
         "Rollback is unavailable. Previously executed robot-side-effect code may have "
         "changed the current physical state, so recovery must append new code that "
         "starts from a fresh observation.\n\n"
+        f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n\n"
         f"Allowed actions: {', '.join(allowed_actions)}.\n\n"
         "Respond with exactly one JSON object. Examples:\n"
         f"{example_text}\n"

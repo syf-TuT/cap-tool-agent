@@ -204,6 +204,29 @@ class FakeSuccessfulNonPrivilegedCapsuleEnv(FakeUnsafeNonPrivilegedCapsuleEnv):
         return 1.0 if self.api.calls else 0.0
 
 
+class FakeSuccessfulRecoveryApi(FakeGripperApi):
+    def functions(self):
+        functions = dict(super().functions())
+        functions["get_observation"] = self.get_observation
+        return functions
+
+    def recovery_observation_functions(self):
+        return {"get_observation"}
+
+    def get_observation(self):
+        return {"gripper": "current"}
+
+
+class FakeSuccessfulRecoveryNonPrivilegedCapsuleEnv(
+    FakeSuccessfulNonPrivilegedCapsuleEnv
+):
+    def __init__(self):
+        self.api = FakeSuccessfulRecoveryApi()
+        self.low_level_env = object()
+        self._apis = {"fake": self.api}
+        self.cfg = SimpleNamespace(privileged=False)
+
+
 class FakePrivilegedCapsuleEnv(FakeGripperCapsuleEnv):
     def __init__(self):
         super().__init__()
@@ -2469,6 +2492,9 @@ def test_capsule_auto_forward_blocks_side_effect_after_reward_drop_from_best(tmp
     assert summary.sandbox_rc == 1
     assert env.api.moves == ["good", "bad"]
     assert trace[2]["event"]["status"] == "invalid"
+    assert trace[2]["event"]["evidence"]["safety_failure"] == (
+        "reward_drop_guard"
+    )
     assert "reward dropped" in trace[2]["event"]["message"]
     assert "append_recovery" in trace[2]["event"]["message"]
 
@@ -2728,6 +2754,47 @@ def test_llm_step_invalid_action_is_recoverable_before_task_success(
     ]
     assert env.api.calls == ["close_gripper"]
     assert summary.sandbox_rc == 0
+
+
+def test_llm_step_safety_failure_stays_failed_after_append_recovery(tmp_path):
+    env = FakeSuccessfulRecoveryNonPrivilegedCapsuleEnv()
+
+    summary = trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "capsule_validate_program_contract": False,
+        },
+        initial_code="close_gripper()\n",
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": "state = get_observation()\nresult = len(state)\n",
+                },
+            },
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "invalid",
+        "success",
+        "success",
+    ]
+    assert trace[1]["event"]["evidence"]["safety_failure"] == (
+        "side_effect_replay"
+    )
+    assert env.api.calls == ["close_gripper"]
+    assert summary.reward == 1.0
+    assert summary.sandbox_rc == 1
 
 
 def test_nonprivileged_strict_preflight_skips_segmentation_for_helper_flood(

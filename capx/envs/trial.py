@@ -1475,6 +1475,7 @@ def _run_capsule_auto_forward_loop(
     step_metrics: list[dict[str, Any]] = []
     prompts: list[list[dict[str, Any]]] = []
     failed = False
+    safety_failed = False
     executed_regions = 0
     best_reward_so_far: float | None = None
     executed_side_effect_regions: set[str] = set()
@@ -1616,6 +1617,9 @@ def _run_capsule_auto_forward_loop(
                 strict_subset_violations=strict_subset_violations,
             )
             step_metrics.append(recovery_metric)
+            safety_failed = safety_failed or _capsule_event_has_safety_failure(
+                recovery_event
+            )
             if recovery_event.status in {"failed", "invalid"}:
                 failed = True
                 break
@@ -1739,6 +1743,9 @@ def _run_capsule_auto_forward_loop(
             executed_side_effect_regions,
             executed_side_effect_groups,
             side_effect_calls,
+        )
+        safety_failed = safety_failed or _capsule_event_has_safety_failure(
+            event
         )
 
         if event.status != "invalid":
@@ -1941,6 +1948,9 @@ def _run_capsule_auto_forward_loop(
                 strict_subset_violations=strict_subset_violations,
             )
             step_metrics.append(recovery_metric)
+            safety_failed = safety_failed or _capsule_event_has_safety_failure(
+                recovery_event
+            )
             if (
                 recovery_action is not None
                 and recovery_action.action in {"patch_region", "patch_group", "append_recovery"}
@@ -2031,7 +2041,7 @@ def _run_capsule_auto_forward_loop(
     reward = _safe_compute_reward(env)
     task_completed = _safe_task_completed(env)
     task_succeeded = bool(task_completed) or reward >= 1.0
-    sandbox_rc = 0 if task_succeeded and not failed else 1
+    sandbox_rc = 0 if task_succeeded and not failed and not safety_failed else 1
     code_path = None
     if output_dir:
         code_path = os.path.join(output_dir, f"capsule_code_trial_{trial:02d}.py")
@@ -2245,7 +2255,8 @@ def _run_capsule_llm_step_loop(
     step_metrics: list[dict[str, Any]] = []
     diagnostic_states: list[dict[str, Any]] = []
     prompts: list[list[dict[str, Any]]] = []
-    failed = False
+    recoverable_failed = False
+    safety_failed = False
     finished = False
     loop_exit_reason: str | None = None
     executed_regions = 0
@@ -2443,10 +2454,13 @@ def _run_capsule_llm_step_loop(
                 )
                 if consumes_recovery_side_effect:
                     recovery_side_effect_budget -= 1
-            if _capsule_event_is_hard_failure(event):
-                failed = True
-                if forced_recovery_action:
-                    pending_recovery_actions.clear()
+            safety_failed = safety_failed or _capsule_event_has_safety_failure(
+                event
+            )
+            if event.status == "failed":
+                recoverable_failed = True
+            if event.status in {"failed", "invalid"} and forced_recovery_action:
+                pending_recovery_actions.clear()
             if (
                 action.action in {"run_region", "resume_from_region"}
                 and event.status != "invalid"
@@ -2619,7 +2633,7 @@ def _run_capsule_llm_step_loop(
                 source_analysis.syntax_error is None
                 and not program_contract_violations
             ):
-                failed = False
+                recoverable_failed = False
             if action.action == "append_recovery":
                 pending_recovery_actions = _runtime_actions_for_appended_recovery(
                     regions,
@@ -2664,7 +2678,11 @@ def _run_capsule_llm_step_loop(
     )
     if budget_exhausted and step_metrics:
         step_metrics[-1]["budget_exhausted"] = True
-    sandbox_rc = 0 if task_succeeded and not failed else 1
+    sandbox_rc = (
+        0
+        if task_succeeded and not recoverable_failed and not safety_failed
+        else 1
+    )
     code_path = None
     if output_dir:
         code_path = os.path.join(output_dir, f"capsule_code_trial_{trial:02d}.py")
@@ -3101,6 +3119,7 @@ def _reward_drop_guard_event(
             "Finish instead if the task is complete."
         ),
         evidence={
+            "safety_failure": "reward_drop_guard",
             "best_reward_so_far": best_reward_so_far,
             "current_reward": current_reward,
             "reward_drop_from_best": reward_drop,
@@ -3171,12 +3190,8 @@ def _strict_subset_guard_event(
     )
 
 
-def _capsule_event_is_hard_failure(event: RuntimeEvent) -> bool:
-    if event.status == "failed":
-        return True
-    return event.status == "invalid" and bool(
-        event.evidence.get("safety_failure")
-    )
+def _capsule_event_has_safety_failure(event: RuntimeEvent) -> bool:
+    return bool(event.evidence.get("safety_failure"))
 
 
 def _runtime_action_targets_side_effect_unit(
