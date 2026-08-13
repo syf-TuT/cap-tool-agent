@@ -267,6 +267,51 @@ def _capsule_capture_error(camera: str, error: str) -> dict[str, str]:
     return {"camera": camera, "error": error}
 
 
+_CAPSULE_VISUAL_ERROR_CAMERAS = {"main", "wrist", "all", "unknown"}
+_CAPSULE_VISUAL_ERROR_CODES = {
+    "camera_unavailable",
+    "capture_failed",
+    "invalid_camera",
+    "save_failed",
+    "unknown_error",
+}
+
+
+def _normalize_capsule_visual_errors(
+    errors: list[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    """Keep visual audit errors generic and safe to persist."""
+    normalized: list[dict[str, str]] = []
+    for error in errors:
+        camera = str(error.get("camera", "unknown"))
+        if camera not in _CAPSULE_VISUAL_ERROR_CAMERAS:
+            camera = "unknown"
+        error_code = str(error.get("error", "unknown_error"))
+        if error_code not in _CAPSULE_VISUAL_ERROR_CODES:
+            error_code = "unknown_error"
+        item = _capsule_capture_error(
+            camera,
+            error_code,
+        )
+        path = _safe_relative_artifact_path(error.get("path"))
+        if path is not None:
+            item["path"] = path
+        normalized.append(item)
+    return normalized
+
+
+def _capsule_visual_audit_entries(
+    errors: list[Mapping[str, Any]],
+    *,
+    step_id: int,
+    phase: str,
+) -> list[dict[str, Any]]:
+    return [
+        {"step_id": step_id, "phase": phase, **error}
+        for error in _normalize_capsule_visual_errors(errors)
+    ]
+
+
 def _visual_payloads(value: Any) -> list[Any]:
     return list(value) if isinstance(value, (list, tuple)) else [value]
 
@@ -487,6 +532,12 @@ def _image_reference_metadata(
         digest = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
 
     artifact = artifact_by_sha256.get(digest)
+    if (
+        isinstance(artifact, Mapping)
+        and "path" not in artifact
+        and camera in artifact
+    ):
+        artifact = artifact[camera]
     artifact_metadata = artifact if isinstance(artifact, Mapping) else {}
     path = artifact_metadata.get("path") if artifact_metadata else artifact
     artifact_camera = artifact_metadata.get("camera", camera)
@@ -560,14 +611,15 @@ def _save_capsule_visuals(
     *,
     trial_id: int,
     step_id: int,
-) -> tuple[dict[str, str], list[dict[str, str]]]:
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
     """Persist captured PNG payloads and return hashes mapped to relative paths."""
     if output_dir is None:
         return {}, []
 
     output_root = Path(output_dir)
     visual_dir = output_root / f"capsule_visuals_trial_{trial_id:02d}"
-    artifact_by_sha256: dict[str, str] = {}
+    artifact_by_sha256: dict[str, Any] = {}
+    camera_by_sha256: dict[str, str] = {}
     errors: list[dict[str, str]] = []
     try:
         visual_dir.mkdir(parents=True, exist_ok=True)
@@ -587,7 +639,20 @@ def _save_capsule_visuals(
                 raise ValueError("visual record metadata mismatch")
             _, png_bytes = _decode_image_data_url(record.data_url)
             (output_root / relative_path).write_bytes(png_bytes)
-            artifact_by_sha256[record.sha256] = relative_path.as_posix()
+            artifact_path = relative_path.as_posix()
+            existing_artifact = artifact_by_sha256.get(record.sha256)
+            if existing_artifact is None:
+                artifact_by_sha256[record.sha256] = artifact_path
+                camera_by_sha256[record.sha256] = record.camera
+            else:
+                if isinstance(existing_artifact, Mapping):
+                    camera_artifacts = dict(existing_artifact)
+                else:
+                    camera_artifacts = {
+                        camera_by_sha256[record.sha256]: existing_artifact
+                    }
+                camera_artifacts[record.camera] = artifact_path
+                artifact_by_sha256[record.sha256] = camera_artifacts
         except (OSError, ValueError, TypeError):
             errors.append(_capsule_capture_error(record.camera, "save_failed"))
     return artifact_by_sha256, errors
@@ -600,7 +665,12 @@ def _capture_and_save_capsule_visuals(
     trial_id: int,
     step_id: int,
     use_wrist_camera: bool,
-) -> tuple[list[CapsuleVisual], list[dict[str, str]], dict[str, str]]:
+) -> tuple[
+    list[CapsuleVisual],
+    list[dict[str, str]],
+    list[dict[str, str]],
+    dict[str, Any],
+]:
     records, capture_errors = _capture_capsule_visuals(
         env, use_wrist_camera=use_wrist_camera
     )
@@ -610,7 +680,12 @@ def _capture_and_save_capsule_visuals(
         trial_id=trial_id,
         step_id=step_id,
     )
-    return records, [*capture_errors, *save_errors], artifacts
+    return (
+        records,
+        _normalize_capsule_visual_errors(capture_errors),
+        _normalize_capsule_visual_errors(save_errors),
+        artifacts,
+    )
 
 
 def _capture_initial_visual_feedback(
@@ -1803,12 +1878,16 @@ def _run_capsule_llm_step_loop(
         config.get("use_wrist_camera", False)
     )
     current_visuals: list[CapsuleVisual] = []
-    current_visual_errors: list[dict[str, str]] = []
-    visual_artifact_by_sha256: dict[str, str] = {}
+    current_visual_capture_errors: list[dict[str, str]] = []
+    current_visual_artifact_errors: list[dict[str, str]] = []
+    visual_artifact_by_sha256: dict[str, Any] = {}
+    visual_capture_audit: list[dict[str, Any]] = []
+    visual_artifact_audit: list[dict[str, Any]] = []
     if capture_visual_feedback:
         (
             current_visuals,
-            current_visual_errors,
+            current_visual_capture_errors,
+            current_visual_artifact_errors,
             saved_artifacts,
         ) = _capture_and_save_capsule_visuals(
             env,
@@ -1818,6 +1897,20 @@ def _run_capsule_llm_step_loop(
             use_wrist_camera=use_wrist_camera,
         )
         visual_artifact_by_sha256.update(saved_artifacts)
+        visual_capture_audit.extend(
+            _capsule_visual_audit_entries(
+                current_visual_capture_errors,
+                step_id=0,
+                phase="initial",
+            )
+        )
+        visual_artifact_audit.extend(
+            _capsule_visual_audit_entries(
+                current_visual_artifact_errors,
+                step_id=0,
+                phase="initial",
+            )
+        )
 
     raw_code: str
     if initial_code is not None:
@@ -1830,7 +1923,9 @@ def _run_capsule_llm_step_loop(
         initial_query_obs = dict(obs)
         initial_query_obs["full_prompt"] = (
             _attach_capsule_visuals(
-                obs["full_prompt"], current_visuals, current_visual_errors
+                obs["full_prompt"],
+                current_visuals,
+                current_visual_capture_errors,
             )
             if use_initial_visual_feedback
             else copy.deepcopy(obs["full_prompt"])
@@ -1961,7 +2056,10 @@ def _run_capsule_llm_step_loop(
         action_prompt_char_budget_metric = None
         action_prompt_over_budget = False
         action_prompt_images: list[dict[str, Any]] = []
-        action_prompt_visual_errors: list[dict[str, str]] = []
+        action_prompt_visual_capture_errors: list[dict[str, str]] = []
+        action_prompt_visual_artifact_errors: list[dict[str, str]] = []
+        post_action_visual_capture_errors: list[dict[str, str]] = []
+        post_action_visual_artifact_errors: list[dict[str, str]] = []
 
         try:
             if pending_recovery_actions:
@@ -2010,13 +2108,16 @@ def _run_capsule_llm_step_loop(
                         )
                         for record in current_visuals
                     ]
-                    action_prompt_visual_errors = copy.deepcopy(
-                        current_visual_errors
+                    action_prompt_visual_capture_errors = copy.deepcopy(
+                        current_visual_capture_errors
+                    )
+                    action_prompt_visual_artifact_errors = copy.deepcopy(
+                        current_visual_artifact_errors
                     )
                     live_prompt = _attach_capsule_visuals(
                         prompt,
                         current_visuals,
-                        action_prompt_visual_errors,
+                        action_prompt_visual_capture_errors,
                     )
                 prompts.append(
                     _sanitize_multimodal_prompt(
@@ -2131,10 +2232,11 @@ def _run_capsule_llm_step_loop(
             )
 
         after_state = _capsule_state_snapshot(env, state_level=prompt_state_level)
-        if capture_visual_feedback:
+        if use_action_visual_feedback:
             (
                 current_visuals,
-                current_visual_errors,
+                current_visual_capture_errors,
+                current_visual_artifact_errors,
                 saved_artifacts,
             ) = _capture_and_save_capsule_visuals(
                 env,
@@ -2144,6 +2246,26 @@ def _run_capsule_llm_step_loop(
                 use_wrist_camera=use_wrist_camera,
             )
             visual_artifact_by_sha256.update(saved_artifacts)
+            post_action_visual_capture_errors = copy.deepcopy(
+                current_visual_capture_errors
+            )
+            post_action_visual_artifact_errors = copy.deepcopy(
+                current_visual_artifact_errors
+            )
+            visual_capture_audit.extend(
+                _capsule_visual_audit_entries(
+                    post_action_visual_capture_errors,
+                    step_id=step_id,
+                    phase="post_action",
+                )
+            )
+            visual_artifact_audit.extend(
+                _capsule_visual_audit_entries(
+                    post_action_visual_artifact_errors,
+                    step_id=step_id,
+                    phase="post_action",
+                )
+            )
         if diagnostic_before_state is not None:
             diagnostic_states.append(
                 {
@@ -2195,7 +2317,14 @@ def _run_capsule_llm_step_loop(
         metric["action_prompt_over_budget"] = action_prompt_over_budget
         metric["action_prompt_image_count"] = len(action_prompt_images)
         metric["action_prompt_images"] = action_prompt_images
-        metric["visual_capture_errors"] = action_prompt_visual_errors
+        metric["visual_capture_errors"] = action_prompt_visual_capture_errors
+        metric["visual_artifact_errors"] = action_prompt_visual_artifact_errors
+        metric["post_action_visual_capture_errors"] = (
+            post_action_visual_capture_errors
+        )
+        metric["post_action_visual_artifact_errors"] = (
+            post_action_visual_artifact_errors
+        )
         metric["program_contract_valid"] = not program_contract_violations
         metric["program_contract_violation_count"] = len(
             program_contract_violations
@@ -2348,12 +2477,20 @@ def _run_capsule_llm_step_loop(
             suffix_extra="capsule",
         )
 
+    visual_audit = {
+        "visual_capture_errors": visual_capture_audit,
+        "visual_artifact_errors": visual_artifact_audit,
+        "visual_artifacts_complete": (
+            not visual_capture_audit and not visual_artifact_audit
+        ),
+    }
     log = (
         f"Capsule actions: {len(history)}\n"
         f"Executed regions: {executed_regions}\n"
         f"Reward: {reward}\n"
         f"Task Completed: {task_completed}\n"
-        f"Budget Exhausted: {budget_exhausted}"
+        f"Budget Exhausted: {budget_exhausted}\n"
+        f"Visual Audit: {json.dumps(visual_audit)}"
     )
     return TrialSummary(
         trial=trial,

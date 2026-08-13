@@ -816,6 +816,54 @@ def test_save_capsule_visuals_writes_decoded_png_bytes_and_returns_relative_mapp
             assert image.size == (record.width, record.height)
 
 
+def test_save_capsule_visuals_preserves_camera_paths_when_images_have_same_hash(
+    tmp_path,
+):
+    main = _capsule_test_visual("main", [12, 34, 56])
+    wrist = replace(main, camera="wrist")
+
+    artifact_by_sha256, errors = _save_capsule_visuals(
+        [main, wrist], tmp_path, trial_id=5, step_id=0
+    )
+    prompt = _attach_capsule_visuals(
+        [{"role": "user", "content": [{"type": "text", "text": "task"}]}],
+        [main, wrist],
+        [],
+    )
+    sanitized = _sanitize_multimodal_prompt(prompt, artifact_by_sha256)
+
+    assert errors == []
+    references = [
+        item["image_reference"]
+        for item in sanitized[-1]["content"]
+        if item.get("type") == "image_reference"
+    ]
+    assert references[0]["camera"] == "main"
+    assert references[0]["path"].endswith("step_00_main.png")
+    assert references[1]["camera"] == "wrist"
+    assert references[1]["path"].endswith("step_00_wrist.png")
+    assert (tmp_path / references[0]["path"]).is_file()
+    assert (tmp_path / references[1]["path"]).is_file()
+
+
+def test_capsule_visual_error_normalization_drops_exception_text_and_unsafe_fields():
+    normalized = trial_module._normalize_capsule_visual_errors(
+        [
+            {
+                "camera": "../../secret-camera",
+                "error": "save_failed: SECRET_EXCEPTION_TEXT",
+                "path": "../secret-path.png",
+                "exception": "SECRET_EXCEPTION_TEXT",
+            }
+        ]
+    )
+
+    assert normalized == [{"camera": "unknown", "error": "unknown_error"}]
+    serialized = json.dumps(normalized)
+    assert "SECRET" not in serialized
+    assert "secret" not in serialized
+
+
 def test_save_capsule_visuals_without_output_dir_is_a_noop():
     records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=False)
 
@@ -1168,6 +1216,124 @@ def test_capsule_llm_step_visual_feedback_clears_failed_camera_for_next_prompt(
     ]
 
 
+def test_capsule_llm_step_visual_feedback_keeps_save_failures_out_of_live_prompt(
+    tmp_path, monkeypatch
+):
+    record = _capsule_test_visual("main", [21, 22, 23])
+    live_prompts = []
+
+    monkeypatch.setattr(
+        trial_module,
+        "_capture_capsule_visuals",
+        lambda env, *, use_wrist_camera=False: ([record], []),
+    )
+    monkeypatch.setattr(
+        trial_module,
+        "_save_capsule_visuals",
+        lambda records, output_dir, *, trial_id, step_id: (
+            {},
+            [{"camera": "main", "error": "save_failed"}],
+        ),
+    )
+
+    def fake_query_model(args, prompt):
+        live_prompts.append(prompt)
+        return {"content": '{"action":"finish","args":{}}'}
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    trial_module._run_capsule_llm_step_loop(
+        FakeCapsuleEnv(),
+        trial=5,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "capsule_action_visual_feedback": True,
+        },
+        initial_code="x = 1\n",
+    )
+
+    assert _prompt_image_urls(live_prompts[0]) == [record.data_url]
+    serialized_live_prompt = json.dumps(live_prompts[0])
+    assert "Current main-camera view unavailable (save_failed)." not in (
+        serialized_live_prompt
+    )
+    assert "save_failed" not in serialized_live_prompt
+    prompt_artifact = (
+        tmp_path / "capsule_prompts_trial_05.json"
+    ).read_text()
+    assert "save_failed" not in prompt_artifact
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_05.jsonl"
+    )
+    assert rows[0]["visual_capture_errors"] == []
+    assert rows[0]["visual_artifact_errors"] == [
+        {"camera": "main", "error": "save_failed"}
+    ]
+
+
+def test_capsule_llm_step_visual_feedback_audits_terminal_refresh_failures(
+    tmp_path, monkeypatch
+):
+    record = _capsule_test_visual("main", [31, 32, 33])
+    captures = iter(
+        [
+            ([record], []),
+            ([], [{"camera": "main", "error": "capture_failed"}]),
+        ]
+    )
+    saves = iter(
+        [
+            ({record.sha256: "capsule_visuals_trial_06/step_00_main.png"}, []),
+            ({}, [{"camera": "all", "error": "save_failed"}]),
+        ]
+    )
+
+    monkeypatch.setattr(
+        trial_module,
+        "_capture_capsule_visuals",
+        lambda env, *, use_wrist_camera=False: next(captures),
+    )
+    monkeypatch.setattr(
+        trial_module,
+        "_save_capsule_visuals",
+        lambda records, output_dir, *, trial_id, step_id: next(saves),
+    )
+
+    summary = trial_module._run_capsule_llm_step_loop(
+        FakeCapsuleEnv(),
+        trial=6,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "capsule_action_visual_feedback": True,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[{"action": "finish", "args": {}}],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_06.jsonl"
+    )
+    assert rows[0]["visual_capture_errors"] == []
+    assert rows[0]["visual_artifact_errors"] == []
+    assert rows[0]["post_action_visual_capture_errors"] == [
+        {"camera": "main", "error": "capture_failed"}
+    ]
+    assert rows[0]["post_action_visual_artifact_errors"] == [
+        {"camera": "all", "error": "save_failed"}
+    ]
+    assert '"step_id": 1' in summary.log
+    assert '"error": "capture_failed"' in summary.log
+    assert '"error": "save_failed"' in summary.log
+    assert '"visual_capture_errors":' in summary.log
+    assert '"visual_artifact_errors":' in summary.log
+    assert '"visual_artifacts_complete": false' in summary.log
+
+
 def test_capsule_llm_step_visual_feedback_can_keep_action_prompts_text_only(
     tmp_path, monkeypatch
 ):
@@ -1212,7 +1378,7 @@ def test_capsule_llm_step_visual_feedback_can_keep_action_prompts_text_only(
         },
     )
 
-    assert capture_calls == [True, True, True]
+    assert capture_calls == [True]
     assert len(_prompt_image_urls(live_prompts[0])) == 2
     assert _prompt_image_urls(live_prompts[1]) == []
     assert _prompt_image_urls(live_prompts[2]) == []
@@ -1221,6 +1387,8 @@ def test_capsule_llm_step_visual_feedback_can_keep_action_prompts_text_only(
     )
     assert [row["action_prompt_image_count"] for row in rows] == [0, 0]
     assert [row["action_prompt_images"] for row in rows] == [[], []]
+    assert [row["post_action_visual_capture_errors"] for row in rows] == [[], []]
+    assert [row["post_action_visual_artifact_errors"] for row in rows] == [[], []]
 
 
 def test_capsule_llm_step_visual_feedback_refreshes_after_all_action_outcomes(
