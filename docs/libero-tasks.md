@@ -77,11 +77,20 @@ computation must remain within the static budget. Legacy arbitrary-Python Capsul
 programs are not available in non-privileged mode.
 
 This configuration also requires an external Molmo vLLM service on port 8122. It is
-not auto-started by the YAML. Start it in a separate server terminal and wait for the
-OpenAI-compatible endpoint to become ready before launching the LIBERO trial:
+not auto-started by the YAML. Use a separate Molmo service environment so the Molmo
+`torch`/vLLM dependencies do not conflict with the dedicated LIBERO environment. Do
+not assume `.venv-libero` already contains vLLM. Create the service environment once:
 
 ```bash
-source .venv-libero/bin/activate
+uv venv .venv-molmo --python 3.12
+source .venv-molmo/bin/activate
+uv sync --active --extra molmo
+```
+
+Then start Molmo from that environment in a separate server terminal:
+
+```bash
+source .venv-molmo/bin/activate
 python -m capx.serving.vllm_server --model allenai/Molmo2-8B --host 127.0.0.1 --port 8122
 ```
 

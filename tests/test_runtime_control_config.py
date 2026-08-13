@@ -133,6 +133,10 @@ def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
     assert "do not run this command from the windows checkout" in docs
     assert "external molmo vllm service" in docs
     assert "not auto-started" in docs
+    assert "separate molmo service environment" in docs
+    assert "uv venv .venv-molmo --python 3.12" in docs
+    assert "source .venv-molmo/bin/activate" in docs
+    assert "uv sync --active --extra molmo" in docs
     assert (
         "python -m capx.serving.vllm_server --model allenai/molmo2-8b "
         "--host 127.0.0.1 --port 8122"
