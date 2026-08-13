@@ -75,6 +75,45 @@ agent_mode: capsule
     assert config["capsule_diagnostic_state_level"] == "none"
 
 
+def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
+    data = yaml.safe_load(
+        Path(
+            "env_configs/libero/franka_libero_object_0_capsule_llm_step.yaml"
+        ).read_text()
+    )
+    cfg = data["env"]["cfg"]
+    low_level = cfg["low_level"]
+
+    assert low_level["suite_name"] == "libero_object"
+    assert low_level["task_id"] == 0
+    assert low_level["privileged"] is False
+    assert cfg["privileged"] is False
+    assert cfg["apis"] == ["FrankaLiberoApi"]
+    assert data["agent_mode"] == "capsule"
+    assert data["capsule_control_mode"] == "llm_step"
+    assert data["max_capsule_steps"] == 24
+    assert data["capsule_progress_mode"] == "sparse_terminal"
+    assert data["capsule_require_task_success_for_finish"] is True
+    assert data["capsule_validate_program_contract"] is True
+    assert data["capsule_action_visual_feedback"] is True
+    assert data["capsule_prompt_state_level"] == "proprioceptive"
+    assert data["capsule_diagnostic_state_level"] == "full"
+    assert data["use_visual_feedback"] is True
+    assert data["use_wrist_camera"] is True
+    assert data["use_parallel_ensemble"] is False
+    assert data["trials"] == 1
+    assert data["num_workers"] == 1
+    assert data["record_video"] is True
+
+    prompt = cfg["prompt"].lower()
+    assert "one complete executable python program" in prompt
+    assert "pure computation, geometry, and perception helpers are allowed" in prompt
+    assert "robot motion or gripper calls inside helper functions, loops, or try blocks" in prompt
+    assert "robot side effects as top-level phases" in prompt
+    assert "at most one side-effect api call per phase" in prompt
+    assert "separated by calculations or fresh observations" in prompt
+
+
 def test_capsule_yaml_uses_code_primitives_not_robot_tools():
     data = yaml.safe_load(
         Path("env_configs/cube_stack/franka_robosuite_cube_stack_capsule_vdm.yaml").read_text()
