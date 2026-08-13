@@ -64,10 +64,7 @@ position = pose.position
 index = 0
 for item in range(3):
     index += item
-try:
-    if any(value > 0 for value in (1, 2, 3)):
-        raise ValueError("positive")
-except ValueError:
+if any(value > 0 for value in (1, 2, 3)):
     mapping["handled"] = True
 object_info = detect_object("bowl")
 ee_pose = get_ee_pose()
@@ -180,13 +177,8 @@ result = configure()
     assert _strict_analyze(source) == []
 
 
-def test_strict_subset_allows_safe_exception_classes_without_calling_them():
-    source = """\
-try:
-    raise ValueError
-except (ValueError, RuntimeError):
-    handled = True
-"""
+def test_strict_subset_allows_direct_safe_exception_construction():
+    source = 'raise ValueError("invalid target")\n'
 
     assert _strict_analyze(source) == []
 
@@ -832,6 +824,92 @@ total = sum((item for item in range(100)))
 """
 
     assert _strict_analyze(source) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "try:\n    value = 1\nexcept ValueError:\n    value = 2\n",
+        "assert condition\n",
+        "with resource:\n    value = 1\n",
+        "match value:\n    case 1:\n        result = True\n",
+        "del values[0]\n",
+    ],
+)
+def test_strict_subset_rejects_unmodeled_statements(source):
+    violations = _strict_analyze(source)
+
+    assert any(
+        "not allowed" in violation.message.lower()
+        for violation in violations
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "raise\n",
+        "raise ValueError\n",
+        'raise ValueError("bad") from cause\n',
+        'raise Exception("bad")\n',
+    ],
+)
+def test_strict_subset_rejects_unsafe_raise_forms(source):
+    violations = _strict_analyze(source)
+
+    assert any(
+        "raise" in violation.message.lower()
+        for violation in violations
+    )
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "values[exact_budget()] = 1",
+        "first, values[exact_budget()] = (1, 2)",
+        "values[exact_budget()]: int = 1",
+        "values[exact_budget()] += 1",
+    ],
+)
+def test_strict_subset_counts_assignment_target_evaluation(assignment):
+    source = (
+        "def exact_budget():\n"
+        "    for item in range(10000):\n"
+        "        value = item\n"
+        f"{assignment}\n"
+        "marker = 1\n"
+    )
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        "module exceeds static compute budget" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_allows_simple_subscript_and_annotated_assignments():
+    source = """\
+values = [1, 2]
+values[0] = 3
+first, values[1] = (4, 5)
+values[0]: int = 6
+values[1] += 1
+(count := 2)
+"""
+
+    assert _strict_analyze(source) == []
+
+
+@pytest.mark.parametrize("source", ["break\n", "continue\n", "return 1\n"])
+def test_strict_subset_rejects_loop_or_function_control_outside_scope(source):
+    violations = _strict_analyze(source)
+
+    assert any(
+        "outside" in violation.message.lower()
+        for violation in violations
+    )
 
 
 def test_allows_pure_helpers_and_one_side_effect_per_top_level_group():

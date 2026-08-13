@@ -136,20 +136,17 @@ _STRICT_CAPSULE_ALLOWED_NODES = (
     ast.Module,
     ast.Expr,
     ast.Assign,
+    ast.AnnAssign,
     ast.AugAssign,
     ast.NamedExpr,
     ast.If,
     ast.For,
-    ast.While,
-    ast.Try,
-    ast.ExceptHandler,
     ast.FunctionDef,
     ast.Return,
     ast.Pass,
     ast.Break,
     ast.Continue,
     ast.Raise,
-    ast.Assert,
     ast.Constant,
     ast.Name,
     ast.Attribute,
@@ -176,6 +173,23 @@ _STRICT_CAPSULE_ALLOWED_NODES = (
     ast.comprehension,
     ast.arguments,
     ast.arg,
+)
+_STRICT_CAPSULE_ALLOWED_STATEMENTS = (
+    ast.Expr,
+    ast.Assign,
+    ast.AnnAssign,
+    ast.AugAssign,
+    ast.If,
+    ast.For,
+    ast.FunctionDef,
+    ast.Return,
+    ast.Pass,
+    ast.Break,
+    ast.Continue,
+    ast.Raise,
+)
+_STRICT_CAPSULE_ANNOTATION_NAMES = frozenset(
+    {"bool", "dict", "float", "int", "list", "set", "str", "tuple"}
 )
 _STRICT_CAPSULE_ALLOWED_NODE_BASES = (
     ast.operator,
@@ -715,21 +729,30 @@ class _StrictStaticCostEstimator:
                 self.block_cost(node.orelse),
             )
             return _add_static_cost(self.expression_cost(node.test), branch_cost)
-        if isinstance(node, ast.Try):
-            alternatives = [self.block_cost(node.body)]
-            alternatives.extend(
-                self.block_cost(handler.body) for handler in node.handlers
-            )
-            cost = max(alternatives, default=0)
-            cost = _add_static_cost(cost, self.block_cost(node.orelse))
-            return _add_static_cost(cost, self.block_cost(node.finalbody))
         if isinstance(node, ast.Assign):
-            return max(1, self.expression_cost(node.value))
+            target_cost = 0
+            for target in node.targets:
+                target_cost = _add_static_cost(
+                    target_cost,
+                    self.assignment_target_cost(target),
+                )
+            return max(
+                1,
+                _add_static_cost(target_cost, self.expression_cost(node.value)),
+            )
+        if isinstance(node, ast.AnnAssign):
+            return max(
+                1,
+                _add_static_cost(
+                    self.assignment_target_cost(node.target),
+                    self.expression_cost(node.value),
+                ),
+            )
         if isinstance(node, ast.AugAssign):
             return max(
                 1,
                 _add_static_cost(
-                    self.expression_cost(node.target),
+                    self.assignment_target_cost(node.target),
                     self.expression_cost(node.value),
                 ),
             )
@@ -745,9 +768,9 @@ class _StrictStaticCostEstimator:
                 1,
                 self.expression_cost(node.exc) if node.exc is not None else 0,
             )
-        if isinstance(node, ast.Assert):
-            return max(1, self.expression_cost(node.test))
-        return 1
+        if isinstance(node, (ast.Pass, ast.Break, ast.Continue)):
+            return 1
+        return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
 
     def expression_cost(self, node: ast.expr | None) -> int:
         if node is None or isinstance(node, (ast.Constant, ast.Name)):
@@ -774,11 +797,37 @@ class _StrictStaticCostEstimator:
             (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp),
         ):
             return self._comprehension_cost(node)
+        if isinstance(node, ast.NamedExpr):
+            if not isinstance(node.target, ast.Name):
+                return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
+            return self.expression_cost(node.value)
         cost = 0
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.expr):
                 cost = _add_static_cost(cost, self.expression_cost(child))
         return cost
+
+    def assignment_target_cost(self, node: ast.expr) -> int:
+        if isinstance(node, ast.Name):
+            return 0
+        if isinstance(node, (ast.Tuple, ast.List)):
+            cost = 0
+            for element in node.elts:
+                cost = _add_static_cost(
+                    cost,
+                    self.assignment_target_cost(element),
+                )
+            return cost
+        if isinstance(node, ast.Starred):
+            return self.assignment_target_cost(node.value)
+        if isinstance(node, ast.Subscript):
+            return _add_static_cost(
+                self.expression_cost(node.value),
+                self.expression_cost(node.slice),
+            )
+        if isinstance(node, ast.Attribute):
+            return self.expression_cost(node.value)
+        return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
 
     def _call_argument_cost(self, node: ast.Call) -> int:
         cost = 0
@@ -909,6 +958,7 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         self.violations: list[ProgramContractViolation] = []
         self._helper_stack: list[str] = []
         self._iteration_products: list[int] = [1]
+        self._loop_depth = 0
 
     def _emit(
         self,
@@ -964,6 +1014,12 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         return None
 
     def generic_visit(self, node: ast.AST) -> None:
+        if isinstance(node, ast.stmt) and not isinstance(
+            node,
+            _STRICT_CAPSULE_ALLOWED_STATEMENTS,
+        ):
+            self._emit(node, f"syntax '{type(node).__name__}' is not allowed")
+            return
         if not isinstance(
             node,
             _STRICT_CAPSULE_ALLOWED_NODES
@@ -1120,13 +1176,26 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
             self.visit(statement)
 
     def visit_Raise(self, node: ast.Raise) -> None:
-        if node.exc is not None and not (
-            isinstance(node.exc, ast.Name)
-            and node.exc.id in _STRICT_CAPSULE_EXCEPTION_CLASSES
-        ):
+        is_safe_exception_call = (
+            isinstance(node.exc, ast.Call)
+            and isinstance(node.exc.func, ast.Name)
+            and node.exc.func.id in _STRICT_CAPSULE_EXCEPTION_CLASSES
+        )
+        if not is_safe_exception_call or node.cause is not None:
+            self._emit(
+                node,
+                "raise must directly construct ValueError or RuntimeError without 'from'",
+            )
+        if node.exc is not None:
             self.visit(node.exc)
         if node.cause is not None:
             self.visit(node.cause)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        self._emit(node, "syntax 'Try' is not allowed")
+
+    def visit_Assert(self, node: ast.Assert) -> None:
+        self._emit(node, "syntax 'Assert' is not allowed")
 
     def visit_While(self, node: ast.While) -> None:
         self._emit(
@@ -1143,12 +1212,38 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         product = self._bounded_iteration_product(node.iter)
         if product is not None:
             self._iteration_products.append(product)
+        self._loop_depth += 1
         for statement in node.body:
             self.visit(statement)
+        self._loop_depth -= 1
         if product is not None:
             self._iteration_products.pop()
         for statement in node.orelse:
             self.visit(statement)
+
+    def visit_Break(self, node: ast.Break) -> None:
+        if self._loop_depth == 0:
+            self._emit(node, "break is not allowed outside a loop")
+
+    def visit_Continue(self, node: ast.Continue) -> None:
+        if self._loop_depth == 0:
+            self._emit(node, "continue is not allowed outside a loop")
+
+    def visit_Return(self, node: ast.Return) -> None:
+        if not self._helper_stack:
+            self._emit(node, "return is not allowed outside a helper")
+        if node.value is not None:
+            self.visit(node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.visit(node.target)
+        if not (
+            isinstance(node.annotation, ast.Name)
+            and node.annotation.id in _STRICT_CAPSULE_ANNOTATION_NAMES
+        ):
+            self._emit(node.annotation, "annotation type is not allowed")
+        if node.value is not None:
+            self.visit(node.value)
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
         self._emit(
