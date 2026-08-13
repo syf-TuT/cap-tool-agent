@@ -26,6 +26,38 @@ def _build_strict_capsule_builtins() -> MappingProxyType:
     )
 
 
+_CAPSULE_PUBLIC_RESERVED_NAMES = STRICT_CAPSULE_SAFE_BUILTINS | frozenset(
+    {"__builtins__", "__name__", "APIS", "INPUTS", "RESULT", "env"}
+)
+
+
+def _validate_public_capsule_api_names(
+    api_functions: list[tuple[str, Callable[..., Any]]],
+) -> None:
+    seen_names: set[str] = set()
+    duplicate_names: set[str] = set()
+    for name, _fn in api_functions:
+        if name in seen_names:
+            duplicate_names.add(name)
+        seen_names.add(name)
+
+    reserved_names = seen_names & _CAPSULE_PUBLIC_RESERVED_NAMES
+    private_names = {
+        name for name in seen_names - reserved_names if name.startswith("_")
+    }
+    if not (reserved_names or private_names or duplicate_names):
+        return
+
+    problems = []
+    if reserved_names:
+        problems.append(f"reserved names: {', '.join(sorted(reserved_names))}")
+    if private_names:
+        problems.append(f"private names: {', '.join(sorted(private_names))}")
+    if duplicate_names:
+        problems.append(f"duplicate names: {', '.join(sorted(duplicate_names))}")
+    raise ValueError(f"Invalid public Capsule API namespace: {'; '.join(problems)}")
+
+
 class Tee(io.TextIOBase):
     """This allows streaming stdout and stderr to both the console and a buffer
     (enables breakpointing for debugging!)
@@ -222,6 +254,14 @@ class CodeExecutionEnvBase(Env):
         include_internal_handles: bool = True,
     ) -> dict[str, Any]:
         """Build a fresh namespace for region-based capsule execution."""
+        api_functions = [
+            (fn_name, fn)
+            for api in self._apis.values()
+            for fn_name, fn in api.functions().items()
+        ]
+        if not include_internal_handles:
+            _validate_public_capsule_api_names(api_functions)
+
         g: dict[str, Any] = {
             "__name__": "__main__",
             "INPUTS": {},
@@ -233,18 +273,17 @@ class CodeExecutionEnvBase(Env):
             # Supplying this explicitly prevents exec() from inserting the full
             # interpreter builtins into a public Capsule namespace.
             g["__builtins__"] = _build_strict_capsule_builtins()
-        for api in self._apis.values():
-            for fn_name, fn in api.functions().items():
-                g[fn_name] = (
-                    wrap_function_for_trace(
-                        fn_name,
-                        fn,
-                        trace,
-                        expose_wrapped=include_internal_handles,
-                    )
-                    if trace is not None
-                    else fn
+        for fn_name, fn in api_functions:
+            g[fn_name] = (
+                wrap_function_for_trace(
+                    fn_name,
+                    fn,
+                    trace,
+                    expose_wrapped=include_internal_handles,
                 )
+                if trace is not None
+                else fn
+            )
         return g
 
     def _build_low_level(

@@ -51,6 +51,14 @@ class FailingApi:
         raise RuntimeError("primitive failed")
 
 
+class NamedApi:
+    def __init__(self, functions):
+        self._functions = functions
+
+    def functions(self):
+        return self._functions
+
+
 def _capsule_env(*, privileged, api=None):
     env = object.__new__(CodeExecutionEnvBase)
     env.cfg = SimpleNamespace(privileged=privileged)
@@ -219,6 +227,62 @@ def test_public_capsule_failed_api_call_remains_opaque_and_traced():
     assert event.status == "failed"
     assert event.evidence["trace_events"][0]["name"] == "fail_primitive"
     assert event.evidence["trace_events"][0]["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "reserved_name",
+    sorted(
+        STRICT_CAPSULE_SAFE_BUILTINS
+        | {"__builtins__", "__name__", "APIS", "INPUTS", "RESULT", "env"}
+    ),
+)
+def test_public_capsule_globals_reject_reserved_api_names(reserved_name):
+    api = NamedApi({reserved_name: lambda: None})
+    env = _capsule_env(privileged=False, api=api)
+
+    with pytest.raises(ValueError) as exc_info:
+        env._build_capsule_globals(include_internal_handles=False)
+
+    assert "reserved" in str(exc_info.value).lower()
+    assert reserved_name in str(exc_info.value)
+
+
+@pytest.mark.parametrize("private_name", ["_private_api", "__dunder_api__"])
+def test_public_capsule_globals_reject_private_api_names(private_name):
+    api = NamedApi({private_name: lambda: None})
+    env = _capsule_env(privileged=False, api=api)
+
+    with pytest.raises(ValueError) as exc_info:
+        env._build_capsule_globals(include_internal_handles=False)
+
+    assert "private" in str(exc_info.value).lower()
+    assert private_name in str(exc_info.value)
+
+
+def test_public_capsule_globals_reject_duplicate_names_across_apis():
+    env = _capsule_env(privileged=False)
+    env._apis = {
+        "first": NamedApi({"observe": lambda: "first"}),
+        "second": NamedApi({"observe": lambda: "second"}),
+    }
+
+    with pytest.raises(ValueError) as exc_info:
+        env._build_capsule_globals(include_internal_handles=False)
+
+    assert "duplicate" in str(exc_info.value).lower()
+    assert "observe" in str(exc_info.value)
+
+
+def test_legacy_capsule_globals_preserve_api_name_overwrite_behavior():
+    replacement = lambda: "legacy-env"
+    env = _capsule_env(
+        privileged=True,
+        api=NamedApi({"env": replacement}),
+    )
+
+    globals_dict = env._build_capsule_globals(include_internal_handles=True)
+
+    assert globals_dict["env"] is replacement
 
 
 def test_legacy_capsule_globals_keep_internal_handles_by_default():
