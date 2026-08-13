@@ -4,10 +4,12 @@ import capx.runtime_control as runtime_control
 from capx.runtime_control.contract import (
     ProgramContractAnalysis,
     ProgramContractViolation,
+    STRICT_CAPSULE_MAX_STATIC_ITERATIONS,
     STRICT_CAPSULE_SAFE_BUILTINS,
     analyze_capsule_program_contract,
     analyze_capsule_program_contract_details,
     analyze_capsule_strict_subset,
+    preflight_capsule_strict_source,
 )
 from capx.runtime_control.normalizer import segment_python_code_groups
 from capx.runtime_control.segmenter import segment_python_code
@@ -463,7 +465,7 @@ for left, right in zip(range(3), reversed([1, 2, 3])):
     total += left + right
 for countdown in range(3, -1, -1):
     total += countdown
-grid = [left + right for left in range(100) for right in range(100)]
+grid = [left + right for left in range(90) for right in range(90)]
 """
 
     assert _strict_analyze(source) == []
@@ -508,9 +510,9 @@ def test_strict_subset_rejects_nested_iteration_products_over_budget(source):
 
 def test_strict_subset_resets_iteration_budget_for_sequential_loops():
     source = """\
-for first in range(10000):
+for first in range(5000):
     value = first
-for second in range(10000):
+for second in range(5000):
     value = second
 """
 
@@ -584,6 +586,175 @@ def test_strict_subset_reports_async_comprehension_at_its_own_line():
         if "asynchronous comprehensions" in violation.message.lower()
     )
     assert (violation.start_line, violation.end_line) == (2, 2)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "values = list(range(1000000000))\n",
+        "values = set(range(10001))\n",
+        "values = tuple(range(limit))\n",
+        "values = dict(observations)\n",
+        "values = sorted(range(10001))\n",
+        "value = sum(range(10 ** 100))\n",
+        "value = min(observations)\n",
+        "value = max(range(10001))\n",
+        "value = all(observations)\n",
+        "value = any(observations)\n",
+        "value = sum(observations, 10)\n",
+    ],
+)
+def test_strict_subset_rejects_unbounded_iterable_consumers(source):
+    violations = _strict_analyze(source)
+
+    assert any(
+        "iterable consumer" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_allows_finite_consumers_and_scalar_min_max():
+    source = """\
+listed = list(range(10))
+unique = set([1, 1, 2])
+packed = tuple((1, 2))
+mapping = dict([("a", 1), ("b", 2)])
+mapping_with_keywords = dict(a=1, b=2)
+empty_mapping = dict()
+ordered = sorted(range(10))
+total = sum(range(10))
+smallest = min(3, 2, 1)
+largest = max(1, 2, 3)
+all_true = all((True, True))
+any_true = any([False, True])
+"""
+
+    assert _strict_analyze(source) == []
+
+
+def test_strict_subset_allows_one_consumer_at_exact_total_budget():
+    source = "ordered = sorted(range(10000))\n"
+
+    assert _strict_analyze(source) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "def work():\n"
+            "    for first in range(10000):\n"
+            "        value = first\n"
+            "    for second in range(10000):\n"
+            "        value = second\n"
+            "work()\n"
+        ),
+        (
+            "def work():\n"
+            "    for item in range(10000):\n"
+            "        value = item\n"
+            "work()\n"
+            "for item in range(10000):\n"
+            "    value = item\n"
+        ),
+    ],
+)
+def test_strict_subset_rejects_sequential_work_over_total_budget(source):
+    violations = _strict_analyze(source)
+
+    assert any(
+        "static compute budget" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_rejects_exponentially_reused_helper_dag():
+    definitions = ["def helper_0():\n    return 1"]
+    for index in range(1, 40):
+        definitions.append(
+            f"def helper_{index}():\n"
+            f"    return helper_{index - 1}() + helper_{index - 1}()"
+        )
+    source = "\n".join([*definitions, "result = helper_39()", ""])
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        "static compute budget" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_allows_small_total_helper_and_loop_cost():
+    source = """\
+def normalize(value):
+    return abs(value)
+def work():
+    total = 0
+    for item in range(20):
+        total += normalize(item)
+    return total
+first = work()
+second = work()
+"""
+
+    assert _strict_analyze(source) == []
+    assert STRICT_CAPSULE_MAX_STATIC_ITERATIONS == 10_000
+
+
+def test_strict_subset_reports_over_budget_helper_even_when_uncalled():
+    source = """\
+def expensive():
+    first = list(range(6000))
+    second = list(range(6000))
+value = 1
+"""
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        violation.helper_name == "expensive"
+        and "static compute budget" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_preflight_rejects_helper_flood_before_segmentation():
+    source = "\n".join(
+        f"def helper_{index}():\n    return {index}"
+        for index in range(1200)
+    )
+
+    violations = preflight_capsule_strict_source(source)
+
+    assert len(violations) == 1
+    assert violations[0].code == "strict_subset_violation"
+    assert "helper limit" in violations[0].message.lower()
+    assert violations[0].region_ids == ()
+    assert violations[0].group_ids == ()
+
+
+def test_strict_subset_preflight_counts_conditional_helper_flood_iteratively():
+    source = "\n".join(
+        f"if condition_{index}:\n    def helper_{index}():\n        return {index}"
+        for index in range(300)
+    )
+
+    violations = preflight_capsule_strict_source(source)
+
+    assert len(violations) == 1
+    assert "helper limit" in violations[0].message.lower()
+
+
+def test_strict_subset_preflight_api_is_exported():
+    assert (
+        runtime_control.preflight_capsule_strict_source
+        is preflight_capsule_strict_source
+    )
+    assert (
+        runtime_control.STRICT_CAPSULE_MAX_STATIC_ITERATIONS
+        == STRICT_CAPSULE_MAX_STATIC_ITERATIONS
+    )
 
 
 def test_allows_pure_helpers_and_one_side_effect_per_top_level_group():

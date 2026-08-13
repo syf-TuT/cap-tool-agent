@@ -76,7 +76,8 @@ STRICT_CAPSULE_SAFE_BUILTINS: frozenset[str] = frozenset(
     }
 )
 STRICT_CAPSULE_MAX_HELPERS = 256
-STRICT_CAPSULE_MAX_ITERATIONS = 10_000
+STRICT_CAPSULE_MAX_STATIC_ITERATIONS = 10_000
+STRICT_CAPSULE_MAX_ITERATIONS = STRICT_CAPSULE_MAX_STATIC_ITERATIONS
 
 _STRICT_CAPSULE_FORBIDDEN_CALLABLES = frozenset(
     {
@@ -124,6 +125,9 @@ _STRICT_CAPSULE_SENSITIVE_NAMES = frozenset(
 )
 _STRICT_CAPSULE_EXCEPTION_CLASSES = frozenset({"RuntimeError", "ValueError"})
 _STRICT_CAPSULE_KEY_CALLBACK_CALLS = frozenset({"max", "min", "sorted"})
+_STRICT_CAPSULE_ITERABLE_CONSUMERS = frozenset(
+    {"all", "any", "dict", "list", "max", "min", "set", "sorted", "sum", "tuple"}
+)
 _STRICT_CAPSULE_BOUNDED_ITERABLE_WRAPPERS = frozenset(
     {"dict", "enumerate", "list", "reversed", "set", "tuple"}
 )
@@ -373,23 +377,13 @@ def analyze_capsule_strict_subset(
         for statement in module.body
         if isinstance(statement, ast.FunctionDef)
     )
-    if len(direct_helpers) > STRICT_CAPSULE_MAX_HELPERS:
-        start_line, _ = _node_span(direct_helpers[0])
-        _, end_line = _node_span(direct_helpers[-1])
-        return [
-            _build_violation(
-                code="strict_subset_violation",
-                message=(
-                    "Strict Capsule subset violation: helper limit exceeded "
-                    f"({len(direct_helpers)} > {STRICT_CAPSULE_MAX_HELPERS})"
-                ),
-                start_line=start_line,
-                end_line=end_line,
-                regions=regions,
-                groups=groups,
-                side_effects=(),
-            )
-        ]
+    preflight_violations = _preflight_capsule_strict_module(
+        module,
+        regions=regions,
+        groups=groups,
+    )
+    if preflight_violations:
+        return preflight_violations
     safe_calls = (
         set(STRICT_CAPSULE_SAFE_BUILTINS)
         if safe_builtin_calls is None
@@ -416,6 +410,15 @@ def analyze_capsule_strict_subset(
     for helper, reason in helper_issues:
         visitor.add_helper_violation(helper, reason)
     visitor.visit(module)
+    visitor.violations.extend(
+        _strict_static_compute_violations(
+            module,
+            direct_helpers,
+            pure_helper_names=pure_helper_names,
+            regions=regions,
+            groups=groups,
+        )
+    )
     return sorted(
         set(visitor.violations),
         key=lambda violation: (
@@ -426,6 +429,53 @@ def analyze_capsule_strict_subset(
             violation.helper_name or "",
         ),
     )
+
+
+def preflight_capsule_strict_source(source: str) -> list[ProgramContractViolation]:
+    """Reject structurally excessive strict Capsule source before segmentation."""
+    module = ast.parse(source)
+    return _preflight_capsule_strict_module(
+        module,
+        regions=[],
+        groups=[],
+    )
+
+
+def _preflight_capsule_strict_module(
+    module: ast.Module,
+    *,
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup],
+) -> list[ProgramContractViolation]:
+    all_helpers = sorted(
+        (
+            node
+            for node in ast.walk(module)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ),
+        key=lambda node: (
+            int(getattr(node, "lineno", 1)),
+            int(getattr(node, "col_offset", 0)),
+        ),
+    )
+    if len(all_helpers) <= STRICT_CAPSULE_MAX_HELPERS:
+        return []
+    start_line, _ = _node_span(all_helpers[0])
+    _, end_line = _node_span(all_helpers[-1])
+    return [
+        _build_violation(
+            code="strict_subset_violation",
+            message=(
+                "Strict Capsule subset violation: helper limit exceeded "
+                f"({len(all_helpers)} > {STRICT_CAPSULE_MAX_HELPERS})"
+            ),
+            start_line=start_line,
+            end_line=end_line,
+            regions=regions,
+            groups=groups,
+            side_effects=(),
+        )
+    ]
 
 
 def _prove_strict_helper_purity(
@@ -548,6 +598,235 @@ def _strict_recursive_helper_names(
         if helper_name in dependencies[helper_name]:
             recursive.add(helper_name)
     return recursive
+
+
+def _strict_static_compute_violations(
+    module: ast.Module,
+    direct_helpers: tuple[ast.FunctionDef, ...],
+    *,
+    pure_helper_names: set[str],
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup],
+) -> list[ProgramContractViolation]:
+    helpers_by_name = {
+        helper.name: helper
+        for helper in direct_helpers
+        if helper.name in pure_helper_names
+    }
+    estimator = _StrictStaticCostEstimator(helpers_by_name)
+    violations: list[ProgramContractViolation] = []
+    for helper in direct_helpers:
+        if helper.name not in pure_helper_names:
+            continue
+        cost = estimator.helper_cost(helper.name)
+        if cost <= STRICT_CAPSULE_MAX_STATIC_ITERATIONS:
+            continue
+        start_line, end_line = _node_span(helper)
+        violations.append(
+            _build_violation(
+                code="strict_subset_violation",
+                message=(
+                    "Strict Capsule subset violation: helper "
+                    f"'{helper.name}' exceeds static compute budget "
+                    f"{STRICT_CAPSULE_MAX_STATIC_ITERATIONS}"
+                ),
+                start_line=start_line,
+                end_line=end_line,
+                regions=regions,
+                groups=groups,
+                side_effects=(),
+                helper_name=helper.name,
+            )
+        )
+
+    module_cost = estimator.block_cost(module.body, include_definitions=False)
+    if module_cost > STRICT_CAPSULE_MAX_STATIC_ITERATIONS and module.body:
+        start_line, _ = _node_span(module.body[0])
+        _, end_line = _node_span(module.body[-1])
+        violations.append(
+            _build_violation(
+                code="strict_subset_violation",
+                message=(
+                    "Strict Capsule subset violation: module exceeds static "
+                    f"compute budget {STRICT_CAPSULE_MAX_STATIC_ITERATIONS}"
+                ),
+                start_line=start_line,
+                end_line=end_line,
+                regions=regions,
+                groups=groups,
+                side_effects=(),
+            )
+        )
+    return violations
+
+
+class _StrictStaticCostEstimator:
+    """Conservatively estimate bounded work, saturating at budget + one."""
+
+    def __init__(self, helpers_by_name: dict[str, ast.FunctionDef]) -> None:
+        self.helpers_by_name = helpers_by_name
+        self._helper_costs: dict[str, int] = {}
+        self._active_helpers: set[str] = set()
+
+    def helper_cost(self, helper_name: str) -> int:
+        if helper_name in self._helper_costs:
+            return self._helper_costs[helper_name]
+        if helper_name in self._active_helpers:
+            return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
+        helper = self.helpers_by_name.get(helper_name)
+        if helper is None:
+            return 1
+        self._active_helpers.add(helper_name)
+        cost = self.block_cost(helper.body)
+        self._active_helpers.remove(helper_name)
+        self._helper_costs[helper_name] = cost
+        return cost
+
+    def block_cost(
+        self,
+        statements: list[ast.stmt],
+        *,
+        include_definitions: bool = True,
+    ) -> int:
+        cost = 0
+        for statement in statements:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                statement_cost = 0 if not include_definitions else 1
+            else:
+                statement_cost = self.statement_cost(statement)
+            cost = _add_static_cost(cost, statement_cost)
+        return cost
+
+    def statement_cost(self, node: ast.stmt) -> int:
+        if isinstance(node, ast.For):
+            bound = _static_iteration_bound(node.iter)
+            if bound is None:
+                return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
+            body_cost = max(1, self.block_cost(node.body))
+            loop_cost = _multiply_static_cost(bound, body_cost)
+            return _add_static_cost(loop_cost, self.block_cost(node.orelse))
+        if isinstance(node, (ast.While, ast.AsyncFor)):
+            return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
+        if isinstance(node, ast.If):
+            branch_cost = max(
+                self.block_cost(node.body),
+                self.block_cost(node.orelse),
+            )
+            return _add_static_cost(self.expression_cost(node.test), branch_cost)
+        if isinstance(node, ast.Try):
+            alternatives = [self.block_cost(node.body)]
+            alternatives.extend(
+                self.block_cost(handler.body) for handler in node.handlers
+            )
+            cost = max(alternatives, default=0)
+            cost = _add_static_cost(cost, self.block_cost(node.orelse))
+            return _add_static_cost(cost, self.block_cost(node.finalbody))
+        if isinstance(node, ast.Assign):
+            return max(1, self.expression_cost(node.value))
+        if isinstance(node, ast.AugAssign):
+            return max(
+                1,
+                _add_static_cost(
+                    self.expression_cost(node.target),
+                    self.expression_cost(node.value),
+                ),
+            )
+        if isinstance(node, ast.Expr):
+            return max(1, self.expression_cost(node.value))
+        if isinstance(node, ast.Return):
+            return max(
+                1,
+                self.expression_cost(node.value) if node.value is not None else 0,
+            )
+        if isinstance(node, ast.Raise):
+            return max(
+                1,
+                self.expression_cost(node.exc) if node.exc is not None else 0,
+            )
+        if isinstance(node, ast.Assert):
+            return max(1, self.expression_cost(node.test))
+        return 1
+
+    def expression_cost(self, node: ast.expr | None) -> int:
+        if node is None or isinstance(node, (ast.Constant, ast.Name)):
+            return 0
+        if isinstance(node, ast.Call):
+            argument_cost = self._call_argument_cost(node)
+            if isinstance(node.func, ast.Name):
+                callable_name = node.func.id
+                if callable_name in self.helpers_by_name:
+                    return _add_static_cost(
+                        argument_cost,
+                        self.helper_cost(callable_name),
+                    )
+                if _strict_call_consumes_iterable(node, callable_name):
+                    bound = _static_iteration_bound(node.args[0])
+                    if bound is None:
+                        return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
+                    return _add_static_cost(argument_cost, bound)
+                if callable_name == "range":
+                    return argument_cost
+            return _add_static_cost(argument_cost, 1)
+        if isinstance(
+            node,
+            (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp),
+        ):
+            return self._comprehension_cost(node)
+        cost = 0
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.expr):
+                cost = _add_static_cost(cost, self.expression_cost(child))
+        return cost
+
+    def _call_argument_cost(self, node: ast.Call) -> int:
+        cost = 0
+        for argument in node.args:
+            cost = _add_static_cost(cost, self.expression_cost(argument))
+        for keyword in node.keywords:
+            cost = _add_static_cost(cost, self.expression_cost(keyword.value))
+        return cost
+
+    def _comprehension_cost(
+        self,
+        node: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp,
+    ) -> int:
+        product = 1
+        condition_cost = 0
+        for generator in node.generators:
+            bound = _static_iteration_bound(generator.iter)
+            if bound is None:
+                return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
+            product = _multiply_static_cost(product, bound)
+            for condition in generator.ifs:
+                condition_cost = _add_static_cost(
+                    condition_cost,
+                    self.expression_cost(condition),
+                )
+        if isinstance(node, ast.DictComp):
+            result_cost = _add_static_cost(
+                self.expression_cost(node.key),
+                self.expression_cost(node.value),
+            )
+        else:
+            result_cost = self.expression_cost(node.elt)
+        per_iteration = max(1, _add_static_cost(condition_cost, result_cost))
+        return _multiply_static_cost(product, per_iteration)
+
+
+def _add_static_cost(first: int, second: int) -> int:
+    return min(
+        STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1,
+        first + second,
+    )
+
+
+def _multiply_static_cost(first: int, second: int) -> int:
+    if first == 0 or second == 0:
+        return 0
+    limit = STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
+    if first > STRICT_CAPSULE_MAX_STATIC_ITERATIONS // second:
+        return limit
+    return min(limit, first * second)
 
 
 def _collect_strict_helper_calls(statements: list[ast.stmt]) -> list[ast.Call]:
@@ -787,6 +1066,18 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
                             keyword,
                             f"callback argument 'key' is not allowed for '{name}'",
                         )
+            if _strict_call_consumes_iterable(node, name):
+                bound = _static_iteration_bound(node.args[0])
+                if (
+                    bound is None
+                    or bound > STRICT_CAPSULE_MAX_STATIC_ITERATIONS
+                ):
+                    self._emit(
+                        node.args[0],
+                        f"iterable consumer '{name}' requires a statically bounded "
+                        "input of at most "
+                        f"{STRICT_CAPSULE_MAX_STATIC_ITERATIONS} items",
+                    )
 
         for argument in node.args:
             self.visit(argument)
@@ -955,6 +1246,16 @@ def _is_none_literal(node: ast.expr) -> bool:
     return isinstance(node, ast.Constant) and node.value is None
 
 
+def _strict_call_consumes_iterable(node: ast.Call, name: str) -> bool:
+    if name not in _STRICT_CAPSULE_ITERABLE_CONSUMERS:
+        return False
+    if name in {"min", "max"}:
+        return len(node.args) == 1
+    if name == "sum":
+        return len(node.args) in {1, 2}
+    return len(node.args) == 1
+
+
 def _static_iteration_bound(node: ast.expr) -> int | None:
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         if any(isinstance(element, ast.Starred) for element in node.elts):
@@ -964,6 +1265,19 @@ def _static_iteration_bound(node: ast.expr) -> int | None:
         if any(key is None for key in node.keys):
             return None
         return len(node.keys)
+    if isinstance(
+        node,
+        (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+    ):
+        product = 1
+        for generator in node.generators:
+            if generator.is_async:
+                return None
+            bound = _static_iteration_bound(generator.iter)
+            if bound is None:
+                return None
+            product = _multiply_static_cost(product, bound)
+        return product
     if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
         return None
     if node.keywords:
