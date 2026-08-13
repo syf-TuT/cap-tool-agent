@@ -9,6 +9,8 @@ from typing import Any
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, RuntimeAction
 
 _CONTRACT_SAFETY_MAX_CHARS = 12000
+_CONTRACT_SAFETY_FALLBACK_MAX_CHARS = 6000
+_CONTRACT_SAFETY_MIN_CHARS = 256
 _CONTRACT_TEXT_MAX_CHARS = 640
 _CONTRACT_ID_MAX_CHARS = 160
 _CONTRACT_LIST_MAX_ITEMS = 6
@@ -123,7 +125,6 @@ def build_capsule_prompt(
     normalized_side_effect_ledger = _normalize_side_effect_ledger(side_effect_ledger)
     run_group_example_id = _example_group_id(groups or [], normalized_side_effect_ledger)
     run_region_example_id = _example_region_id(regions, normalized_side_effect_ledger)
-    contract_safety_context = _compact_contract_violations(contract_violations)
     strict_source_constraints = f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n" if strict_subset else ""
 
     prompt_text = _build_capsule_prompt_text(
@@ -132,7 +133,7 @@ def build_capsule_prompt(
         groups=groups,
         history=history,
         trace_summary=trace_summary,
-        contract_safety_context=contract_safety_context,
+        contract_safety_context=_compact_contract_violations(contract_violations),
         strict_source_constraints=strict_source_constraints,
         side_effect_ledger=normalized_side_effect_ledger,
         compact_context=compact_context,
@@ -155,7 +156,14 @@ def build_capsule_prompt(
             groups=groups,
             history=history,
             trace_summary=trace_summary,
-            contract_safety_context=contract_safety_context,
+            contract_safety_context=_compact_contract_violations(
+                contract_violations,
+                max_chars=_contract_safety_budget(
+                    prompt_char_budget,
+                    divisor=1,
+                    max_chars=_CONTRACT_SAFETY_FALLBACK_MAX_CHARS,
+                ),
+            ),
             strict_source_constraints=strict_source_constraints,
             side_effect_ledger=normalized_side_effect_ledger,
             compact_context=True,
@@ -183,7 +191,14 @@ def build_capsule_prompt(
             groups=groups,
             history=history,
             trace_summary=trace_summary,
-            contract_safety_context=contract_safety_context,
+            contract_safety_context=_compact_contract_violations(
+                contract_violations,
+                max_chars=_contract_safety_budget(
+                    prompt_char_budget,
+                    divisor=3,
+                    max_chars=_CONTRACT_SAFETY_MAX_CHARS,
+                ),
+            ),
             strict_source_constraints=strict_source_constraints,
             side_effect_ledger=normalized_side_effect_ledger,
             compact_context=True,
@@ -192,6 +207,37 @@ def build_capsule_prompt(
             source_preview_chars=0,
             focused_source_max_units=0,
             history_inspect_max_chars=_HISTORY_INSPECT_MINIMAL_SERIALIZED_CHARS,
+            recovery_guidance=recovery_guidance,
+            allowed_actions_text=allowed_actions_text,
+            recovery_example_line=recovery_example_line,
+            recovery_rule=recovery_rule,
+            run_group_example_id=run_group_example_id,
+            run_region_example_id=run_region_example_id,
+        )
+    if (
+        compact_context
+        and prompt_char_budget is not None
+        and prompt_char_budget >= _MINIMAL_FALLBACK_MIN_PROMPT_CHARS
+        and _prompt_text_over_budget(prompt_text, prompt_char_budget)
+    ):
+        prompt_text = _build_capsule_prompt_text(
+            task=task,
+            regions=regions,
+            groups=groups,
+            history=history,
+            trace_summary=trace_summary,
+            contract_safety_context=_compact_contract_violations(
+                contract_violations,
+                max_chars=_CONTRACT_SAFETY_MIN_CHARS,
+            ),
+            strict_source_constraints=strict_source_constraints,
+            side_effect_ledger=normalized_side_effect_ledger,
+            compact_context=True,
+            history_max_entries=min(history_max_entries, 1),
+            trace_max_events=0,
+            source_preview_chars=0,
+            focused_source_max_units=0,
+            history_inspect_max_chars=0,
             recovery_guidance=recovery_guidance,
             allowed_actions_text=allowed_actions_text,
             recovery_example_line=recovery_example_line,
@@ -377,7 +423,15 @@ def _compact_contract_violations(
             "violations": candidate_items,
             "omitted_count": total_count - len(candidate_items),
         }
-        if compact_items and len(json.dumps(candidate, default=str)) > max_chars:
+        if len(json.dumps(candidate, default=str)) > max_chars:
+            if not compact_items:
+                compact_items = [
+                    _minimal_contract_violation(
+                        violation,
+                        total_count=total_count,
+                        max_chars=max_chars,
+                    )
+                ]
             break
         compact_items = candidate_items
 
@@ -386,6 +440,49 @@ def _compact_contract_violations(
         "violations": compact_items,
         "omitted_count": total_count - len(compact_items),
     }
+
+
+def _minimal_contract_violation(
+    violation: dict[str, Any],
+    *,
+    total_count: int,
+    max_chars: int,
+) -> dict[str, str]:
+    raw_code = str(violation.get("code") or "<unknown>")
+
+    def context_for_code(code: str) -> dict[str, Any]:
+        return {
+            "total_count": total_count,
+            "violations": [{"code": code}],
+            "omitted_count": total_count - 1,
+        }
+
+    low = 1
+    high = min(len(raw_code), _CONTRACT_ID_MAX_CHARS)
+    best_code = raw_code[:1]
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate_code = raw_code[:midpoint]
+        if len(json.dumps(context_for_code(candidate_code), default=str)) <= max_chars:
+            best_code = candidate_code
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    return {"code": best_code}
+
+
+def _contract_safety_budget(
+    prompt_char_budget: int | None,
+    *,
+    divisor: int,
+    max_chars: int,
+) -> int:
+    if prompt_char_budget is None or prompt_char_budget < _MINIMAL_FALLBACK_MIN_PROMPT_CHARS:
+        return max_chars
+    return min(
+        max_chars,
+        max(_CONTRACT_SAFETY_MIN_CHARS, prompt_char_budget // divisor),
+    )
 
 
 def _compact_contract_violation(violation: dict[str, Any]) -> dict[str, Any]:
