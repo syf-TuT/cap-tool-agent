@@ -1,5 +1,6 @@
 import json
 
+import capx.runtime_control.prompts as prompt_module
 from capx.runtime_control.prompts import (
     _summarize_history_for_prompt,
     build_capsule_prompt,
@@ -557,6 +558,148 @@ def test_capsule_prompt_compact_second_fallback_respects_serialized_budget():
     assert "FULL_FEEDBACK_SOURCE_MUST_NOT_APPEAR" not in serialized
     assert "FULL_EVENT_SOURCE_MUST_NOT_APPEAR" not in serialized
     assert "A" * 300 not in serialized
+
+
+def test_compact_inspected_variables_share_aggregate_budget():
+    payload = "data:image/png;base64," + "A" * 10000
+    leaf = [payload for _ in range(32)]
+    level_two = [leaf for _ in range(32)]
+    nested_bomb = [level_two for _ in range(32)]
+    history = [
+        {
+            "step_id": 9,
+            "action": {
+                "action": "inspect_variables",
+                "args": {"names": ["a_short", "z_bomb"]},
+            },
+            "event": {
+                "action": "inspect_variables",
+                "status": "success",
+                "evidence": {
+                    "z_bomb": {"type": "list", "value": nested_bomb},
+                    "a_short": {"type": "int", "repr": "7"},
+                },
+            },
+            "feedback": {
+                "status": "warning",
+                "evidence": {
+                    "terminal_progress_unverified": True,
+                    "progress_mode": "sparse_terminal",
+                },
+            },
+        }
+    ]
+
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=history,
+        trace_summary={},
+        compact_context=True,
+        prompt_char_budget=6500,
+    )
+
+    serialized = json.dumps(prompt, default=str)
+    text = prompt[1]["content"][0]["text"]
+
+    assert len(serialized) <= 6500
+    assert '"terminal_progress_unverified": true' in text
+    assert '"progress_mode": "sparse_terminal"' in text
+    assert '"a_short"' in text
+    assert '"repr": "7"' in text
+    assert "data:image" not in serialized
+    assert "base64," not in serialized
+    assert "A" * 300 not in serialized
+
+
+def test_compact_inspected_variable_mapping_order_is_deterministic():
+    def history_with_evidence(evidence):
+        return [
+            {
+                "step_id": 1,
+                "action": {"action": "inspect_variables", "args": {"names": list(evidence)}},
+                "event": {
+                    "action": "inspect_variables",
+                    "status": "success",
+                    "evidence": evidence,
+                },
+            }
+        ]
+
+    ascending = {
+        "alpha": {"type": "dict", "value": {"a": 1, "b": 2}},
+        "beta": {"type": "dict", "value": {"x": 3, "y": 4}},
+    }
+    descending = {
+        "beta": {"value": {"y": 4, "x": 3}, "type": "dict"},
+        "alpha": {"value": {"b": 2, "a": 1}, "type": "dict"},
+    }
+
+    first = _summarize_history_for_prompt(history_with_evidence(ascending), max_entries=1)
+    second = _summarize_history_for_prompt(history_with_evidence(descending), max_entries=1)
+
+    assert json.dumps(first) == json.dumps(second)
+
+
+def test_compact_prompt_uses_third_fallback_without_dropping_safety_context(monkeypatch):
+    calls = []
+    original_build = prompt_module._build_capsule_prompt_text
+
+    def tracking_build(**kwargs):
+        calls.append(kwargs)
+        return original_build(**kwargs)
+
+    monkeypatch.setattr(prompt_module, "_build_capsule_prompt_text", tracking_build)
+    history = []
+    for step_id in range(2):
+        history.append(
+            {
+                "step_id": step_id,
+                "action": {"action": "inspect_variables", "args": {"names": ["a_short"]}},
+                "event": {
+                    "action": "inspect_variables",
+                    "status": "success",
+                    "evidence": {"a_short": {"type": "int", "repr": "7"}},
+                },
+                "feedback": {
+                    "status": "warning",
+                    "message": "M" * 1000,
+                    "evidence": {
+                        "terminal_progress_unverified": True,
+                        "progress_mode": "sparse_terminal",
+                        "primitive_calls": ["P" * 1000 for _ in range(100)],
+                    },
+                },
+            }
+        )
+
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=history,
+        trace_summary={},
+        contract_violations=[
+            {
+                "code": "effectful_helper",
+                "message": "Patch this violation before running effects",
+            }
+        ],
+        strict_subset=True,
+        compact_context=True,
+        prompt_char_budget=6500,
+    )
+
+    serialized = json.dumps(prompt, default=str)
+    text = prompt[1]["content"][0]["text"]
+
+    assert len(calls) == 3
+    assert calls[-1]["history_max_entries"] == 1
+    assert len(serialized) <= 6500
+    assert "Strict Python subset" in text
+    assert "Capsule-ready program contract violations" in text
+    assert "effectful_helper" in text
+    assert '"terminal_progress_unverified": true' in text
+    assert '"a_short"' in text
 
 
 def test_capsule_prompt_compact_context_includes_focused_failed_unit_source():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from heapq import nsmallest
 from itertools import islice
 from typing import Any
 
@@ -17,10 +18,15 @@ _HISTORY_INSPECT_MAX_LIST_ITEMS = 32
 _HISTORY_INSPECT_MAX_MAPPING_ITEMS = 8
 _HISTORY_INSPECT_MAX_DEPTH = 3
 _HISTORY_INSPECT_VALUE_KEYS = ("type", "shape", "value", "repr")
+_HISTORY_INSPECT_MAX_NODES = 96
+_HISTORY_INSPECT_MAX_SERIALIZED_CHARS = 1400
+_HISTORY_INSPECT_FALLBACK_SERIALIZED_CHARS = 512
+_HISTORY_INSPECT_MINIMAL_SERIALIZED_CHARS = 256
 _HISTORY_SCALAR_MAX_CHARS = 120
 _HISTORY_MESSAGE_MAX_CHARS = 240
 _HISTORY_PRIMITIVE_MAX_ITEMS = 8
 _HISTORY_PRIMITIVE_NAME_MAX_CHARS = 80
+_MINIMAL_FALLBACK_MIN_PROMPT_CHARS = 4096
 _STRICT_CAPSULE_SOURCE_CONSTRAINTS = (
     "Strict Python subset for every generated or patched source:\n"
     "- Use no imports, classes, lambdas, try, while, async, dynamic or reflective "
@@ -128,6 +134,7 @@ def build_capsule_prompt(
         trace_max_events=trace_max_events,
         source_preview_chars=source_preview_chars,
         focused_source_max_units=focused_source_max_units,
+        history_inspect_max_chars=_HISTORY_INSPECT_MAX_SERIALIZED_CHARS,
         recovery_guidance=recovery_guidance,
         allowed_actions_text=allowed_actions_text,
         recovery_example_line=recovery_example_line,
@@ -150,6 +157,35 @@ def build_capsule_prompt(
             trace_max_events=min(trace_max_events, 2),
             source_preview_chars=min(source_preview_chars, 80),
             focused_source_max_units=0,
+            history_inspect_max_chars=_HISTORY_INSPECT_FALLBACK_SERIALIZED_CHARS,
+            recovery_guidance=recovery_guidance,
+            allowed_actions_text=allowed_actions_text,
+            recovery_example_line=recovery_example_line,
+            recovery_rule=recovery_rule,
+            run_group_example_id=run_group_example_id,
+            run_region_example_id=run_region_example_id,
+        )
+    if (
+        compact_context
+        and prompt_char_budget is not None
+        and prompt_char_budget >= _MINIMAL_FALLBACK_MIN_PROMPT_CHARS
+        and _prompt_text_over_budget(prompt_text, prompt_char_budget)
+    ):
+        prompt_text = _build_capsule_prompt_text(
+            task=task,
+            regions=regions,
+            groups=groups,
+            history=history,
+            trace_summary=trace_summary,
+            contract_safety_context=contract_safety_context,
+            strict_source_constraints=strict_source_constraints,
+            side_effect_ledger=normalized_side_effect_ledger,
+            compact_context=True,
+            history_max_entries=min(history_max_entries, 1),
+            trace_max_events=0,
+            source_preview_chars=0,
+            focused_source_max_units=0,
+            history_inspect_max_chars=_HISTORY_INSPECT_MINIMAL_SERIALIZED_CHARS,
             recovery_guidance=recovery_guidance,
             allowed_actions_text=allowed_actions_text,
             recovery_example_line=recovery_example_line,
@@ -182,6 +218,7 @@ def _build_capsule_prompt_text(
     trace_max_events: int,
     source_preview_chars: int,
     focused_source_max_units: int,
+    history_inspect_max_chars: int,
     recovery_guidance: str,
     allowed_actions_text: str,
     recovery_example_line: str,
@@ -198,7 +235,11 @@ def _build_capsule_prompt_text(
             _compact_group_for_prompt(group, source_preview_chars=source_preview_chars)
             for group in groups or []
         ]
-        history_data = _summarize_history_for_prompt(history, max_entries=history_max_entries)
+        history_data = _summarize_history_for_prompt(
+            history,
+            max_entries=history_max_entries,
+            inspect_max_chars=history_inspect_max_chars,
+        )
         trace_data = _bound_trace_summary(trace_summary, max_events=trace_max_events)
         focused_source_data = _focused_failed_units_for_prompt(
             history=history,
@@ -800,7 +841,15 @@ def _bound_history_text_list(
     ]
 
 
-def _bound_history_runtime_value(value: Any, *, depth: int) -> Any:
+def _bound_history_runtime_value(
+    value: Any,
+    *,
+    depth: int,
+    node_budget: dict[str, int],
+) -> Any:
+    if node_budget["remaining"] <= 0:
+        return "<summary limit>"
+    node_budget["remaining"] -= 1
     if value is None or isinstance(value, (bool, float)):
         return value
     if isinstance(value, int):
@@ -811,41 +860,79 @@ def _bound_history_runtime_value(value: Any, *, depth: int) -> Any:
         return "<max depth>"
     if isinstance(value, (list, tuple)):
         return [
-            _bound_history_runtime_value(item, depth=depth + 1)
-            for item in value[:_HISTORY_INSPECT_MAX_LIST_ITEMS]
+            _bound_history_runtime_value(
+                item,
+                depth=depth + 1,
+                node_budget=node_budget,
+            )
+            for item in islice(value, _HISTORY_INSPECT_MAX_LIST_ITEMS)
+            if node_budget["remaining"] > 0
         ]
     if isinstance(value, dict):
         bounded: dict[str, Any] = {}
-        for key, item in islice(value.items(), _HISTORY_INSPECT_MAX_MAPPING_ITEMS):
-            bounded_key = _truncate_history_text(
-                str(key), max_chars=_HISTORY_INSPECT_MAX_NAME_CHARS
+        string_items = ((key, item) for key, item in value.items() if isinstance(key, str))
+        for key, item in nsmallest(
+            _HISTORY_INSPECT_MAX_MAPPING_ITEMS,
+            string_items,
+            key=lambda pair: pair[0],
+        ):
+            if node_budget["remaining"] <= 0:
+                break
+            bounded_key = _truncate_history_text(key, max_chars=_HISTORY_INSPECT_MAX_NAME_CHARS)
+            bounded[bounded_key] = _bound_history_runtime_value(
+                item,
+                depth=depth + 1,
+                node_budget=node_budget,
             )
-            bounded[bounded_key] = _bound_history_runtime_value(item, depth=depth + 1)
         return bounded
     return f"<{type(value).__name__}>"
 
 
-def _bound_inspected_variables(evidence: Any) -> dict[str, Any]:
-    if not isinstance(evidence, dict):
+def _bound_inspected_variables(
+    evidence: Any,
+    *,
+    max_serialized_chars: int,
+) -> dict[str, Any]:
+    if not isinstance(evidence, dict) or max_serialized_chars <= 0:
         return {}
     inspected: dict[str, Any] = {}
-    for name, raw_summary in islice(evidence.items(), _HISTORY_INSPECT_MAX_VARIABLES):
+    node_budget = {"remaining": _HISTORY_INSPECT_MAX_NODES}
+    string_items = ((name, value) for name, value in evidence.items() if isinstance(name, str))
+    for name, raw_summary in nsmallest(
+        _HISTORY_INSPECT_MAX_VARIABLES,
+        string_items,
+        key=lambda pair: pair[0],
+    ):
         if not isinstance(raw_summary, dict):
             continue
+        remaining_before = node_budget["remaining"]
         summary = {
-            key: _bound_history_runtime_value(raw_summary[key], depth=0)
+            key: _bound_history_runtime_value(
+                raw_summary[key],
+                depth=0,
+                node_budget=node_budget,
+            )
             for key in _HISTORY_INSPECT_VALUE_KEYS
             if key in raw_summary
         }
         if not summary:
             continue
-        bounded_name = _truncate_history_text(str(name), max_chars=_HISTORY_INSPECT_MAX_NAME_CHARS)
-        inspected[bounded_name] = summary
+        bounded_name = _truncate_history_text(name, max_chars=_HISTORY_INSPECT_MAX_NAME_CHARS)
+        candidate = {**inspected, bounded_name: summary}
+        if len(json.dumps(candidate, default=str, separators=(",", ":"))) > max_serialized_chars:
+            node_budget["remaining"] = remaining_before
+            continue
+        inspected = candidate
+        if node_budget["remaining"] <= 0:
+            break
     return inspected
 
 
 def _summarize_history_for_prompt(
-    history: list[dict[str, Any]], *, max_entries: int
+    history: list[dict[str, Any]],
+    *,
+    max_entries: int,
+    inspect_max_chars: int = _HISTORY_INSPECT_MAX_SERIALIZED_CHARS,
 ) -> list[dict[str, Any]]:
     bounded_count = max(0, int(max_entries))
     bounded = history[-bounded_count:] if bounded_count else []
@@ -893,7 +980,10 @@ def _summarize_history_for_prompt(
         if progress_mode in {"dense", "sparse_terminal"}:
             summary["progress_mode"] = progress_mode
         if action_name == "inspect_variables":
-            inspected_variables = _bound_inspected_variables(evidence)
+            inspected_variables = _bound_inspected_variables(
+                evidence,
+                max_serialized_chars=inspect_max_chars,
+            )
             if inspected_variables:
                 summary["inspected_variables"] = inspected_variables
         summaries.append(
