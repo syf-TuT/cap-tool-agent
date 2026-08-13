@@ -317,6 +317,108 @@ def test_strict_subset_api_is_exported_from_runtime_control_package():
     )
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "if condition:\n    def helper():\n        return 1\n",
+        "for item in values:\n    def helper():\n        return item\n",
+        "try:\n    def helper():\n        return 1\nexcept ValueError:\n    pass\n",
+        "with resource:\n    def helper():\n        return 1\n",
+    ],
+)
+def test_strict_subset_rejects_helpers_not_directly_in_module_body(source):
+    violations = _strict_analyze(source)
+
+    assert any(
+        "direct module" in violation.message.lower()
+        for violation in violations
+    )
+
+
+@pytest.mark.parametrize(
+    "use_helper",
+    [
+        "ordered = sorted([2, 1], key=helper)\n",
+        "alias = helper\n",
+    ],
+)
+def test_strict_subset_rejects_top_level_helper_as_callable_value(use_helper):
+    source = "def helper(value):\n    return value\n" + use_helper
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        "callable 'helper'" in violation.message.lower()
+        for violation in violations
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def unsafe():\n    close_gripper()\nunsafe()\n",
+        "def unsafe():\n    close_gripper()\nvalue = 1\n",
+        (
+            "def unsafe():\n"
+            "    close_gripper()\n"
+            "def outer():\n"
+            "    unsafe()\n"
+            "outer()\n"
+        ),
+    ],
+)
+def test_strict_subset_rejects_direct_and_transitive_effectful_helpers(source):
+    violations = _strict_analyze(source)
+
+    assert any(
+        "unsafe helper" in violation.message.lower()
+        or "side effect" in violation.message.lower()
+        for violation in violations
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def recurse():\n    recurse()\nvalue = 1\n",
+        (
+            "def first():\n"
+            "    second()\n"
+            "def second():\n"
+            "    first()\n"
+            "value = 1\n"
+        ),
+        (
+            "def unsafe_recurse():\n"
+            "    close_gripper()\n"
+            "    unsafe_recurse()\n"
+            "value = 1\n"
+        ),
+    ],
+)
+def test_strict_subset_rejects_recursive_helpers_even_when_uncalled(source):
+    violations = _strict_analyze(source)
+
+    assert any(
+        "recursive helper" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_allows_proven_pure_helper_chains_and_public_queries():
+    source = """\
+def normalize(value):
+    return round(abs(value), 2)
+def locate(name):
+    return detect_object(name)
+def prepare(value, name):
+    return (normalize(value), locate(name))
+result = prepare(-1.25, "bowl")
+"""
+
+    assert _strict_analyze(source) == []
+
+
 def test_allows_pure_helpers_and_one_side_effect_per_top_level_group():
     source = """\
 def offset(p):

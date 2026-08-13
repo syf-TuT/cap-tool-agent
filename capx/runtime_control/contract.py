@@ -362,24 +362,36 @@ def analyze_capsule_strict_subset(
 ) -> list[ProgramContractViolation]:
     """Validate the fail-closed Python subset used by non-privileged Capsules."""
     module = ast.parse(source)
-    helper_names = {
-        statement.name
+    direct_helpers = tuple(
+        statement
         for statement in module.body
         if isinstance(statement, ast.FunctionDef)
-    }
+    )
     safe_calls = (
         set(STRICT_CAPSULE_SAFE_BUILTINS)
         if safe_builtin_calls is None
         else set(safe_builtin_calls)
     )
+    public_calls = set(public_api_calls) | set(side_effect_calls)
+    helper_names, pure_helper_names, helper_issues = _prove_strict_helper_purity(
+        direct_helpers,
+        public_api_calls=public_calls,
+        side_effect_calls=set(side_effect_calls),
+        safe_builtin_calls=safe_calls,
+    )
     visitor = _StrictCapsuleSubsetVisitor(
         regions=regions,
         groups=groups,
-        public_api_calls=set(public_api_calls) | set(side_effect_calls),
+        public_api_calls=public_calls,
         side_effect_calls=set(side_effect_calls),
         safe_builtin_calls=safe_calls,
         helper_names=helper_names,
+        pure_helper_names=pure_helper_names,
+        direct_helper_node_ids={id(helper) for helper in direct_helpers},
     )
+    visitor.reject_misplaced_helpers(module)
+    for helper, reason in helper_issues:
+        visitor.add_helper_violation(helper, reason)
     visitor.visit(module)
     return sorted(
         set(visitor.violations),
@@ -393,6 +405,162 @@ def analyze_capsule_strict_subset(
     )
 
 
+def _prove_strict_helper_purity(
+    direct_helpers: tuple[ast.FunctionDef, ...],
+    *,
+    public_api_calls: set[str],
+    side_effect_calls: set[str],
+    safe_builtin_calls: set[str],
+) -> tuple[set[str], set[str], list[tuple[ast.FunctionDef, str]]]:
+    helpers_by_name: dict[str, list[ast.FunctionDef]] = {}
+    for helper in direct_helpers:
+        helpers_by_name.setdefault(helper.name, []).append(helper)
+    helper_names = set(helpers_by_name)
+
+    dependencies: dict[str, set[str]] = {
+        helper_name: set() for helper_name in helper_names
+    }
+    unsafe_reasons: dict[str, str] = {}
+    for helper_name, definitions in helpers_by_name.items():
+        if len(definitions) > 1:
+            unsafe_reasons[helper_name] = (
+                f"helper name '{helper_name}' is defined more than once"
+            )
+            continue
+
+        helper = definitions[0]
+        calls = _collect_strict_helper_calls(helper.body)
+        for call in calls:
+            if not isinstance(call.func, ast.Name):
+                unsafe_reasons.setdefault(
+                    helper_name,
+                    f"helper '{helper_name}' contains a non-direct call and is not provably pure"
+                )
+                continue
+            called_name = call.func.id
+            if called_name in side_effect_calls:
+                unsafe_reasons.setdefault(
+                    helper_name,
+                    f"helper '{helper_name}' calls robot side effect '{called_name}'"
+                )
+                continue
+            if called_name in helper_names:
+                dependencies[helper_name].add(called_name)
+                continue
+            if called_name in public_api_calls or called_name in safe_builtin_calls:
+                continue
+            unsafe_reasons.setdefault(
+                helper_name,
+                f"helper '{helper_name}' calls unknown callable '{called_name}' "
+                "and is not provably pure"
+            )
+
+    recursive_helpers = _strict_recursive_helper_names(dependencies)
+    for helper_name in recursive_helpers:
+        unsafe_reasons.setdefault(
+            helper_name,
+            f"recursive helper '{helper_name}' is unsupported",
+        )
+
+    changed = True
+    while changed:
+        changed = False
+        for helper_name, helper_dependencies in dependencies.items():
+            if helper_name in unsafe_reasons:
+                continue
+            unsafe_dependency = next(
+                (
+                    dependency
+                    for dependency in sorted(helper_dependencies)
+                    if dependency in unsafe_reasons
+                ),
+                None,
+            )
+            if unsafe_dependency is None:
+                continue
+            unsafe_reasons[helper_name] = (
+                f"helper '{helper_name}' depends on unsafe helper '{unsafe_dependency}'"
+            )
+            changed = True
+
+    pure_helper_names = helper_names - set(unsafe_reasons)
+    issues = [
+        (helper, unsafe_reasons[helper_name])
+        for helper_name, helpers in helpers_by_name.items()
+        if helper_name in unsafe_reasons
+        for helper in helpers
+    ]
+    for helper_name in sorted(recursive_helpers):
+        recursive_reason = f"recursive helper '{helper_name}' is unsupported"
+        if unsafe_reasons[helper_name] == recursive_reason:
+            continue
+        issues.extend(
+            (helper, recursive_reason)
+            for helper in helpers_by_name[helper_name]
+        )
+    return helper_names, pure_helper_names, issues
+
+
+def _strict_recursive_helper_names(
+    dependencies: dict[str, set[str]],
+) -> set[str]:
+    ordered_names = sorted(dependencies)
+    index_by_name = {
+        helper_name: index for index, helper_name in enumerate(ordered_names)
+    }
+    adjacency = {
+        index_by_name[helper_name]: [
+            index_by_name[dependency]
+            for dependency in sorted(helper_dependencies)
+        ]
+        for helper_name, helper_dependencies in dependencies.items()
+    }
+    recursive: set[str] = set()
+    for component in _strongly_connected_components(adjacency):
+        component_names = {ordered_names[index] for index in component}
+        if len(component_names) > 1:
+            recursive.update(component_names)
+            continue
+        helper_name = next(iter(component_names))
+        if helper_name in dependencies[helper_name]:
+            recursive.add(helper_name)
+    return recursive
+
+
+def _collect_strict_helper_calls(statements: list[ast.stmt]) -> list[ast.Call]:
+    visitor = _StrictHelperCallVisitor()
+    for statement in statements:
+        visitor.visit(statement)
+    return sorted(
+        visitor.calls,
+        key=lambda call: (
+            int(getattr(call, "lineno", 1)),
+            int(getattr(call, "col_offset", 0)),
+        ),
+    )
+
+
+class _StrictHelperCallVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.calls: list[ast.Call] = []
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self.calls.append(node)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+
 class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
     def __init__(
         self,
@@ -403,6 +571,8 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         side_effect_calls: set[str],
         safe_builtin_calls: set[str],
         helper_names: set[str],
+        pure_helper_names: set[str],
+        direct_helper_node_ids: set[int],
     ) -> None:
         self.regions = regions
         self.groups = groups
@@ -410,14 +580,26 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         self.side_effect_calls = side_effect_calls
         self.safe_builtin_calls = safe_builtin_calls
         self.helper_names = helper_names
-        self.allowed_calls = public_api_calls | safe_builtin_calls | helper_names
+        self.pure_helper_names = pure_helper_names
+        self.direct_helper_node_ids = direct_helper_node_ids
+        self.allowed_calls = (
+            public_api_calls | safe_builtin_calls | pure_helper_names
+        )
         self.protected_callable_names = (
-            self.allowed_calls | _STRICT_CAPSULE_FORBIDDEN_CALLABLES
+            self.allowed_calls
+            | helper_names
+            | _STRICT_CAPSULE_FORBIDDEN_CALLABLES
         )
         self.violations: list[ProgramContractViolation] = []
         self._helper_stack: list[str] = []
 
-    def _emit(self, node: ast.AST, reason: str) -> None:
+    def _emit(
+        self,
+        node: ast.AST,
+        reason: str,
+        *,
+        helper_name: str | None = None,
+    ) -> None:
         start_line, end_line = _node_span(node)
         side_effects = tuple(
             dict.fromkeys(
@@ -437,10 +619,25 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
                 groups=self.groups,
                 side_effects=side_effects,
                 helper_name=(
-                    self._helper_stack[-1] if self._helper_stack else None
+                    helper_name
+                    or (self._helper_stack[-1] if self._helper_stack else None)
                 ),
             )
         )
+
+    def reject_misplaced_helpers(self, module: ast.Module) -> None:
+        for node in ast.walk(module):
+            if isinstance(node, ast.FunctionDef) and (
+                id(node) not in self.direct_helper_node_ids
+            ):
+                self._emit(
+                    node,
+                    "nested or conditional helper definitions must be direct module statements",
+                    helper_name=node.name,
+                )
+
+    def add_helper_violation(self, helper: ast.FunctionDef, reason: str) -> None:
+        self._emit(helper, reason, helper_name=helper.name)
 
     def _identifier_violation(self, name: str) -> str | None:
         if name.startswith("_"):
@@ -460,8 +657,12 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         super().generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        if self._helper_stack:
-            self._emit(node, "nested function definitions are not allowed")
+        if id(node) not in self.direct_helper_node_ids:
+            self._emit(
+                node,
+                "nested or conditional helper definitions must be direct module statements",
+                helper_name=node.name,
+            )
             return
 
         identifier_reason = self._identifier_violation(node.name)
@@ -548,6 +749,8 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
                 self._emit(node, reason)
             elif name in _STRICT_CAPSULE_FORBIDDEN_CALLABLES:
                 self._emit(node, f"call to forbidden callable '{name}' is not allowed")
+            elif name in self.helper_names and name not in self.pure_helper_names:
+                self._emit(node, f"call to unsafe helper '{name}' is not allowed")
             elif name not in self.allowed_calls:
                 self._emit(node, f"call to unknown callable '{name}' is not allowed")
 
