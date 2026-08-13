@@ -1431,6 +1431,140 @@ def test_capsule_no_replay_ledger_survives_patch_group_renumbering(tmp_path):
     assert '"executed_side_effect_groups": [\n    "group_3"\n  ]' in third_prompt_text
 
 
+def test_capsule_no_replay_rejects_second_resume_from_side_effect_region(tmp_path):
+    env = FakeCustomMoveCapsuleEnv()
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code='custom_move("once")\n',
+        scripted_actions=[
+            {"action": "resume_from_region", "args": {"region_id": "region_1"}},
+            {"action": "resume_from_region", "args": {"region_id": "region_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "invalid",
+        "success",
+    ]
+    assert env.api.moves == ["once"]
+
+
+def test_capsule_region_execution_seals_containing_group(tmp_path):
+    env = FakeCustomMoveCapsuleEnv()
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code='x = 1\ncustom_move("once")\n',
+        scripted_actions=[
+            {"action": "run_region", "args": {"region_id": "region_2"}},
+            {
+                "action": "patch_group",
+                "args": {
+                    "group_id": "group_1",
+                    "source": 'x = 2\ncustom_move("patched")\n',
+                },
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    code = (tmp_path / "capsule_code_trial_00.py").read_text()
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "invalid",
+        "success",
+    ]
+    assert env.api.moves == ["once"]
+    assert code == 'x = 1\ncustom_move("once")\n'
+
+
+def test_capsule_resume_execution_seals_containing_group(tmp_path):
+    env = FakeCustomMoveCapsuleEnv()
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code='x = 1\ncustom_move("once")\n',
+        scripted_actions=[
+            {"action": "resume_from_region", "args": {"region_id": "region_2"}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "invalid",
+        "success",
+    ]
+    assert env.api.moves == ["once"]
+
+
+def test_capsule_side_effect_lineage_uses_edit_span_with_duplicate_source(tmp_path):
+    env = FakeCustomMoveCapsuleEnv()
+    initial_source = 'x = 1\ncustom_move("same")\n'
+    replacement = 'custom_move("same")\nx = 2\n'
+    patched_source = f'{replacement}custom_move("same")\n'
+    current_regions = trial_module.segment_python_code(patched_source)
+    current_groups = trial_module.segment_python_code_groups(
+        patched_source,
+        current_regions,
+        max_regions_per_group=1,
+        side_effect_calls={"custom_move"},
+    )
+    moved_effect_group_id = current_groups[-1].group_id
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code=initial_source,
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": replacement},
+            },
+            {"action": "run_group", "args": {"group_id": moved_effect_group_id}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    prompts = json.loads((tmp_path / "capsule_prompts_trial_00.json").read_text())
+    third_prompt_text = prompts[2][1]["content"][0]["text"]
+
+    assert trace[2]["event"]["status"] == "invalid"
+    assert env.api.moves == ["same"]
+    assert moved_effect_group_id in third_prompt_text
+    assert (
+        f'"executed_side_effect_groups": [\n    "{moved_effect_group_id}"\n  ]'
+        in third_prompt_text
+    )
+
+
 def test_capsule_llm_step_reanalyzes_forced_appended_recovery(tmp_path):
     env = FakeRewardDropCapsuleEnv()
     recovery_source = (

@@ -15,7 +15,6 @@ from __future__ import annotations
 import ast
 import base64
 import copy
-import difflib
 import gc
 import io
 import json
@@ -908,6 +907,7 @@ def _run_capsule_auto_forward_loop(
                         recovery_action,
                         executed_side_effect_regions,
                         executed_side_effect_groups,
+                        group_by_id,
                         recovery_observation_functions=recovery_observation_functions,
                     )
                     if recovery_event is None:
@@ -970,6 +970,9 @@ def _run_capsule_auto_forward_loop(
             if recovery_action is None or recovery_action.action == "finish":
                 break
             if recovery_action.action == "append_recovery":
+                previous_source = source
+                previous_regions = regions
+                previous_groups = groups
                 source = str(recovery_event.evidence["source"])
                 regions = segment_python_code(source)
                 groups = segment_python_code_groups(
@@ -980,6 +983,20 @@ def _run_capsule_auto_forward_loop(
                 )
                 region_by_id = {region.region_id: region for region in regions}
                 group_by_id = {group.group_id: group for group in groups}
+                (
+                    executed_side_effect_regions,
+                    executed_side_effect_groups,
+                ) = _remap_executed_side_effect_ledger(
+                    recovery_action,
+                    previous_source,
+                    source,
+                    previous_regions,
+                    regions,
+                    previous_groups,
+                    groups,
+                    executed_side_effect_regions,
+                    executed_side_effect_groups,
+                )
                 group_index = _first_group_index_starting_after_line(
                     groups,
                     last_unit.end_line,
@@ -1000,6 +1017,7 @@ def _run_capsule_auto_forward_loop(
             action,
             executed_side_effect_regions,
             executed_side_effect_groups,
+            group_by_id,
             recovery_observation_functions=recovery_observation_functions,
         )
         if event is None:
@@ -1036,24 +1054,15 @@ def _run_capsule_auto_forward_loop(
             if consumes_recovery_side_effect:
                 recovery_side_effect_budget -= 1
 
-        if event.status in {"failed", "invalid"}:
-            _mark_executed_side_effects_from_trace(
-                event,
-                group,
-                region_by_id,
-                executed_side_effect_regions,
-                executed_side_effect_groups,
-                side_effect_calls,
-            )
-        elif group.has_robot_side_effect:
-            executed_side_effect_groups.add(group.group_id)
-            for member_region_id in group.region_ids:
-                member_region = region_by_id.get(member_region_id)
-                if member_region is not None and _region_has_side_effect_call(
-                    member_region,
-                    side_effect_calls,
-                ):
-                    executed_side_effect_regions.add(member_region_id)
+        _record_runtime_side_effect_execution(
+            action,
+            event,
+            region_by_id,
+            group_by_id,
+            executed_side_effect_regions,
+            executed_side_effect_groups,
+            side_effect_calls,
+        )
 
         if event.status != "invalid":
             executed_regions += len(group.region_ids)
@@ -1140,6 +1149,7 @@ def _run_capsule_auto_forward_loop(
                         recovery_action,
                         executed_side_effect_regions,
                         executed_side_effect_groups,
+                        group_by_id,
                         recovery_observation_functions=recovery_observation_functions,
                     )
                 if recovery_event is None:
@@ -1181,6 +1191,15 @@ def _run_capsule_auto_forward_loop(
                     and recovery_event.status == "success"
                 ):
                     recovery_side_effect_budget = 1
+                _record_runtime_side_effect_execution(
+                    recovery_action,
+                    recovery_event,
+                    region_by_id,
+                    group_by_id,
+                    executed_side_effect_regions,
+                    executed_side_effect_groups,
+                    side_effect_calls,
+                )
 
             recovery_after_state = _capsule_state_snapshot(env)
             recovery_trace_events = recovery_event.evidence.get("trace_events", [])
@@ -1228,6 +1247,9 @@ def _run_capsule_auto_forward_loop(
                 recovery_action_name = recovery_action.action
                 recovery_group_id = str(recovery_action.args.get("group_id", ""))
                 recovery_region_id = str(recovery_action.args.get("region_id", ""))
+                previous_source = source
+                previous_regions = regions
+                previous_groups = groups
                 source = str(recovery_event.evidence["source"])
                 regions = segment_python_code(source)
                 groups = segment_python_code_groups(
@@ -1238,6 +1260,20 @@ def _run_capsule_auto_forward_loop(
                 )
                 region_by_id = {region.region_id: region for region in regions}
                 group_by_id = {group.group_id: group for group in groups}
+                (
+                    executed_side_effect_regions,
+                    executed_side_effect_groups,
+                ) = _remap_executed_side_effect_ledger(
+                    recovery_action,
+                    previous_source,
+                    source,
+                    previous_regions,
+                    regions,
+                    previous_groups,
+                    groups,
+                    executed_side_effect_regions,
+                    executed_side_effect_groups,
+                )
                 if recovery_action_name == "append_recovery":
                     group_index = _first_group_index_starting_after_line(
                         groups,
@@ -1551,6 +1587,7 @@ def _run_capsule_llm_step_loop(
                     action,
                     executed_side_effect_regions,
                     executed_side_effect_groups,
+                    group_by_id,
                     recovery_observation_functions=recovery_observation_functions,
                 )
             if event is None:
@@ -1590,46 +1627,26 @@ def _run_capsule_llm_step_loop(
                 failed = True
                 if forced_recovery_action:
                     pending_recovery_actions.clear()
-            if action.action == "run_region" and event.status != "invalid":
+            if (
+                action.action in {"run_region", "resume_from_region"}
+                and event.status != "invalid"
+            ):
                 executed_regions += 1
-                region = region_by_id.get(region_id)
-                if (
-                    event.status == "success"
-                    and region is not None
-                    and _region_has_side_effect_call(region, side_effect_calls)
-                ):
-                    executed_side_effect_regions.add(region_id)
-                elif event.status == "failed" and region is not None:
-                    _mark_executed_side_effect_region_from_trace(
-                        event,
-                        region,
-                        executed_side_effect_regions,
-                        side_effect_calls,
-                    )
             elif action.action == "run_group":
                 group = group_by_id.get(group_id)
                 if event.status != "invalid":
                     executed_regions += len(group.region_ids) if group is not None else 0
-                if event.status == "success" and group is not None and group.has_robot_side_effect:
-                    executed_side_effect_groups.add(group_id)
-                    for member_region_id in group.region_ids:
-                        member_region = region_by_id.get(member_region_id)
-                        if member_region is not None and _region_has_side_effect_call(
-                            member_region,
-                            side_effect_calls,
-                        ):
-                            executed_side_effect_regions.add(member_region_id)
-                elif event.status == "failed" and group is not None:
-                    _mark_executed_side_effects_from_trace(
-                        event,
-                        group,
-                        region_by_id,
-                        executed_side_effect_regions,
-                        executed_side_effect_groups,
-                        side_effect_calls,
-                    )
             elif action.action == "append_recovery" and event.status == "success":
                 recovery_side_effect_budget = 1
+            _record_runtime_side_effect_execution(
+                action,
+                event,
+                region_by_id,
+                group_by_id,
+                executed_side_effect_regions,
+                executed_side_effect_groups,
+                side_effect_calls,
+            )
 
         after_state = _capsule_state_snapshot(env)
         trace_events = event.evidence.get("trace_events", [])
@@ -1683,6 +1700,7 @@ def _run_capsule_llm_step_loop(
             and action.action in {"patch_region", "patch_group", "append_recovery"}
             and event.status == "success"
         ):
+            previous_source = source
             previous_source_line_count = len(source.splitlines())
             previous_regions = regions
             previous_groups = groups
@@ -1704,6 +1722,9 @@ def _run_capsule_llm_step_loop(
                 executed_side_effect_regions,
                 executed_side_effect_groups,
             ) = _remap_executed_side_effect_ledger(
+                action,
+                previous_source,
+                source,
                 previous_regions,
                 regions,
                 previous_groups,
@@ -2092,13 +2113,20 @@ def _no_rollback_guard_event(
     action: RuntimeAction,
     executed_side_effect_regions: set[str],
     executed_side_effect_groups: set[str],
+    group_by_id: dict[str, CodeRegionGroup] | None = None,
     *,
     recovery_observation_functions: set[str] | None = None,
 ) -> RuntimeEvent | None:
+    group_by_id = group_by_id or {}
     recovery_hint = _recovery_instruction(recovery_observation_functions)
     if action.action in {"run_group", "patch_group"}:
         group_id = str(action.args.get("group_id", ""))
-        if group_id in executed_side_effect_groups:
+        group = group_by_id.get(group_id)
+        contains_executed_region = bool(
+            group is not None
+            and executed_side_effect_regions.intersection(group.region_ids)
+        )
+        if group_id in executed_side_effect_groups or contains_executed_region:
             return _already_executed_side_effect_event(action.action, group_id, recovery_hint)
         return None
 
@@ -2292,37 +2320,44 @@ def _recovery_region_is_local(
     return region_id == failed_unit.region_id
 
 
-def _mark_executed_side_effects_from_trace(
+def _record_runtime_side_effect_execution(
+    action: RuntimeAction,
     event: RuntimeEvent,
-    group: CodeRegionGroup,
-    region_by_id: dict[str, Any],
+    region_by_id: dict[str, CodeRegion],
+    group_by_id: dict[str, CodeRegionGroup],
     executed_side_effect_regions: set[str],
     executed_side_effect_groups: set[str],
     side_effect_calls: set[str],
 ) -> None:
-    if not _event_has_side_effect_trace(event, side_effect_calls):
+    if event.status == "invalid" or not _event_has_side_effect_trace(
+        event, side_effect_calls
+    ):
         return
 
-    executed_side_effect_groups.add(group.group_id)
-    for member_region_id in group.region_ids:
-        member_region = region_by_id.get(member_region_id)
-        if member_region is not None and _region_has_side_effect_call(
-            member_region,
-            side_effect_calls,
-        ):
-            executed_side_effect_regions.add(member_region_id)
-
-
-def _mark_executed_side_effect_region_from_trace(
-    event: RuntimeEvent,
-    region: CodeRegion,
-    executed_side_effect_regions: set[str],
-    side_effect_calls: set[str],
-) -> None:
-    if not _event_has_side_effect_trace(event, side_effect_calls):
+    if action.action in {"run_region", "resume_from_region"}:
+        region_id = str(action.args.get("region_id", ""))
+        if region_id not in region_by_id:
+            return
+        executed_side_effect_regions.add(region_id)
+        executed_side_effect_groups.update(
+            group.group_id
+            for group in group_by_id.values()
+            if region_id in group.region_ids
+        )
         return
-    if _region_has_side_effect_call(region, side_effect_calls):
-        executed_side_effect_regions.add(region.region_id)
+
+    if action.action == "run_group":
+        group_id = str(action.args.get("group_id", ""))
+        group = group_by_id.get(group_id)
+        if group is None:
+            return
+        executed_side_effect_groups.add(group_id)
+        executed_side_effect_regions.update(group.region_ids)
+        executed_side_effect_groups.update(
+            candidate.group_id
+            for candidate in group_by_id.values()
+            if executed_side_effect_regions.intersection(candidate.region_ids)
+        )
 
 
 def _event_has_side_effect_trace(event: RuntimeEvent, side_effect_calls: set[str]) -> bool:
@@ -2433,6 +2468,9 @@ def _already_executed_side_effect_event(
 
 
 def _remap_executed_side_effect_ledger(
+    action: RuntimeAction,
+    previous_source: str,
+    current_source: str,
     previous_regions: list[CodeRegion],
     current_regions: list[CodeRegion],
     previous_groups: list[CodeRegionGroup],
@@ -2440,26 +2478,68 @@ def _remap_executed_side_effect_ledger(
     executed_region_ids: set[str],
     executed_group_ids: set[str],
 ) -> tuple[set[str], set[str]]:
-    region_id_map = _aligned_unit_id_map(
+    edit_span = _runtime_source_edit_span(
+        action,
+        previous_source,
+        current_source,
         previous_regions,
-        current_regions,
-        id_attribute="region_id",
-    )
-    group_id_map = _aligned_unit_id_map(
         previous_groups,
-        current_groups,
-        id_attribute="group_id",
     )
-    remapped_region_ids = {
-        region_id_map[region_id]
-        for region_id in executed_region_ids
-        if region_id in region_id_map
+    if edit_span is None:
+        return (
+            {region.region_id for region in current_regions},
+            {group.group_id for group in current_groups},
+        )
+    edit_start_line, edit_end_line, line_delta = edit_span
+    previous_region_by_id = {
+        region.region_id: region for region in previous_regions
     }
-    remapped_group_ids = {
-        group_id_map[group_id]
-        for group_id in executed_group_ids
-        if group_id in group_id_map
+    remapped_region_ids: set[str] = set()
+    lineage_unresolved = False
+    for region_id in executed_region_ids:
+        previous_region = previous_region_by_id.get(region_id)
+        if previous_region is None:
+            lineage_unresolved = True
+            continue
+        matches = _lineage_matches_after_edit(
+            previous_region,
+            current_regions,
+            edit_start_line=edit_start_line,
+            edit_end_line=edit_end_line,
+            line_delta=line_delta,
+            id_attribute="region_id",
+        )
+        if not matches:
+            lineage_unresolved = True
+        remapped_region_ids.update(matches)
+
+    anchored_group_ids = {
+        group.group_id
+        for group in previous_groups
+        if executed_region_ids.intersection(group.region_ids)
     }
+    previous_group_by_id = {group.group_id: group for group in previous_groups}
+    remapped_group_ids: set[str] = set()
+    for group_id in executed_group_ids - anchored_group_ids:
+        previous_group = previous_group_by_id.get(group_id)
+        if previous_group is None:
+            lineage_unresolved = True
+            continue
+        matches = _lineage_matches_after_edit(
+            previous_group,
+            current_groups,
+            edit_start_line=edit_start_line,
+            edit_end_line=edit_end_line,
+            line_delta=line_delta,
+            id_attribute="group_id",
+        )
+        if not matches:
+            lineage_unresolved = True
+        remapped_group_ids.update(matches)
+
+    if lineage_unresolved:
+        remapped_region_ids.update(region.region_id for region in current_regions)
+        remapped_group_ids.update(group.group_id for group in current_groups)
     remapped_group_ids.update(
         group.group_id
         for group in current_groups
@@ -2468,27 +2548,72 @@ def _remap_executed_side_effect_ledger(
     return remapped_region_ids, remapped_group_ids
 
 
-def _aligned_unit_id_map(
-    previous_units: list[CodeRegion] | list[CodeRegionGroup],
+def _runtime_source_edit_span(
+    action: RuntimeAction,
+    previous_source: str,
+    current_source: str,
+    previous_regions: list[CodeRegion],
+    previous_groups: list[CodeRegionGroup],
+) -> tuple[int, int, int] | None:
+    line_delta = len(current_source.splitlines()) - len(previous_source.splitlines())
+    if action.action == "patch_region":
+        target_id = str(action.args.get("region_id", ""))
+        target = next(
+            (region for region in previous_regions if region.region_id == target_id),
+            None,
+        )
+        if target is None:
+            return None
+        return target.start_line, target.end_line, line_delta
+    if action.action == "patch_group":
+        target_id = str(action.args.get("group_id", ""))
+        target = next(
+            (group for group in previous_groups if group.group_id == target_id),
+            None,
+        )
+        if target is None:
+            return None
+        return target.start_line, target.end_line, line_delta
+    if action.action == "append_recovery":
+        insertion_line = len(previous_source.splitlines()) + 1
+        return insertion_line, insertion_line - 1, line_delta
+    return None
+
+
+def _lineage_matches_after_edit(
+    previous_unit: CodeRegion | CodeRegionGroup,
     current_units: list[CodeRegion] | list[CodeRegionGroup],
     *,
+    edit_start_line: int,
+    edit_end_line: int,
+    line_delta: int,
     id_attribute: str,
-) -> dict[str, str]:
-    matcher = difflib.SequenceMatcher(
-        None,
-        [unit.source for unit in previous_units],
-        [unit.source for unit in current_units],
-        autojunk=False,
+) -> set[str]:
+    if previous_unit.end_line < edit_start_line:
+        expected_start = previous_unit.start_line
+        expected_end = previous_unit.end_line
+    elif previous_unit.start_line > edit_end_line:
+        expected_start = previous_unit.start_line + line_delta
+        expected_end = previous_unit.end_line + line_delta
+    else:
+        return set()
+
+    exact_source_candidates = [
+        unit
+        for unit in current_units
+        if unit.source.rstrip("\n") == previous_unit.source.rstrip("\n")
+    ]
+    expected_candidates = [
+        unit
+        for unit in exact_source_candidates
+        if unit.start_line == expected_start and unit.end_line == expected_end
+    ]
+    matches = (
+        expected_candidates
+        if len(expected_candidates) == 1
+        else exact_source_candidates
     )
-    result: dict[str, str] = {}
-    for previous_start, current_start, size in matcher.get_matching_blocks():
-        for offset in range(size):
-            previous_unit = previous_units[previous_start + offset]
-            current_unit = current_units[current_start + offset]
-            result[str(getattr(previous_unit, id_attribute))] = str(
-                getattr(current_unit, id_attribute)
-            )
-    return result
+    return {str(getattr(unit, id_attribute)) for unit in matches}
 
 
 def _runtime_patch_replacement(args: dict[str, Any]) -> Any:
