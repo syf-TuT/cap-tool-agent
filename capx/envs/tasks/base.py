@@ -1,9 +1,11 @@
+import builtins
 import contextlib
 import io
 import sys
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, SupportsFloat
 
 import numpy as np
@@ -13,7 +15,15 @@ from capx.envs.base import BaseEnv, ObsType, get_env
 from capx.envs.configs.instantiate import instantiate as cfg_instantiate
 from capx.envs.configs.loader import DictLoader
 from capx.integrations.base_api import ApiBase, get_api
+from capx.runtime_control.contract import STRICT_CAPSULE_SAFE_BUILTINS
 from capx.runtime_control.trace import RuntimeTrace, wrap_function_for_trace
+
+
+def _build_strict_capsule_builtins() -> MappingProxyType:
+    """Return the immutable builtin namespace exposed to guarded Capsule code."""
+    return MappingProxyType(
+        {name: getattr(builtins, name) for name in STRICT_CAPSULE_SAFE_BUILTINS}
+    )
 
 
 class Tee(io.TextIOBase):
@@ -219,6 +229,10 @@ class CodeExecutionEnvBase(Env):
         }
         if include_internal_handles:
             g.update({"env": self.low_level_env, "APIS": self._apis})
+        else:
+            # Supplying this explicitly prevents exec() from inserting the full
+            # interpreter builtins into a public Capsule namespace.
+            g["__builtins__"] = _build_strict_capsule_builtins()
         for api in self._apis.values():
             for fn_name, fn in api.functions().items():
                 g[fn_name] = (
