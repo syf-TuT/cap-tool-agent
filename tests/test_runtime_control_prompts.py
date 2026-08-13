@@ -579,6 +579,31 @@ def test_capsule_prompt_contract_violations_survive_compact_budget_fallback():
     assert "before running any robot effects" in text
 
 
+def test_capsule_prompt_states_strict_python_subset_constraints():
+    prompt = build_capsule_prompt(
+        task="close the gripper",
+        regions=[
+            CodeRegion(
+                region_id="region_1",
+                start_line=1,
+                end_line=1,
+                source="close_gripper()",
+            )
+        ],
+        history=[],
+        trace_summary={},
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert "Strict Python subset" in text
+    assert "no imports, classes, lambdas, try, while, async" in text
+    assert "callable aliases" in text
+    assert "attribute calls" in text
+    assert "direct public API functions" in text
+    assert "bounded for loops" in text
+
+
 def test_capsule_prompt_bounds_large_contract_safety_context():
     violations = [
         {

@@ -199,6 +199,17 @@ class FakeUnsafeNonPrivilegedCapsuleEnv(FakeGripperCapsuleEnv):
         return globals_dict
 
 
+class FakeSuccessfulNonPrivilegedCapsuleEnv(FakeUnsafeNonPrivilegedCapsuleEnv):
+    def compute_reward(self):
+        return 1.0 if self.api.calls else 0.0
+
+
+class FakePrivilegedCapsuleEnv(FakeGripperCapsuleEnv):
+    def __init__(self):
+        super().__init__()
+        self.cfg = SimpleNamespace(privileged=True)
+
+
 class FakeTraceFailureApi(FakeApi):
     def functions(self):
         functions = dict(super().functions())
@@ -1654,6 +1665,78 @@ def test_capsule_auto_forward_runs_groups_without_capsule_action_llm(tmp_path, m
     assert "capsule_action" not in telemetry_stages
 
 
+def test_nonprivileged_auto_forward_strict_violation_never_executes(tmp_path, monkeypatch):
+    env = FakeUnsafeNonPrivilegedCapsuleEnv()
+
+    monkeypatch.setattr(
+        trial_module,
+        "_query_model",
+        lambda args, prompt: {
+            "content": '{"action": "finish", "args": {}}',
+            "reasoning": None,
+        },
+    )
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "capsule_control_mode": "auto_forward",
+            "capsule_validate_program_contract": False,
+            "max_capsule_steps": 2,
+        },
+        initial_code="runner = close_gripper\nrunner()\n",
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert trace[0]["event"]["status"] == "invalid"
+    assert trace[0]["event"]["evidence"]["strict_subset_violations"]
+    assert env.api.calls == []
+    assert summary.sandbox_rc == 1
+
+
+def test_nonprivileged_auto_forward_reanalyzes_recovery_patch(tmp_path, monkeypatch):
+    env = FakeSuccessfulNonPrivilegedCapsuleEnv()
+
+    monkeypatch.setattr(
+        trial_module,
+        "_query_model",
+        lambda args, prompt: {
+            "content": (
+                '{"action": "patch_group", "args": {"group_id": "group_1", '
+                '"source": "close_gripper()\\n"}}'
+            ),
+            "reasoning": None,
+        },
+    )
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "capsule_control_mode": "auto_forward",
+            "capsule_validate_program_contract": False,
+            "max_capsule_steps": 3,
+        },
+        initial_code="runner = close_gripper\nrunner()\n",
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "invalid",
+        "success",
+        "success",
+    ]
+    assert env.api.calls == ["close_gripper"]
+    assert summary.sandbox_rc == 0
+
+
 def test_capsule_auto_forward_executes_effect_bounded_groups_in_source_order(
     tmp_path, monkeypatch
 ):
@@ -2480,7 +2563,7 @@ def test_capsule_llm_step_program_contract_blocks_effects_until_patch(tmp_path):
 
 
 def test_capsule_llm_step_program_contract_flag_false_preserves_execution(tmp_path):
-    env = FakeCustomMoveCapsuleEnv()
+    env = FakePrivilegedCapsuleEnv()
 
     trial_module._run_capsule_llm_step_loop(
         env,
@@ -2492,10 +2575,8 @@ def test_capsule_llm_step_program_contract_flag_false_preserves_execution(tmp_pa
             "capsule_validate_program_contract": False,
         },
         initial_code=(
-            "def move_cube():\n"
-            '    custom_move("legacy")\n'
-            "\n"
-            "move_cube()\n"
+            "runner = close_gripper\n"
+            "runner()\n"
         ),
         scripted_actions=[
             {"action": "run_group", "args": {"group_id": "group_1"}},
@@ -2506,10 +2587,183 @@ def test_capsule_llm_step_program_contract_flag_false_preserves_execution(tmp_pa
     metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
 
     assert trace[0]["event"]["status"] == "success"
-    assert env.api.moves == ["legacy"]
+    assert env.api.calls == ["close_gripper"]
     assert metrics[0]["program_contract_valid"] is True
     assert metrics[0]["program_contract_violation_count"] == 0
     assert metrics[0]["program_contract_violation_codes"] == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "runner = close_gripper\n"
+            "if True:\n"
+            "    runner = close_gripper\n"
+            "runner()\n"
+        ),
+        (
+            "import sys\n"
+            "print(sys._getframe().f_locals)\n"
+        ),
+        "close_gripper.__call__()\n",
+    ],
+)
+def test_nonprivileged_llm_step_enforces_strict_subset_when_contract_flag_false(
+    tmp_path, source
+):
+    env = FakeUnsafeNonPrivilegedCapsuleEnv()
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "capsule_validate_program_contract": False,
+        },
+        initial_code=source,
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace_text = (tmp_path / "capsule_trace_trial_00.json").read_text()
+    trace = json.loads(trace_text)
+    prompts = (tmp_path / "capsule_prompts_trial_00.json").read_text()
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+
+    assert trace[0]["event"]["status"] == "invalid"
+    assert trace[0]["event"]["evidence"]["strict_subset_violations"]
+    assert env.api.calls == []
+    assert "SIM_TRUTH_SENTINEL" not in trace_text
+    assert "SIM_TRUTH_SENTINEL" not in prompts
+    assert "strict_subset_violation" in prompts
+    assert metrics[0]["strict_subset_valid"] is False
+    assert metrics[0]["strict_subset_violation_count"] >= 1
+    assert metrics[0]["program_contract_valid"] is False
+    assert "strict_subset_violation" in metrics[0][
+        "program_contract_violation_codes"
+    ]
+
+
+def test_nonprivileged_llm_step_reanalyzes_strict_source_after_patch(tmp_path):
+    env = FakeSuccessfulNonPrivilegedCapsuleEnv()
+
+    summary = trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_validate_program_contract": False,
+        },
+        initial_code="runner = close_gripper\nrunner()\n",
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {
+                "action": "patch_group",
+                "args": {
+                    "group_id": "group_1",
+                    "source": "close_gripper()\n",
+                },
+            },
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "invalid",
+        "success",
+        "success",
+    ]
+    assert env.api.calls == ["close_gripper"]
+    assert [row["strict_subset_valid"] for row in metrics] == [False, False, True]
+    assert metrics[-1]["program_contract_valid"] is True
+    assert summary.sandbox_rc == 0
+
+
+def test_llm_step_invalid_action_is_recoverable_before_task_success(
+    tmp_path, monkeypatch
+):
+    env = FakeSuccessfulNonPrivilegedCapsuleEnv()
+    responses = iter(
+        [
+            {"content": '{"action": "not_supported", "args": {}}'},
+            {
+                "content": (
+                    '{"action": "run_group", "args": {"group_id": "group_1"}}'
+                )
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        trial_module,
+        "_query_model",
+        lambda args, prompt: next(responses),
+    )
+
+    summary = trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_validate_program_contract": False,
+        },
+        initial_code="close_gripper()\n",
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "invalid",
+        "success",
+    ]
+    assert env.api.calls == ["close_gripper"]
+    assert summary.sandbox_rc == 0
+
+
+def test_nonprivileged_strict_preflight_skips_segmentation_for_helper_flood(
+    tmp_path, monkeypatch
+):
+    env = FakeUnsafeNonPrivilegedCapsuleEnv()
+    source = "\n".join(f"def helper_{index}():\n    return {index}" for index in range(257))
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("strict preflight must run before source segmentation")
+
+    monkeypatch.setattr(trial_module, "segment_python_code", fail_if_called)
+    monkeypatch.setattr(trial_module, "segment_python_code_groups", fail_if_called)
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "capsule_validate_program_contract": False,
+        },
+        initial_code=source,
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert trace[0]["event"]["status"] == "invalid"
+    violation = trace[0]["event"]["evidence"]["strict_subset_violations"][0]
+    assert violation["region_ids"] == ["region_1"]
+    assert violation["group_ids"] == ["group_1"]
+    assert env.api.calls == []
 
 
 def test_nonprivileged_capsule_globals_block_raw_env_truth_without_prompt_leak(
@@ -2537,9 +2791,8 @@ def test_nonprivileged_capsule_globals_block_raw_env_truth_without_prompt_leak(
     prompt_text = (tmp_path / "capsule_prompts_trial_00.json").read_text()
     trace = json.loads(trace_text)
 
-    assert trace[0]["event"]["status"] == "failed"
-    assert trace[0]["event"]["evidence"]["exception_type"] == "NameError"
-    assert trace[0]["event"]["message"] == "name 'env' is not defined"
+    assert trace[0]["event"]["status"] == "invalid"
+    assert trace[0]["event"]["evidence"]["strict_subset_violations"]
     assert "SIM_TRUTH_SENTINEL" not in trace_text
     assert "SIM_TRUTH_SENTINEL" not in prompt_text
     assert env.api.calls == []

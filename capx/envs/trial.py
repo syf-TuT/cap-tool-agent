@@ -58,9 +58,11 @@ from capx.runtime_control import (
     RuntimeEvent,
     RuntimeTrace,
     analyze_capsule_program_contract_details,
+    analyze_capsule_strict_subset,
     build_capsule_prompt,
     build_runtime_feedback,
     parse_runtime_action_response,
+    preflight_capsule_strict_source,
     replace_region_source,
     segment_python_code,
     segment_python_code_groups,
@@ -1158,6 +1160,158 @@ def _whole_source_fallback_units(
     return [region], [group]
 
 
+@dataclass
+class _CapsuleSourceAnalysis:
+    regions: list[CodeRegion]
+    groups: list[CodeRegionGroup]
+    syntax_error: SyntaxError | None
+    contract_violations: list[ProgramContractViolation]
+    strict_subset_violations: list[ProgramContractViolation]
+    contract_effectful_region_ids: set[str]
+    contract_effectful_group_ids: set[str]
+
+
+def _capsule_requires_strict_subset(env: CodeExecutionEnvBase) -> bool:
+    env_config = getattr(env, "cfg", None)
+    privileged = (
+        env_config.get("privileged")
+        if isinstance(env_config, Mapping)
+        else getattr(env_config, "privileged", None)
+    )
+    return privileged is False
+
+
+def _collect_public_api_calls(apis: Any) -> set[str]:
+    names: set[str] = set()
+    for api in apis:
+        functions = api.functions()
+        if isinstance(functions, Mapping):
+            names.update(str(name) for name in functions)
+    return names
+
+
+def _sort_contract_violations(
+    violations: list[ProgramContractViolation],
+) -> list[ProgramContractViolation]:
+    return sorted(
+        set(violations),
+        key=lambda violation: (
+            violation.start_line,
+            violation.end_line,
+            violation.code,
+            violation.message,
+            violation.helper_name or "",
+            violation.region_ids,
+            violation.group_ids,
+            violation.side_effect_calls,
+        ),
+    )
+
+
+def _analyze_capsule_source(
+    source: str,
+    *,
+    use_semantic_groups: bool,
+    max_regions_per_group: int,
+    public_api_calls: set[str],
+    side_effect_calls: set[str],
+    require_strict_subset: bool,
+    validate_program_contract: bool,
+) -> _CapsuleSourceAnalysis:
+    syntax_error: SyntaxError | None = None
+    strict_preflight_violations: list[ProgramContractViolation] = []
+    if require_strict_subset:
+        try:
+            strict_preflight_violations = preflight_capsule_strict_source(source)
+        except SyntaxError as exc:
+            syntax_error = exc
+
+    if syntax_error is not None or strict_preflight_violations:
+        regions, fallback_groups = _whole_source_fallback_units(source)
+        groups = fallback_groups if use_semantic_groups else []
+    else:
+        try:
+            regions = segment_python_code(source)
+            groups = (
+                segment_python_code_groups(
+                    source,
+                    regions,
+                    max_regions_per_group=max_regions_per_group,
+                    side_effect_calls=side_effect_calls,
+                )
+                if use_semantic_groups
+                else []
+            )
+        except SyntaxError as exc:
+            syntax_error = exc
+            regions, fallback_groups = _whole_source_fallback_units(source)
+            groups = fallback_groups if use_semantic_groups else []
+
+    strict_subset_violations: list[ProgramContractViolation] = []
+    if require_strict_subset and syntax_error is None:
+        strict_subset_violations = analyze_capsule_strict_subset(
+            source,
+            regions,
+            groups,
+            public_api_calls=public_api_calls,
+            side_effect_calls=side_effect_calls,
+        )
+
+    contract_effectful_region_ids: set[str] = set()
+    contract_effectful_group_ids: set[str] = set()
+    legacy_violations: list[ProgramContractViolation] = []
+    if (
+        validate_program_contract
+        and syntax_error is None
+        and not strict_preflight_violations
+    ):
+        contract_analysis = analyze_capsule_program_contract_details(
+            source,
+            regions,
+            groups,
+            side_effect_calls=side_effect_calls,
+        )
+        legacy_violations = list(contract_analysis.violations)
+        contract_effectful_region_ids = set(
+            contract_analysis.effectful_region_ids
+        )
+        contract_effectful_group_ids = set(
+            contract_analysis.effectful_group_ids
+        )
+
+    return _CapsuleSourceAnalysis(
+        regions=regions,
+        groups=groups,
+        syntax_error=syntax_error,
+        contract_violations=_sort_contract_violations(
+            [*strict_subset_violations, *legacy_violations]
+        ),
+        strict_subset_violations=_sort_contract_violations(
+            strict_subset_violations
+        ),
+        contract_effectful_region_ids=contract_effectful_region_ids,
+        contract_effectful_group_ids=contract_effectful_group_ids,
+    )
+
+
+def _add_capsule_contract_metrics(
+    metric: dict[str, Any],
+    *,
+    contract_violations: list[ProgramContractViolation],
+    strict_subset_violations: list[ProgramContractViolation],
+) -> None:
+    metric["program_contract_valid"] = not contract_violations
+    metric["program_contract_violation_count"] = len(contract_violations)
+    metric["program_contract_violation_codes"] = sorted(
+        {item.code for item in contract_violations}
+    )
+    metric["strict_subset_valid"] = not strict_subset_violations
+    metric["strict_subset_violation_count"] = len(strict_subset_violations)
+    metric["strict_subset_violation_codes"] = sorted(
+        {item.code for item in strict_subset_violations}
+    )
+
+
 def _initial_syntax_error_history_entry(exc: SyntaxError) -> dict[str, Any]:
     return {
         "step_id": 0,
@@ -1224,14 +1378,7 @@ def _build_capsule_execution_globals(
     config: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build a public namespace when Capsule safety boundaries are enabled."""
-    env_config = getattr(env, "cfg", None)
-    privileged = (
-        env_config.get("privileged")
-        if isinstance(env_config, Mapping)
-        else getattr(env_config, "privileged", None)
-    )
-    is_nonprivileged = privileged is False
-    public_only = is_nonprivileged or _coerce_config_bool(
+    public_only = _capsule_requires_strict_subset(env) or _coerce_config_bool(
         config.get("capsule_validate_program_contract", False)
     )
     if public_only:
@@ -1280,24 +1427,34 @@ def _run_capsule_auto_forward_loop(
         source = "\n\n".join(_extract_code(raw_code))
 
     max_regions_per_group = int(config.get("capsule_max_regions_per_group", 20))
-    side_effect_calls = collect_side_effect_calls(getattr(env, "_apis", {}).values())
+    apis = getattr(env, "_apis", {}).values()
+    public_api_calls = _collect_public_api_calls(apis)
+    side_effect_calls = collect_side_effect_calls(apis)
     if not side_effect_calls:
         side_effect_calls = ROBOT_SIDE_EFFECT_CALLS
     recovery_observation_functions = _collect_recovery_observation_functions(
         getattr(env, "_apis", {}).values()
     )
-    initial_syntax_error: SyntaxError | None = None
-    try:
-        regions = segment_python_code(source)
-        groups = segment_python_code_groups(
-            source,
-            regions,
-            max_regions_per_group=max_regions_per_group,
-            side_effect_calls=side_effect_calls,
-        )
-    except SyntaxError as exc:
-        initial_syntax_error = exc
-        regions, groups = _whole_source_fallback_units(source)
+    validate_program_contract = _coerce_config_bool(
+        config.get("capsule_validate_program_contract", False)
+    )
+    require_strict_subset = _capsule_requires_strict_subset(env)
+    source_analysis = _analyze_capsule_source(
+        source,
+        use_semantic_groups=True,
+        max_regions_per_group=max_regions_per_group,
+        public_api_calls=public_api_calls,
+        side_effect_calls=side_effect_calls,
+        require_strict_subset=require_strict_subset,
+        validate_program_contract=validate_program_contract,
+    )
+    regions = source_analysis.regions
+    groups = source_analysis.groups
+    initial_syntax_error = source_analysis.syntax_error
+    program_contract_violations = source_analysis.contract_violations
+    strict_subset_violations = source_analysis.strict_subset_violations
+    contract_effectful_region_ids = source_analysis.contract_effectful_region_ids
+    contract_effectful_group_ids = source_analysis.contract_effectful_group_ids
     region_by_id = {region.region_id: region for region in regions}
     group_by_id = {group.group_id: group for group in groups}
 
@@ -1453,6 +1610,11 @@ def _run_capsule_auto_forward_loop(
                 best_reward_so_far=best_reward_so_far,
                 recovery_execution_attempt=False,
             )
+            _add_capsule_contract_metrics(
+                recovery_metric,
+                contract_violations=program_contract_violations,
+                strict_subset_violations=strict_subset_violations,
+            )
             step_metrics.append(recovery_metric)
             if recovery_event.status in {"failed", "invalid"}:
                 failed = True
@@ -1464,12 +1626,24 @@ def _run_capsule_auto_forward_loop(
                 previous_regions = regions
                 previous_groups = groups
                 source = str(recovery_event.evidence["source"])
-                regions = segment_python_code(source)
-                groups = segment_python_code_groups(
+                source_analysis = _analyze_capsule_source(
                     source,
-                    regions,
+                    use_semantic_groups=True,
                     max_regions_per_group=max_regions_per_group,
+                    public_api_calls=public_api_calls,
                     side_effect_calls=side_effect_calls,
+                    require_strict_subset=require_strict_subset,
+                    validate_program_contract=validate_program_contract,
+                )
+                regions = source_analysis.regions
+                groups = source_analysis.groups
+                program_contract_violations = source_analysis.contract_violations
+                strict_subset_violations = source_analysis.strict_subset_violations
+                contract_effectful_region_ids = (
+                    source_analysis.contract_effectful_region_ids
+                )
+                contract_effectful_group_ids = (
+                    source_analysis.contract_effectful_group_ids
                 )
                 region_by_id = {region.region_id: region for region in regions}
                 group_by_id = {group.group_id: group for group in groups}
@@ -1503,13 +1677,26 @@ def _run_capsule_auto_forward_loop(
         before_state = _capsule_state_snapshot(env)
         consumes_recovery_side_effect = False
 
-        event = _no_rollback_guard_event(
-            action,
-            executed_side_effect_regions,
-            executed_side_effect_groups,
-            group_by_id,
-            recovery_observation_functions=recovery_observation_functions,
-        )
+        event = _strict_subset_guard_event(action, strict_subset_violations)
+        if event is None:
+            event = (
+                _program_contract_guard_event(
+                    action,
+                    program_contract_violations,
+                    contract_effectful_region_ids,
+                    contract_effectful_group_ids,
+                )
+                if validate_program_contract
+                else None
+            )
+        if event is None:
+            event = _no_rollback_guard_event(
+                action,
+                executed_side_effect_regions,
+                executed_side_effect_groups,
+                group_by_id,
+                recovery_observation_functions=recovery_observation_functions,
+            )
         if event is None:
             event = _reward_drop_guard_event(
                 action,
@@ -1589,6 +1776,11 @@ def _run_capsule_auto_forward_loop(
             best_reward_so_far=best_reward_so_far,
             recovery_execution_attempt=consumes_recovery_side_effect,
         )
+        _add_capsule_contract_metrics(
+            metric,
+            contract_violations=program_contract_violations,
+            strict_subset_violations=strict_subset_violations,
+        )
         step_metrics.append(metric)
 
         recovery_continued = False
@@ -1634,6 +1826,21 @@ def _run_capsule_auto_forward_loop(
                     region_by_id=region_by_id,
                     group_by_id=group_by_id,
                 )
+                if recovery_event is None:
+                    recovery_event = _strict_subset_guard_event(
+                        recovery_action, strict_subset_violations
+                    )
+                if recovery_event is None:
+                    recovery_event = (
+                        _program_contract_guard_event(
+                            recovery_action,
+                            program_contract_violations,
+                            contract_effectful_region_ids,
+                            contract_effectful_group_ids,
+                        )
+                        if validate_program_contract
+                        else None
+                    )
                 if recovery_event is None:
                     recovery_event = _no_rollback_guard_event(
                         recovery_action,
@@ -1728,6 +1935,11 @@ def _run_capsule_auto_forward_loop(
                 best_reward_so_far=best_reward_so_far,
                 recovery_execution_attempt=recovery_consumes_side_effect,
             )
+            _add_capsule_contract_metrics(
+                recovery_metric,
+                contract_violations=program_contract_violations,
+                strict_subset_violations=strict_subset_violations,
+            )
             step_metrics.append(recovery_metric)
             if (
                 recovery_action is not None
@@ -1741,12 +1953,24 @@ def _run_capsule_auto_forward_loop(
                 previous_regions = regions
                 previous_groups = groups
                 source = str(recovery_event.evidence["source"])
-                regions = segment_python_code(source)
-                groups = segment_python_code_groups(
+                source_analysis = _analyze_capsule_source(
                     source,
-                    regions,
+                    use_semantic_groups=True,
                     max_regions_per_group=max_regions_per_group,
+                    public_api_calls=public_api_calls,
                     side_effect_calls=side_effect_calls,
+                    require_strict_subset=require_strict_subset,
+                    validate_program_contract=validate_program_contract,
+                )
+                regions = source_analysis.regions
+                groups = source_analysis.groups
+                program_contract_violations = source_analysis.contract_violations
+                strict_subset_violations = source_analysis.strict_subset_violations
+                contract_effectful_region_ids = (
+                    source_analysis.contract_effectful_region_ids
+                )
+                contract_effectful_group_ids = (
+                    source_analysis.contract_effectful_group_ids
                 )
                 region_by_id = {region.region_id: region for region in regions}
                 group_by_id = {group.group_id: group for group in groups}
@@ -1972,56 +2196,36 @@ def _run_capsule_llm_step_loop(
     use_semantic_groups = (
         config.get("capsule_execution_granularity", "semantic_group") == "semantic_group"
     )
-    side_effect_calls = collect_side_effect_calls(getattr(env, "_apis", {}).values())
+    apis = getattr(env, "_apis", {}).values()
+    public_api_calls = _collect_public_api_calls(apis)
+    side_effect_calls = collect_side_effect_calls(apis)
     if not side_effect_calls:
         side_effect_calls = ROBOT_SIDE_EFFECT_CALLS
     recovery_observation_functions = _collect_recovery_observation_functions(
         getattr(env, "_apis", {}).values()
     )
-    initial_syntax_error: SyntaxError | None = None
-    try:
-        regions = segment_python_code(source)
-        groups = (
-            segment_python_code_groups(
-                source,
-                regions,
-                max_regions_per_group=max_regions_per_group,
-                side_effect_calls=side_effect_calls,
-            )
-            if use_semantic_groups
-            else []
-        )
-    except SyntaxError as exc:
-        initial_syntax_error = exc
-        regions, fallback_groups = _whole_source_fallback_units(source)
-        groups = fallback_groups if use_semantic_groups else []
-    region_by_id = {region.region_id: region for region in regions}
-    group_by_id = {group.group_id: group for group in groups}
     validate_program_contract = _coerce_config_bool(
         config.get("capsule_validate_program_contract", False)
     )
-    program_contract_analysis = (
-        analyze_capsule_program_contract_details(
-            source,
-            regions,
-            groups,
-            side_effect_calls=side_effect_calls,
-        )
-        if validate_program_contract and initial_syntax_error is None
-        else None
+    require_strict_subset = _capsule_requires_strict_subset(env)
+    source_analysis = _analyze_capsule_source(
+        source,
+        use_semantic_groups=use_semantic_groups,
+        max_regions_per_group=max_regions_per_group,
+        public_api_calls=public_api_calls,
+        side_effect_calls=side_effect_calls,
+        require_strict_subset=require_strict_subset,
+        validate_program_contract=validate_program_contract,
     )
-    if program_contract_analysis is not None:
-        program_contract_violations = list(program_contract_analysis.violations)
-        contract_effectful_region_ids = set(
-            program_contract_analysis.effectful_region_ids
-        )
-        contract_effectful_group_ids = set(
-            program_contract_analysis.effectful_group_ids
-        )
-    else:
-        program_contract_violations = []
-        contract_effectful_region_ids = set()
-        contract_effectful_group_ids = set()
+    regions = source_analysis.regions
+    groups = source_analysis.groups
+    initial_syntax_error = source_analysis.syntax_error
+    region_by_id = {region.region_id: region for region in regions}
+    group_by_id = {group.group_id: group for group in groups}
+    program_contract_violations = source_analysis.contract_violations
+    strict_subset_violations = source_analysis.strict_subset_violations
+    contract_effectful_region_ids = source_analysis.contract_effectful_region_ids
+    contract_effectful_group_ids = source_analysis.contract_effectful_group_ids
     trace = RuntimeTrace()
     executor = CapsuleExecutor(
         base_globals=_build_capsule_execution_globals(env, trace, config),
@@ -2174,7 +2378,6 @@ def _run_capsule_llm_step_loop(
                 message=str(exc),
                 evidence={"exception_type": type(exc).__name__},
             )
-            failed = True
         else:
             region_id = str(action.args.get("region_id", ""))
             group_id = str(action.args.get("group_id", ""))
@@ -2184,6 +2387,10 @@ def _run_capsule_llm_step_loop(
                 before_state,
                 require_task_success=require_task_success_for_finish,
             )
+            if event is None:
+                event = _strict_subset_guard_event(
+                    action, strict_subset_violations
+                )
             if event is None:
                 event = (
                     _program_contract_guard_event(
@@ -2236,7 +2443,7 @@ def _run_capsule_llm_step_loop(
                 )
                 if consumes_recovery_side_effect:
                     recovery_side_effect_budget -= 1
-            if event.status in {"failed", "invalid"}:
+            if _capsule_event_is_hard_failure(event):
                 failed = True
                 if forced_recovery_action:
                     pending_recovery_actions.clear()
@@ -2355,12 +2562,10 @@ def _run_capsule_llm_step_loop(
         metric["post_action_visual_artifact_errors"] = (
             post_action_visual_artifact_errors
         )
-        metric["program_contract_valid"] = not program_contract_violations
-        metric["program_contract_violation_count"] = len(
-            program_contract_violations
-        )
-        metric["program_contract_violation_codes"] = sorted(
-            {item.code for item in program_contract_violations}
+        _add_capsule_contract_metrics(
+            metric,
+            contract_violations=program_contract_violations,
+            strict_subset_violations=strict_subset_violations,
         )
         metric["budget_exhausted"] = False
         step_metrics.append(metric)
@@ -2375,17 +2580,17 @@ def _run_capsule_llm_step_loop(
             previous_regions = regions
             previous_groups = groups
             source = str(event.evidence["source"])
-            regions = segment_python_code(source)
-            groups = (
-                segment_python_code_groups(
-                    source,
-                    regions,
-                    max_regions_per_group=max_regions_per_group,
-                    side_effect_calls=side_effect_calls,
-                )
-                if use_semantic_groups
-                else []
+            source_analysis = _analyze_capsule_source(
+                source,
+                use_semantic_groups=use_semantic_groups,
+                max_regions_per_group=max_regions_per_group,
+                public_api_calls=public_api_calls,
+                side_effect_calls=side_effect_calls,
+                require_strict_subset=require_strict_subset,
+                validate_program_contract=validate_program_contract,
             )
+            regions = source_analysis.regions
+            groups = source_analysis.groups
             region_by_id = {region.region_id: region for region in regions}
             group_by_id = {group.group_id: group for group in groups}
             (
@@ -2402,30 +2607,19 @@ def _run_capsule_llm_step_loop(
                 executed_side_effect_regions,
                 executed_side_effect_groups,
             )
-            program_contract_analysis = (
-                analyze_capsule_program_contract_details(
-                    source,
-                    regions,
-                    groups,
-                    side_effect_calls=side_effect_calls,
-                )
-                if validate_program_contract
-                else None
+            program_contract_violations = source_analysis.contract_violations
+            strict_subset_violations = source_analysis.strict_subset_violations
+            contract_effectful_region_ids = (
+                source_analysis.contract_effectful_region_ids
             )
-            if program_contract_analysis is not None:
-                program_contract_violations = list(
-                    program_contract_analysis.violations
-                )
-                contract_effectful_region_ids = set(
-                    program_contract_analysis.effectful_region_ids
-                )
-                contract_effectful_group_ids = set(
-                    program_contract_analysis.effectful_group_ids
-                )
-            else:
-                program_contract_violations = []
-                contract_effectful_region_ids = set()
-                contract_effectful_group_ids = set()
+            contract_effectful_group_ids = (
+                source_analysis.contract_effectful_group_ids
+            )
+            if (
+                source_analysis.syntax_error is None
+                and not program_contract_violations
+            ):
+                failed = False
             if action.action == "append_recovery":
                 pending_recovery_actions = _runtime_actions_for_appended_recovery(
                     regions,
@@ -2814,6 +3008,7 @@ def _execute_runtime_action(
                 "Rollback is disabled. Continue from the current physical state with "
                 "fresh observation and recovery code."
             ),
+            evidence={"safety_failure": "rollback_disabled"},
         )
 
     if action.action == "resume_from_region":
@@ -2947,6 +3142,40 @@ def _program_contract_guard_event(
         evidence={
             "program_contract_violations": [item.to_dict() for item in violations]
         },
+    )
+
+
+def _strict_subset_guard_event(
+    action: RuntimeAction,
+    violations: list[ProgramContractViolation],
+) -> RuntimeEvent | None:
+    if not violations or action.action not in {
+        "run_group",
+        "run_region",
+        "resume_from_region",
+    }:
+        return None
+    serialized_violations = [item.to_dict() for item in violations]
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=_runtime_action_unit_id(action),
+        message=(
+            "Source execution is blocked until all strict Capsule Python subset "
+            "violations are repaired. Patch the source before running or resuming it."
+        ),
+        evidence={
+            "strict_subset_violations": serialized_violations,
+            "program_contract_violations": serialized_violations,
+        },
+    )
+
+
+def _capsule_event_is_hard_failure(event: RuntimeEvent) -> bool:
+    if event.status == "failed":
+        return True
+    return event.status == "invalid" and bool(
+        event.evidence.get("safety_failure")
     )
 
 
@@ -3186,6 +3415,7 @@ def _already_executed_side_effect_event(
             f"{unit_id} already executed robot-side-effect code and rollback is disabled. "
             f"{recovery_hint}"
         ),
+        evidence={"safety_failure": "side_effect_replay"},
     )
 
 
