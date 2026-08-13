@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import capx.envs.trial as trial_module
+import pytest
 from capx.envs.trial import (
     _describe_initial_scene,
     _execute_runtime_action,
@@ -2930,6 +2931,31 @@ def test_capsule_llm_step_rejects_premature_finish_and_continues(tmp_path):
     assert [entry["event"]["action"] for entry in trace] == ["finish", "run_group"]
     assert trace[0]["event"]["status"] == "warning"
     assert trace[0]["feedback"]["status"] == "warning"
+    assert trace[0]["feedback"]["message"] == (
+        "Finish rejected because the environment success predicate is not satisfied."
+    )
+
+
+def test_capsule_llm_step_rejects_invalid_progress_mode_before_side_effect(tmp_path):
+    env = FakeRewardDropCapsuleEnv()
+
+    with pytest.raises(ValueError, match="progress_mode.*dense.*sparse_terminal"):
+        trial_module._run_capsule_llm_step_loop(
+            env,
+            trial=0,
+            args=SimpleNamespace(model="test", use_oracle_code=False),
+            config={
+                "output_dir": str(tmp_path),
+                "max_capsule_steps": 1,
+                "capsule_progress_mode": "invalid",
+            },
+            initial_code='move_to("recover")\n',
+            scripted_actions=[
+                {"action": "run_group", "args": {"group_id": "group_1"}},
+            ],
+        )
+
+    assert env.api.moves == []
 
 
 def test_capsule_llm_step_stops_immediately_on_success_when_finish_guard_enabled(tmp_path):

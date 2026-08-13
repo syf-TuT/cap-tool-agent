@@ -11,6 +11,17 @@ from capx.runtime_control.schema import (
     RuntimeStatus,
 )
 
+_ALLOWED_PROGRESS_MODES = ("dense", "sparse_terminal")
+
+
+def validate_progress_mode(progress_mode: str) -> str:
+    if progress_mode not in _ALLOWED_PROGRESS_MODES:
+        allowed = ", ".join(repr(mode) for mode in _ALLOWED_PROGRESS_MODES)
+        raise ValueError(
+            f"progress_mode must be one of {allowed}; got {progress_mode!r}"
+        )
+    return progress_mode
+
 
 def build_runtime_feedback(
     *,
@@ -22,12 +33,9 @@ def build_runtime_feedback(
     before_state: dict[str, Any],
     after_state: dict[str, Any],
     progress_mode: str = "dense",
+    side_effect_calls: set[str] | None = None,
 ) -> RuntimeFeedback:
-    if progress_mode not in {"dense", "sparse_terminal"}:
-        raise ValueError(
-            "progress_mode must be either 'dense' or 'sparse_terminal', "
-            f"got {progress_mode!r}"
-        )
+    progress_mode = validate_progress_mode(progress_mode)
 
     evidence = dict(event.evidence)
     evidence.update(
@@ -51,6 +59,11 @@ def build_runtime_feedback(
         if hasattr(region, "has_robot_side_effect"):
             evidence["has_robot_side_effect"] = bool(region.has_robot_side_effect)
 
+    successful_side_effect_trace = _has_successful_side_effect_trace(
+        region,
+        trace_events,
+        side_effect_calls=side_effect_calls,
+    )
     terminal_progress_unverified = bool(
         progress_mode == "sparse_terminal"
         and event.status == "success"
@@ -58,6 +71,7 @@ def build_runtime_feedback(
         and region is not None
         and getattr(region, "has_robot_side_effect", True)
         and not _made_task_progress(before_state, after_state)
+        and successful_side_effect_trace
     )
     if terminal_progress_unverified:
         evidence["terminal_progress_unverified"] = True
@@ -69,6 +83,7 @@ def build_runtime_feedback(
         before_state,
         after_state,
         progress_mode=progress_mode,
+        successful_side_effect_trace=successful_side_effect_trace,
     )
     region_id = event.region_id or (region.region_id if region is not None else None)
 
@@ -91,6 +106,7 @@ def _feedback_status(
     after_state: dict[str, Any],
     *,
     progress_mode: str,
+    successful_side_effect_trace: bool,
 ) -> RuntimeStatus:
     if event.status in {"failed", "invalid", "warning", "skipped"}:
         return event.status
@@ -99,10 +115,34 @@ def _feedback_status(
     if region is not None and not _made_task_progress(before_state, after_state):
         if getattr(region, "has_robot_side_effect", True) is False:
             return "success"
-        if progress_mode == "sparse_terminal":
+        if progress_mode == "sparse_terminal" and successful_side_effect_trace:
             return "success"
         return "warning"
     return "success"
+
+
+def _has_successful_side_effect_trace(
+    region: CodeRegion | None,
+    trace_events: list[dict[str, Any]],
+    *,
+    side_effect_calls: set[str] | None,
+) -> bool:
+    if region is None:
+        return False
+
+    primitive_calls = set(getattr(region, "primitive_calls", []))
+    if side_effect_calls is None:
+        candidate_calls = primitive_calls
+    else:
+        candidate_calls = set(side_effect_calls)
+        if primitive_calls:
+            candidate_calls.intersection_update(primitive_calls)
+
+    return any(
+        trace_event.get("status") == "success"
+        and trace_event.get("name") in candidate_calls
+        for trace_event in trace_events
+    )
 
 
 def _made_task_progress(before_state: dict[str, Any], after_state: dict[str, Any]) -> bool:
@@ -130,6 +170,8 @@ def _feedback_message(
     else:
         detail = ""
     if region is None:
+        if status == "warning" and event.message:
+            return event.message
         return f"{event.action} completed with status {status}{detail}."
     if status == "warning":
         return (

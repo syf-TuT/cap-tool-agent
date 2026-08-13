@@ -43,6 +43,7 @@ from capx.runtime_control import (
     segment_python_code,
     segment_python_code_groups,
 )
+from capx.runtime_control.feedback import validate_progress_mode
 from capx.runtime_control.prompts import (
     build_capsule_recovery_prompt,
     build_capsule_terminal_recovery_prompt,
@@ -1380,6 +1381,9 @@ def _run_capsule_llm_step_loop(
     stop_after_failed_event: bool = False,
     stop_after_task_success: bool = False,
 ) -> TrialSummary:
+    progress_mode = validate_progress_mode(
+        str(config.get("capsule_progress_mode", "dense"))
+    )
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
     output_dir = config.get("output_dir")
     if output_dir:
@@ -1500,7 +1504,6 @@ def _run_capsule_llm_step_loop(
     action_prompt_char_budget = int(
         config.get("capsule_action_prompt_char_budget", 60000)
     )
-    progress_mode = str(config.get("capsule_progress_mode", "dense"))
     require_task_success_for_finish = _coerce_config_bool(
         config.get("capsule_require_task_success_for_finish", False)
     )
@@ -1671,6 +1674,7 @@ def _run_capsule_llm_step_loop(
             before_state=before_state,
             after_state=after_state,
             progress_mode=progress_mode,
+            side_effect_calls=side_effect_calls,
         )
 
         history.append(
