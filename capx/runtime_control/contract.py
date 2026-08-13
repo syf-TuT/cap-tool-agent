@@ -702,9 +702,11 @@ class _StrictStaticCostEstimator:
             bound = _static_iteration_bound(node.iter)
             if bound is None:
                 return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
+            iterable_cost = self.expression_cost(node.iter)
             body_cost = max(1, self.block_cost(node.body))
             loop_cost = _multiply_static_cost(bound, body_cost)
-            return _add_static_cost(loop_cost, self.block_cost(node.orelse))
+            cost = _add_static_cost(iterable_cost, loop_cost)
+            return _add_static_cost(cost, self.block_cost(node.orelse))
         if isinstance(node, (ast.While, ast.AsyncFor)):
             return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
         if isinstance(node, ast.If):
@@ -791,8 +793,16 @@ class _StrictStaticCostEstimator:
         node: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp,
     ) -> int:
         product = 1
+        iterable_construction_cost = 0
         condition_cost = 0
         for generator in node.generators:
+            iterable_construction_cost = _add_static_cost(
+                iterable_construction_cost,
+                _multiply_static_cost(
+                    product,
+                    self.expression_cost(generator.iter),
+                ),
+            )
             bound = _static_iteration_bound(generator.iter)
             if bound is None:
                 return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
@@ -810,7 +820,11 @@ class _StrictStaticCostEstimator:
         else:
             result_cost = self.expression_cost(node.elt)
         per_iteration = max(1, _add_static_cost(condition_cost, result_cost))
-        return _multiply_static_cost(product, per_iteration)
+        result_iterations_cost = _multiply_static_cost(product, per_iteration)
+        return _add_static_cost(
+            iterable_construction_cost,
+            result_iterations_cost,
+        )
 
 
 def _add_static_cost(first: int, second: int) -> int:

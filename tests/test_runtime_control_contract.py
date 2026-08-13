@@ -757,6 +757,83 @@ def test_strict_subset_preflight_api_is_exported():
     )
 
 
+def test_strict_subset_counts_for_iterable_construction_cost():
+    source = "for item in list(range(10000)):\n    value = item\n"
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        "static compute budget" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_counts_nested_iterable_construction_per_prefix():
+    source = (
+        "pairs = [(outer, inner) "
+        "for outer in range(100) "
+        "for inner in list(range(100))]\n"
+    )
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        "static compute budget" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_counts_outer_comprehension_iterable_construction():
+    source = "copied = [item for item in [value for value in range(10000)]]\n"
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        "static compute budget" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_multiplies_exact_budget_helper_inside_comprehension():
+    source = """\
+def exact_budget():
+    for item in range(10000):
+        value = item
+values = [exact_budget() for item in range(10000)]
+"""
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        "module exceeds static compute budget" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_composes_generator_and_consumer_costs():
+    source = "total = sum((item for item in range(6000)))\n"
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        "static compute budget" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_allows_small_nested_iterable_construction():
+    source = """\
+pairs = [
+    (outer, inner)
+    for outer in range(10)
+    for inner in list(range(10))
+]
+total = sum((item for item in range(100)))
+"""
+
+    assert _strict_analyze(source) == []
+
+
 def test_allows_pure_helpers_and_one_side_effect_per_top_level_group():
     source = """\
 def offset(p):
