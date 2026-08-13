@@ -1,9 +1,11 @@
 from capx.runtime_control.checkpoints import NamespaceCheckpointStore
 from capx.runtime_control.contract import (
+    STRICT_CAPSULE_SAFE_BUILTINS,
     ProgramContractAnalysis,
     ProgramContractViolation,
     analyze_capsule_program_contract,
     analyze_capsule_program_contract_details,
+    analyze_capsule_strict_subset,
 )
 from capx.runtime_control.executor import CapsuleExecutor
 from capx.runtime_control.feedback import build_runtime_feedback, validate_progress_mode
@@ -27,12 +29,14 @@ __all__ = [
     "NamespaceCheckpointStore",
     "ProgramContractAnalysis",
     "ProgramContractViolation",
+    "STRICT_CAPSULE_SAFE_BUILTINS",
     "RuntimeTrace",
     "build_capsule_prompt",
     "build_runtime_feedback",
     "validate_progress_mode",
     "analyze_capsule_program_contract",
     "analyze_capsule_program_contract_details",
+    "analyze_capsule_strict_subset",
     "parse_runtime_action_response",
     "RuntimeAction",
     "RuntimeEvent",

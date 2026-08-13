@@ -47,6 +47,134 @@ _CallableNode = _FunctionNode | ast.Lambda
 _EFFECT_SUMMARY_LIMIT = 2
 _DYNAMIC_EFFECT_MARKER = "dynamic_effect_call"
 
+STRICT_CAPSULE_SAFE_BUILTINS: frozenset[str] = frozenset(
+    {
+        "RuntimeError",
+        "ValueError",
+        "abs",
+        "all",
+        "any",
+        "bool",
+        "dict",
+        "enumerate",
+        "float",
+        "int",
+        "len",
+        "list",
+        "max",
+        "min",
+        "print",
+        "range",
+        "reversed",
+        "round",
+        "set",
+        "sorted",
+        "str",
+        "sum",
+        "tuple",
+        "zip",
+    }
+)
+
+_STRICT_CAPSULE_FORBIDDEN_CALLABLES = frozenset(
+    {
+        "__import__",
+        "breakpoint",
+        "compile",
+        "dir",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "help",
+        "input",
+        "locals",
+        "object",
+        "open",
+        "setattr",
+        "super",
+        "type",
+        "vars",
+    }
+)
+_STRICT_CAPSULE_SENSITIVE_NAMES = frozenset(
+    {
+        "APIS",
+        "__builtins__",
+        "builtins",
+        "ctypes",
+        "env",
+        "frame",
+        "gc",
+        "importlib",
+        "inspect",
+        "marshal",
+        "os",
+        "pathlib",
+        "pickle",
+        "sim",
+        "simulator",
+        "socket",
+        "subprocess",
+        "sys",
+        "types",
+    }
+)
+_STRICT_CAPSULE_EXCEPTION_CLASSES = frozenset({"RuntimeError", "ValueError"})
+
+_STRICT_CAPSULE_ALLOWED_NODES = (
+    ast.Module,
+    ast.Expr,
+    ast.Assign,
+    ast.AugAssign,
+    ast.NamedExpr,
+    ast.If,
+    ast.For,
+    ast.While,
+    ast.Try,
+    ast.ExceptHandler,
+    ast.FunctionDef,
+    ast.Return,
+    ast.Pass,
+    ast.Break,
+    ast.Continue,
+    ast.Raise,
+    ast.Assert,
+    ast.Constant,
+    ast.Name,
+    ast.Attribute,
+    ast.Subscript,
+    ast.Slice,
+    ast.Starred,
+    ast.List,
+    ast.Tuple,
+    ast.Set,
+    ast.Dict,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.BoolOp,
+    ast.Compare,
+    ast.IfExp,
+    ast.Call,
+    ast.keyword,
+    ast.JoinedStr,
+    ast.FormattedValue,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+    ast.comprehension,
+    ast.arguments,
+    ast.arg,
+)
+_STRICT_CAPSULE_ALLOWED_NODE_BASES = (
+    ast.operator,
+    ast.unaryop,
+    ast.boolop,
+    ast.cmpop,
+    ast.expr_context,
+)
+
 
 @dataclass(frozen=True)
 class _CallOccurrence:
@@ -221,6 +349,282 @@ def analyze_capsule_program_contract_details(
         effectful_region_ids=effectful_region_ids,
         effectful_group_ids=effectful_group_ids,
     )
+
+
+def analyze_capsule_strict_subset(
+    source: str,
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup],
+    *,
+    public_api_calls: set[str],
+    side_effect_calls: set[str],
+    safe_builtin_calls: set[str] | None = None,
+) -> list[ProgramContractViolation]:
+    """Validate the fail-closed Python subset used by non-privileged Capsules."""
+    module = ast.parse(source)
+    helper_names = {
+        statement.name
+        for statement in module.body
+        if isinstance(statement, ast.FunctionDef)
+    }
+    safe_calls = (
+        set(STRICT_CAPSULE_SAFE_BUILTINS)
+        if safe_builtin_calls is None
+        else set(safe_builtin_calls)
+    )
+    visitor = _StrictCapsuleSubsetVisitor(
+        regions=regions,
+        groups=groups,
+        public_api_calls=set(public_api_calls) | set(side_effect_calls),
+        side_effect_calls=set(side_effect_calls),
+        safe_builtin_calls=safe_calls,
+        helper_names=helper_names,
+    )
+    visitor.visit(module)
+    return sorted(
+        set(visitor.violations),
+        key=lambda violation: (
+            violation.start_line,
+            violation.end_line,
+            violation.code,
+            violation.message,
+            violation.helper_name or "",
+        ),
+    )
+
+
+class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
+    def __init__(
+        self,
+        *,
+        regions: list[CodeRegion],
+        groups: list[CodeRegionGroup],
+        public_api_calls: set[str],
+        side_effect_calls: set[str],
+        safe_builtin_calls: set[str],
+        helper_names: set[str],
+    ) -> None:
+        self.regions = regions
+        self.groups = groups
+        self.public_api_calls = public_api_calls
+        self.side_effect_calls = side_effect_calls
+        self.safe_builtin_calls = safe_builtin_calls
+        self.helper_names = helper_names
+        self.allowed_calls = public_api_calls | safe_builtin_calls | helper_names
+        self.protected_callable_names = (
+            self.allowed_calls | _STRICT_CAPSULE_FORBIDDEN_CALLABLES
+        )
+        self.violations: list[ProgramContractViolation] = []
+        self._helper_stack: list[str] = []
+
+    def _emit(self, node: ast.AST, reason: str) -> None:
+        start_line, end_line = _node_span(node)
+        side_effects = tuple(
+            dict.fromkeys(
+                child.id
+                for child in ast.walk(node)
+                if isinstance(child, ast.Name)
+                and child.id in self.side_effect_calls
+            )
+        )
+        self.violations.append(
+            _build_violation(
+                code="strict_subset_violation",
+                message=f"Strict Capsule subset violation: {reason}",
+                start_line=start_line,
+                end_line=end_line,
+                regions=self.regions,
+                groups=self.groups,
+                side_effects=side_effects,
+                helper_name=(
+                    self._helper_stack[-1] if self._helper_stack else None
+                ),
+            )
+        )
+
+    def _identifier_violation(self, name: str) -> str | None:
+        if name.startswith("_"):
+            return f"private name '{name}' is not available"
+        if name in _STRICT_CAPSULE_SENSITIVE_NAMES:
+            return f"sensitive runtime name '{name}' is not available"
+        return None
+
+    def generic_visit(self, node: ast.AST) -> None:
+        if not isinstance(
+            node,
+            _STRICT_CAPSULE_ALLOWED_NODES
+            + _STRICT_CAPSULE_ALLOWED_NODE_BASES,
+        ):
+            self._emit(node, f"syntax '{type(node).__name__}' is not allowed")
+            return
+        super().generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        if self._helper_stack:
+            self._emit(node, "nested function definitions are not allowed")
+            return
+
+        identifier_reason = self._identifier_violation(node.name)
+        if identifier_reason is not None:
+            self._emit(node, identifier_reason)
+        elif node.name in (
+            self.public_api_calls
+            | self.safe_builtin_calls
+            | _STRICT_CAPSULE_FORBIDDEN_CALLABLES
+        ):
+            self._emit(node, f"callable '{node.name}' cannot be redefined")
+
+        if node.decorator_list:
+            self._emit(node, "function decorators are not allowed")
+        if _function_has_annotations(node):
+            self._emit(node, "function annotations are not allowed")
+        if any(
+            not _is_literal_expression(default)
+            for default in (*node.args.defaults, *node.args.kw_defaults)
+            if default is not None
+        ):
+            self._emit(node, "function defaults must be literal values")
+
+        for argument in _function_arguments(node.args):
+            reason = self._identifier_violation(argument.arg)
+            if reason is not None:
+                self._emit(argument, reason)
+            elif argument.arg in self.protected_callable_names:
+                self._emit(
+                    argument,
+                    f"parameter cannot rebind callable '{argument.arg}'",
+                )
+
+        self._helper_stack.append(node.name)
+        for statement in node.body:
+            self.visit(statement)
+        self._helper_stack.pop()
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._emit(node, "syntax 'AsyncFunctionDef' is not allowed")
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._emit(node, "syntax 'ClassDef' is not allowed")
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._emit(node, "syntax 'Lambda' is not allowed")
+
+    def visit_Name(self, node: ast.Name) -> None:
+        reason = self._identifier_violation(node.id)
+        if reason is not None:
+            self._emit(node, reason)
+            return
+        if isinstance(node.ctx, ast.Store) and node.id in self.protected_callable_names:
+            self._emit(node, f"assignment cannot rebind callable '{node.id}'")
+        elif (
+            isinstance(node.ctx, ast.Load)
+            and node.id in self.protected_callable_names
+        ):
+            self._emit(
+                node,
+                f"callable '{node.id}' may only be used as a direct call",
+            )
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        reason = self._identifier_violation(node.attr)
+        if reason is not None:
+            self._emit(node, reason)
+            return
+        if not isinstance(node.ctx, ast.Load):
+            self._emit(node, "data attributes are read-only")
+            return
+        self.visit(node.value)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if not isinstance(node.func, ast.Name):
+            self._emit(
+                node,
+                "calls must target a direct public API, safe builtin, or top-level helper name",
+            )
+        else:
+            name = node.func.id
+            reason = self._identifier_violation(name)
+            if reason is not None:
+                self._emit(node, reason)
+            elif name in _STRICT_CAPSULE_FORBIDDEN_CALLABLES:
+                self._emit(node, f"call to forbidden callable '{name}' is not allowed")
+            elif name not in self.allowed_calls:
+                self._emit(node, f"call to unknown callable '{name}' is not allowed")
+
+        for argument in node.args:
+            self.visit(argument)
+        for keyword in node.keywords:
+            self.visit(keyword)
+
+    def visit_keyword(self, node: ast.keyword) -> None:
+        if node.arg is not None:
+            reason = self._identifier_violation(node.arg)
+            if reason is not None:
+                self._emit(node, reason)
+        self.visit(node.value)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.type is not None:
+            self._visit_exception_type(node.type)
+        if node.name is not None:
+            reason = self._identifier_violation(node.name)
+            if reason is not None:
+                self._emit(node, reason)
+            elif node.name in self.protected_callable_names:
+                self._emit(node, f"exception binding cannot rebind callable '{node.name}'")
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_Raise(self, node: ast.Raise) -> None:
+        if node.exc is not None and not (
+            isinstance(node.exc, ast.Name)
+            and node.exc.id in _STRICT_CAPSULE_EXCEPTION_CLASSES
+        ):
+            self.visit(node.exc)
+        if node.cause is not None:
+            self.visit(node.cause)
+
+    def _visit_exception_type(self, node: ast.expr) -> None:
+        if isinstance(node, ast.Name) and node.id in _STRICT_CAPSULE_EXCEPTION_CLASSES:
+            return
+        if isinstance(node, ast.Tuple):
+            for element in node.elts:
+                self._visit_exception_type(element)
+            return
+        self.visit(node)
+
+    def visit_comprehension(self, node: ast.comprehension) -> None:
+        if node.is_async:
+            self._emit(node, "asynchronous comprehensions are not allowed")
+            return
+        self.visit(node.target)
+        self.visit(node.iter)
+        for condition in node.ifs:
+            self.visit(condition)
+
+
+def _function_arguments(arguments: ast.arguments) -> tuple[ast.arg, ...]:
+    return (
+        *arguments.posonlyargs,
+        *arguments.args,
+        *((arguments.vararg,) if arguments.vararg is not None else ()),
+        *arguments.kwonlyargs,
+        *((arguments.kwarg,) if arguments.kwarg is not None else ()),
+    )
+
+
+def _function_has_annotations(node: ast.FunctionDef) -> bool:
+    return node.returns is not None or any(
+        argument.annotation is not None for argument in _function_arguments(node.args)
+    )
+
+
+def _is_literal_expression(node: ast.expr) -> bool:
+    try:
+        ast.literal_eval(node)
+    except (ValueError, TypeError):
+        return False
+    return True
 
 
 class _DefinitionGraphBuilder:

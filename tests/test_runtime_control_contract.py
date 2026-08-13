@@ -4,14 +4,17 @@ import capx.runtime_control as runtime_control
 from capx.runtime_control.contract import (
     ProgramContractAnalysis,
     ProgramContractViolation,
+    STRICT_CAPSULE_SAFE_BUILTINS,
     analyze_capsule_program_contract,
     analyze_capsule_program_contract_details,
+    analyze_capsule_strict_subset,
 )
 from capx.runtime_control.normalizer import segment_python_code_groups
 from capx.runtime_control.segmenter import segment_python_code
 
 
 SIDE_EFFECTS = {"goto_pose", "open_gripper", "close_gripper"}
+PUBLIC_API_CALLS = {*SIDE_EFFECTS, "detect_object", "get_ee_pose"}
 
 
 def _analyze(source: str) -> list[ProgramContractViolation]:
@@ -26,6 +29,291 @@ def _analyze(source: str) -> list[ProgramContractViolation]:
         regions,
         groups,
         side_effect_calls=SIDE_EFFECTS,
+    )
+
+
+def _strict_analyze(source: str) -> list[ProgramContractViolation]:
+    regions = segment_python_code(source)
+    groups = segment_python_code_groups(
+        source,
+        regions,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+    return analyze_capsule_strict_subset(
+        source,
+        regions,
+        groups,
+        public_api_calls=PUBLIC_API_CALLS,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+
+def test_strict_subset_allows_bounded_python_and_direct_capabilities():
+    source = """\
+def clamp(value, lower=0, upper=1):
+    return min(max(value, lower), upper)
+def transform(values):
+    return [clamp(item + 0.25) for item in values]
+values = [1, 2, 3]
+adjusted = transform(values)
+mapping = {"first": adjusted[0]}
+position = pose.position
+index = 0
+for item in range(len(adjusted)):
+    index += item
+while index < 4:
+    index += 1
+try:
+    if any(value > 0 for value in adjusted):
+        raise ValueError("positive")
+except ValueError:
+    mapping["handled"] = True
+object_info = detect_object("bowl")
+ee_pose = get_ee_pose()
+close_gripper()
+"""
+
+    assert _strict_analyze(source) == []
+
+
+def test_strict_subset_allows_each_safe_builtin_as_a_direct_call():
+    source = """\
+absolute = abs(-1)
+all_true = all([True, True])
+any_true = any([False, True])
+truth = bool(1)
+mapping = dict([("a", 1)])
+pairs = list(enumerate([1, 2]))
+decimal = float(1)
+integer = int(1.2)
+size = len(pairs)
+listed = list((1, 2))
+largest = max(1, 2)
+smallest = min(1, 2)
+sequence = range(2)
+backwards = reversed([1, 2])
+rounded = round(1.25, 1)
+unique = set([1, 1])
+ordered = sorted([2, 1])
+text = str(integer)
+total = sum([1, 2])
+packed = tuple([1, 2])
+paired = zip([1], [2])
+print(text)
+"""
+
+    assert _strict_analyze(source) == []
+    assert {
+        "abs",
+        "all",
+        "any",
+        "bool",
+        "dict",
+        "enumerate",
+        "float",
+        "int",
+        "len",
+        "list",
+        "max",
+        "min",
+        "print",
+        "range",
+        "reversed",
+        "round",
+        "set",
+        "sorted",
+        "str",
+        "sum",
+        "tuple",
+        "zip",
+    } <= STRICT_CAPSULE_SAFE_BUILTINS
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import sys\n",
+        "from sys import version\n",
+        "class Unsafe:\n    pass\n",
+        "value = lambda item: item\n",
+        "async def helper():\n    return 1\n",
+        "def helper():\n    yield 1\n",
+        "def helper():\n    yield from values\n",
+        "def helper():\n    global state\n",
+        "def helper():\n    nonlocal state\n",
+        "with resource:\n    value = 1\n",
+    ],
+)
+def test_strict_subset_rejects_syntax_outside_the_language(source):
+    violations = _strict_analyze(source)
+
+    assert violations
+    assert {violation.code for violation in violations} == {
+        "strict_subset_violation"
+    }
+    assert all(violation.message for violation in violations)
+
+
+@pytest.mark.parametrize(
+    "source,reason",
+    [
+        ("@register\ndef helper():\n    return 1\n", "decorator"),
+        ("def helper(value=make_default()):\n    return value\n", "default"),
+        ("def helper(value: int):\n    return value\n", "annotation"),
+        ("def outer():\n    def nested():\n        return 1\n", "nested"),
+    ],
+)
+def test_strict_subset_rejects_unsafe_helper_definitions(source, reason):
+    violations = _strict_analyze(source)
+
+    assert any(reason in violation.message.lower() for violation in violations)
+
+
+def test_strict_subset_allows_literal_helper_defaults():
+    source = """\
+def configure(count=2, labels=("a", "b"), options=None):
+    return count + len(labels) if options is None else 0
+result = configure()
+"""
+
+    assert _strict_analyze(source) == []
+
+
+def test_strict_subset_allows_safe_exception_classes_without_calling_them():
+    source = """\
+try:
+    raise ValueError
+except (ValueError, RuntimeError):
+    handled = True
+"""
+
+    assert _strict_analyze(source) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "obj.measure()\n",
+        "callbacks[0]()\n",
+        "(lambda: 1)()\n",
+        "unknown_call()\n",
+        "np.array([1, 2])\n",
+        "def invoke(fn):\n    return fn()\ninvoke(callback)\n",
+    ],
+)
+def test_strict_subset_rejects_non_direct_or_unknown_calls(source):
+    violations = _strict_analyze(source)
+
+    assert any(
+        violation.code == "strict_subset_violation"
+        and "call" in violation.message.lower()
+        for violation in violations
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "alias = close_gripper\nalias()\n",
+        "alias = close_gripper if condition else len\nalias()\n",
+        "(alias,) = (close_gripper,)\nalias()\n",
+        "[alias] = [close_gripper]\nalias()\n",
+        "(alias := close_gripper)()\n",
+        "close_gripper = callback\nclose_gripper()\n",
+        "def helper():\n    return 1\nhelper = callback\nhelper()\n",
+    ],
+)
+def test_strict_subset_rejects_callable_aliases_and_rebinding(source):
+    violations = _strict_analyze(source)
+
+    assert any(
+        violation.code == "strict_subset_violation"
+        and any(
+            reason in violation.message.lower()
+            for reason in ("callable", "call", "rebind")
+        )
+        for violation in violations
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "value = env\n",
+        "APIS = {}\n",
+        "value = __builtins__\n",
+        "value = frame\n",
+        "value = pose._position\n",
+        "pose.position = target\n",
+        "_hidden = 1\n",
+        "sys._getframe()\n",
+    ],
+)
+def test_strict_subset_rejects_private_and_sensitive_runtime_access(source):
+    violations = _strict_analyze(source)
+
+    assert violations
+    assert all(
+        violation.code == "strict_subset_violation"
+        for violation in violations
+    )
+
+
+@pytest.mark.parametrize(
+    "forbidden_name",
+    [
+        "eval",
+        "exec",
+        "globals",
+        "locals",
+        "getattr",
+        "setattr",
+        "vars",
+        "dir",
+        "open",
+        "compile",
+        "__import__",
+        "breakpoint",
+        "input",
+        "help",
+        "type",
+        "object",
+        "super",
+    ],
+)
+def test_strict_subset_rejects_forbidden_builtin_calls(forbidden_name):
+    violations = _strict_analyze(f"{forbidden_name}()\n")
+
+    assert len(violations) == 1
+    assert forbidden_name in violations[0].message
+
+
+def test_strict_subset_violations_are_deterministic_and_bind_source_units():
+    source = "alias = close_gripper\nalias()\n"
+
+    first = _strict_analyze(source)
+    second = _strict_analyze(source)
+
+    assert first == second
+    assert all(violation.region_ids for violation in first)
+    assert all(violation.group_ids for violation in first)
+    assert [
+        (violation.start_line, violation.end_line, violation.message)
+        for violation in first
+    ] == sorted(
+        (violation.start_line, violation.end_line, violation.message)
+        for violation in first
+    )
+
+
+def test_strict_subset_api_is_exported_from_runtime_control_package():
+    assert (
+        runtime_control.analyze_capsule_strict_subset
+        is analyze_capsule_strict_subset
+    )
+    assert (
+        runtime_control.STRICT_CAPSULE_SAFE_BUILTINS
+        is STRICT_CAPSULE_SAFE_BUILTINS
     )
 
 
