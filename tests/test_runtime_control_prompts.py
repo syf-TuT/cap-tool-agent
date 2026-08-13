@@ -353,6 +353,110 @@ def test_capsule_prompt_compact_history_prefers_warning_feedback_status():
     assert '"feedback_status": "warning"' in text
 
 
+def test_capsule_prompt_compact_history_keeps_sparse_terminal_evidence_after_fallback():
+    history = [
+        {
+            "step_id": 1,
+            "action": {"action": "run_group", "args": {"group_id": "group_1"}},
+            "event": {
+                "action": "run_group",
+                "status": "success",
+                "region_id": "group_1",
+                "evidence": {
+                    "source": "FULL_SOURCE_MUST_NOT_APPEAR",
+                    "trace_events": [{"name": "FULL_TRACE_MUST_NOT_APPEAR"}],
+                },
+            },
+            "feedback": {
+                "status": "warning",
+                "evidence": {
+                    "terminal_progress_unverified": True,
+                    "progress_mode": "sparse_terminal",
+                    "unrelated": "UNRELATED_EVIDENCE_MUST_NOT_APPEAR",
+                },
+            },
+        }
+    ]
+
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=history,
+        trace_summary={},
+        compact_context=True,
+        prompt_char_budget=1,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert '"terminal_progress_unverified": true' in text
+    assert '"progress_mode": "sparse_terminal"' in text
+    assert "FULL_SOURCE_MUST_NOT_APPEAR" not in text
+    assert "FULL_TRACE_MUST_NOT_APPEAR" not in text
+    assert "UNRELATED_EVIDENCE_MUST_NOT_APPEAR" not in text
+
+
+def test_capsule_prompt_compact_history_bounds_inspected_variable_summaries():
+    variable_evidence = {
+        "array": {
+            "type": "ndarray",
+            "shape": [1000, 1000],
+            "value": list(range(200)),
+            "source": "INSPECT_SOURCE_MUST_NOT_APPEAR",
+        },
+        "description": {"type": "str", "repr": "R" * 2000},
+        "binary": {
+            "type": "str",
+            "repr": "data:image/png;base64," + "A" * 2000,
+        },
+        **{
+            f"extra_{index}": {"type": "str", "repr": f"value_{index}"}
+            for index in range(10)
+        },
+    }
+    history = [
+        {
+            "step_id": 3,
+            "action": {"action": "inspect_variables", "args": {"names": ["array"]}},
+            "event": {
+                "action": "inspect_variables",
+                "status": "success",
+                "evidence": variable_evidence,
+            },
+        },
+        {
+            "step_id": 4,
+            "action": {"action": "inspect_trace", "args": {}},
+            "event": {
+                "action": "inspect_trace",
+                "status": "success",
+                "evidence": {"ordinary": "ORDINARY_EVIDENCE_MUST_NOT_APPEAR"},
+            },
+        },
+    ]
+
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=history,
+        trace_summary={},
+        compact_context=True,
+        prompt_char_budget=1,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert '"inspected_variables"' in text
+    assert '"array"' in text
+    assert '"type": "ndarray"' in text
+    assert "INSPECT_SOURCE_MUST_NOT_APPEAR" not in text
+    assert "ORDINARY_EVIDENCE_MUST_NOT_APPEAR" not in text
+    assert "data:image" not in text
+    assert "base64," not in text
+    assert "R" * 300 not in text
+    assert len(text) < 20000
+
+
 def test_capsule_prompt_compact_context_includes_focused_failed_unit_source():
     unique_tail = "focused_tail_marker_final_line = 8675309"
     failed_source = "\n".join(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from itertools import islice
 from typing import Any
 
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, RuntimeAction
@@ -9,6 +10,13 @@ _CONTRACT_SAFETY_MAX_CHARS = 12000
 _CONTRACT_TEXT_MAX_CHARS = 640
 _CONTRACT_ID_MAX_CHARS = 160
 _CONTRACT_LIST_MAX_ITEMS = 6
+_HISTORY_INSPECT_MAX_VARIABLES = 8
+_HISTORY_INSPECT_MAX_NAME_CHARS = 80
+_HISTORY_INSPECT_MAX_TEXT_CHARS = 200
+_HISTORY_INSPECT_MAX_LIST_ITEMS = 32
+_HISTORY_INSPECT_MAX_MAPPING_ITEMS = 8
+_HISTORY_INSPECT_MAX_DEPTH = 3
+_HISTORY_INSPECT_VALUE_KEYS = ("type", "shape", "value", "repr")
 _STRICT_CAPSULE_SOURCE_CONSTRAINTS = (
     "Strict Python subset for every generated or patched source:\n"
     "- Use no imports, classes, lambdas, try, while, async, dynamic or reflective "
@@ -97,16 +105,10 @@ def build_capsule_prompt(
     allowed_actions.extend(["resume_from_region", "finish"])
     allowed_actions_text = ", ".join(allowed_actions)
     normalized_side_effect_ledger = _normalize_side_effect_ledger(side_effect_ledger)
-    run_group_example_id = _example_group_id(
-        groups or [], normalized_side_effect_ledger
-    )
-    run_region_example_id = _example_region_id(
-        regions, normalized_side_effect_ledger
-    )
+    run_group_example_id = _example_group_id(groups or [], normalized_side_effect_ledger)
+    run_region_example_id = _example_region_id(regions, normalized_side_effect_ledger)
     contract_safety_context = _compact_contract_violations(contract_violations)
-    strict_source_constraints = (
-        f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n" if strict_subset else ""
-    )
+    strict_source_constraints = f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n" if strict_subset else ""
 
     prompt_text = _build_capsule_prompt_text(
         task=task,
@@ -192,9 +194,7 @@ def _build_capsule_prompt_text(
             _compact_group_for_prompt(group, source_preview_chars=source_preview_chars)
             for group in groups or []
         ]
-        history_data = _summarize_history_for_prompt(
-            history, max_entries=history_max_entries
-        )
+        history_data = _summarize_history_for_prompt(history, max_entries=history_max_entries)
         trace_data = _bound_trace_summary(trace_summary, max_events=trace_max_events)
         focused_source_data = _focused_failed_units_for_prompt(
             history=history,
@@ -229,10 +229,7 @@ def _build_capsule_prompt_text(
     )
     group_text = ""
     if group_data:
-        group_text = (
-            f"{group_heading}:\n"
-            f"{json.dumps(group_data, indent=2, default=str)}\n\n"
-        )
+        group_text = f"{group_heading}:\n{json.dumps(group_data, indent=2, default=str)}\n\n"
     focused_source_text = ""
     if focused_source_data:
         focused_source_text = (
@@ -345,9 +342,7 @@ def _compact_contract_violation(violation: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(source_span, dict):
         source_span = {}
     return {
-        "code": _truncate_contract_text(
-            violation.get("code"), max_chars=_CONTRACT_ID_MAX_CHARS
-        ),
+        "code": _truncate_contract_text(violation.get("code"), max_chars=_CONTRACT_ID_MAX_CHARS),
         "message": _truncate_contract_text(
             violation.get("message"), max_chars=_CONTRACT_TEXT_MAX_CHARS
         ),
@@ -357,9 +352,7 @@ def _compact_contract_violation(violation: dict[str, Any]) -> dict[str, Any]:
         },
         "region_ids": _compact_contract_list(violation.get("region_ids")),
         "group_ids": _compact_contract_list(violation.get("group_ids")),
-        "side_effect_calls": _compact_contract_list(
-            violation.get("side_effect_calls")
-        ),
+        "side_effect_calls": _compact_contract_list(violation.get("side_effect_calls")),
         "helper_name": _truncate_contract_text(
             violation.get("helper_name"), max_chars=_CONTRACT_ID_MAX_CHARS
         ),
@@ -424,10 +417,7 @@ def build_capsule_recovery_prompt(
         append_recovery_example = {
             "action": "append_recovery",
             "args": {
-                "source": (
-                    f"state = {recovery_functions[0]}()\n"
-                    "# recover from the current state"
-                )
+                "source": (f"state = {recovery_functions[0]}()\n# recover from the current state")
             },
         }
     else:
@@ -475,9 +465,7 @@ def build_capsule_recovery_prompt(
     example_text = "\n".join(json.dumps(example) for example in examples)
     bounded_history = history_tail[-4:]
     bounded_trace_summary = _bound_trace_summary(trace_summary, max_events=5)
-    strict_source_constraints = (
-        f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n\n" if strict_subset else ""
-    )
+    strict_source_constraints = f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n\n" if strict_subset else ""
     prompt_text = (
         "Task:\n"
         f"{task}\n\n"
@@ -543,10 +531,7 @@ def build_capsule_terminal_recovery_prompt(
         append_recovery_example = {
             "action": "append_recovery",
             "args": {
-                "source": (
-                    f"state = {recovery_functions[0]}()\n"
-                    "# continue from the terminal state"
-                )
+                "source": (f"state = {recovery_functions[0]}()\n# continue from the terminal state")
             },
         }
     else:
@@ -563,9 +548,7 @@ def build_capsule_terminal_recovery_prompt(
     bounded_history = history_tail[-4:]
     bounded_trace_summary = _bound_trace_summary(trace_summary, max_events=5)
     terminal_state_summary = summarize_terminal_state_for_recovery(terminal_state)
-    strict_source_constraints = (
-        f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n\n" if strict_subset else ""
-    )
+    strict_source_constraints = f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n\n" if strict_subset else ""
     response_contract = (
         "Response contract:\n"
         "- Your entire response must be one JSON object that starts with { and ends with }.\n"
@@ -647,9 +630,7 @@ def _source_preview(source: str, *, max_chars: int) -> str:
     return normalized[: max(0, max_chars - 4)].rstrip() + " ..."
 
 
-def _compact_region_for_prompt(
-    region: CodeRegion, *, source_preview_chars: int
-) -> dict[str, Any]:
+def _compact_region_for_prompt(region: CodeRegion, *, source_preview_chars: int) -> dict[str, Any]:
     return {
         "region_id": region.region_id,
         "source_span": {"start_line": region.start_line, "end_line": region.end_line},
@@ -773,6 +754,60 @@ def _primitive_calls_from_history(entry: dict[str, Any]) -> list[str]:
     return []
 
 
+def _truncate_history_text(value: str, *, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    suffix = "...<truncated>"
+    return value[: max(0, max_chars - len(suffix))] + suffix
+
+
+def _bound_history_runtime_value(value: Any, *, depth: int) -> Any:
+    if value is None or isinstance(value, (bool, float)):
+        return value
+    if isinstance(value, int):
+        return value if value.bit_length() <= 256 else "<large integer>"
+    if isinstance(value, str):
+        lowered = value.casefold()
+        if lowered.startswith("data:") or "base64," in lowered:
+            return "<redacted binary data>"
+        return _truncate_history_text(value, max_chars=_HISTORY_INSPECT_MAX_TEXT_CHARS)
+    if depth >= _HISTORY_INSPECT_MAX_DEPTH:
+        return "<max depth>"
+    if isinstance(value, (list, tuple)):
+        return [
+            _bound_history_runtime_value(item, depth=depth + 1)
+            for item in value[:_HISTORY_INSPECT_MAX_LIST_ITEMS]
+        ]
+    if isinstance(value, dict):
+        bounded: dict[str, Any] = {}
+        for key, item in islice(value.items(), _HISTORY_INSPECT_MAX_MAPPING_ITEMS):
+            bounded_key = _truncate_history_text(
+                str(key), max_chars=_HISTORY_INSPECT_MAX_NAME_CHARS
+            )
+            bounded[bounded_key] = _bound_history_runtime_value(item, depth=depth + 1)
+        return bounded
+    return f"<{type(value).__name__}>"
+
+
+def _bound_inspected_variables(evidence: Any) -> dict[str, Any]:
+    if not isinstance(evidence, dict):
+        return {}
+    inspected: dict[str, Any] = {}
+    for name, raw_summary in islice(evidence.items(), _HISTORY_INSPECT_MAX_VARIABLES):
+        if not isinstance(raw_summary, dict):
+            continue
+        summary = {
+            key: _bound_history_runtime_value(raw_summary[key], depth=0)
+            for key in _HISTORY_INSPECT_VALUE_KEYS
+            if key in raw_summary
+        }
+        if not summary:
+            continue
+        bounded_name = _truncate_history_text(str(name), max_chars=_HISTORY_INSPECT_MAX_NAME_CHARS)
+        inspected[bounded_name] = summary
+    return inspected
+
+
 def _summarize_history_for_prompt(
     history: list[dict[str, Any]], *, max_entries: int
 ) -> list[dict[str, Any]]:
@@ -784,11 +819,15 @@ def _summarize_history_for_prompt(
         event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
         feedback = entry.get("feedback") if isinstance(entry.get("feedback"), dict) else {}
         evidence = event.get("evidence") if isinstance(event.get("evidence"), dict) else {}
+        feedback_evidence = (
+            feedback.get("evidence") if isinstance(feedback.get("evidence"), dict) else {}
+        )
         event_status = event.get("status")
         feedback_status = feedback.get("status")
+        action_name = action.get("action") or event.get("action")
         summary = {
             "step_id": entry.get("step_id"),
-            "action": action.get("action") or event.get("action"),
+            "action": action_name,
             "unit_id": _action_unit_id(action, event, feedback),
             "status": feedback_status or event_status,
             "event_status": event_status,
@@ -797,14 +836,19 @@ def _summarize_history_for_prompt(
             "exception_type": evidence.get("exception_type"),
             "reward_before": _history_state_value(entry, "state_before", "reward"),
             "reward_after": _history_state_value(entry, "state_after", "reward"),
-            "task_completed_before": _history_state_value(
-                entry, "state_before", "task_completed"
-            ),
-            "task_completed_after": _history_state_value(
-                entry, "state_after", "task_completed"
-            ),
+            "task_completed_before": _history_state_value(entry, "state_before", "task_completed"),
+            "task_completed_after": _history_state_value(entry, "state_after", "task_completed"),
             "primitive_calls": _primitive_calls_from_history(entry),
         }
+        if feedback_evidence.get("terminal_progress_unverified") is True:
+            summary["terminal_progress_unverified"] = True
+        progress_mode = feedback_evidence.get("progress_mode")
+        if progress_mode in {"dense", "sparse_terminal"}:
+            summary["progress_mode"] = progress_mode
+        if action_name == "inspect_variables":
+            inspected_variables = _bound_inspected_variables(evidence)
+            if inspected_variables:
+                summary["inspected_variables"] = inspected_variables
         summaries.append(
             {key: value for key, value in summary.items() if value not in (None, [], "")}
         )
@@ -848,8 +892,7 @@ def _prompt_text_over_budget(prompt_text: str, prompt_char_budget: int | None) -
     return (
         prompt_char_budget is not None
         and prompt_char_budget > 0
-        and len(json.dumps(_capsule_prompt_messages(prompt_text), default=str))
-        > prompt_char_budget
+        and len(json.dumps(_capsule_prompt_messages(prompt_text), default=str)) > prompt_char_budget
     )
 
 
@@ -876,7 +919,7 @@ def _terminal_object_pair_geometry(objects: dict[str, Any]) -> list[dict[str, An
         left_pos = objects[left_name].get("pos_xyz")
         if not _is_xyz(left_pos):
             continue
-        for right_name in names[left_index + 1:]:
+        for right_name in names[left_index + 1 :]:
             right_pos = objects[right_name].get("pos_xyz")
             if not _is_xyz(right_pos):
                 continue
