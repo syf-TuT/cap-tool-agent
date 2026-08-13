@@ -459,6 +459,63 @@ def _decoded_data_url(data_url):
     return base64.b64decode(data_url.split(",", 1)[1])
 
 
+def _capsule_test_visual(camera, rgb, *, data_url_padding=0):
+    class _SolidColorEnv:
+        def render(self):
+            return np.full((2, 3, 3), rgb, dtype=np.uint8)
+
+    data_url, image = trial_module._get_visual_feedback(
+        _SolidColorEnv(), use_wrist_camera=False
+    )
+    if data_url_padding:
+        data_url = data_url.replace(",", "," + " " * data_url_padding, 1)
+    return trial_module._capsule_visual_from_payload(camera, data_url, image)
+
+
+def _prompt_image_urls(prompt):
+    return [
+        item["image_url"]["url"]
+        for message in prompt
+        for item in (
+            message.get("content", [])
+            if isinstance(message.get("content", []), list)
+            else []
+        )
+        if isinstance(item, dict) and item.get("type") == "image_url"
+    ]
+
+
+class _FakeLiberoGoalVisualEnv(FakeCapsuleEnv):
+    def __init__(self):
+        super().__init__()
+        self.shared_prompt = [
+            {"role": "system", "content": "x"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Goal: {libero_environment_goal}",
+                    }
+                ],
+            },
+        ]
+        self.low_level_env = SimpleNamespace(
+            handle=SimpleNamespace(
+                task_language="Pick the alphabet soup and place it in the basket"
+            )
+        )
+
+    def reset(self, *, seed=None, options=None):
+        return {"full_prompt": self.shared_prompt}, {}
+
+    def render(self):
+        return np.full((2, 3, 3), [10, 20, 30], dtype=np.uint8)
+
+    def render_wrist(self):
+        return np.full((1, 2, 3), [40, 50, 60], dtype=np.uint8)
+
+
 def test_capture_capsule_visuals_returns_png_hashed_main_and_wrist_records():
     records, errors = _capture_capsule_visuals(
         _FakeCapsuleVisualEnv(), use_wrist_camera=True
@@ -880,6 +937,380 @@ def test_query_initial_code_sanitizes_initial_prompt_multimodal_artifact(
     assert record.sha256 in artifact
     assert "data:image" not in artifact
     assert "base64," not in artifact
+
+
+def test_capsule_llm_step_libero_goal_before_initial_query_and_shared_prompt_isolation(
+    tmp_path, monkeypatch
+):
+    env = _FakeLiberoGoalVisualEnv()
+    captured_prompts = []
+
+    def fake_initial_code(args, config, obs, artifact_by_sha256=None):
+        captured_prompts.append(
+            {
+                "prompt": json.loads(json.dumps(obs["full_prompt"])),
+                "artifacts": dict(artifact_by_sha256 or {}),
+            }
+        )
+        return "x = 1\n", None, None
+
+    monkeypatch.setattr(trial_module, "_query_initial_code", fake_initial_code)
+
+    for trial_id in range(2):
+        trial_module._run_capsule_llm_step_loop(
+            env,
+            trial=trial_id,
+            args=SimpleNamespace(model="test", use_oracle_code=False),
+            config={
+                "output_dir": str(tmp_path),
+                "max_capsule_steps": 1,
+                "use_visual_feedback": True,
+                "use_wrist_camera": True,
+            },
+            scripted_actions=[{"action": "finish", "args": {}}],
+        )
+
+    goal = "Pick the alphabet soup and place it in the basket"
+    assert len(captured_prompts) == 2
+    for captured in captured_prompts:
+        prompt_text = json.dumps(captured["prompt"])
+        assert goal in prompt_text
+        assert "libero_environment_goal" not in prompt_text
+        assert len(_prompt_image_urls(captured["prompt"])) == 2
+        assert len(captured["artifacts"]) == 2
+
+    assert env.shared_prompt[-1]["content"] == [
+        {"type": "text", "text": "Goal: {libero_environment_goal}"}
+    ]
+
+
+def test_capsule_llm_step_visual_feedback_uses_current_pairs_and_sanitized_artifacts(
+    tmp_path, monkeypatch
+):
+    step_0 = [
+        _capsule_test_visual("main", [10, 11, 12], data_url_padding=50000),
+        _capsule_test_visual("wrist", [20, 21, 22]),
+    ]
+    step_1 = [
+        _capsule_test_visual("main", [30, 31, 32]),
+        _capsule_test_visual("wrist", [40, 41, 42]),
+    ]
+    step_2 = [
+        _capsule_test_visual("main", [50, 51, 52]),
+        _capsule_test_visual("wrist", [60, 61, 62]),
+    ]
+    capture_batches = iter([(step_0, []), (step_1, []), (step_2, [])])
+    capture_calls = []
+
+    def fake_capture(env, *, use_wrist_camera=False):
+        capture_calls.append(use_wrist_camera)
+        return next(capture_batches)
+
+    live_prompts = []
+    responses = iter(
+        [
+            {"content": "x = 1\n", "reasoning": None},
+            {"content": '{"action":"run_group","args":{"group_id":"group_1"}}'},
+            {"content": '{"action":"finish","args":{}}'},
+        ]
+    )
+
+    def fake_query_model(args, prompt):
+        live_prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(trial_module, "_capture_capsule_visuals", fake_capture)
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    trial_module._run_capsule_llm_step_loop(
+        FakeCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "use_parallel_ensemble": False,
+            "use_visual_feedback": True,
+            "capsule_action_visual_feedback": True,
+            "use_wrist_camera": True,
+        },
+    )
+
+    assert capture_calls == [True, True, True]
+    assert _prompt_image_urls(live_prompts[0]) == [
+        step_0[0].data_url,
+        step_0[1].data_url,
+    ]
+    assert _prompt_image_urls(live_prompts[1]) == [
+        step_0[0].data_url,
+        step_0[1].data_url,
+    ]
+    assert _prompt_image_urls(live_prompts[2]) == [
+        step_1[0].data_url,
+        step_1[1].data_url,
+    ]
+    assert step_0[0].data_url not in json.dumps(live_prompts[2])
+    assert step_0[1].data_url not in json.dumps(live_prompts[2])
+
+    initial_artifact = (tmp_path / "initial_prompt.txt").read_text()
+    prompt_artifact_path = tmp_path / "capsule_prompts_trial_00.json"
+    prompt_artifact = prompt_artifact_path.read_text()
+    for artifact in (initial_artifact, prompt_artifact):
+        assert "image_reference" in artifact
+        assert "data:image" not in artifact
+        assert "base64," not in artifact
+
+    saved_images = sorted(
+        (tmp_path / "capsule_visuals_trial_00").glob("step_*.png")
+    )
+    assert [path.name for path in saved_images] == [
+        "step_00_main.png",
+        "step_00_wrist.png",
+        "step_01_main.png",
+        "step_01_wrist.png",
+        "step_02_main.png",
+        "step_02_wrist.png",
+    ]
+    sanitized_prompts = json.loads(prompt_artifact_path.read_text())
+    for prompt in sanitized_prompts:
+        for item in prompt[-1]["content"]:
+            if item.get("type") != "image_reference":
+                continue
+            reference = item["image_reference"]
+            assert reference["camera"] in {"main", "wrist"}
+            assert reference["width"] == 3
+            assert reference["height"] == 2
+            assert len(reference["sha256"]) == 64
+            assert (tmp_path / reference["path"]).is_file()
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+    assert [row["action_prompt_image_count"] for row in rows] == [2, 2]
+    assert [row["visual_capture_errors"] for row in rows] == [[], []]
+    assert [image["path"] for image in rows[0]["action_prompt_images"]] == [
+        "capsule_visuals_trial_00/step_00_main.png",
+        "capsule_visuals_trial_00/step_00_wrist.png",
+    ]
+    assert [image["path"] for image in rows[1]["action_prompt_images"]] == [
+        "capsule_visuals_trial_00/step_01_main.png",
+        "capsule_visuals_trial_00/step_01_wrist.png",
+    ]
+    text_only_prompt = json.loads(json.dumps(live_prompts[1]))
+    text_only_prompt[-1]["content"] = text_only_prompt[-1]["content"][:1]
+    assert rows[0]["action_prompt_chars"] == len(
+        json.dumps(text_only_prompt, default=str)
+    )
+
+
+def test_capsule_llm_step_visual_feedback_clears_failed_camera_for_next_prompt(
+    tmp_path, monkeypatch
+):
+    step_0 = [
+        _capsule_test_visual("main", [1, 2, 3]),
+        _capsule_test_visual("wrist", [4, 5, 6]),
+    ]
+    step_1 = [_capsule_test_visual("main", [7, 8, 9])]
+    step_2 = [_capsule_test_visual("main", [10, 11, 12])]
+    batches = iter(
+        [
+            (step_0, []),
+            (step_1, [{"camera": "wrist", "error": "capture_failed"}]),
+            (step_2, [{"camera": "wrist", "error": "capture_failed"}]),
+        ]
+    )
+    live_prompts = []
+    responses = iter(
+        [
+            {"content": "x = 1\n", "reasoning": None},
+            {"content": '{"action":"inspect_trace","args":{}}'},
+            {"content": '{"action":"finish","args":{}}'},
+        ]
+    )
+
+    monkeypatch.setattr(
+        trial_module,
+        "_capture_capsule_visuals",
+        lambda env, *, use_wrist_camera=False: next(batches),
+    )
+
+    def fake_query_model(args, prompt):
+        live_prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    trial_module._run_capsule_llm_step_loop(
+        FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "use_parallel_ensemble": False,
+            "capsule_action_visual_feedback": True,
+            "use_wrist_camera": True,
+        },
+    )
+
+    second_action_prompt = live_prompts[2]
+    assert _prompt_image_urls(second_action_prompt) == [step_1[0].data_url]
+    assert step_0[1].data_url not in json.dumps(second_action_prompt)
+    assert "Current wrist-camera view unavailable (capture_failed)." in json.dumps(
+        second_action_prompt
+    )
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_01.jsonl"
+    )
+    assert rows[1]["action_prompt_image_count"] == 1
+    assert rows[1]["visual_capture_errors"] == [
+        {"camera": "wrist", "error": "capture_failed"}
+    ]
+
+
+def test_capsule_llm_step_visual_feedback_can_keep_action_prompts_text_only(
+    tmp_path, monkeypatch
+):
+    records = [
+        _capsule_test_visual("main", [1, 1, 1]),
+        _capsule_test_visual("wrist", [2, 2, 2]),
+    ]
+    capture_calls = []
+
+    def fake_capture(env, *, use_wrist_camera=False):
+        capture_calls.append(use_wrist_camera)
+        return records, []
+
+    live_prompts = []
+    responses = iter(
+        [
+            {"content": "x = 1\n", "reasoning": None},
+            {"content": '{"action":"inspect_trace","args":{}}'},
+            {"content": '{"action":"finish","args":{}}'},
+        ]
+    )
+
+    monkeypatch.setattr(trial_module, "_capture_capsule_visuals", fake_capture)
+
+    def fake_query_model(args, prompt):
+        live_prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    trial_module._run_capsule_llm_step_loop(
+        FakeCapsuleEnv(),
+        trial=2,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "use_parallel_ensemble": False,
+            "use_visual_feedback": True,
+            "capsule_action_visual_feedback": False,
+            "use_wrist_camera": True,
+        },
+    )
+
+    assert capture_calls == [True, True, True]
+    assert len(_prompt_image_urls(live_prompts[0])) == 2
+    assert _prompt_image_urls(live_prompts[1]) == []
+    assert _prompt_image_urls(live_prompts[2]) == []
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_02.jsonl"
+    )
+    assert [row["action_prompt_image_count"] for row in rows] == [0, 0]
+    assert [row["action_prompt_images"] for row in rows] == [[], []]
+
+
+def test_capsule_llm_step_visual_feedback_refreshes_after_all_action_outcomes(
+    tmp_path, monkeypatch
+):
+    records = [_capsule_test_visual("main", [9, 9, 9])]
+    capture_calls = []
+
+    def fake_capture(env, *, use_wrist_camera=False):
+        capture_calls.append(use_wrist_camera)
+        return records, []
+
+    monkeypatch.setattr(trial_module, "_capture_capsule_visuals", fake_capture)
+
+    trial_module._run_capsule_llm_step_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=3,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 6,
+            "capsule_action_visual_feedback": True,
+            "capsule_require_task_success_for_finish": True,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": "x = 2\n"},
+            },
+            {"action": "finish", "args": {}},
+            {"action": "run_group", "args": {"group_id": "missing"}},
+            {"action": "unsupported", "args": {}},
+        ],
+    )
+
+    assert capture_calls == [False] * 7
+    trace = json.loads((tmp_path / "capsule_trace_trial_03.json").read_text())
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "success",
+        "success",
+        "warning",
+        "invalid",
+        "invalid",
+    ]
+
+
+def test_capsule_llm_step_visual_feedback_refreshes_for_forced_recovery_without_prompt(
+    tmp_path, monkeypatch
+):
+    records = [_capsule_test_visual("main", [3, 3, 3])]
+    capture_calls = []
+
+    def fake_capture(env, *, use_wrist_camera=False):
+        capture_calls.append(use_wrist_camera)
+        return records, []
+
+    monkeypatch.setattr(trial_module, "_capture_capsule_visuals", fake_capture)
+
+    trial_module._run_capsule_llm_step_loop(
+        FakeRewardDropCapsuleEnv(),
+        trial=4,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_action_visual_feedback": True,
+        },
+        initial_code='move_to("bad")\n',
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": 'obs = get_observation()\nmove_to("recover")\n'
+                },
+            }
+        ],
+    )
+
+    assert capture_calls == [False, False, False]
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_04.jsonl"
+    )
+    assert rows[0]["action_prompt_image_count"] == 1
+    assert rows[1]["action_prompt_image_count"] == 0
+    assert rows[1]["action_prompt_images"] == []
+    assert rows[1]["visual_capture_errors"] == []
 
 
 def test_visual_model_queries_use_visual_feedback_stage(tmp_path, monkeypatch):

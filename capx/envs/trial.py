@@ -592,6 +592,27 @@ def _save_capsule_visuals(
             errors.append(_capsule_capture_error(record.camera, "save_failed"))
     return artifact_by_sha256, errors
 
+
+def _capture_and_save_capsule_visuals(
+    env: CodeExecutionEnvBase,
+    output_dir: str | os.PathLike[str] | None,
+    *,
+    trial_id: int,
+    step_id: int,
+    use_wrist_camera: bool,
+) -> tuple[list[CapsuleVisual], list[dict[str, str]], dict[str, str]]:
+    records, capture_errors = _capture_capsule_visuals(
+        env, use_wrist_camera=use_wrist_camera
+    )
+    artifacts, save_errors = _save_capsule_visuals(
+        records,
+        output_dir,
+        trial_id=trial_id,
+        step_id=step_id,
+    )
+    return records, [*capture_errors, *save_errors], artifacts
+
+
 def _capture_initial_visual_feedback(
     env: CodeExecutionEnvBase,
     obs: dict[str, Any],
@@ -1757,6 +1778,8 @@ def _run_capsule_llm_step_loop(
         allow_none=True,
     )
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
+    obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
+    _patch_libero_goal(env, obs)
     output_dir = config.get("output_dir")
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -1767,6 +1790,35 @@ def _run_capsule_llm_step_loop(
             wrist_camera=config.get("use_wrist_camera", False),
         )
 
+    use_initial_visual_feedback = _coerce_config_bool(
+        config.get("use_visual_feedback", False)
+    )
+    use_action_visual_feedback = _coerce_config_bool(
+        config.get("capsule_action_visual_feedback", False)
+    )
+    capture_visual_feedback = (
+        use_initial_visual_feedback or use_action_visual_feedback
+    )
+    use_wrist_camera = _coerce_config_bool(
+        config.get("use_wrist_camera", False)
+    )
+    current_visuals: list[CapsuleVisual] = []
+    current_visual_errors: list[dict[str, str]] = []
+    visual_artifact_by_sha256: dict[str, str] = {}
+    if capture_visual_feedback:
+        (
+            current_visuals,
+            current_visual_errors,
+            saved_artifacts,
+        ) = _capture_and_save_capsule_visuals(
+            env,
+            output_dir,
+            trial_id=trial,
+            step_id=0,
+            use_wrist_camera=use_wrist_camera,
+        )
+        visual_artifact_by_sha256.update(saved_artifacts)
+
     raw_code: str
     if initial_code is not None:
         raw_code = initial_code
@@ -1775,7 +1827,20 @@ def _run_capsule_llm_step_loop(
         raw_code = env.oracle_code
         source = env.oracle_code
     else:
-        raw_code, _, _ = _query_initial_code(args, config, obs)
+        initial_query_obs = dict(obs)
+        initial_query_obs["full_prompt"] = (
+            _attach_capsule_visuals(
+                obs["full_prompt"], current_visuals, current_visual_errors
+            )
+            if use_initial_visual_feedback
+            else copy.deepcopy(obs["full_prompt"])
+        )
+        raw_code, _, _ = _query_initial_code(
+            args,
+            config,
+            initial_query_obs,
+            artifact_by_sha256=visual_artifact_by_sha256,
+        )
         source = "\n\n".join(_extract_code(raw_code))
 
     max_regions_per_group = int(config.get("capsule_max_regions_per_group", 20))
@@ -1895,6 +1960,8 @@ def _run_capsule_llm_step_loop(
         action_prompt_chars = 0
         action_prompt_char_budget_metric = None
         action_prompt_over_budget = False
+        action_prompt_images: list[dict[str, Any]] = []
+        action_prompt_visual_errors: list[dict[str, str]] = []
 
         try:
             if pending_recovery_actions:
@@ -1933,7 +2000,30 @@ def _run_capsule_llm_step_loop(
                     and action_prompt_char_budget_metric > 0
                     and action_prompt_chars > action_prompt_char_budget_metric
                 )
-                prompts.append(prompt)
+                live_prompt = prompt
+                if use_action_visual_feedback:
+                    action_prompt_images = [
+                        _image_reference_metadata(
+                            {"url": record.data_url},
+                            camera=record.camera,
+                            artifact_by_sha256=visual_artifact_by_sha256,
+                        )
+                        for record in current_visuals
+                    ]
+                    action_prompt_visual_errors = copy.deepcopy(
+                        current_visual_errors
+                    )
+                    live_prompt = _attach_capsule_visuals(
+                        prompt,
+                        current_visuals,
+                        action_prompt_visual_errors,
+                    )
+                prompts.append(
+                    _sanitize_multimodal_prompt(
+                        live_prompt,
+                        artifact_by_sha256=visual_artifact_by_sha256,
+                    )
+                )
 
             if action is None and script is not None:
                 if script_idx >= len(script):
@@ -1943,7 +2033,7 @@ def _run_capsule_llm_step_loop(
                     script_idx += 1
             elif action is None:
                 with llm_call_stage("capsule_action"):
-                    response = _query_model(action_query_args, prompt)
+                    response = _query_model(action_query_args, live_prompt)
                 action = parse_runtime_action_response(response["content"])
             action.step_id = step_id
         except ValueError as exc:
@@ -2041,6 +2131,19 @@ def _run_capsule_llm_step_loop(
             )
 
         after_state = _capsule_state_snapshot(env, state_level=prompt_state_level)
+        if capture_visual_feedback:
+            (
+                current_visuals,
+                current_visual_errors,
+                saved_artifacts,
+            ) = _capture_and_save_capsule_visuals(
+                env,
+                output_dir,
+                trial_id=trial,
+                step_id=step_id,
+                use_wrist_camera=use_wrist_camera,
+            )
+            visual_artifact_by_sha256.update(saved_artifacts)
         if diagnostic_before_state is not None:
             diagnostic_states.append(
                 {
@@ -2090,6 +2193,9 @@ def _run_capsule_llm_step_loop(
         metric["action_prompt_compact_context"] = llm_step_compact_context
         metric["action_prompt_char_budget"] = action_prompt_char_budget_metric
         metric["action_prompt_over_budget"] = action_prompt_over_budget
+        metric["action_prompt_image_count"] = len(action_prompt_images)
+        metric["action_prompt_images"] = action_prompt_images
+        metric["visual_capture_errors"] = action_prompt_visual_errors
         metric["program_contract_valid"] = not program_contract_violations
         metric["program_contract_violation_count"] = len(
             program_contract_violations
