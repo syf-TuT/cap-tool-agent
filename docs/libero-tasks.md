@@ -56,6 +56,63 @@ python capx/envs/launch.py \
     --total-trials 10
 ```
 
+### Capsule LLM-step for standard LIBERO-Object
+
+The `franka_libero_object_0_capsule_llm_step.yaml` configuration targets standard
+`libero_object` task 0. It uses the non-privileged `FrankaLiberoApi`, not a reduced or
+ground-truth API. The initial generation prompt and every Action LLM step receive the
+current main- and wrist-camera images. Prompt-visible state is limited to
+proprioception, while full object state is written only to diagnostic artifacts and is
+never added to the LLM prompt or runtime history.
+
+Run the commands below only on a server or dedicated LIBERO runtime with the LIBERO
+environment and required LLM, PyRoKi, SAM3, and Contact-GraspNet services available.
+They are not local Windows commands. Validate task 0 first, then expand to all ten tasks.
+
+Task-0 smoke test:
+
+```bash
+source .venv-libero/bin/activate
+MUJOCO_GL=egl TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+uv run --no-sync --active capx/envs/launch.py \
+  --config-path env_configs/libero/franka_libero_object_0_capsule_llm_step.yaml \
+  --total-trials 1 \
+  --num-workers 1
+```
+
+Task 0 over five initial states:
+
+```bash
+source .venv-libero/bin/activate
+MUJOCO_GL=egl TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+uv run --no-sync --active python -m capx.envs.scripts.run_libero_batch \
+  --base-config-path env_configs/libero/franka_libero_object_0_capsule_llm_step.yaml \
+  --suites libero_object \
+  --task-ids 0 \
+  --total-trials 5 \
+  --num-workers 1 \
+  --output-dir ./outputs/libero_object_capsule_llm_step_task0
+```
+
+All ten tasks over five initial states each:
+
+```bash
+source .venv-libero/bin/activate
+MUJOCO_GL=egl TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+uv run --no-sync --active python -m capx.envs.scripts.run_libero_batch \
+  --base-config-path env_configs/libero/franka_libero_object_0_capsule_llm_step.yaml \
+  --suites libero_object \
+  --total-trials 5 \
+  --num-workers 1 \
+  --output-dir ./outputs/libero_object_capsule_llm_step_all
+```
+
+Each run directory contains the generated Capsule program, sanitized initial/step
+prompts, runtime trace JSON, per-step metrics, full-state diagnostic JSONL, and a
+`capsule_visuals_trial_<NN>/` directory with the main/wrist PNG files. Persisted prompt
+artifacts contain image metadata and relative PNG paths rather than inline base64 image
+payloads.
+
 ## Choosing a Task
 
 Each LIBERO task is specified by a **suite name** and **task index**. The YAML config's `low_level` field follows the pattern:
