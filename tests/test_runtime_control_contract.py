@@ -240,3 +240,151 @@ def test_transitive_helper_effect_expansion_is_saturated():
         for violation in violations
     )
     assert all(len(violation.side_effect_calls) <= 2 for violation in violations)
+
+
+def test_pure_helper_calls_do_not_hide_a_later_direct_effect():
+    source = """\
+def p1():
+    return 1
+def p2():
+    return 2
+def bad():
+    p1()
+    p2()
+    close_gripper()
+bad()
+"""
+
+    violations = _analyze(source)
+
+    assert any(
+        violation.code == "effectful_helper"
+        and violation.helper_name == "bad"
+        and violation.side_effect_calls == ("close_gripper",)
+        for violation in violations
+    )
+
+
+def test_class_body_effects_count_as_definition_time_occurrences():
+    source = """\
+class Bad:
+    open_gripper()
+    close_gripper()
+"""
+
+    violations = _analyze(source)
+
+    assert any(
+        violation.code == "multiple_effects_in_group"
+        and violation.side_effect_calls == ("open_gripper", "close_gripper")
+        for violation in violations
+    )
+
+
+def test_function_annotation_effects_count_as_definition_time_occurrences():
+    source = """\
+def prepare(target: open_gripper()) -> close_gripper():
+    pass
+"""
+
+    violations = _analyze(source)
+
+    assert any(
+        violation.code == "multiple_effects_in_group"
+        and violation.side_effect_calls == ("open_gripper", "close_gripper")
+        for violation in violations
+    )
+
+
+def test_pure_helper_dag_uses_one_bounded_summary_pass(monkeypatch):
+    original = runtime_control.contract._compute_definition_effect_summaries
+    summary_passes = 0
+
+    def counted_summary_pass(*args, **kwargs):
+        nonlocal summary_passes
+        summary_passes += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        runtime_control.contract,
+        "_compute_definition_effect_summaries",
+        counted_summary_pass,
+    )
+    definitions = ["def helper_0():\n    return 0"]
+    for index in range(1, 31):
+        definitions.append(
+            f"def helper_{index}():\n"
+            f"    helper_{index - 1}()\n"
+            f"    helper_{index - 1}()"
+        )
+
+    assert _analyze("\n".join([*definitions, "helper_30()", ""])) == []
+    assert summary_passes == 1
+
+
+def test_unreachable_nested_effectful_loop_is_not_reported():
+    source = """\
+def outer():
+    def nested():
+        for item in items:
+            close_gripper()
+    return True
+outer()
+"""
+
+    violations = _analyze(source)
+
+    assert all(
+        violation.code != "effectful_control_flow"
+        for violation in violations
+    )
+    assert all(
+        violation.helper_name != "outer"
+        for violation in violations
+        if violation.code == "effectful_helper"
+    )
+
+
+def test_inner_local_binding_shadows_effectful_enclosing_binding():
+    source = """\
+def outer():
+    def move():
+        close_gripper()
+    def inner():
+        def move():
+            return True
+        move()
+    inner()
+outer()
+"""
+
+    violations = _analyze(source)
+
+    assert all(
+        violation.helper_name != "outer"
+        for violation in violations
+        if violation.code == "effectful_helper"
+    )
+
+
+def test_reachable_local_effect_cycle_propagates_with_a_bounded_summary():
+    source = """\
+def outer():
+    def first():
+        second()
+    def second():
+        first()
+        close_gripper()
+    first()
+outer()
+"""
+
+    violations = _analyze(source)
+
+    outer = next(
+        violation
+        for violation in violations
+        if violation.code == "effectful_helper"
+        and violation.helper_name == "outer"
+    )
+    assert outer.side_effect_calls == ("close_gripper",)

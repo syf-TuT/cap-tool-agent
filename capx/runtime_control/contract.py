@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+from collections import deque
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import Any
 
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup
@@ -33,25 +35,53 @@ class ProgramContractViolation:
         }
 
 
+_FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
+_EFFECT_SUMMARY_LIMIT = 2
+
+
 @dataclass(frozen=True)
 class _CallOccurrence:
     name: str
     is_direct_name: bool
     line: int
+    column: int
 
 
-_FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
-_LocalDefinitions = dict[str, list[_FunctionNode]]
-_HelperCallGraph = dict[str, list[tuple[_CallOccurrence, ...]]]
+@dataclass
+class _Scope:
+    scope_id: int
+    parent_scope_id: int | None
+    bindings: dict[str, list[int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
-class _HelperDefinitionFacts:
+class _Definition:
+    definition_id: int
     node: _FunctionNode
-    calls: tuple[_CallOccurrence, ...]
+    defining_scope_id: int
+    body_scope_id: int
+    is_top_level: bool
 
 
-_HELPER_EFFECT_LIMIT = 2
+@dataclass(frozen=True)
+class _DefinitionGraph:
+    module_scope_id: int
+    scopes: dict[int, _Scope]
+    definitions: dict[int, _Definition]
+    top_level_definition_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _ResolvedCall:
+    line: int
+    column: int
+    effect_name: str | None = None
+    target_definition_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class _DefinitionAnalysis:
+    calls: tuple[_ResolvedCall, ...]
 
 
 def analyze_capsule_program_contract(
@@ -63,59 +93,403 @@ def analyze_capsule_program_contract(
 ) -> list[ProgramContractViolation]:
     """Validate that robot effects remain explicit, bounded execution steps."""
     module = ast.parse(source)
-    helper_nodes = [
-        node
-        for node in module.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
-    helper_names = {node.name for node in helper_nodes}
-    helper_definitions: list[_HelperDefinitionFacts] = []
-    helper_calls: _HelperCallGraph = {}
-    for node in helper_nodes:
-        calls = tuple(
-            _collect_relevant_scope_calls(
-                node.body,
-                helper_names=helper_names,
-                side_effect_calls=side_effect_calls,
-            )
-        )
-        helper_definitions.append(_HelperDefinitionFacts(node=node, calls=calls))
-        helper_calls.setdefault(node.name, []).append(calls)
+    graph = _DefinitionGraphBuilder().build(module)
+    definition_analyses = _analyze_definitions(
+        graph,
+        side_effect_calls=side_effect_calls,
+    )
+    definition_summaries = _compute_definition_effect_summaries(
+        definition_analyses
+    )
 
-    violations: list[ProgramContractViolation] = []
-    for definition in helper_definitions:
-        helper_name = definition.node.name
-        effects = _resolve_helper_effects(
-            definition.calls,
-            helper_calls,
-            side_effect_calls,
-            visiting={helper_name},
+    violations = _helper_violations(
+        graph,
+        definition_summaries,
+        regions=regions,
+        groups=groups,
+    )
+    violations.extend(
+        _control_flow_violations(
+            module,
+            graph,
+            definition_analyses,
+            definition_summaries,
+            regions=regions,
+            groups=groups,
+            side_effect_calls=side_effect_calls,
         )
+    )
+    violations.extend(
+        _group_violations(
+            module,
+            graph,
+            definition_summaries,
+            regions=regions,
+            groups=groups,
+            side_effect_calls=side_effect_calls,
+        )
+    )
+
+    return sorted(
+        set(violations),
+        key=lambda violation: (
+            violation.start_line,
+            violation.end_line,
+            violation.code,
+            violation.helper_name or "",
+        ),
+    )
+
+
+class _DefinitionGraphBuilder:
+    def __init__(self) -> None:
+        self._next_scope_id = 0
+        self._next_definition_id = 0
+        self._scopes: dict[int, _Scope] = {}
+        self._definitions: dict[int, _Definition] = {}
+
+    def build(self, module: ast.Module) -> _DefinitionGraph:
+        module_scope_id = self._new_scope(parent_scope_id=None)
+        top_level_nodes = _collect_scope_function_definitions(module.body)
+        top_level_definition_ids = self._register_definitions(
+            top_level_nodes,
+            defining_scope_id=module_scope_id,
+            is_top_level=True,
+        )
+        return _DefinitionGraph(
+            module_scope_id=module_scope_id,
+            scopes=self._scopes,
+            definitions=self._definitions,
+            top_level_definition_ids=tuple(top_level_definition_ids),
+        )
+
+    def _new_scope(self, *, parent_scope_id: int | None) -> int:
+        scope_id = self._next_scope_id
+        self._next_scope_id += 1
+        self._scopes[scope_id] = _Scope(
+            scope_id=scope_id,
+            parent_scope_id=parent_scope_id,
+        )
+        return scope_id
+
+    def _register_definitions(
+        self,
+        nodes: list[_FunctionNode],
+        *,
+        defining_scope_id: int,
+        is_top_level: bool,
+    ) -> list[int]:
+        definition_ids: list[int] = []
+        for node in nodes:
+            definition_id = self._next_definition_id
+            self._next_definition_id += 1
+            body_scope_id = self._new_scope(parent_scope_id=defining_scope_id)
+            self._definitions[definition_id] = _Definition(
+                definition_id=definition_id,
+                node=node,
+                defining_scope_id=defining_scope_id,
+                body_scope_id=body_scope_id,
+                is_top_level=is_top_level,
+            )
+            self._scopes[defining_scope_id].bindings.setdefault(
+                node.name, []
+            ).append(definition_id)
+            definition_ids.append(definition_id)
+
+        for definition_id in definition_ids:
+            definition = self._definitions[definition_id]
+            local_nodes = _collect_scope_function_definitions(
+                definition.node.body
+            )
+            self._register_definitions(
+                local_nodes,
+                defining_scope_id=definition.body_scope_id,
+                is_top_level=False,
+            )
+        return definition_ids
+
+
+def _collect_scope_function_definitions(
+    statements: list[ast.stmt],
+) -> list[_FunctionNode]:
+    visitor = _ScopeFunctionDefinitionVisitor()
+    for statement in statements:
+        visitor.visit(statement)
+    return visitor.functions
+
+
+class _ScopeFunctionDefinitionVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.functions: list[_FunctionNode] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.functions.append(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.functions.append(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+
+def _analyze_definitions(
+    graph: _DefinitionGraph,
+    *,
+    side_effect_calls: set[str],
+) -> dict[int, _DefinitionAnalysis]:
+    return {
+        definition_id: _DefinitionAnalysis(
+            calls=tuple(
+                _resolve_calls(
+                    _collect_calls(definition.node.body),
+                    graph,
+                    scope_id=definition.body_scope_id,
+                    side_effect_calls=side_effect_calls,
+                )
+            ),
+        )
+        for definition_id, definition in graph.definitions.items()
+    }
+
+
+def _resolve_calls(
+    calls: list[_CallOccurrence],
+    graph: _DefinitionGraph,
+    *,
+    scope_id: int,
+    side_effect_calls: set[str],
+) -> list[_ResolvedCall]:
+    resolved: list[_ResolvedCall] = []
+    for call in calls:
+        if call.name in side_effect_calls:
+            resolved.append(
+                _ResolvedCall(
+                    line=call.line,
+                    column=call.column,
+                    effect_name=call.name,
+                )
+            )
+            continue
+        if not call.is_direct_name:
+            continue
+        targets = _resolve_binding(graph, scope_id=scope_id, name=call.name)
+        if targets:
+            resolved.append(
+                _ResolvedCall(
+                    line=call.line,
+                    column=call.column,
+                    target_definition_ids=targets,
+                )
+            )
+    return resolved
+
+
+def _resolve_binding(
+    graph: _DefinitionGraph,
+    *,
+    scope_id: int,
+    name: str,
+) -> tuple[int, ...]:
+    current_scope_id: int | None = scope_id
+    while current_scope_id is not None:
+        scope = graph.scopes[current_scope_id]
+        if name in scope.bindings:
+            return tuple(scope.bindings[name])
+        current_scope_id = scope.parent_scope_id
+    return ()
+
+
+def _compute_definition_effect_summaries(
+    analyses: dict[int, _DefinitionAnalysis],
+) -> dict[int, tuple[str, ...]]:
+    """Return memoized cap-two summaries for every definition, including pure ones."""
+    adjacency = {
+        definition_id: _ordered_unique(
+            target_id
+            for call in analysis.calls
+            for target_id in call.target_definition_ids
+        )
+        for definition_id, analysis in analyses.items()
+    }
+    components = _strongly_connected_components(adjacency)
+    component_by_definition = {
+        definition_id: component_id
+        for component_id, definition_ids in enumerate(components)
+        for definition_id in definition_ids
+    }
+    memo: dict[int, tuple[str, ...]] = {}
+
+    def summarize_component(component_id: int) -> tuple[str, ...]:
+        if component_id in memo:
+            return memo[component_id]
+
+        terms: list[tuple[int, int, int, int, str | None, int | None]] = []
+        for definition_id in components[component_id]:
+            for call_index, call in enumerate(analyses[definition_id].calls):
+                if call.effect_name is not None:
+                    terms.append(
+                        (
+                            call.line,
+                            call.column,
+                            definition_id,
+                            call_index,
+                            call.effect_name,
+                            None,
+                        )
+                    )
+                for target_index, target_id in enumerate(
+                    call.target_definition_ids
+                ):
+                    target_component_id = component_by_definition[target_id]
+                    if target_component_id == component_id:
+                        continue
+                    terms.append(
+                        (
+                            call.line,
+                            call.column,
+                            definition_id,
+                            call_index + target_index,
+                            None,
+                            target_component_id,
+                        )
+                    )
+
+        effects: list[str] = []
+        for _, _, _, _, effect_name, target_component_id in sorted(terms):
+            if effect_name is not None:
+                effects.append(effect_name)
+            elif target_component_id is not None:
+                _extend_effects(
+                    effects,
+                    summarize_component(target_component_id),
+                    limit=_EFFECT_SUMMARY_LIMIT,
+                )
+            if len(effects) >= _EFFECT_SUMMARY_LIMIT:
+                break
+
+        memo[component_id] = tuple(effects[:_EFFECT_SUMMARY_LIMIT])
+        return memo[component_id]
+
+    return {
+        definition_id: summarize_component(component_by_definition[definition_id])
+        for definition_id in analyses
+    }
+
+
+def _strongly_connected_components(
+    adjacency: dict[int, list[int]],
+) -> list[tuple[int, ...]]:
+    next_index = 0
+    indices: dict[int, int] = {}
+    low_links: dict[int, int] = {}
+    stack: list[int] = []
+    on_stack: set[int] = set()
+    components: list[tuple[int, ...]] = []
+
+    def connect(definition_id: int) -> None:
+        nonlocal next_index
+        indices[definition_id] = next_index
+        low_links[definition_id] = next_index
+        next_index += 1
+        stack.append(definition_id)
+        on_stack.add(definition_id)
+
+        for target_id in adjacency[definition_id]:
+            if target_id not in indices:
+                connect(target_id)
+                low_links[definition_id] = min(
+                    low_links[definition_id], low_links[target_id]
+                )
+            elif target_id in on_stack:
+                low_links[definition_id] = min(
+                    low_links[definition_id], indices[target_id]
+                )
+
+        if low_links[definition_id] != indices[definition_id]:
+            return
+        component: list[int] = []
+        while stack:
+            member_id = stack.pop()
+            on_stack.remove(member_id)
+            component.append(member_id)
+            if member_id == definition_id:
+                break
+        components.append(tuple(sorted(component)))
+
+    for definition_id in sorted(adjacency):
+        if definition_id not in indices:
+            connect(definition_id)
+    return components
+
+
+def _helper_violations(
+    graph: _DefinitionGraph,
+    summaries: dict[int, tuple[str, ...]],
+    *,
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup],
+) -> list[ProgramContractViolation]:
+    violations: list[ProgramContractViolation] = []
+    for definition_id in graph.top_level_definition_ids:
+        effects = summaries[definition_id]
         if not effects:
             continue
-        start_line, end_line = _node_span(definition.node)
+        node = graph.definitions[definition_id].node
+        start_line, end_line = _node_span(node)
         violations.append(
             _build_violation(
                 code="effectful_helper",
-                message=f"Helper '{helper_name}' can execute a robot side effect",
+                message=f"Helper '{node.name}' can execute a robot side effect",
                 start_line=start_line,
                 end_line=end_line,
                 regions=regions,
                 groups=groups,
                 side_effects=effects,
-                helper_name=helper_name,
+                helper_name=node.name,
             )
         )
+    return violations
 
-    for node, calls in _collect_control_flow_cases(
-        module,
-        helper_names=helper_names,
-        side_effect_calls=side_effect_calls,
+
+def _control_flow_violations(
+    module: ast.Module,
+    graph: _DefinitionGraph,
+    analyses: dict[int, _DefinitionAnalysis],
+    summaries: dict[int, tuple[str, ...]],
+    *,
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup],
+    side_effect_calls: set[str],
+) -> list[ProgramContractViolation]:
+    cases: list[tuple[ast.AST, int]] = [
+        (node, graph.module_scope_id)
+        for node in _collect_control_flow_nodes(module.body)
+    ]
+    for definition_id in _reachable_definition_ids(
+        graph.top_level_definition_ids,
+        analyses,
     ):
-        effects = _resolve_effects(
+        definition = graph.definitions[definition_id]
+        cases.extend(
+            (node, definition.body_scope_id)
+            for node in _collect_control_flow_nodes(definition.node.body)
+        )
+
+    violations: list[ProgramContractViolation] = []
+    for node, scope_id in cases:
+        calls = _resolve_calls(
+            _collect_calls([node]),
+            graph,
+            scope_id=scope_id,
+            side_effect_calls=side_effect_calls,
+        )
+        effects = _materialize_effects(
             calls,
-            helper_calls,
-            side_effect_calls,
+            summaries,
+            limit=_EFFECT_SUMMARY_LIMIT,
         )
         if not effects:
             continue
@@ -134,15 +508,49 @@ def analyze_capsule_program_contract(
                 side_effects=effects,
             )
         )
+    return violations
 
-    top_level_calls = _collect_top_level_calls(module)
+
+def _reachable_definition_ids(
+    roots: tuple[int, ...],
+    analyses: dict[int, _DefinitionAnalysis],
+) -> list[int]:
+    reachable = set(roots)
+    pending = deque(roots)
+    while pending:
+        definition_id = pending.popleft()
+        for call in analyses[definition_id].calls:
+            for target_id in call.target_definition_ids:
+                if target_id in reachable:
+                    continue
+                reachable.add(target_id)
+                pending.append(target_id)
+    return sorted(reachable)
+
+
+def _group_violations(
+    module: ast.Module,
+    graph: _DefinitionGraph,
+    summaries: dict[int, tuple[str, ...]],
+    *,
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup],
+    side_effect_calls: set[str],
+) -> list[ProgramContractViolation]:
+    module_calls = _resolve_calls(
+        _collect_calls(module.body),
+        graph,
+        scope_id=graph.module_scope_id,
+        side_effect_calls=side_effect_calls,
+    )
+    violations: list[ProgramContractViolation] = []
     for group in groups:
         group_calls = [
             call
-            for call in top_level_calls
+            for call in module_calls
             if group.start_line <= call.line <= group.end_line
         ]
-        effects = _resolve_effects(group_calls, helper_calls, side_effect_calls)
+        effects = _materialize_effects(group_calls, summaries)
         if len(effects) <= 1:
             continue
         violations.append(
@@ -159,16 +567,43 @@ def analyze_capsule_program_contract(
                 side_effects=effects,
             )
         )
+    return violations
 
-    return sorted(
-        set(violations),
-        key=lambda violation: (
-            violation.start_line,
-            violation.end_line,
-            violation.code,
-            violation.helper_name or "",
-        ),
-    )
+
+def _materialize_effects(
+    calls: list[_ResolvedCall] | tuple[_ResolvedCall, ...],
+    summaries: dict[int, tuple[str, ...]],
+    *,
+    limit: int | None = None,
+) -> tuple[str, ...]:
+    effects: list[str] = []
+    for call in calls:
+        if call.effect_name is not None:
+            effects.append(call.effect_name)
+        else:
+            for target_id in call.target_definition_ids:
+                _extend_effects(effects, summaries[target_id], limit=limit)
+                if limit is not None and len(effects) >= limit:
+                    break
+        if limit is not None and len(effects) >= limit:
+            break
+    if limit is not None:
+        return tuple(effects[:limit])
+    return tuple(effects)
+
+
+def _extend_effects(
+    destination: list[str],
+    values: tuple[str, ...],
+    *,
+    limit: int | None,
+) -> None:
+    if limit is None:
+        destination.extend(values)
+        return
+    remaining = limit - len(destination)
+    if remaining > 0:
+        destination.extend(values[:remaining])
 
 
 def _collect_calls(statements: list[ast.stmt]) -> list[_CallOccurrence]:
@@ -178,77 +613,79 @@ def _collect_calls(statements: list[ast.stmt]) -> list[_CallOccurrence]:
     return visitor.calls
 
 
-def _collect_top_level_calls(module: ast.Module) -> list[_CallOccurrence]:
-    return _collect_calls(module.body)
+class _ExecutableCallVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.calls: list[_CallOccurrence] = []
 
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_definition_time_expressions(node)
 
-def _collect_control_flow_cases(
-    module: ast.Module,
-    *,
-    helper_names: set[str],
-    side_effect_calls: set[str],
-) -> list[tuple[ast.AST, list[_CallOccurrence]]]:
-    cases: list[tuple[ast.AST, list[_CallOccurrence]]] = []
-    for statement in module.body:
-        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            cases.extend(
-                _collect_function_control_flow_cases(
-                    statement,
-                    helper_names=helper_names,
-                    side_effect_calls=side_effect_calls,
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_definition_time_expressions(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for expression in sorted(
+            [*node.decorator_list, *node.bases, *(item.value for item in node.keywords)],
+            key=_source_position,
+        ):
+            self.visit(expression)
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        for expression in sorted(
+            [*node.args.defaults, *(item for item in node.args.kw_defaults if item)],
+            key=_source_position,
+        ):
+            self.visit(expression)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self.visit(node.func)
+        for argument in node.args:
+            self.visit(argument)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+
+        name = _callable_name(node.func)
+        if name is not None:
+            self.calls.append(
+                _CallOccurrence(
+                    name=name,
+                    is_direct_name=isinstance(node.func, ast.Name),
+                    line=node.lineno,
+                    column=node.col_offset,
                 )
             )
-            continue
 
-        for node in _collect_control_flow_nodes([statement]):
-            cases.append(
-                (
-                    node,
-                    _collect_relevant_scope_calls(
-                        [node],
-                        helper_names=helper_names,
-                        side_effect_calls=side_effect_calls,
-                    ),
-                )
-            )
-    return cases
-
-
-def _collect_function_control_flow_cases(
-    node: _FunctionNode,
-    *,
-    helper_names: set[str],
-    side_effect_calls: set[str],
-    inherited_local_definitions: _LocalDefinitions | None = None,
-) -> list[tuple[ast.AST, list[_CallOccurrence]]]:
-    direct_local_definitions = _collect_local_function_definitions(node.body)
-    local_definitions = _merge_local_definitions(
-        inherited_local_definitions or {},
-        direct_local_definitions,
-    )
-    cases = [
-        (
-            control_node,
-            _collect_relevant_scope_calls(
-                [control_node],
-                helper_names=helper_names,
-                side_effect_calls=side_effect_calls,
-                inherited_local_definitions=local_definitions,
-            ),
+    def _visit_definition_time_expressions(self, node: _FunctionNode) -> None:
+        expressions: list[ast.expr] = [
+            *node.decorator_list,
+            *node.args.defaults,
+            *(item for item in node.args.kw_defaults if item is not None),
+        ]
+        arguments = [
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        ]
+        if node.args.vararg is not None:
+            arguments.append(node.args.vararg)
+        if node.args.kwarg is not None:
+            arguments.append(node.args.kwarg)
+        expressions.extend(
+            argument.annotation
+            for argument in arguments
+            if argument.annotation is not None
         )
-        for control_node in _collect_control_flow_nodes(node.body)
-    ]
-    for definitions in direct_local_definitions.values():
-        for local_node in definitions:
-            cases.extend(
-                _collect_function_control_flow_cases(
-                    local_node,
-                    helper_names=helper_names,
-                    side_effect_calls=side_effect_calls,
-                    inherited_local_definitions=local_definitions,
-                )
-            )
-    return cases
+        if node.returns is not None:
+            expressions.append(node.returns)
+
+        for expression in sorted(expressions, key=_source_position):
+            self.visit(expression)
+
+
+def _source_position(node: ast.AST) -> tuple[int, int]:
+    return int(getattr(node, "lineno", 0)), int(getattr(node, "col_offset", 0))
 
 
 def _collect_control_flow_nodes(statements: list[ast.stmt]) -> list[ast.AST]:
@@ -258,145 +695,37 @@ def _collect_control_flow_nodes(statements: list[ast.stmt]) -> list[ast.AST]:
     return visitor.nodes
 
 
-def _collect_relevant_scope_calls(
-    statements: list[ast.stmt],
-    *,
-    helper_names: set[str],
-    side_effect_calls: set[str],
-    inherited_local_definitions: _LocalDefinitions | None = None,
-    visiting_local_definitions: set[int] | None = None,
-) -> list[_CallOccurrence]:
-    local_definitions = _merge_local_definitions(
-        inherited_local_definitions or {},
-        _collect_local_function_definitions(statements),
-    )
-    visiting = visiting_local_definitions or set()
-    relevant_calls: list[_CallOccurrence] = []
-
-    for call in _collect_calls(statements):
-        if call.name in side_effect_calls:
-            relevant_calls.append(call)
-        elif call.is_direct_name and call.name in local_definitions:
-            for local_node in local_definitions[call.name]:
-                node_key = id(local_node)
-                if node_key in visiting:
-                    continue
-                nested_calls = _collect_relevant_scope_calls(
-                    local_node.body,
-                    helper_names=helper_names,
-                    side_effect_calls=side_effect_calls,
-                    inherited_local_definitions=local_definitions,
-                    visiting_local_definitions={*visiting, node_key},
-                )
-                _extend_saturated(relevant_calls, nested_calls)
-                if len(relevant_calls) >= _HELPER_EFFECT_LIMIT:
-                    break
-        elif call.is_direct_name and call.name in helper_names:
-            relevant_calls.append(call)
-
-        if len(relevant_calls) >= _HELPER_EFFECT_LIMIT:
-            break
-
-    return relevant_calls
+_CONTROL_FLOW_TYPES: tuple[type[ast.AST], ...] = (
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.Try,
+)
+if hasattr(ast, "TryStar"):
+    _CONTROL_FLOW_TYPES += (ast.TryStar,)
 
 
-def _collect_local_function_definitions(
-    statements: list[ast.stmt],
-) -> _LocalDefinitions:
-    visitor = _LocalFunctionDefinitionVisitor()
-    for statement in statements:
-        visitor.visit(statement)
-    return visitor.functions
+class _ControlFlowVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.nodes: list[ast.AST] = []
 
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
 
-def _merge_local_definitions(
-    inherited: _LocalDefinitions,
-    current: _LocalDefinitions,
-) -> _LocalDefinitions:
-    merged = {name: list(nodes) for name, nodes in inherited.items()}
-    for name, nodes in current.items():
-        merged.setdefault(name, []).extend(nodes)
-    return merged
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
 
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for statement in node.body:
+            self.visit(statement)
 
-def _resolve_effects(
-    calls: list[_CallOccurrence],
-    helper_calls: _HelperCallGraph,
-    side_effect_calls: set[str],
-) -> tuple[str, ...]:
-    effects: list[str] = []
-    for call in calls:
-        if call.name in side_effect_calls:
-            effects.append(call.name)
-        elif call.is_direct_name and call.name in helper_calls:
-            effects.extend(
-                _expand_helper_effects(
-                    call.name,
-                    helper_calls,
-                    side_effect_calls,
-                    visiting=set(),
-                )
-            )
-    return tuple(effects)
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
 
-
-def _expand_helper_effects(
-    helper_name: str,
-    helper_calls: _HelperCallGraph,
-    side_effect_calls: set[str],
-    *,
-    visiting: set[str],
-) -> tuple[str, ...]:
-    if helper_name in visiting:
-        return ()
-
-    effects: list[str] = []
-    next_visiting = {*visiting, helper_name}
-    for definition_calls in helper_calls.get(helper_name, []):
-        _extend_saturated(
-            effects,
-            _resolve_helper_effects(
-                definition_calls,
-                helper_calls,
-                side_effect_calls,
-                visiting=next_visiting,
-            ),
-        )
-        if len(effects) >= _HELPER_EFFECT_LIMIT:
-            break
-    return tuple(effects)
-
-
-def _resolve_helper_effects(
-    calls: tuple[_CallOccurrence, ...] | list[_CallOccurrence],
-    helper_calls: _HelperCallGraph,
-    side_effect_calls: set[str],
-    *,
-    visiting: set[str],
-) -> tuple[str, ...]:
-    effects: list[str] = []
-    for call in calls:
-        if call.name in side_effect_calls:
-            effects.append(call.name)
-        elif call.is_direct_name and call.name in helper_calls:
-            _extend_saturated(
-                effects,
-                _expand_helper_effects(
-                    call.name,
-                    helper_calls,
-                    side_effect_calls,
-                    visiting=visiting,
-                ),
-            )
-        if len(effects) >= _HELPER_EFFECT_LIMIT:
-            break
-    return tuple(effects)
-
-
-def _extend_saturated(destination: list[Any], values: list[Any] | tuple[Any, ...]) -> None:
-    remaining = _HELPER_EFFECT_LIMIT - len(destination)
-    if remaining > 0:
-        destination.extend(values[:remaining])
+    def generic_visit(self, node: ast.AST) -> None:
+        if isinstance(node, _CONTROL_FLOW_TYPES):
+            self.nodes.append(node)
+        super().generic_visit(node)
 
 
 def _build_violation(
@@ -459,99 +788,12 @@ def _callable_name(node: ast.AST) -> str | None:
     return None
 
 
-class _ExecutableCallVisitor(ast.NodeVisitor):
-    def __init__(self) -> None:
-        self.calls: list[_CallOccurrence] = []
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._visit_function_definition(node)
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self._visit_function_definition(node)
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        for decorator in node.decorator_list:
-            self.visit(decorator)
-        for base in node.bases:
-            self.visit(base)
-        for keyword in node.keywords:
-            self.visit(keyword.value)
-
-    def visit_Lambda(self, node: ast.Lambda) -> None:
-        self._visit_argument_defaults(node.args)
-
-    def visit_Call(self, node: ast.Call) -> None:
-        name = _callable_name(node.func)
-        if name is not None:
-            self.calls.append(
-                _CallOccurrence(
-                    name=name,
-                    is_direct_name=isinstance(node.func, ast.Name),
-                    line=node.lineno,
-                )
-            )
-        self.generic_visit(node)
-
-    def _visit_function_definition(
-        self,
-        node: _FunctionNode,
-    ) -> None:
-        for decorator in node.decorator_list:
-            self.visit(decorator)
-        self._visit_argument_defaults(node.args)
-
-    def _visit_argument_defaults(self, arguments: ast.arguments) -> None:
-        for default in arguments.defaults:
-            self.visit(default)
-        for default in arguments.kw_defaults:
-            if default is not None:
-                self.visit(default)
-
-
-class _LocalFunctionDefinitionVisitor(ast.NodeVisitor):
-    def __init__(self) -> None:
-        self.functions: _LocalDefinitions = {}
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self.functions.setdefault(node.name, []).append(node)
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self.functions.setdefault(node.name, []).append(node)
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        return
-
-    def visit_Lambda(self, node: ast.Lambda) -> None:
-        return
-
-
-_CONTROL_FLOW_TYPES: tuple[type[ast.AST], ...] = (
-    ast.For,
-    ast.AsyncFor,
-    ast.While,
-    ast.Try,
-)
-if hasattr(ast, "TryStar"):
-    _CONTROL_FLOW_TYPES += (ast.TryStar,)
-
-
-class _ControlFlowVisitor(ast.NodeVisitor):
-    def __init__(self) -> None:
-        self.nodes: list[ast.AST] = []
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        return
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        return
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        return
-
-    def visit_Lambda(self, node: ast.Lambda) -> None:
-        return
-
-    def generic_visit(self, node: ast.AST) -> None:
-        if isinstance(node, _CONTROL_FLOW_TYPES):
-            self.nodes.append(node)
-        super().generic_visit(node)
+def _ordered_unique(values: Iterable[int]) -> list[int]:
+    result: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
