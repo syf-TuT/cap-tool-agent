@@ -760,6 +760,12 @@ _CONTROL_FLOW_TYPES: tuple[type[ast.AST], ...] = (
     ast.AsyncFor,
     ast.While,
     ast.Try,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    # Generator bodies are lazy, but the safety contract conservatively rejects
+    # effectful generator expressions before a later consumer can iterate them.
+    ast.GeneratorExp,
 )
 if hasattr(ast, "TryStar"):
     _CONTROL_FLOW_TYPES += (ast.TryStar,)

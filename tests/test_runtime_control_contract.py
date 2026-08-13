@@ -131,6 +131,29 @@ except RuntimeError:
     ] == ["effectful_control_flow", "effectful_control_flow"]
 
 
+def test_rejects_effectful_comprehensions_and_transitive_helper_calls():
+    source = """\
+def close_twice():
+    close_gripper()
+values = [close_twice() for _ in range(2)]
+pending = (open_gripper() for _ in range(2))
+"""
+
+    violations = _analyze(source)
+
+    comprehension_violations = [
+        violation
+        for violation in violations
+        if violation.code == "effectful_control_flow"
+    ]
+    assert [item.start_line for item in comprehension_violations] == [
+        3,
+        4,
+    ]
+    assert comprehension_violations[0].side_effect_calls == ("close_gripper",)
+    assert comprehension_violations[1].side_effect_calls == ("open_gripper",)
+
+
 def test_control_flow_resolves_transitive_helper_effects_and_cycles():
     source = """\
 def first():

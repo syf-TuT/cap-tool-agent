@@ -1357,6 +1357,80 @@ def test_capsule_contract_region_guard_tracks_transitive_helper_effects(tmp_path
     assert env.api.calls == []
 
 
+def test_capsule_contract_guard_blocks_effectful_comprehension(tmp_path):
+    env = FakeGripperCapsuleEnv()
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_validate_program_contract": True,
+        },
+        initial_code="[close_gripper() for _ in range(2)]\n",
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert trace[0]["event"]["status"] == "invalid"
+    assert trace[0]["event"]["evidence"]["program_contract_violations"][0][
+        "code"
+    ] == "effectful_control_flow"
+    assert env.api.calls == []
+
+
+def test_capsule_no_replay_ledger_survives_patch_group_renumbering(tmp_path):
+    env = FakeCustomMoveCapsuleEnv()
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code=(
+            "x = 1\n"
+            'custom_move("same")\n'
+            'custom_move("same")\n'
+        ),
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {
+                "action": "patch_group",
+                "args": {
+                    "group_id": "group_1",
+                    "source": "x = 2\ny = 3\n",
+                },
+            },
+            {"action": "run_group", "args": {"group_id": "group_3"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    prompts = json.loads((tmp_path / "capsule_prompts_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "success",
+        "invalid",
+        "success",
+    ]
+    assert "already executed robot-side-effect code" in trace[2]["event"]["message"]
+    assert env.api.moves == ["same"]
+    third_prompt_text = prompts[2][1]["content"][0]["text"]
+    assert '"executed_side_effect_groups": [\n    "group_3"\n  ]' in third_prompt_text
+
+
 def test_capsule_llm_step_reanalyzes_forced_appended_recovery(tmp_path):
     env = FakeRewardDropCapsuleEnv()
     recovery_source = (

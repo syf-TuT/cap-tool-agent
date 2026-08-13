@@ -557,6 +557,53 @@ def test_capsule_prompt_contract_violations_survive_compact_budget_fallback():
     assert "before running any robot effects" in text
 
 
+def test_capsule_prompt_bounds_large_contract_safety_context():
+    violations = [
+        {
+            "code": f"effectful_helper_{index}_" + "c" * 1000,
+            "message": f"unsafe helper {index}: " + "m" * 4000,
+            "source_span": {"start_line": index + 1, "end_line": index + 2},
+            "region_ids": [f"region_{index}_" + "r" * 1000 for _ in range(20)],
+            "group_ids": [f"group_{index}_" + "g" * 1000 for _ in range(20)],
+            "side_effect_calls": ["close_gripper_" + "s" * 1000],
+            "helper_name": "helper_" + "h" * 1000,
+        }
+        for index in range(1000)
+    ]
+
+    prompt = build_capsule_prompt(
+        task="close the gripper",
+        regions=[
+            CodeRegion(
+                region_id="region_1",
+                start_line=1,
+                end_line=1,
+                source="x = 1",
+            )
+        ],
+        history=[],
+        trace_summary={},
+        contract_violations=violations,
+        compact_context=True,
+        prompt_char_budget=60000,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+    serialized = json.dumps(prompt, default=str)
+
+    assert len(serialized) <= 60000
+    assert "Capsule-ready program contract violations" in text
+    assert '"total_count": 1000' in text
+    assert '"omitted_count":' in text
+    assert '"violations": [' in text
+    assert '"code": "effectful_helper_0_' in text
+    assert '"message": "unsafe helper 0:' in text
+    assert '"source_span": {"start_line": 1, "end_line": 2}' in text
+    assert '"group_ids": ["group_0_' in text
+    assert "before running any robot effects" in text
+    assert violations[0]["message"] not in text
+
+
 def test_recovery_prompt_is_local_and_bounded():
     groups = [
         CodeRegionGroup(

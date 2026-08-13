@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import base64
 import copy
+import difflib
 import gc
 import io
 import json
@@ -1683,6 +1684,8 @@ def _run_capsule_llm_step_loop(
             and event.status == "success"
         ):
             previous_source_line_count = len(source.splitlines())
+            previous_regions = regions
+            previous_groups = groups
             source = str(event.evidence["source"])
             regions = segment_python_code(source)
             groups = (
@@ -1697,6 +1700,17 @@ def _run_capsule_llm_step_loop(
             )
             region_by_id = {region.region_id: region for region in regions}
             group_by_id = {group.group_id: group for group in groups}
+            (
+                executed_side_effect_regions,
+                executed_side_effect_groups,
+            ) = _remap_executed_side_effect_ledger(
+                previous_regions,
+                regions,
+                previous_groups,
+                groups,
+                executed_side_effect_regions,
+                executed_side_effect_groups,
+            )
             program_contract_analysis = (
                 analyze_capsule_program_contract_details(
                     source,
@@ -2416,6 +2430,65 @@ def _already_executed_side_effect_event(
             f"{recovery_hint}"
         ),
     )
+
+
+def _remap_executed_side_effect_ledger(
+    previous_regions: list[CodeRegion],
+    current_regions: list[CodeRegion],
+    previous_groups: list[CodeRegionGroup],
+    current_groups: list[CodeRegionGroup],
+    executed_region_ids: set[str],
+    executed_group_ids: set[str],
+) -> tuple[set[str], set[str]]:
+    region_id_map = _aligned_unit_id_map(
+        previous_regions,
+        current_regions,
+        id_attribute="region_id",
+    )
+    group_id_map = _aligned_unit_id_map(
+        previous_groups,
+        current_groups,
+        id_attribute="group_id",
+    )
+    remapped_region_ids = {
+        region_id_map[region_id]
+        for region_id in executed_region_ids
+        if region_id in region_id_map
+    }
+    remapped_group_ids = {
+        group_id_map[group_id]
+        for group_id in executed_group_ids
+        if group_id in group_id_map
+    }
+    remapped_group_ids.update(
+        group.group_id
+        for group in current_groups
+        if remapped_region_ids.intersection(group.region_ids)
+    )
+    return remapped_region_ids, remapped_group_ids
+
+
+def _aligned_unit_id_map(
+    previous_units: list[CodeRegion] | list[CodeRegionGroup],
+    current_units: list[CodeRegion] | list[CodeRegionGroup],
+    *,
+    id_attribute: str,
+) -> dict[str, str]:
+    matcher = difflib.SequenceMatcher(
+        None,
+        [unit.source for unit in previous_units],
+        [unit.source for unit in current_units],
+        autojunk=False,
+    )
+    result: dict[str, str] = {}
+    for previous_start, current_start, size in matcher.get_matching_blocks():
+        for offset in range(size):
+            previous_unit = previous_units[previous_start + offset]
+            current_unit = current_units[current_start + offset]
+            result[str(getattr(previous_unit, id_attribute))] = str(
+                getattr(current_unit, id_attribute)
+            )
+    return result
 
 
 def _runtime_patch_replacement(args: dict[str, Any]) -> Any:

@@ -6,6 +6,12 @@ from typing import Any
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, RuntimeAction
 
 
+_CONTRACT_SAFETY_MAX_CHARS = 12000
+_CONTRACT_TEXT_MAX_CHARS = 640
+_CONTRACT_ID_MAX_CHARS = 160
+_CONTRACT_LIST_MAX_ITEMS = 6
+
+
 def parse_runtime_action_response(content: str) -> RuntimeAction:
     text = content.strip()
     if text.startswith("```"):
@@ -91,6 +97,7 @@ def build_capsule_prompt(
     run_region_example_id = _example_region_id(
         regions, normalized_side_effect_ledger
     )
+    contract_safety_context = _compact_contract_violations(contract_violations)
 
     prompt_text = _build_capsule_prompt_text(
         task=task,
@@ -98,7 +105,7 @@ def build_capsule_prompt(
         groups=groups,
         history=history,
         trace_summary=trace_summary,
-        contract_violations=contract_violations,
+        contract_safety_context=contract_safety_context,
         side_effect_ledger=normalized_side_effect_ledger,
         compact_context=compact_context,
         history_max_entries=history_max_entries,
@@ -119,7 +126,7 @@ def build_capsule_prompt(
             groups=groups,
             history=history,
             trace_summary=trace_summary,
-            contract_violations=contract_violations,
+            contract_safety_context=contract_safety_context,
             side_effect_ledger=normalized_side_effect_ledger,
             compact_context=True,
             history_max_entries=min(history_max_entries, 2),
@@ -150,7 +157,7 @@ def _build_capsule_prompt_text(
     groups: list[CodeRegionGroup] | None,
     history: list[dict[str, Any]],
     trace_summary: dict[str, Any],
-    contract_violations: list[dict[str, Any]] | None,
+    contract_safety_context: dict[str, Any] | None,
     side_effect_ledger: dict[str, Any],
     compact_context: bool,
     history_max_entries: int,
@@ -221,10 +228,10 @@ def _build_capsule_prompt_text(
             f"{json.dumps(focused_source_data, indent=2, default=str)}\n\n"
         )
     contract_violation_text = ""
-    if contract_violations:
+    if contract_safety_context:
         contract_violation_text = (
             "Capsule-ready program contract violations:\n"
-            f"{json.dumps(contract_violations, default=str)}\n"
+            f"{json.dumps(contract_safety_context, default=str)}\n"
             "Patch these violations before running any robot effects. Do not execute "
             "a robot-side-effect region or group until the program contract is repaired.\n\n"
         )
@@ -285,6 +292,84 @@ def _build_capsule_prompt_text(
         "for robot primitives as tools."
     )
     return prompt_text
+
+
+def _compact_contract_violations(
+    violations: list[dict[str, Any]] | None,
+    *,
+    max_chars: int = _CONTRACT_SAFETY_MAX_CHARS,
+) -> dict[str, Any] | None:
+    if not violations:
+        return None
+
+    total_count = len(violations)
+    compact_items: list[dict[str, Any]] = []
+    for violation in violations:
+        item = _compact_contract_violation(violation)
+        candidate_items = [*compact_items, item]
+        candidate = {
+            "total_count": total_count,
+            "violations": candidate_items,
+            "omitted_count": total_count - len(candidate_items),
+        }
+        if compact_items and len(json.dumps(candidate, default=str)) > max_chars:
+            break
+        compact_items = candidate_items
+
+    return {
+        "total_count": total_count,
+        "violations": compact_items,
+        "omitted_count": total_count - len(compact_items),
+    }
+
+
+def _compact_contract_violation(violation: dict[str, Any]) -> dict[str, Any]:
+    source_span = violation.get("source_span")
+    if not isinstance(source_span, dict):
+        source_span = {}
+    return {
+        "code": _truncate_contract_text(
+            violation.get("code"), max_chars=_CONTRACT_ID_MAX_CHARS
+        ),
+        "message": _truncate_contract_text(
+            violation.get("message"), max_chars=_CONTRACT_TEXT_MAX_CHARS
+        ),
+        "source_span": {
+            "start_line": _compact_contract_scalar(source_span.get("start_line")),
+            "end_line": _compact_contract_scalar(source_span.get("end_line")),
+        },
+        "region_ids": _compact_contract_list(violation.get("region_ids")),
+        "group_ids": _compact_contract_list(violation.get("group_ids")),
+        "side_effect_calls": _compact_contract_list(
+            violation.get("side_effect_calls")
+        ),
+        "helper_name": _truncate_contract_text(
+            violation.get("helper_name"), max_chars=_CONTRACT_ID_MAX_CHARS
+        ),
+    }
+
+
+def _compact_contract_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [
+        _truncate_contract_text(item, max_chars=_CONTRACT_ID_MAX_CHARS)
+        for item in value[:_CONTRACT_LIST_MAX_ITEMS]
+    ]
+
+
+def _compact_contract_scalar(value: Any) -> int | float | bool | str | None:
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    return _truncate_contract_text(value, max_chars=_CONTRACT_ID_MAX_CHARS)
+
+
+def _truncate_contract_text(value: Any, *, max_chars: int) -> str:
+    text = str(value) if value is not None else ""
+    if len(text) <= max_chars:
+        return text
+    suffix = "...<truncated>"
+    return f"{text[: max_chars - len(suffix)]}{suffix}"
 
 
 def build_capsule_recovery_prompt(
