@@ -16,6 +16,8 @@ env:
     privileged: false
     apis:
       - FrankaLiberoApi
+    molmo_base_url: http://127.0.0.1:8122/v1
+    molmo_model_name: allenai/Molmo2-8B
     prompt: |
       You are controlling a Franka Emika robot with the API described below.
       Goal: {libero_environment_goal}

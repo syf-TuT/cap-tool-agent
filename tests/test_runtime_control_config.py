@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import yaml
 
+from capx.envs.tasks.base import CodeExecEnvConfig
 from capx.utils.launch_utils import _load_config
 
 
@@ -89,6 +90,8 @@ def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
     assert low_level["privileged"] is False
     assert cfg["privileged"] is False
     assert cfg["apis"] == ["FrankaLiberoApi"]
+    assert cfg["molmo_base_url"] == "http://127.0.0.1:8122/v1"
+    assert cfg["molmo_model_name"] == "allenai/Molmo2-8B"
     assert data["agent_mode"] == "capsule"
     assert data["capsule_control_mode"] == "llm_step"
     assert data["max_capsule_steps"] == 24
@@ -128,6 +131,21 @@ def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
     assert "all loops" not in docs
     assert "prepared wsl project at `/home/capx/code/cap-x`" in docs
     assert "do not run this command from the windows checkout" in docs
+    assert "external molmo vllm service" in docs
+    assert "not auto-started" in docs
+    assert (
+        "python -m capx.serving.vllm_server --model allenai/molmo2-8b "
+        "--host 127.0.0.1 --port 8122"
+    ) in docs
+    assert "sam3" in docs
+    assert "point-cloud" in docs
+
+
+def test_code_exec_env_config_defaults_molmo_service_to_unspecified():
+    cfg = CodeExecEnvConfig(low_level=object(), apis=[])
+
+    assert cfg.molmo_base_url is None
+    assert cfg.molmo_model_name is None
 
 
 def test_capsule_yaml_uses_code_primitives_not_robot_tools():

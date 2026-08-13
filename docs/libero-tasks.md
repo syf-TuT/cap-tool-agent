@@ -76,6 +76,23 @@ top-level helpers. They may use only statically bounded `for` loops, and total
 computation must remain within the static budget. Legacy arbitrary-Python Capsule
 programs are not available in non-privileged mode.
 
+This configuration also requires an external Molmo vLLM service on port 8122. It is
+not auto-started by the YAML. Start it in a separate server terminal and wait for the
+OpenAI-compatible endpoint to become ready before launching the LIBERO trial:
+
+```bash
+source .venv-libero/bin/activate
+python -m capx.serving.vllm_server --model allenai/Molmo2-8B --host 127.0.0.1 --port 8122
+```
+
+From another terminal, confirm `http://127.0.0.1:8122/v1/models` is ready before
+starting the configured launch.
+
+`FrankaLiberoApi` uses SAM3 for text segmentation when possible, with Molmo point
+prompts as a fallback. Its multi-view point-cloud API queries Molmo first to locate the
+object in each camera view before applying SAM3, so the Molmo endpoint must be ready
+even though a SAM3 server is also configured.
+
 For a local source-only check, run the focused configuration test below from the
 prepared WSL project at `/home/capx/code/cap-x`; do not run this command from the Windows
 checkout. It parses the YAML and verifies the non-privileged prompt contract; it does

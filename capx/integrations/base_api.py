@@ -54,11 +54,7 @@ class ApiBase(ABC):
         self,
         tool_name: str,
         text: str,
-        images: list[np.ndarray | Image.Image | str]
-        | np.ndarray
-        | Image.Image
-        | str
-        | None = None,
+        images: list[np.ndarray | Image.Image | str] | np.ndarray | Image.Image | str | None = None,
         highlight: bool = False,
     ) -> None:
         """Log an execution step if web UI mode is enabled.
@@ -76,11 +72,7 @@ class ApiBase(ABC):
     def _log_step_update(
         self,
         text: str | None = None,
-        images: list[np.ndarray | Image.Image | str]
-        | np.ndarray
-        | Image.Image
-        | str
-        | None = None,
+        images: list[np.ndarray | Image.Image | str] | np.ndarray | Image.Image | str | None = None,
     ) -> None:
         """Update the last logged step if web UI mode is enabled."""
         if not self._webui_enabled:
@@ -140,18 +132,35 @@ class ApiBase(ABC):
         return "\n".join(lines).strip()
 
 
-_API_FACTORIES: dict[str, Callable[[], ApiBase]] = {}
+_API_FACTORIES: dict[str, Callable[..., ApiBase]] = {}
+_CONFIG_AWARE_API_FACTORIES: set[str] = set()
 
 
-def register_api(name: str, factory: Callable[[], ApiBase]) -> None:
+def register_api(
+    name: str,
+    factory: Callable[..., ApiBase],
+    *,
+    accepts_config: bool = False,
+) -> None:
     _API_FACTORIES[name] = factory
+    if accepts_config:
+        _CONFIG_AWARE_API_FACTORIES.add(name)
+    else:
+        _CONFIG_AWARE_API_FACTORIES.discard(name)
 
 
 @lru_cache(maxsize=256)
-def get_api(name: str) -> Callable[[BaseEnv], ApiBase]:
+def get_api(name: str) -> Callable[..., ApiBase]:
     if name not in _API_FACTORIES:
         raise KeyError(f"API '{name}' not registered")
     return _API_FACTORIES[name]
+
+
+def instantiate_api(name: str, env: BaseEnv, config: Any) -> ApiBase:
+    factory = get_api(name)
+    if name in _CONFIG_AWARE_API_FACTORIES:
+        return factory(env, config)
+    return factory(env)
 
 
 def list_apis() -> list[str]:

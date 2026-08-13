@@ -2,23 +2,25 @@ from .base_api import list_apis, register_api
 from .franka.control import FrankaControlApi
 from .franka.control_privileged import FrankaControlPrivilegedApi
 from .franka.control_reduced import FrankaControlApiReduced, FrankaStateControlApi
-from .franka.control_reduced_skill_library import FrankaControlApiReducedSkillLibrary
 from .franka.control_reduced_exampleless import FrankaControlApiReducedExampleless
+from .franka.control_reduced_skill_library import FrankaControlApiReducedSkillLibrary
+from .franka.handover import FrankaHandoverApi
+from .franka.handover_privileged import FrankaHandoverPrivilegedApi
+from .franka.handover_reduced import FrankaHandoverApiReduced
+from .franka.handover_reduced_exampleless import FrankaHandoverApiReducedExampleless
 from .franka.nut_assembly_privileged import FrankaControlNutAssemblyPrivilegedApi
 from .franka.nut_assembly_visual import FrankaControlNutAssemblyVisualApi
 from .franka.spill_wipe import FrankaControlSpillWipeApi
 from .franka.spill_wipe_privileged import FrankaControlSpillWipePrivilegedApi
-from .franka.handover_privileged import FrankaHandoverPrivilegedApi
-from .franka.handover import FrankaHandoverApi
-from .franka.handover_reduced import FrankaHandoverApiReduced
-from .franka.handover_reduced_exampleless import FrankaHandoverApiReducedExampleless
 from .franka.two_arm_lift import FrankaTwoArmLiftApi
 from .franka.two_arm_lift_privileged import FrankaTwoArmLiftPrivilegedApi
+
 try:
     from .franka.libero import FrankaLiberoApi
     from .franka.libero_privileged import FrankaLiberoPrivilegedApi
     from .franka.libero_reduced import FrankaLiberoApiReduced
     from .franka.libero_reduced_skill_library import FrankaLiberoApiReducedSkillLibrary
+
     _libero_available = True
 except ImportError:
     _libero_available = False
@@ -32,13 +34,16 @@ register_api(
     "FrankaControlApiReducedBimanual", lambda env: FrankaControlApiReduced(env, bimanual=True)
 )
 register_api(
-    "FrankaControlApiReducedExamplelessBimanual", lambda env: FrankaControlApiReducedExampleless(env, bimanual=True)
+    "FrankaControlApiReducedExamplelessBimanual",
+    lambda env: FrankaControlApiReducedExampleless(env, bimanual=True),
 )
 register_api(
-    "FrankaControlApiReducedBimanualHandover", lambda env: FrankaControlApiReduced(env, bimanual=True, is_handover=True)
+    "FrankaControlApiReducedBimanualHandover",
+    lambda env: FrankaControlApiReduced(env, bimanual=True, is_handover=True),
 )
 register_api(
-    "FrankaControlApiReducedExamplelessBimanualHandover", lambda env: FrankaControlApiReducedExampleless(env, bimanual=True, is_handover=True)
+    "FrankaControlApiReducedExamplelessBimanualHandover",
+    lambda env: FrankaControlApiReducedExampleless(env, bimanual=True, is_handover=True),
 )
 register_api(
     "FrankaControlApiReducedSpillWipe",
@@ -57,7 +62,7 @@ register_api(
 )
 register_api(
     "FrankaControlApiReducedSkillLibraryBimanualHandover",
-    lambda env: FrankaControlApiReducedSkillLibrary(env, bimanual=True, is_handover=True)
+    lambda env: FrankaControlApiReducedSkillLibrary(env, bimanual=True, is_handover=True),
 )
 
 # For spill wipe environment, we use a custom tcp offset of -0.0158m since panda end effector has been modified by robosuite to have the sponge attachement
@@ -67,9 +72,7 @@ register_api(
 )
 register_api(
     "FrankaControlSpillWipeApiReduced",
-    lambda env: FrankaControlApiReduced(
-        env, tcp_offset=[0.0, 0.0, -0.0158], is_spill_wipe=True
-    ),
+    lambda env: FrankaControlApiReduced(env, tcp_offset=[0.0, 0.0, -0.0158], is_spill_wipe=True),
 )
 register_api(
     "FrankaControlSpillWipePrivilegedApi",
@@ -90,7 +93,7 @@ register_api("FrankaHandoverApiReducedExampleless", FrankaHandoverApiReducedExam
 register_api("FrankaTwoArmLiftApi", FrankaTwoArmLiftApi)
 register_api("FrankaTwoArmLiftPrivilegedApi", FrankaTwoArmLiftPrivilegedApi)
 register_api(
-    "FrankaTwoArmLiftApiReduced", 
+    "FrankaTwoArmLiftApiReduced",
     lambda env: FrankaControlApiReduced(env, bimanual=True, use_sam3=False),
 )
 register_api(
@@ -114,17 +117,33 @@ register_api(
     lambda env: FrankaControlPrivilegedApi(env, multi_turn=True),
 )
 
-register_api("FrankaRealReducedSkillLibraryControlApi", lambda env: FrankaControlApiReducedSkillLibrary(env, tcp_offset=[0.0, 0.0, -0.157], real = True))
-register_api("FrankaRealControlApi", lambda env: FrankaControlApi(env, tcp_offset=[0.0, 0.0, -0.157], real = True))
+register_api(
+    "FrankaRealReducedSkillLibraryControlApi",
+    lambda env: FrankaControlApiReducedSkillLibrary(env, tcp_offset=[0.0, 0.0, -0.157], real=True),
+)
+register_api(
+    "FrankaRealControlApi",
+    lambda env: FrankaControlApi(env, tcp_offset=[0.0, 0.0, -0.157], real=True),
+)
 
 try:
     from .r1pro.control import R1ProControlApi
+
     register_api("R1ProControlApi", lambda env: R1ProControlApi(env, use_sam3=True))
 except ImportError:
     print("R1Pro not installed, skipping R1Pro APIs")
 
 if _libero_available:
     register_api("FrankaLiberoPrivilegedApi", FrankaLiberoPrivilegedApi)
-    register_api("FrankaLiberoApi", lambda env: FrankaLiberoApi(env, use_sam3=True))
+    register_api(
+        "FrankaLiberoApi",
+        lambda env, cfg: FrankaLiberoApi(
+            env,
+            use_sam3=True,
+            molmo_base_url=cfg.molmo_base_url,
+            molmo_model_name=cfg.molmo_model_name,
+        ),
+        accepts_config=True,
+    )
     register_api("FrankaLiberoApiReduced", FrankaLiberoApiReduced)
     register_api("FrankaLiberoApiReducedSkillLibrary", FrankaLiberoApiReducedSkillLibrary)

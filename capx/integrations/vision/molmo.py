@@ -17,8 +17,9 @@ _PROC: Any | None = None  # kept for backward compatibility; unused with vLLM HT
 _MODEL: Any | None = None  # kept for backward compatibility; unused with vLLM HTTP API
 
 # SERVICE_URL = "https://openrouter.ai/api/" # OpenRouter
-SERVICE_URL = "http://127.0.0.1:8122/v1"  # local
-
+DEFAULT_MOLMO_BASE_URL = "http://127.0.0.1:8122/v1"
+DEFAULT_MOLMO_MODEL_NAME = "allenai/Molmo2-8B"
+SERVICE_URL = DEFAULT_MOLMO_BASE_URL  # backward-compatible alias
 
 
 def _parse_points(text: str) -> tuple[list[tuple[float, float]], float]:
@@ -39,7 +40,9 @@ def _parse_points(text: str) -> tuple[list[tuple[float, float]], float]:
     """
     # 1) Molmo2 format: <points coords="type obj_idx x y ...">label</points>
     # Format: type indicator, then triplets of (obj_idx, x, y) where x,y are in [0, 1000]
-    coords_match = re.search(r'<points\s+coords\s*=\s*["\']([^"\']+)["\']', text, flags=re.IGNORECASE)
+    coords_match = re.search(
+        r'<points\s+coords\s*=\s*["\']([^"\']+)["\']', text, flags=re.IGNORECASE
+    )
     if coords_match:
         nums = [float(n) for n in coords_match.group(1).split()]
         points: list[tuple[float, float]] = []
@@ -86,7 +89,11 @@ def _parse_points(text: str) -> tuple[list[tuple[float, float]], float]:
 
 
 def _overlay_and_save(
-    image: Image.Image, points: list[tuple[float, float]], save_path: str, *, norm_scale: float = 100.0
+    image: Image.Image,
+    points: list[tuple[float, float]],
+    save_path: str,
+    *,
+    norm_scale: float = 100.0,
 ) -> None:
     """Overlay points on image and save figure.
 
@@ -105,7 +112,7 @@ def _overlay_and_save(
     fig, ax = plt.subplots()
     ax.imshow(image)
     ax.scatter(xs, ys, s=60, c="red", edgecolors="white", linewidths=1.5, zorder=3)
-    for i, (x, y) in enumerate(zip(xs, ys)):
+    for i, (x, y) in enumerate(zip(xs, ys, strict=True)):
         ax.text(x + 3, y + 3, str(i), color="yellow", fontsize=10, weight="bold", zorder=4)
     ax.set_axis_off()
     plt.tight_layout(pad=0)
@@ -119,7 +126,7 @@ def convert_to_pixel_coordinates(
     points: list[tuple[float, float]], image: PIL.Image.Image, norm_scale: float = 100.0
 ) -> list[tuple[int, int]]:
     """Convert normalized point coordinates to pixel coordinates.
-    
+
     Args:
         points: List of (x, y) tuples in normalized coordinates.
         image: PIL image to get dimensions from.
@@ -142,8 +149,8 @@ def _image_to_data_url(image: PIL.Image.Image) -> str:
 def init_molmo(
     # model_name: str = "allenai/moldmo-2-8b:free", # OpenRouter
     # model_name: str = "allenai/Molmo2-O-7B",
-    model_name: str = "allenai/Molmo2-8B",
-    base_url: str = SERVICE_URL,
+    model_name: str = DEFAULT_MOLMO_MODEL_NAME,
+    base_url: str = DEFAULT_MOLMO_BASE_URL,
     api_key: str | None = None,
 ) -> Callable[[PIL.Image.Image, list[str] | None], dict[str, tuple[int | None, int | None]]]:
     """Initialize a detector that queries a vLLM OpenAI-compatible server.
@@ -158,8 +165,8 @@ def init_molmo(
         mapping from object name to a pixel coordinate tuple (x, y). If a point
         could not be parsed, the value is (None, None).
     """
-    # chat_url = f"{base_url.rstrip('/')}/v1/chat/completions" # SGLANG 
-    chat_url = f"{base_url.rstrip('/')}/chat/completions" # vLLM
+    # chat_url = f"{base_url.rstrip('/')}/v1/chat/completions" # SGLANG
+    chat_url = f"{base_url.rstrip('/')}/chat/completions"  # vLLM
     session = requests.Session()
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -184,9 +191,7 @@ def init_molmo(
         img_url = _image_to_data_url(image)
         all_points: dict[str, tuple[int | None, int | None]] = {}
         for obj in objects:
-            prompt = (
-                f"Point at {obj}"
-            )
+            prompt = f"Point at {obj}"
             payload = {
                 "model": model_name,
                 "messages": [
@@ -209,13 +214,15 @@ def init_molmo(
                     resp = session.post(chat_url, json=payload, headers=headers, timeout=120)
                     resp.raise_for_status()
                     data = resp.json()
-                    generated_text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    generated_text = (
+                        data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    )
                     print(f"Generated text for '{obj}': {generated_text}")
                     break
                 except Exception as e:  # noqa: BLE001
                     print(f"Request failed for '{obj}' (attempt {attempt + 1}/{max_retries}): {e}")
                     if attempt < max_retries - 1:
-                        time.sleep(backoff * (2 ** attempt))
+                        time.sleep(backoff * (2**attempt))
                     else:
                         generated_text = ""
 

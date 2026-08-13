@@ -14,7 +14,7 @@ from gymnasium import Env, spaces
 from capx.envs.base import BaseEnv, ObsType, get_env
 from capx.envs.configs.instantiate import instantiate as cfg_instantiate
 from capx.envs.configs.loader import DictLoader
-from capx.integrations.base_api import ApiBase, get_api
+from capx.integrations.base_api import ApiBase, instantiate_api
 from capx.runtime_control.contract import STRICT_CAPSULE_SAFE_BUILTINS
 from capx.runtime_control.trace import RuntimeTrace, wrap_function_for_trace
 
@@ -42,9 +42,7 @@ def _validate_public_capsule_api_names(
         seen_names.add(name)
 
     reserved_names = seen_names & _CAPSULE_PUBLIC_RESERVED_NAMES
-    private_names = {
-        name for name in seen_names - reserved_names if name.startswith("_")
-    }
+    private_names = {name for name in seen_names - reserved_names if name.startswith("_")}
     if not (reserved_names or private_names or duplicate_names):
         return
 
@@ -96,6 +94,8 @@ class CodeExecEnvConfig:
     privileged: bool = False
     enable_render: bool = True
     viser_debug: bool = False
+    molmo_base_url: str | None = None
+    molmo_model_name: str | None = None
 
 
 class SimpleExecutor:
@@ -138,7 +138,9 @@ class CodeExecutionEnvBase(Env):
             cfg.low_level, cfg.privileged, cfg.enable_render, cfg.viser_debug
         )  # type: ignore[assignment]
         # Create APIs once; maximize sharing inside a worker via lru_cache in get_api
-        self._apis: dict[str, ApiBase] = {n: get_api(n)(self.low_level_env) for n in cfg.apis}
+        self._apis: dict[str, ApiBase] = {
+            name: instantiate_api(name, self.low_level_env, cfg) for name in cfg.apis
+        }
         # for api in self._apis.values():
         #     api.set_env(self.low_level_env)
         self._executor = SimpleExecutor(self.low_level_env, self._apis)
@@ -255,9 +257,7 @@ class CodeExecutionEnvBase(Env):
     ) -> dict[str, Any]:
         """Build a fresh namespace for region-based capsule execution."""
         api_functions = [
-            (fn_name, fn)
-            for api in self._apis.values()
-            for fn_name, fn in api.functions().items()
+            (fn_name, fn) for api in self._apis.values() for fn_name, fn in api.functions().items()
         ]
         if not include_internal_handles:
             _validate_public_capsule_api_names(api_functions)
@@ -287,7 +287,11 @@ class CodeExecutionEnvBase(Env):
         return g
 
     def _build_low_level(
-        self, src: Env | str, privileged: bool = False, enable_render: bool = True, viser_debug: bool = False
+        self,
+        src: Env | str,
+        privileged: bool = False,
+        enable_render: bool = True,
+        viser_debug: bool = False,
     ) -> BaseEnv:
         """
         Builds the low level environment from the given source.
@@ -303,7 +307,9 @@ class CodeExecutionEnvBase(Env):
                     return cfg_instantiate(cfg)  # type: ignore[no-any-return]
                 return cfg  # type: ignore[return-value]
             else:
-                return get_env(src, privileged=privileged, enable_render=enable_render, viser_debug=viser_debug)
+                return get_env(
+                    src, privileged=privileged, enable_render=enable_render, viser_debug=viser_debug
+                )
         return src
 
     def _get_observation(self) -> dict[str, Any]:
@@ -357,9 +363,7 @@ class CodeExecutionEnvBase(Env):
         reward = self.compute_reward()
         if hasattr(self.low_level_env, "task_completed"):
             raw_task_completed = self.low_level_env.task_completed()
-            task_completed = (
-                None if raw_task_completed is None else bool(raw_task_completed)
-            )
+            task_completed = None if raw_task_completed is None else bool(raw_task_completed)
         else:
             task_completed = None
         terminated = reward == 1.0
@@ -402,9 +406,7 @@ class CodeExecutionEnvBase(Env):
 
         sig = inspect.signature(self.low_level_env.enable_video_capture)
         if "wrist_camera" in sig.parameters:
-            self.low_level_env.enable_video_capture(
-                enabled, clear=clear, wrist_camera=wrist_camera
-            )
+            self.low_level_env.enable_video_capture(enabled, clear=clear, wrist_camera=wrist_camera)
         else:
             self.low_level_env.enable_video_capture(enabled, clear=clear)
 

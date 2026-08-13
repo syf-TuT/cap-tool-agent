@@ -7,13 +7,22 @@ import open3d as o3d
 import viser.transforms as vtf
 from PIL import Image, ImageDraw
 from scipy.spatial.transform import Rotation as SciRotation
+from sklearn.cluster import DBSCAN
 
 from capx.envs.base import (
     BaseEnv,
 )
 from capx.integrations.base_api import ApiBase
-from capx.integrations.vision.graspnet import init_contact_graspnet, init_contact_graspnet_point_clouds
-from capx.integrations.vision.molmo import init_molmo
+from capx.integrations.motion.pyroki import init_pyroki
+from capx.integrations.vision.graspnet import (
+    init_contact_graspnet,
+    init_contact_graspnet_point_clouds,
+)
+from capx.integrations.vision.molmo import (
+    DEFAULT_MOLMO_BASE_URL,
+    DEFAULT_MOLMO_MODEL_NAME,
+    init_molmo,
+)
 from capx.integrations.vision.sam2 import init_sam2_point_prompt
 from capx.integrations.vision.sam3 import init_sam3, init_sam3_point_prompt
 from capx.utils.camera_utils import obs_get_rgb
@@ -23,27 +32,33 @@ from capx.utils.depth_utils import (
     depth_to_pointcloud,
     depth_to_rgb,
 )
-from capx.integrations.motion.pyroki import init_pyroki
 
 _curobo_api = None
+
 
 def _get_curobo_api():
     """Lazy import of cuRobo API to avoid warp init before Isaac Sim."""
     global _curobo_api
     if _curobo_api is None:
         from capx.integrations.motion import curobo_api as _mod
+
         _curobo_api = _mod
     return _curobo_api
-from sklearn.cluster import DBSCAN
+
 
 # ------------------------------- Control API ------------------------------
 class FrankaLiberoApi(ApiBase):
-    """Robot control helpers for Franka.
-    """
+    """Robot control helpers for Franka."""
 
     _TCP_OFFSET = np.array([0.0, 0.0, -0.1], dtype=np.float64)
-    
-    def __init__(self, env: BaseEnv, use_sam3: bool = True) -> None:
+
+    def __init__(
+        self,
+        env: BaseEnv,
+        use_sam3: bool = True,
+        molmo_base_url: str | None = None,
+        molmo_model_name: str | None = None,
+    ) -> None:
         super().__init__(env)
         # Lazy-import to keep startup light
         from capx.integrations.motion import pyroki_snippets as pks  # type: ignore
@@ -61,7 +76,10 @@ class FrankaLiberoApi(ApiBase):
             self.sam3_point_prompt_fn = init_sam3_point_prompt()
         else:
             self.sam2_point_prompt_fn = init_sam2_point_prompt()
-        self.molmo_point_fn = init_molmo()
+        self.molmo_point_fn = init_molmo(
+            model_name=(DEFAULT_MOLMO_MODEL_NAME if molmo_model_name is None else molmo_model_name),
+            base_url=(DEFAULT_MOLMO_BASE_URL if molmo_base_url is None else molmo_base_url),
+        )
         self.grasp_net_plan_fn = init_contact_graspnet()
         # used for multiview grasps
         self.grasp_net_plan_point_clouds_fn = init_contact_graspnet_point_clouds()
@@ -72,7 +90,7 @@ class FrankaLiberoApi(ApiBase):
         self._curobo_world_config = None
 
     def functions(self) -> dict[str, Any]:
-        fns =  {
+        fns = {
             "get_observation": self.get_observation,
             "get_object_pose": self.get_object_pose,
             "sample_grasp_pose": self.sample_grasp_pose,
@@ -116,8 +134,12 @@ class FrankaLiberoApi(ApiBase):
                 - ["robot_joint_pos"]: Current joint positions as a numpy array of shape (7,), dtype float64. The last element is the gripper position normalized, 0 (closed) to 1 (open).
         """
         obs = self._env.get_observation()
-        obs[self.camera_name]["images"]["depth"] = obs[self.camera_name]["images"]["depth"].squeeze(-1)
-        obs[self.wrist_camera_name]["images"]["depth"] = obs[self.wrist_camera_name]["images"]["depth"].squeeze(-1)
+        obs[self.camera_name]["images"]["depth"] = obs[self.camera_name]["images"]["depth"].squeeze(
+            -1
+        )
+        obs[self.wrist_camera_name]["images"]["depth"] = obs[self.wrist_camera_name]["images"][
+            "depth"
+        ].squeeze(-1)
         return obs
 
     def segment_sam3_point_prompt(
@@ -177,7 +199,9 @@ class FrankaLiberoApi(ApiBase):
         """
         results = self.sam3_seg_fn(rgb, text_prompt=text_prompt)
         if len(results) == 0:
-            print(f"[segment_sam3_text_prompt] SAM3 returned no results for prompt: '{text_prompt}'")
+            print(
+                f"[segment_sam3_text_prompt] SAM3 returned no results for prompt: '{text_prompt}'"
+            )
             return []
         return results
 
@@ -200,25 +224,6 @@ class FrankaLiberoApi(ApiBase):
             object query; (None, None) if parsing failed.
         """
         return self.molmo_point_fn(Image.fromarray(image), objects=[text_prompt])
-
-    def get_oriented_bounding_box_from_3d_points(self, points: np.ndarray) -> dict[str, Any]:
-        """Get the oriented bounding box from 3D points.
-
-        Args:
-            points: np.ndarray: The 3D points to get the oriented bounding box from.
-                Shape: (N, 3), dtype float64.
-
-        Returns:
-            dict[str, Any]: The oriented bounding box. The dictionary contains the following keys:
-                - "center": np.ndarray: The center of the oriented bounding box in point cloud frame.
-                - "extent": np.ndarray: The extent of the oriented bounding box.
-                - "R": np.ndarray: The rotation matrix of the oriented bounding box in point cloud frame.
-
-        Example:
-            >>> points = np.random.randn((100, 3))
-            >>> obb = get_oriented_bounding_box_from_3d_points(points)
-        """
-        return _get_obb(points)
 
     def goto_pose(
         self, position: np.ndarray, quaternion_wxyz: np.ndarray, z_approach: float = 0.0
@@ -304,7 +309,9 @@ class FrankaLiberoApi(ApiBase):
         for _ in range(60):
             self._env._step_once()
 
-    def get_object_pose(self, object_name: str, use_multiview: bool = True) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+    def get_object_pose(
+        self, object_name: str, use_multiview: bool = True
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
         """Get the pose of an object in the environment from a natural language description.
         The quaternion from get_object_pose may be unreliable, so disregard it and use the grasp
         pose quaternion OR (0, 0, 1, 0) wxyz as the gripper down orientation if using this for
@@ -349,7 +356,9 @@ class FrankaLiberoApi(ApiBase):
         print(f"get_object_pose in {time.time() - start_time} seconds")
         return position, quaternion_wxyz
 
-    def sample_grasp_pose(self, object_name: str, use_multiview: bool = True) -> tuple[np.ndarray, np.ndarray]:
+    def sample_grasp_pose(
+        self, object_name: str, use_multiview: bool = True
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Sample a grasp pose for an object in the environment from a natural language description.
         Uses multiview point clouds and plan_grasp_from_point_clouds for more reliable grasp planning.
         Do use the grasp sample quaternion from sample_grasp_pose.
@@ -380,9 +389,7 @@ class FrankaLiberoApi(ApiBase):
             intrinsics = obs[cam_name]["intrinsics"]
             extrinsics = obs[cam_name]["pose_mat"]
             pts_camera = depth_to_pointcloud(depth, intrinsics, subsample_factor=1)
-            pts_homogeneous = np.concatenate(
-                [pts_camera, np.ones((len(pts_camera), 1))], axis=1
-            )
+            pts_homogeneous = np.concatenate([pts_camera, np.ones((len(pts_camera), 1))], axis=1)
             pts_world = (extrinsics @ pts_homogeneous.T).T[:, :3]
             pc_full_parts.append(pts_world)
         pc_full = np.concatenate(pc_full_parts)
@@ -422,7 +429,7 @@ class FrankaLiberoApi(ApiBase):
                     return None, None, None
                 point_coords = (float(point[0]), float(point[1]))
                 results = self.sam3_point_prompt_fn(image, point_coords=point_coords)
-            
+
             if len(results) == 0:
                 return None, None, None
 
@@ -432,10 +439,7 @@ class FrankaLiberoApi(ApiBase):
 
             # Get center point of mask for visualization
             ys, xs = np.where(mask_bool)
-            if len(xs) > 0 and len(ys) > 0:
-                point_xy = (int(xs.mean()), int(ys.mean()))
-            else:
-                point_xy = None
+            point_xy = (int(xs.mean()), int(ys.mean())) if len(xs) > 0 and len(ys) > 0 else None
 
             return mask_bool, point_xy, scores
         else:
@@ -494,14 +498,14 @@ class FrankaLiberoApi(ApiBase):
         use_multiview: bool = True,
     ) -> dict[str, Any]:
         """Segment an object using text prompt across multiple views (agentview and wrist).
-        
+
         Uses Molmo to locate the object in both camera views, then SAM3 for
         segmentation. Returns the masks and 3D points that appear in both views.
-        
+
         Args:
             text_prompt: Text description of the object to segment.
             use_multiview: If True, uses the wrist camera as well as the main camera for segmentation.
-            
+
         Returns:
             dict containing:
                 - "agentview_mask": np.ndarray of shape (H, W), dtype bool
@@ -511,24 +515,24 @@ class FrankaLiberoApi(ApiBase):
                 - "wrist_score": float, SAM3 confidence score (None if single view)
         """
         obs = self.get_observation()
-        
+
         cameras = [self.camera_name]
         if use_multiview:
             cameras.append(self.wrist_camera_name)
-            
+
         camera_data = {}
-        
+
         for cam_name in cameras:
             # get images from camera
             rgb = obs[cam_name]["images"]["rgb"]
             depth = obs[cam_name]["images"]["depth"]
             intrinsics = obs[cam_name]["intrinsics"]
             extrinsics = obs[cam_name]["pose_mat"]
-            
+
             # use Molmo to point prompt
             points = self.point_prompt_molmo(rgb, text_prompt)
             point = points[text_prompt]
-            
+
             # Get SAM3 segmentations (fall back to text prompt if point prompt yields nothing)
             masks = []
             if point[0] is not None:
@@ -541,54 +545,53 @@ class FrankaLiberoApi(ApiBase):
                     f"No masks returned from either point or text prompt."
                 )
             mask_data = max(masks, key=lambda x: x["score"])
-            
+
             mask = mask_data["mask"]
             score = mask_data["score"]
-            
+
             # Get 3D points in camera frame
             pts_camera = depth_to_pointcloud(depth, intrinsics, subsample_factor=1)
-            
+
             # Transform to world frame
-            pts_homogeneous = np.concatenate([pts_camera, np.ones((len(pts_camera), 1))], axis=1) # add column of ones
+            pts_homogeneous = np.concatenate(
+                [pts_camera, np.ones((len(pts_camera), 1))], axis=1
+            )  # add column of ones
             pts_world = (extrinsics @ pts_homogeneous.T).T[:, :3]
-            
+
             # Apply mask - ensure shapes match
             mask_flat = mask.flatten()
             if len(pts_world) != len(mask_flat):
-                print(f"Warning: Point cloud size ({len(pts_world)}) doesn't match mask size ({len(mask_flat)}) for {cam_name}")
+                print(
+                    f"Warning: Point cloud size ({len(pts_world)}) doesn't match mask size ({len(mask_flat)}) for {cam_name}"
+                )
                 min_len = min(len(pts_world), len(mask_flat))
                 pts_3d = pts_world[:min_len][mask_flat[:min_len]]
             else:
                 pts_3d = pts_world[mask_flat]
-            
-            camera_data[cam_name] = {
-                "mask": mask,
-                "score": score,
-                "points_3d": pts_3d
-            }
-        
+
+            camera_data[cam_name] = {"mask": mask, "score": score, "points_3d": pts_3d}
+
         agent_data = camera_data[self.camera_name]
         agent_pts_3d = agent_data["points_3d"]
-        
+
         points_3d = agent_pts_3d
-        
+
         wrist_mask = None
         wrist_score = None
         wrist_pts_3d = None
-        
+
         if use_multiview and self.wrist_camera_name in camera_data:
             # Takes the union of the points from the wrist and agent view if they are close enough, otherwise takes the view with the higher score.
             wrist_data = camera_data[self.wrist_camera_name]
             wrist_pts_3d = wrist_data["points_3d"]
             wrist_mask = wrist_data["mask"]
             wrist_score = wrist_data["score"]
-            
+
             # Find intersection using numpy broadcasting
             if len(wrist_pts_3d) > 0 and len(agent_pts_3d) > 0:
                 # Compute pairwise distances between all agent and wrist points
                 distances = np.linalg.norm(
-                    agent_pts_3d[:, np.newaxis, :] - wrist_pts_3d[np.newaxis, :, :], 
-                    axis=2
+                    agent_pts_3d[:, np.newaxis, :] - wrist_pts_3d[np.newaxis, :, :], axis=2
                 )
                 # Find minimum distance for each agent point
                 min_distances = np.min(distances, axis=1)
@@ -597,10 +600,7 @@ class FrankaLiberoApi(ApiBase):
                 if min_distances.min() < threshold:
                     points_3d = np.concatenate([agent_pts_3d, wrist_pts_3d])
                 else:
-                    if wrist_score > agent_data["score"]:
-                        points_3d = wrist_pts_3d
-                    else:
-                        points_3d = agent_pts_3d
+                    points_3d = wrist_pts_3d if wrist_score > agent_data["score"] else agent_pts_3d
             elif len(wrist_pts_3d) > 0:
                 points_3d = wrist_pts_3d
             elif len(agent_pts_3d) > 0:
@@ -608,7 +608,7 @@ class FrankaLiberoApi(ApiBase):
             else:
                 print(f"Warning: No points found for {text_prompt}")
                 points_3d = np.array([]).reshape(0, 3)
-        
+
         return {
             "agentview_mask": agent_data["mask"],
             "wrist_mask": wrist_mask,
@@ -618,7 +618,7 @@ class FrankaLiberoApi(ApiBase):
             "agentview_score": agent_data["score"],
             "wrist_score": wrist_score,
         }
-    
+
     def goto_home_joint_position(self) -> None:
         """Return the arm to its reset joint configuration with high manipulability"""
         home = getattr(self._env, "home_joint_position", None)
@@ -629,7 +629,7 @@ class FrankaLiberoApi(ApiBase):
 
     def subsample_point_cloud(self, pc: np.ndarray, max_points: int = 10000) -> np.ndarray:
         """Randomly subsample a point cloud to a maximum number of points.
-        
+
         Args:
             pc: (N, 3) array of points.
             max_points: The maximum number of points to subsample to. Default is 10000.
@@ -639,8 +639,10 @@ class FrankaLiberoApi(ApiBase):
         if len(pc) > max_points:
             return pc[np.random.choice(len(pc), max_points, replace=False)]
         return pc
-    
-    def filter_noise(self, points: np.ndarray, colors: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray | None]:
+
+    def filter_noise(
+        self, points: np.ndarray, colors: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray | None]:
         """Filter noise from the point cloud.
         Args:
             points: (N, 3) array of points.
@@ -654,12 +656,9 @@ class FrankaLiberoApi(ApiBase):
         dbscan = DBSCAN(eps=eps, min_samples=min_samples)
         labels = dbscan.fit_predict(points)
         filtered_pointcloud = points[labels != -1]
-        if colors is not None:
-            filtered_colors = colors[labels != -1]
-        else:
-            filtered_colors = None
+        filtered_colors = colors[labels != -1] if colors is not None else None
         return filtered_pointcloud, filtered_colors
-    
+
     def plan_grasp_from_point_clouds(
         self,
         pc_full: np.ndarray,
@@ -679,15 +678,17 @@ class FrankaLiberoApi(ApiBase):
             grasp_sample_tf: (4, 4) homogeneous transform for the grasp pose in THE POINT CLOUD FRAME.
             grasp_scores: (N,) array of grasp scores.
         """
-        grasp_sample, grasp_scores, _ = self.grasp_net_plan_point_clouds_fn(pc_full, pc_segment, segmap_id=1)
-        
+        grasp_sample, grasp_scores, _ = self.grasp_net_plan_point_clouds_fn(
+            pc_full, pc_segment, segmap_id=1
+        )
+
         assert len(grasp_sample) > 0, "No grasp candidates found"
 
         grasp_sample_tf = (
             vtf.SE3.from_matrix(grasp_sample) @ vtf.SE3.from_translation(np.array([0, 0, 0.12]))
         ).as_matrix()
         return grasp_sample_tf, grasp_scores
-    
+
     def parse_grasp_poses_for_curobo(
         self, grasp_poses_world: np.ndarray, grasp_scores: np.ndarray, top_k: int = 15
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -702,7 +703,7 @@ class FrankaLiberoApi(ApiBase):
             positions: (N, 3) array of grasp positions
             quaternions: (N, 4) array of grasp quaternions
             scores: (N,) array of grasp scores sorted by score
-        
+
         Example:
             >>> grasp_poses_cam, grasp_scores = plan_grasp_from_point_clouds(...)
             >>> positions, quaternions, scores = parse_grasp_poses_for_curobo(grasp_poses_cam, grasp_scores, top_k=15)
@@ -715,7 +716,7 @@ class FrankaLiberoApi(ApiBase):
         k = min(top_k, len(positions))
         order = np.argsort(-scores)[:k]
         return positions[order], quaternions[order], scores[order]
-    
+
     ### CuRobo-related functions ###
     def create_curobo_world_from_depth(
         self,
@@ -736,7 +737,9 @@ class FrankaLiberoApi(ApiBase):
         self, point_cloud: np.ndarray, object_mask: np.ndarray, **kwargs: Any
     ):
         """Create a CuRobo WorldConfig from a point cloud and per-point object mask. Stores the result for use by plan_grasp_trajectory."""
-        world = _get_curobo_api().create_curobo_world_from_pointcloud(point_cloud, object_mask, **kwargs)
+        world = _get_curobo_api().create_curobo_world_from_pointcloud(
+            point_cloud, object_mask, **kwargs
+        )
         self._curobo_world_config = world
         return world
 
@@ -749,9 +752,7 @@ class FrankaLiberoApi(ApiBase):
         scene_name: str = "scene",
         **kwargs: Any,
     ):
-        """Create a CuRobo WorldConfig from the current observation: uses this camera's depth, intrinsics, and pose to build the world, split by object_mask. Stores the result for use by plan_grasp_trajectory.
-        
-        """
+        """Create a CuRobo WorldConfig from the current observation: uses this camera's depth, intrinsics, and pose to build the world, split by object_mask. Stores the result for use by plan_grasp_trajectory."""
         obs = self._env.get_observation()
         cam = camera_name or self.camera_name
         depth = obs[cam]["images"]["depth"]
@@ -829,8 +830,8 @@ class FrankaLiberoApi(ApiBase):
         self,
         object_name: str,
         *,
-        object_mask: np.ndarray, #| None = None,
-        grasp_poses: list[tuple[np.ndarray, np.ndarray]], #| None = None,
+        object_mask: np.ndarray,  # | None = None,
+        grasp_poses: list[tuple[np.ndarray, np.ndarray]],  # | None = None,
         top_k_grasps: int = 15,
         use_world_collision: bool = True,
         robot_distance_threshold: float = 0.15,
@@ -881,7 +882,9 @@ class FrankaLiberoApi(ApiBase):
             )
             world = self._curobo_world_config
             # Disable collision with the object so the robot can reach into it
-            ignore_obstacle_names = [getattr(self, "_curobo_world_object_name", object_name.replace(" ", "_"))]
+            ignore_obstacle_names = [
+                getattr(self, "_curobo_world_object_name", object_name.replace(" ", "_"))
+            ]
         else:
             ignore_obstacle_names = []
 
@@ -924,10 +927,8 @@ class FrankaLiberoApi(ApiBase):
             indices.append(len(traj) - 1)
         for i in indices:
             joints = traj[i, :7]
-            self._env.move_to_joints_blocking(
-                joints, tolerance=tolerance, max_steps=max_steps
-            )
-    
+            self._env.move_to_joints_blocking(joints, tolerance=tolerance, max_steps=max_steps)
+
     def update_curobo_world_with_object(
         self,
         object_name: str,
@@ -983,14 +984,18 @@ class FrankaLiberoApi(ApiBase):
         if object_mask is None:
             object_mask = self.get_object_mask(object_name)
         if object_mask is None:
-            raise ValueError(f"Could not get object mask for '{object_name}' to create world with object/scene split")
+            raise ValueError(
+                f"Could not get object mask for '{object_name}' to create world with object/scene split"
+            )
         mask_bool = np.asarray(object_mask, dtype=bool)
         if getattr(self._env, "output_dir", None):
             rgb = np.asarray(obs[cam]["images"]["rgb"])
             self._save_rgb_with_object_mask(rgb, mask_bool, object_name, suffix="world")
 
         # World-safe name (no spaces) for CuRobo lookup
-        world_object_name = object_name_in_world if object_name_in_world is not None else object_name
+        world_object_name = (
+            object_name_in_world if object_name_in_world is not None else object_name
+        )
         mesh_name = world_object_name.replace(" ", "_")
         # Place object mesh at current EE pose so the world matches the grasped location (fixes wrong position in planning/debug)
         ee_pos, ee_quat_wxyz = self.get_ee_pose()
