@@ -78,10 +78,7 @@ agent_mode: capsule
 def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
     repo_root = Path(__file__).resolve().parents[1]
     config_path = (
-        repo_root
-        / "env_configs"
-        / "libero"
-        / "franka_libero_object_0_capsule_llm_step.yaml"
+        repo_root / "env_configs" / "libero" / "franka_libero_object_0_capsule_llm_step.yaml"
     )
     data = yaml.safe_load(config_path.read_text())
     cfg = data["env"]["cfg"]
@@ -110,11 +107,19 @@ def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
 
     prompt = cfg["prompt"].lower()
     assert "one complete executable python program" in prompt
-    assert "pure computation, geometry, and perception helpers are allowed" in prompt
-    assert "robot motion or gripper calls inside helper functions, loops, or try blocks" in prompt
-    assert "robot side effects as top-level phases" in prompt
-    assert "at most one side-effect api call per phase" in prompt
-    assert "separated by calculations or fresh observations" in prompt
+    assert "strict python subset is mandatory" in prompt
+    assert "imports are forbidden" in prompt
+    assert "dynamic or reflective calls" in prompt
+    assert "callable aliases" in prompt
+    assert "attribute calls" in prompt
+    assert "direct calls to the public api functions" in prompt
+    assert "safe builtins" in prompt
+    assert "proven-pure top-level helper functions" in prompt
+    assert "loops must be statically bounded" in prompt
+    assert "total static computation budget" in prompt
+    assert "robot side effects must be top-level" in prompt
+    assert "at most one robot side-effect api call per semantic group" in prompt
+    assert "import numpy" not in prompt
 
 
 def test_capsule_yaml_uses_code_primitives_not_robot_tools():

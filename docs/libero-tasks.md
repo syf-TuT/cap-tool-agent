@@ -65,9 +65,29 @@ current main- and wrist-camera images. Prompt-visible state is limited to
 proprioception, while full object state is written only to diagnostic artifacts and is
 never added to the LLM prompt or runtime history.
 
-Run the commands below only on a server or dedicated LIBERO runtime with the LIBERO
-environment and required LLM, PyRoKi, SAM3, and Contact-GraspNet services available.
-They are not local Windows commands. Validate task 0 first, then expand to all ten tasks.
+Because this configuration sets `privileged: false`, every generated Capsule program
+must pass the strict Python-subset preflight. This enforcement is independent of
+`capsule_validate_program_contract`; setting that flag to `false` does not disable the
+strict subset. Imports, dynamic or reflective calls, callable aliases, and attribute
+calls are unavailable. The execution globals contain only restricted safe builtins and
+approved public API bindings. Programs may directly call those bindings, safe builtins,
+or proven-pure top-level helpers, and all loops and total computation must be statically
+bounded. Legacy arbitrary-Python Capsule programs are not available in non-privileged
+mode.
+
+For a local source-only check, run the focused configuration test below from the
+prepared development environment. It parses the YAML and verifies the non-privileged
+prompt contract; it does not start LIBERO, MuJoCo, model servers, or a robot trial.
+
+```bash
+uv run --no-sync pytest tests/test_runtime_control_config.py -q \
+  -k libero_object_capsule_llm_step_yaml_uses_approved_capabilities
+```
+
+Run the simulator commands below only on a server or dedicated LIBERO runtime with the
+LIBERO environment and required LLM, PyRoKi, SAM3, and Contact-GraspNet services
+available. They are not local Windows validation commands. Validate task 0 first, then
+expand to all ten tasks.
 
 Task-0 smoke test:
 

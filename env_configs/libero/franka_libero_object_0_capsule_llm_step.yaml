@@ -20,11 +20,13 @@ env:
       You are controlling a Franka Emika robot with the API described below.
       Goal: {libero_environment_goal}
       Generate one complete executable Python program for the goal.
-      Pure computation, geometry, and perception helpers are allowed.
-      Do not place robot motion or gripper calls inside helper functions, loops, or try blocks.
-      Write robot side effects as top-level phases with at most one side-effect API call per phase, separated by calculations or fresh observations needed by the next phase.
+      The strict Python subset is mandatory for this non-privileged Capsule program.
+      Imports are forbidden. Dynamic or reflective calls, callable aliases, and attribute calls are also forbidden.
+      Use only direct calls to the public API functions and safe builtins, plus direct calls to proven-pure top-level helper functions.
+      Loops must be statically bounded, and the whole program must stay within the total static computation budget.
+      Robot side effects must be top-level, with at most one robot side-effect API call per semantic group.
       You may write Python code comments for reasoning, but only write executable Python code and do not use code fences.
-      The functions (APIs) below are already imported into the environment. If you want to use numpy, import it explicitly.
+      The public API functions below are already available in the restricted execution environment.
 
 agent_mode: capsule
 capsule_control_mode: llm_step
