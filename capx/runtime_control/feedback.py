@@ -5,6 +5,7 @@ from typing import Any
 
 from capx.runtime_control.schema import (
     CodeRegion,
+    CodeRegionGroup,
     RuntimeAction,
     RuntimeEvent,
     RuntimeFeedback,
@@ -28,7 +29,7 @@ def build_runtime_feedback(
     step_id: int,
     action: RuntimeAction,
     event: RuntimeEvent,
-    region: CodeRegion | None,
+    region: CodeRegion | CodeRegionGroup | None,
     trace_events: list[dict[str, Any]],
     before_state: dict[str, Any],
     after_state: dict[str, Any],
@@ -101,7 +102,7 @@ def build_runtime_feedback(
 def _feedback_status(
     action: RuntimeAction,
     event: RuntimeEvent,
-    region: CodeRegion | None,
+    region: CodeRegion | CodeRegionGroup | None,
     before_state: dict[str, Any],
     after_state: dict[str, Any],
     *,
@@ -122,7 +123,7 @@ def _feedback_status(
 
 
 def _has_successful_side_effect_trace(
-    region: CodeRegion | None,
+    region: CodeRegion | CodeRegionGroup | None,
     trace_events: list[dict[str, Any]],
     *,
     side_effect_calls: set[str] | None,
@@ -163,12 +164,11 @@ def _numeric_reward(value: Any) -> float | None:
 def _feedback_message(
     status: RuntimeStatus,
     event: RuntimeEvent,
-    region: CodeRegion | None,
+    region: CodeRegion | CodeRegionGroup | None,
 ) -> str:
+    detail = ""
     if event.message:
         detail = f": {event.message}"
-    else:
-        detail = ""
     if region is None:
         if status == "warning" and event.message:
             return event.message

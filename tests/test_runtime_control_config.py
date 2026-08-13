@@ -76,11 +76,14 @@ agent_mode: capsule
 
 
 def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
-    data = yaml.safe_load(
-        Path(
-            "env_configs/libero/franka_libero_object_0_capsule_llm_step.yaml"
-        ).read_text()
+    repo_root = Path(__file__).resolve().parents[1]
+    config_path = (
+        repo_root
+        / "env_configs"
+        / "libero"
+        / "franka_libero_object_0_capsule_llm_step.yaml"
     )
+    data = yaml.safe_load(config_path.read_text())
     cfg = data["env"]["cfg"]
     low_level = cfg["low_level"]
 

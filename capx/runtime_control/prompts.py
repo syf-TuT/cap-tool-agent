@@ -5,7 +5,6 @@ from typing import Any
 
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, RuntimeAction
 
-
 _CONTRACT_SAFETY_MAX_CHARS = 12000
 _CONTRACT_TEXT_MAX_CHARS = 640
 _CONTRACT_ID_MAX_CHARS = 160

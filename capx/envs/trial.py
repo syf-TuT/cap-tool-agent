@@ -26,13 +26,29 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+
+# Use TYPE_CHECKING to avoid circular imports for type hints only
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from PIL import Image
 
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
+from capx.llm.client import (
+    VLM_MODELS,
+    ModelQueryArgs,
+)
+from capx.llm.client import (
+    query_model as _query_model,
+)
+from capx.llm.client import (
+    query_model_ensemble as _query_model_ensemble,
+)
+from capx.llm.client import (
+    query_single_model_ensemble as _query_single_model_ensemble,
+)
+from capx.llm.context import llm_call_stage
 from capx.runtime_control import (
     CapsuleExecutor,
     CodeRegion,
@@ -48,23 +64,14 @@ from capx.runtime_control import (
     replace_region_source,
     segment_python_code,
     segment_python_code_groups,
+    validate_progress_mode,
 )
-from capx.runtime_control.feedback import validate_progress_mode
 from capx.runtime_control.prompts import (
     build_capsule_recovery_prompt,
     build_capsule_terminal_recovery_prompt,
 )
 from capx.runtime_control.segmenter import ROBOT_SIDE_EFFECT_CALLS
 from capx.runtime_control.side_effects import collect_side_effect_calls
-
-from capx.llm.client import (
-    VLM_MODELS,
-    ModelQueryArgs,
-    query_model as _query_model,
-    query_model_ensemble as _query_model_ensemble,
-    query_single_model_ensemble as _query_single_model_ensemble,
-)
-from capx.llm.context import llm_call_stage
 from capx.utils.launch_utils import (
     TrialSummary,
     _build_multi_turn_decision_prompt,
@@ -75,9 +82,6 @@ from capx.utils.launch_utils import (
     _save_trial_artifacts,
 )
 from capx.utils.video_utils import _encode_video_base64, _write_video
-
-# Use TYPE_CHECKING to avoid circular imports for type hints only
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from capx.envs.launch import LaunchArgs
@@ -95,7 +99,7 @@ def _annotate_code_blocks(
 ) -> str:
     """Join code blocks into a single string with ``# Code block N`` headers."""
     annotated = []
-    for i, (block, metadata) in enumerate(zip(code_blocks, code_block_metadata, strict=False)):
+    for i, (block, _metadata) in enumerate(zip(code_blocks, code_block_metadata, strict=False)):
         annotated.append(f"# Code block {i}\n{block}")
     return "\n\n".join(annotated)
 
@@ -515,10 +519,9 @@ def _image_reference_metadata(
     camera: str,
     artifact_by_sha256: Mapping[str, Any],
 ) -> dict[str, Any]:
+    image_url = value
     if isinstance(value, Mapping):
         image_url = value.get("url", "")
-    else:
-        image_url = value
     image_url = image_url if isinstance(image_url, str) else str(image_url)
 
     width = height = None
@@ -3955,7 +3958,7 @@ def _run_single_trial(
         try:
             from capx.skills import SkillLibrary
 
-            skill_lib_path = config.get("skill_library_path", None)
+            skill_lib_path = config.get("skill_library_path")
             skill_lib = SkillLibrary(path=skill_lib_path)
             task_name = config.get("task_name", f"trial_{trial}")
             new_skills = skill_lib.extract_from_code(final_code, task_name=task_name)
@@ -3994,7 +3997,7 @@ def _patch_libero_goal(env: CodeExecutionEnvBase, obs: dict[str, Any]) -> None:
         hasattr(handle, "task_language")
         and "libero_environment_goal" in obs["full_prompt"][-1]["content"][0]["text"]
     ):
-        goal = getattr(handle, "task_language")
+        goal = handle.task_language
         obs["full_prompt"][-1]["content"][0]["text"] = (
             obs["full_prompt"][-1]["content"][0]["text"].format(
                 libero_environment_goal=goal

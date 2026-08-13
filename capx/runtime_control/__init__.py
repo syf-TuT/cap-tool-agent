@@ -6,7 +6,7 @@ from capx.runtime_control.contract import (
     analyze_capsule_program_contract_details,
 )
 from capx.runtime_control.executor import CapsuleExecutor
-from capx.runtime_control.feedback import build_runtime_feedback
+from capx.runtime_control.feedback import build_runtime_feedback, validate_progress_mode
 from capx.runtime_control.patching import replace_region_source
 from capx.runtime_control.prompts import build_capsule_prompt, parse_runtime_action_response
 from capx.runtime_control.schema import (
@@ -30,6 +30,7 @@ __all__ = [
     "RuntimeTrace",
     "build_capsule_prompt",
     "build_runtime_feedback",
+    "validate_progress_mode",
     "analyze_capsule_program_contract",
     "analyze_capsule_program_contract_details",
     "parse_runtime_action_response",

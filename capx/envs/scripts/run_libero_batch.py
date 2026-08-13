@@ -4,8 +4,9 @@ import copy
 import os
 import sys
 import traceback
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from typing import Any
 
 import tyro
 import yaml
@@ -152,7 +153,7 @@ def main(args: LiberoBatchLaunchArgs) -> None:
         print(f"Error: Base config file not found: {args.base_config_path}")
         sys.exit(1)
         
-    with open(args.base_config_path, "r") as f:
+    with open(args.base_config_path) as f:
         base_config = yaml.safe_load(f)
 
     benchmark_dict = _load_benchmark_dict()

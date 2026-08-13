@@ -37,9 +37,17 @@ from capx.llm.client import (  # noqa: F401
     _completions_to_responses_convert_prompt,
     collapse_text_image_inputs,
     is_openrouter_model,
+)
+from capx.llm.client import (
     query_model as _query_model,
-    query_model_streaming as _query_model_streaming,
+)
+from capx.llm.client import (
     query_model_ensemble as _query_model_ensemble,
+)
+from capx.llm.client import (
+    query_model_streaming as _query_model_streaming,
+)
+from capx.llm.client import (
     query_single_model_ensemble as _query_single_model_ensemble,
 )
 
@@ -586,8 +594,6 @@ def _print_and_save_summary(
     except (subprocess.CalledProcessError, FileNotFoundError):
         git_commit = "unknown"
         is_dirty = False
-
-    import time
 
     elapsed_time = time.time() - start_time
     print("\nSummary Statistics:")
