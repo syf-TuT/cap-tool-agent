@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from PIL import Image
 from capx.envs.trial import (
+    _analyze_capsule_source,
     _attach_capsule_visuals,
     _capture_capsule_visuals,
     _describe_initial_scene,
@@ -1721,6 +1722,45 @@ def test_nonprivileged_auto_forward_strict_violation_never_executes(tmp_path, mo
     assert summary.sandbox_rc == 1
 
 
+def test_nonprivileged_auto_forward_flag_false_blocks_effectful_loop(
+    tmp_path, monkeypatch
+):
+    env = FakeUnsafeNonPrivilegedCapsuleEnv()
+
+    monkeypatch.setattr(
+        trial_module,
+        "_query_model",
+        lambda args, prompt: {
+            "content": '{"action": "finish", "args": {}}',
+            "reasoning": None,
+        },
+    )
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "capsule_control_mode": "auto_forward",
+            "capsule_validate_program_contract": False,
+            "max_capsule_steps": 2,
+        },
+        initial_code="for _ in range(2):\n    close_gripper()\n",
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+
+    assert trace[0]["event"]["status"] == "invalid"
+    assert trace[0]["event"]["evidence"]["program_contract_violations"]
+    assert env.api.calls == []
+    assert "effectful_control_flow" in metrics[0][
+        "program_contract_violation_codes"
+    ]
+    assert summary.sandbox_rc == 1
+
+
 def test_nonprivileged_auto_forward_reanalyzes_recovery_patch(tmp_path, monkeypatch):
     env = FakeSuccessfulNonPrivilegedCapsuleEnv()
 
@@ -2617,6 +2657,95 @@ def test_capsule_llm_step_program_contract_flag_false_preserves_execution(tmp_pa
     assert metrics[0]["program_contract_valid"] is True
     assert metrics[0]["program_contract_violation_count"] == 0
     assert metrics[0]["program_contract_violation_codes"] == []
+
+
+def test_privileged_contract_flag_false_preserves_effectful_loop_execution(tmp_path):
+    env = FakePrivilegedCapsuleEnv()
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "capsule_validate_program_contract": False,
+        },
+        initial_code="for _ in range(2):\n    close_gripper()\n",
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert trace[0]["event"]["status"] == "success"
+    assert env.api.calls == ["close_gripper", "close_gripper"]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_code"),
+    [
+        (
+            "for _ in range(2):\n    close_gripper()\n",
+            "effectful_control_flow",
+        ),
+        (
+            "result = (close_gripper(), close_gripper())\n",
+            "multiple_effects_in_group",
+        ),
+    ],
+)
+def test_nonprivileged_source_analysis_enforces_effect_structure_when_flag_false(
+    source, expected_code
+):
+    analysis = _analyze_capsule_source(
+        source,
+        use_semantic_groups=True,
+        max_regions_per_group=20,
+        public_api_calls={"close_gripper"},
+        side_effect_calls={"close_gripper"},
+        require_strict_subset=True,
+        validate_program_contract=False,
+    )
+
+    assert expected_code in {
+        violation.code for violation in analysis.contract_violations
+    }
+    assert analysis.contract_effectful_region_ids
+    assert analysis.contract_effectful_group_ids
+
+
+def test_nonprivileged_llm_step_flag_false_blocks_multiple_effects_before_execution(
+    tmp_path
+):
+    env = FakeUnsafeNonPrivilegedCapsuleEnv()
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "capsule_validate_program_contract": False,
+        },
+        initial_code="result = (close_gripper(), close_gripper())\n",
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    prompts = (tmp_path / "capsule_prompts_trial_00.json").read_text()
+
+    assert trace[0]["event"]["status"] == "invalid"
+    assert env.api.calls == []
+    assert "multiple_effects_in_group" in metrics[0][
+        "program_contract_violation_codes"
+    ]
+    assert "multiple_effects_in_group" in prompts
 
 
 @pytest.mark.parametrize(

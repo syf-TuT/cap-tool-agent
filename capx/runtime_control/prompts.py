@@ -49,6 +49,7 @@ def build_capsule_prompt(
     contract_violations: list[dict[str, Any]] | None = None,
     side_effect_ledger: dict[str, Any] | None = None,
     recovery_observation_functions: set[str] | None = None,
+    strict_subset: bool = False,
     compact_context: bool = False,
     history_max_entries: int = 8,
     trace_max_events: int = 8,
@@ -103,6 +104,9 @@ def build_capsule_prompt(
         regions, normalized_side_effect_ledger
     )
     contract_safety_context = _compact_contract_violations(contract_violations)
+    strict_source_constraints = (
+        f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n" if strict_subset else ""
+    )
 
     prompt_text = _build_capsule_prompt_text(
         task=task,
@@ -111,6 +115,7 @@ def build_capsule_prompt(
         history=history,
         trace_summary=trace_summary,
         contract_safety_context=contract_safety_context,
+        strict_source_constraints=strict_source_constraints,
         side_effect_ledger=normalized_side_effect_ledger,
         compact_context=compact_context,
         history_max_entries=history_max_entries,
@@ -132,6 +137,7 @@ def build_capsule_prompt(
             history=history,
             trace_summary=trace_summary,
             contract_safety_context=contract_safety_context,
+            strict_source_constraints=strict_source_constraints,
             side_effect_ledger=normalized_side_effect_ledger,
             compact_context=True,
             history_max_entries=min(history_max_entries, 2),
@@ -163,6 +169,7 @@ def _build_capsule_prompt_text(
     history: list[dict[str, Any]],
     trace_summary: dict[str, Any],
     contract_safety_context: dict[str, Any] | None,
+    strict_source_constraints: str,
     side_effect_ledger: dict[str, Any],
     compact_context: bool,
     history_max_entries: int,
@@ -264,7 +271,7 @@ def _build_capsule_prompt_text(
         "preconditions. "
         f"{recovery_guidance}\n\n"
         "Execution constraints:\n"
-        f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n"
+        f"{strict_source_constraints}"
         "- Do not use callable introspection (__closure__, __self__, __globals__, "
         "__wrapped__, or related private attributes), globals()/eval()/exec(), "
         "vars()/dir(), inspect, gc, or dynamic API lookup. Use documented public "
@@ -390,6 +397,7 @@ def build_capsule_recovery_prompt(
     trace_summary: dict[str, Any],
     side_effect_ledger: dict[str, Any],
     recovery_observation_functions: set[str] | None = None,
+    strict_subset: bool = False,
 ) -> list[dict[str, Any]]:
     recovery_functions = sorted(
         {"get_observation"}
@@ -467,6 +475,9 @@ def build_capsule_recovery_prompt(
     example_text = "\n".join(json.dumps(example) for example in examples)
     bounded_history = history_tail[-4:]
     bounded_trace_summary = _bound_trace_summary(trace_summary, max_events=5)
+    strict_source_constraints = (
+        f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n\n" if strict_subset else ""
+    )
     prompt_text = (
         "Task:\n"
         f"{task}\n\n"
@@ -484,7 +495,7 @@ def build_capsule_recovery_prompt(
         "Rollback is unavailable. Previously executed robot-side-effect code may have "
         "changed the current physical state, so repairs must continue from that state. "
         "Use a fresh observation before appending recovery code.\n\n"
-        f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n\n"
+        f"{strict_source_constraints}"
         f"Allowed actions: {', '.join(allowed_actions)}.\n\n"
         "Respond with exactly one JSON object. Examples:\n"
         f"{example_text}\n"
@@ -512,6 +523,7 @@ def build_capsule_terminal_recovery_prompt(
     side_effect_ledger: dict[str, Any],
     terminal_state: dict[str, Any],
     recovery_observation_functions: set[str] | None = None,
+    strict_subset: bool = False,
 ) -> list[dict[str, Any]]:
     recovery_functions = sorted(
         {"get_observation"}
@@ -551,6 +563,9 @@ def build_capsule_terminal_recovery_prompt(
     bounded_history = history_tail[-4:]
     bounded_trace_summary = _bound_trace_summary(trace_summary, max_events=5)
     terminal_state_summary = summarize_terminal_state_for_recovery(terminal_state)
+    strict_source_constraints = (
+        f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n\n" if strict_subset else ""
+    )
     response_contract = (
         "Response contract:\n"
         "- Your entire response must be one JSON object that starts with { and ends with }.\n"
@@ -583,7 +598,7 @@ def build_capsule_terminal_recovery_prompt(
         "Rollback is unavailable. Previously executed robot-side-effect code may have "
         "changed the current physical state, so recovery must append new code that "
         "starts from a fresh observation.\n\n"
-        f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n\n"
+        f"{strict_source_constraints}"
         f"Allowed actions: {', '.join(allowed_actions)}.\n\n"
         "Respond with exactly one JSON object. Examples:\n"
         f"{example_text}\n"

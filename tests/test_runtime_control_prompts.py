@@ -592,6 +592,7 @@ def test_capsule_prompt_states_strict_python_subset_constraints():
         ],
         history=[],
         trace_summary={},
+        strict_subset=True,
     )
 
     text = prompt[1]["content"][0]["text"]
@@ -761,6 +762,7 @@ def test_recovery_prompt_states_strict_python_subset_constraints():
         trace_summary={},
         side_effect_ledger={},
         recovery_observation_functions={"get_observation"},
+        strict_subset=True,
     )
 
     text = prompt[1]["content"][0]["text"]
@@ -802,6 +804,7 @@ def test_terminal_recovery_prompt_only_allows_forward_append_or_finish():
             },
         },
         recovery_observation_functions={"get_observation"},
+        strict_subset=True,
     )
 
     text = prompt[1]["content"][0]["text"]
@@ -830,6 +833,54 @@ def test_terminal_recovery_prompt_only_allows_forward_append_or_finish():
     assert "Strict Python subset" in text
     assert "no imports, classes, lambdas, try, while, async" in text
     assert "direct public API functions" in text
+
+
+def test_capsule_prompt_defaults_to_legacy_without_strict_constraints():
+    prompt = build_capsule_prompt(
+        task="close the gripper",
+        regions=[
+            CodeRegion(
+                region_id="region_1",
+                start_line=1,
+                end_line=1,
+                source="close_gripper()",
+            )
+        ],
+        history=[],
+        trace_summary={},
+    )
+
+    assert "Strict Python subset" not in prompt[1]["content"][0]["text"]
+
+
+def test_recovery_prompts_default_to_legacy_without_strict_constraints():
+    group = CodeRegionGroup(
+        group_id="group_1",
+        start_line=1,
+        end_line=1,
+        source='raise RuntimeError("boom")',
+        region_ids=["region_1"],
+    )
+    common = {
+        "task": "close the gripper",
+        "history_tail": [],
+        "trace_summary": {},
+        "side_effect_ledger": {},
+        "recovery_observation_functions": {"get_observation"},
+    }
+
+    recovery_prompt = build_capsule_recovery_prompt(
+        failed_unit=group,
+        **common,
+    )
+    terminal_prompt = build_capsule_terminal_recovery_prompt(
+        last_unit=group,
+        terminal_state={"reward": 0.0, "task_completed": False},
+        **common,
+    )
+
+    assert "Strict Python subset" not in recovery_prompt[1]["content"][0]["text"]
+    assert "Strict Python subset" not in terminal_prompt[1]["content"][0]["text"]
 
 
 def test_summarize_terminal_state_for_recovery_compacts_object_geometry():

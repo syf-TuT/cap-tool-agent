@@ -1261,7 +1261,7 @@ def _analyze_capsule_source(
     contract_effectful_group_ids: set[str] = set()
     legacy_violations: list[ProgramContractViolation] = []
     if (
-        validate_program_contract
+        (validate_program_contract or require_strict_subset)
         and syntax_error is None
         and not strict_preflight_violations
     ):
@@ -1516,6 +1516,7 @@ def _run_capsule_auto_forward_loop(
                 },
                 terminal_state=terminal_state,
                 recovery_observation_functions=recovery_observation_functions,
+                strict_subset=require_strict_subset,
             )
             prompts.append(recovery_prompt)
             try:
@@ -1690,7 +1691,7 @@ def _run_capsule_auto_forward_loop(
                     contract_effectful_region_ids,
                     contract_effectful_group_ids,
                 )
-                if validate_program_contract
+                if validate_program_contract or require_strict_subset
                 else None
             )
         if event is None:
@@ -1807,6 +1808,7 @@ def _run_capsule_auto_forward_loop(
                     "executed_side_effect_groups": sorted(executed_side_effect_groups),
                 },
                 recovery_observation_functions=recovery_observation_functions,
+                strict_subset=require_strict_subset,
             )
             prompts.append(recovery_prompt)
             try:
@@ -1845,7 +1847,7 @@ def _run_capsule_auto_forward_loop(
                             contract_effectful_region_ids,
                             contract_effectful_group_ids,
                         )
-                        if validate_program_contract
+                        if validate_program_contract or require_strict_subset
                         else None
                     )
                 if recovery_event is None:
@@ -2325,6 +2327,7 @@ def _run_capsule_llm_step_loop(
                         "executed_side_effect_regions": sorted(executed_side_effect_regions),
                     },
                     recovery_observation_functions=recovery_observation_functions,
+                    strict_subset=require_strict_subset,
                     compact_context=llm_step_compact_context,
                     history_max_entries=action_history_max_entries,
                     trace_max_events=action_trace_max_events,
@@ -2410,7 +2413,7 @@ def _run_capsule_llm_step_loop(
                         contract_effectful_region_ids,
                         contract_effectful_group_ids,
                     )
-                    if validate_program_contract
+                    if validate_program_contract or require_strict_subset
                     else None
                 )
             if event is None:
