@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -5,7 +7,10 @@ from types import SimpleNamespace
 import capx.envs.trial as trial_module
 import numpy as np
 import pytest
+from PIL import Image
 from capx.envs.trial import (
+    _attach_capsule_visuals,
+    _capture_capsule_visuals,
     _describe_initial_scene,
     _execute_runtime_action,
     _get_video_differencing_feedback,
@@ -17,6 +22,8 @@ from capx.envs.trial import (
     _reward_drop_guard_event,
     _run_capsule_trial,
     _run_single_trial,
+    _sanitize_multimodal_prompt,
+    _save_capsule_visuals,
     _summarize_runtime_value,
 )
 from capx.llm.client import ModelQueryArgs
@@ -432,6 +439,234 @@ def test_initial_generation_query_uses_initial_code_stage(tmp_path, monkeypatch)
         )
 
     assert _telemetry_stages(telemetry_path) == ["initial_code"]
+
+
+class _FakeCapsuleVisualEnv:
+    def __init__(self, *, fail_wrist=False):
+        self.fail_wrist = fail_wrist
+
+    def render(self):
+        return np.full((2, 3, 3), [10, 20, 30], dtype=np.uint8)
+
+    def render_wrist(self):
+        if self.fail_wrist:
+            raise RuntimeError("camera token must never reach an artifact")
+        return np.full((1, 2, 3), [40, 50, 60], dtype=np.uint8)
+
+
+def _decoded_data_url(data_url):
+    return base64.b64decode(data_url.split(",", 1)[1])
+
+
+def test_capture_capsule_visuals_returns_png_hashed_main_and_wrist_records():
+    records, errors = _capture_capsule_visuals(
+        _FakeCapsuleVisualEnv(), use_wrist_camera=True
+    )
+
+    assert errors == []
+    assert [record.camera for record in records] == ["main", "wrist"]
+    assert [(record.width, record.height) for record in records] == [(3, 2), (2, 1)]
+    for record in records:
+        png_bytes = _decoded_data_url(record.data_url)
+        assert record.sha256 == hashlib.sha256(png_bytes).hexdigest()
+        assert record.metadata() == {
+            "camera": record.camera,
+            "width": record.width,
+            "height": record.height,
+            "sha256": record.sha256,
+        }
+        assert record.image is not None
+        assert record.image.size == (record.width, record.height)
+
+
+def test_capture_capsule_visuals_keeps_current_main_when_wrist_capture_fails():
+    records, errors = _capture_capsule_visuals(
+        _FakeCapsuleVisualEnv(fail_wrist=True), use_wrist_camera=True
+    )
+
+    assert [record.camera for record in records] == ["main"]
+    assert errors == [{"camera": "wrist", "error": "capture_failed"}]
+    assert "camera token" not in json.dumps(errors)
+
+
+def test_attach_capsule_visuals_returns_new_multimodal_prompt_without_mutating_input():
+    records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=True)
+    original = [{"role": "user", "content": [{"type": "text", "text": "task"}]}]
+
+    attached = _attach_capsule_visuals(
+        original,
+        records[:1],
+        [{"camera": "wrist", "error": "capture_failed"}],
+    )
+
+    assert original == [
+        {"role": "user", "content": [{"type": "text", "text": "task"}]}
+    ]
+    assert attached is not original
+    assert [item["type"] for item in attached[-1]["content"]] == [
+        "text",
+        "text",
+        "image_url",
+        "text",
+    ]
+    assert attached[-1]["content"][1]["text"] == "Current main-camera view"
+    assert attached[-1]["content"][2]["image_url"]["url"].startswith("data:image/png")
+    assert "Current wrist-camera view unavailable" in attached[-1]["content"][3]["text"]
+
+
+def test_sanitize_capsule_visual_prompt_replaces_images_without_mutation():
+    records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=False)
+    record = records[0]
+    prompt = _attach_capsule_visuals(
+        [{"role": "user", "content": [{"type": "text", "text": "task"}]}],
+        records,
+        [],
+    )
+    prompt[-1]["content"].append(
+        {
+            "type": "image_url",
+            "image_url": {"url": "https://secret.example/frame.png?token=private"},
+        }
+    )
+
+    sanitized = _sanitize_multimodal_prompt(
+        prompt, {record.sha256: "capsule_visuals_trial_02/step_00_main.png"}
+    )
+
+    assert prompt[-1]["content"][2]["type"] == "image_url"
+    serialized = json.dumps(sanitized)
+    assert "data:image" not in serialized
+    assert "base64," not in serialized
+    assert "secret.example" not in serialized
+    references = [
+        item["image_reference"]
+        for item in sanitized[-1]["content"]
+        if item.get("type") == "image_reference"
+    ]
+    assert references[0] == {
+        "camera": "main",
+        "path": "capsule_visuals_trial_02/step_00_main.png",
+        "width": 3,
+        "height": 2,
+        "sha256": record.sha256,
+        "media_type": "image/png",
+    }
+    assert references[1]["camera"] == "unknown"
+    assert references[1]["path"] is None
+    assert references[1]["width"] is None
+    assert references[1]["height"] is None
+    assert len(references[1]["sha256"]) == 64
+
+
+def test_sanitize_capsule_visual_prompt_removes_unstructured_base64_payload():
+    prompt = [{"role": "user", "content": "diagnostic base64,U0VDUkVU"}]
+
+    sanitized = _sanitize_multimodal_prompt(prompt, {})
+
+    serialized = json.dumps(sanitized)
+    assert "U0VDUkVU" not in serialized
+    assert "base64," not in serialized
+
+
+def test_sanitize_capsule_visual_prompt_identifies_legacy_main_and_wrist_labels():
+    records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=True)
+    prompt = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Included below is an image of the initial state.",
+                },
+                {"type": "image_url", "image_url": {"url": records[0].data_url}},
+                {
+                    "type": "text",
+                    "text": "Included below is an image from the robot's wrist camera.",
+                },
+                {"type": "image_url", "image_url": {"url": records[1].data_url}},
+            ],
+        }
+    ]
+
+    sanitized = _sanitize_multimodal_prompt(prompt, {})
+
+    references = [
+        item["image_reference"]
+        for item in sanitized[-1]["content"]
+        if item.get("type") == "image_reference"
+    ]
+    assert [reference["camera"] for reference in references] == ["main", "wrist"]
+
+
+def test_save_capsule_visuals_writes_decoded_png_bytes_and_returns_relative_mapping(
+    tmp_path,
+):
+    records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=True)
+
+    artifact_by_sha256, errors = _save_capsule_visuals(
+        records, tmp_path, trial_id=2, step_id=3
+    )
+
+    assert errors == []
+    assert artifact_by_sha256 == {
+        records[0].sha256: "capsule_visuals_trial_02/step_03_main.png",
+        records[1].sha256: "capsule_visuals_trial_02/step_03_wrist.png",
+    }
+    for record in records:
+        saved = tmp_path / artifact_by_sha256[record.sha256]
+        assert saved.read_bytes() == _decoded_data_url(record.data_url)
+        with Image.open(saved) as image:
+            assert image.size == (record.width, record.height)
+
+
+def test_save_capsule_visuals_without_output_dir_is_a_noop():
+    records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=False)
+
+    assert _save_capsule_visuals(records, None, trial_id=0, step_id=0) == ({}, [])
+
+
+def test_save_capsule_visuals_reports_directory_creation_failure(tmp_path):
+    records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=False)
+    invalid_output_dir = tmp_path / "not-a-directory"
+    invalid_output_dir.write_text("occupied")
+
+    artifact_by_sha256, errors = _save_capsule_visuals(
+        records, invalid_output_dir, trial_id=0, step_id=0
+    )
+
+    assert artifact_by_sha256 == {}
+    assert errors == [{"camera": "all", "error": "save_failed"}]
+
+
+def test_query_initial_code_sanitizes_initial_prompt_multimodal_artifact(
+    tmp_path, monkeypatch
+):
+    records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=False)
+    record = records[0]
+    prompt = _attach_capsule_visuals(
+        [{"role": "user", "content": [{"type": "text", "text": "task"}]}],
+        records,
+        [],
+    )
+    monkeypatch.setattr(
+        "capx.envs.trial._query_model",
+        lambda args, live_prompt: {"content": "code", "reasoning": None},
+    )
+
+    _query_initial_code(
+        SimpleNamespace(model="test"),
+        {"output_dir": str(tmp_path), "use_parallel_ensemble": False},
+        {"full_prompt": prompt},
+        artifact_by_sha256={
+            record.sha256: "capsule_visuals_trial_00/step_00_main.png"
+        },
+    )
+
+    artifact = (tmp_path / "initial_prompt.txt").read_text()
+    assert "image_reference" in artifact
+    assert record.sha256 in artifact
+    assert "data:image" not in artifact
+    assert "base64," not in artifact
 
 
 def test_visual_model_queries_use_visual_feedback_stage(tmp_path, monkeypatch):

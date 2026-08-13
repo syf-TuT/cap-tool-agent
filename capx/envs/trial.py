@@ -16,11 +16,15 @@ import ast
 import base64
 import copy
 import gc
+import hashlib
 import io
 import json
 import os
+import re
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -236,6 +240,282 @@ def _save_turn_and_combined_videos(
 # ---------------------------------------------------------------------------
 # Visual feedback and image differencing
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CapsuleVisual:
+    """One current camera observation prepared for a Capsule prompt."""
+
+    camera: str
+    data_url: str
+    image: Image.Image
+    width: int
+    height: int
+    sha256: str
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "camera": self.camera,
+            "width": self.width,
+            "height": self.height,
+            "sha256": self.sha256,
+        }
+
+
+class _CapsuleCameraAdapter:
+    """Expose one alternate renderer through the existing visual helper protocol."""
+
+    def __init__(self, render):
+        self.render = render
+
+
+def _capsule_capture_error(camera: str, error: str) -> dict[str, str]:
+    return {"camera": camera, "error": error}
+
+
+def _first_visual_payload(value: Any) -> Any:
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
+def _decode_image_data_url(data_url: str) -> tuple[str, bytes]:
+    header, encoded = data_url.split(",", 1)
+    if not header.startswith("data:") or ";base64" not in header:
+        raise ValueError("visual payload is not a base64 data URL")
+    media_type = header[5:].split(";", 1)[0] or "application/octet-stream"
+    return media_type, base64.b64decode(encoded, validate=True)
+
+
+def _capsule_visual_from_payload(
+    camera: str,
+    data_url: Any,
+    image: Any,
+) -> CapsuleVisual:
+    data_url = _first_visual_payload(data_url)
+    image = _first_visual_payload(image)
+    if not isinstance(data_url, str) or not isinstance(image, Image.Image):
+        raise ValueError("visual capture returned no image")
+    _, png_bytes = _decode_image_data_url(data_url)
+    independent_image = image.copy()
+    width, height = independent_image.size
+    return CapsuleVisual(
+        camera=camera,
+        data_url=data_url,
+        image=independent_image,
+        width=width,
+        height=height,
+        sha256=hashlib.sha256(png_bytes).hexdigest(),
+    )
+
+
+def _capture_capsule_visuals(
+    env: CodeExecutionEnvBase,
+    *,
+    use_wrist_camera: bool = False,
+) -> tuple[list[CapsuleVisual], list[dict[str, str]]]:
+    """Capture current main/wrist observations without retaining stale frames."""
+    records: list[CapsuleVisual] = []
+    errors: list[dict[str, str]] = []
+
+    try:
+        main_data_url, main_image = _get_visual_feedback(env, use_wrist_camera=False)
+        records.append(_capsule_visual_from_payload("main", main_data_url, main_image))
+    except Exception:
+        errors.append(_capsule_capture_error("main", "capture_failed"))
+
+    if not use_wrist_camera:
+        return records, errors
+
+    render_wrist = getattr(env, "render_wrist", None)
+    if render_wrist is None:
+        errors.append(_capsule_capture_error("wrist", "camera_unavailable"))
+        return records, errors
+
+    try:
+        wrist_data_url, wrist_image = _get_visual_feedback(
+            _CapsuleCameraAdapter(render_wrist), use_wrist_camera=False
+        )
+        records.append(_capsule_visual_from_payload("wrist", wrist_data_url, wrist_image))
+    except Exception:
+        errors.append(_capsule_capture_error("wrist", "capture_failed"))
+
+    return records, errors
+
+
+def _attach_capsule_visuals(
+    prompt: list[dict[str, Any]],
+    records: list[CapsuleVisual],
+    errors: list[Mapping[str, str]],
+) -> list[dict[str, Any]]:
+    """Return a prompt copy with current camera observations appended."""
+    attached = copy.deepcopy(prompt)
+    if not attached:
+        attached.append({"role": "user", "content": []})
+
+    content = attached[-1].get("content", [])
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    elif not isinstance(content, list):
+        content = [{"type": "text", "text": str(content)}]
+    else:
+        content = list(content)
+    attached[-1]["content"] = content
+
+    for record in records:
+        content.extend([
+            {"type": "text", "text": f"Current {record.camera}-camera view"},
+            {"type": "image_url", "image_url": {"url": record.data_url}},
+        ])
+    for error in errors:
+        camera = error.get("camera", "unknown")
+        error_code = error.get("error", "capture_failed")
+        content.append({
+            "type": "text",
+            "text": f"Current {camera}-camera view unavailable ({error_code}).",
+        })
+    return attached
+
+
+_DATA_URL_PATTERN = re.compile(
+    r"data:(?P<media>[-\w.+/]+);base64,(?P<payload>[A-Za-z0-9+/=]+)"
+)
+
+
+def _sanitize_text_data_urls(value: str) -> str:
+    def replacement(match: re.Match[str]) -> str:
+        try:
+            payload = base64.b64decode(match.group("payload"), validate=True)
+        except (ValueError, TypeError):
+            payload = match.group("payload").encode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        return f"[image_reference sha256={digest}]"
+
+    sanitized = _DATA_URL_PATTERN.sub(replacement, value)
+    if "base64," in sanitized:
+        prefix, _, _ = sanitized.partition("base64,")
+        return f"{prefix}[binary_payload_redacted]"
+    return sanitized
+
+
+def _image_reference_metadata(
+    value: Any,
+    *,
+    camera: str,
+    artifact_by_sha256: Mapping[str, Any],
+) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        image_url = value.get("url", "")
+    else:
+        image_url = value
+    image_url = image_url if isinstance(image_url, str) else str(image_url)
+
+    width = height = None
+    media_type = "unknown"
+    try:
+        media_type, image_bytes = _decode_image_data_url(image_url)
+        digest = hashlib.sha256(image_bytes).hexdigest()
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            width, height = image.size
+    except Exception:
+        digest = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
+
+    artifact = artifact_by_sha256.get(digest)
+    artifact_metadata = artifact if isinstance(artifact, Mapping) else {}
+    path = artifact_metadata.get("path") if artifact_metadata else artifact
+    return {
+        "camera": artifact_metadata.get("camera", camera),
+        "path": str(path).replace("\\", "/") if path is not None else None,
+        "width": artifact_metadata.get("width", width),
+        "height": artifact_metadata.get("height", height),
+        "sha256": digest,
+        "media_type": artifact_metadata.get("media_type", media_type),
+    }
+
+
+def _sanitize_multimodal_prompt(
+    prompt: Any,
+    artifact_by_sha256: Mapping[str, Any] | None = None,
+) -> Any:
+    """Deep-copy a prompt while replacing image payloads with artifact metadata."""
+    artifacts = artifact_by_sha256 or {}
+
+    def sanitize(value: Any, *, camera: str = "unknown") -> Any:
+        if isinstance(value, list):
+            sanitized_items = []
+            next_camera = camera
+            image_count = 0
+            for item in value:
+                if isinstance(item, Mapping) and item.get("type") == "text":
+                    text = str(item.get("text", "")).lower()
+                    if "wrist-camera" in text or "wrist camera" in text:
+                        next_camera = "wrist"
+                    elif (
+                        "main-camera" in text
+                        or "main camera" in text
+                        or "image of the initial state" in text
+                    ):
+                        next_camera = "main"
+                if isinstance(item, Mapping) and item.get("type") == "image_url":
+                    item_camera = next_camera
+                    if item_camera == "unknown" and image_count == 0:
+                        item_camera = "main"
+                    sanitized_items.append(sanitize(item, camera=item_camera))
+                    image_count += 1
+                    next_camera = "unknown"
+                else:
+                    sanitized_items.append(sanitize(item, camera=next_camera))
+            return sanitized_items
+        if isinstance(value, Mapping):
+            if value.get("type") == "image_url" or "image_url" in value:
+                image_value = value.get("image_url", value)
+                return {
+                    "type": "image_reference",
+                    "image_reference": _image_reference_metadata(
+                        image_value,
+                        camera=camera,
+                        artifact_by_sha256=artifacts,
+                    ),
+                }
+            return {key: sanitize(item, camera=camera) for key, item in value.items()}
+        if isinstance(value, str):
+            return _sanitize_text_data_urls(value)
+        return copy.deepcopy(value)
+
+    return sanitize(copy.deepcopy(prompt))
+
+
+def _save_capsule_visuals(
+    records: list[CapsuleVisual],
+    output_dir: str | os.PathLike[str] | None,
+    *,
+    trial_id: int,
+    step_id: int,
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Persist captured PNG payloads and return hashes mapped to relative paths."""
+    if output_dir is None:
+        return {}, []
+
+    output_root = Path(output_dir)
+    visual_dir = output_root / f"capsule_visuals_trial_{trial_id:02d}"
+    artifact_by_sha256: dict[str, str] = {}
+    errors: list[dict[str, str]] = []
+    try:
+        visual_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return {}, [_capsule_capture_error("all", "save_failed")]
+
+    for record in records:
+        relative_path = Path(visual_dir.name) / f"step_{step_id:02d}_{record.camera}.png"
+        try:
+            _, png_bytes = _decode_image_data_url(record.data_url)
+            if hashlib.sha256(png_bytes).hexdigest() != record.sha256:
+                raise ValueError("visual payload hash mismatch")
+            (output_root / relative_path).write_bytes(png_bytes)
+            artifact_by_sha256[record.sha256] = relative_path.as_posix()
+        except (OSError, ValueError, TypeError):
+            errors.append(_capsule_capture_error(record.camera, "save_failed"))
+    return artifact_by_sha256, errors
 
 def _capture_initial_visual_feedback(
     env: CodeExecutionEnvBase,
@@ -499,6 +779,7 @@ def _query_initial_code(
     args: LaunchArgs,
     config: dict[str, Any],
     obs: dict[str, Any],
+    artifact_by_sha256: Mapping[str, Any] | None = None,
 ) -> tuple[str, str | None, dict | None]:
     """Query the model for the initial code generation.
 
@@ -507,7 +788,13 @@ def _query_initial_code(
     """
     # Save the initial prompt
     with open(os.path.join(config["output_dir"], "initial_prompt.txt"), "w") as f:
-        f.write(str(obs["full_prompt"]))
+        f.write(
+            str(
+                _sanitize_multimodal_prompt(
+                    obs["full_prompt"], artifact_by_sha256=artifact_by_sha256
+                )
+            )
+        )
 
     ensemble_data = None
     if config["use_parallel_ensemble"]:
