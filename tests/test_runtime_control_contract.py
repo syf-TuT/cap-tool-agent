@@ -874,3 +874,54 @@ def test_unresolved_starred_assignment_containing_effect_callable_is_rejected():
     )
     assert analysis.effectful_region_ids
     assert analysis.effectful_group_ids
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'runner = eval\nrunner("close_gripper()")\n',
+        'runner = exec\nrunner("close_gripper()")\n',
+        'runner = globals\nrunner()["close_gripper"]()\n',
+        "runner = locals\nrunner()\n",
+        "runner = vars\nrunner(close_gripper)\n",
+        "runner = dir\nrunner(close_gripper)\n",
+        'runner = __import__\nrunner("inspect")\n',
+        'r = eval\ns = r\ns("close_gripper()")\n',
+        'ga = getattr\nga(close_gripper, "__self__")\n',
+        '(runner := eval)("close_gripper()")\n',
+        '(runner,) = (exec,)\nrunner("close_gripper()")\n',
+    ],
+)
+def test_forbidden_runtime_callable_aliases_propagate(source):
+    regions = segment_python_code(source)
+    groups = segment_python_code_groups(
+        source,
+        regions,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    analysis = analyze_capsule_program_contract_details(
+        source,
+        regions,
+        groups,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    assert any(
+        violation.code == "forbidden_runtime_access"
+        for violation in analysis.violations
+    )
+    assert analysis.effectful_region_ids
+    assert analysis.effectful_group_ids
+
+
+def test_forbidden_callable_alias_can_be_rebound_to_pure_callable():
+    source = "runner = eval\nrunner = len\nrunner([])\n"
+
+    assert _analyze(source) == []
+
+
+def test_uncalled_forbidden_callable_alias_is_not_executable():
+    source = "runner = eval\nvalue = 1\n"
+
+    assert _analyze(source) == []

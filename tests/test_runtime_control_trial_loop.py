@@ -2691,6 +2691,54 @@ def test_capsule_contract_blocks_effectful_class_definition(tmp_path):
     assert env.api.calls == []
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        'runner = eval\nrunner("close_gripper()")\n',
+        'runner = exec\nrunner("close_gripper()")\n',
+        'r = eval\ns = r\ns("close_gripper()")\n',
+        (
+            "ga = getattr\n"
+            "ga(ga(close_gripper, '__closure__')[0], 'cell_contents')()\n"
+        ),
+        (
+            "ga = getattr\n"
+            "raw = ga(ga(close_gripper, '__closure__')[0], 'cell_contents')\n"
+            "api = ga(raw, '__self__')\n"
+            "print(api.env._get_all_object_poses())\n"
+        ),
+    ],
+)
+def test_capsule_contract_blocks_forbidden_builtin_aliases(tmp_path, source):
+    env = FakeUnsafeNonPrivilegedCapsuleEnv()
+    env.api.env = env.low_level_env
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "capsule_validate_program_contract": True,
+        },
+        initial_code=source,
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace_text = (tmp_path / "capsule_trace_trial_00.json").read_text()
+    prompt_text = (tmp_path / "capsule_prompts_trial_00.json").read_text()
+    trace = json.loads(trace_text)
+
+    assert trace[0]["event"]["status"] == "invalid"
+    assert trace[0]["event"]["evidence"]["program_contract_violations"]
+    assert "SIM_TRUTH_SENTINEL" not in trace_text
+    assert "SIM_TRUTH_SENTINEL" not in prompt_text
+    assert env.api.calls == []
+
+
 def test_program_contract_guard_only_blocks_side_effect_execution_units():
     violation = ProgramContractViolation(
         code="effectful_helper",

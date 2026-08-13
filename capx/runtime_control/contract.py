@@ -553,13 +553,15 @@ def _resolve_calls(
                 )
             )
             continue
-        effect_name, targets, via_alias, is_dynamic = _resolve_callable_binding(
+        effect_name, targets, via_alias, dynamic_code = _resolve_callable_binding(
             graph,
             scope_id=scope_id,
             name=call.name,
             line=call.line,
             side_effect_calls=side_effect_calls,
         )
+        if dynamic_code is None and call.uncertain_assignment:
+            dynamic_code = "dynamic_effect_call"
         if effect_name is not None or targets:
             resolved.append(
                 _ResolvedCall(
@@ -569,11 +571,7 @@ def _resolve_calls(
                     effect_name=effect_name,
                     target_definition_ids=targets,
                     via_alias=via_alias,
-                    dynamic_code=(
-                        "dynamic_effect_call"
-                        if is_dynamic or call.uncertain_assignment
-                        else None
-                    ),
+                    dynamic_code=dynamic_code,
                     class_method_name=call.class_method_name,
                     class_method_span=call.class_method_span,
                     lambda_span=call.lambda_span,
@@ -590,7 +588,7 @@ def _resolve_callable_binding(
     line: int,
     side_effect_calls: set[str],
     visited: frozenset[tuple[int, str, int]] = frozenset(),
-) -> tuple[str | None, tuple[int, ...], bool, bool]:
+) -> tuple[str | None, tuple[int, ...], bool, str | None]:
     binding = _resolve_alias_binding(
         graph,
         scope_id=scope_id,
@@ -600,14 +598,14 @@ def _resolve_callable_binding(
     if binding is not None:
         marker = (scope_id, name, binding.line)
         if marker in visited:
-            return _DYNAMIC_EFFECT_MARKER, (), True, True
+            return _DYNAMIC_EFFECT_MARKER, (), True, "dynamic_effect_call"
         if binding.is_dynamic:
-            return _DYNAMIC_EFFECT_MARKER, (), True, True
+            return _DYNAMIC_EFFECT_MARKER, (), True, "dynamic_effect_call"
         if binding.target_definition_id is not None:
-            return None, (binding.target_definition_id,), True, False
+            return None, (binding.target_definition_id,), True, None
         if binding.target_name is None:
-            return None, (), True, False
-        effect_name, targets, _, is_dynamic = _resolve_callable_binding(
+            return None, (), True, None
+        effect_name, targets, _, dynamic_code = _resolve_callable_binding(
             graph,
             scope_id=scope_id,
             name=binding.target_name,
@@ -615,17 +613,19 @@ def _resolve_callable_binding(
             side_effect_calls=side_effect_calls,
             visited=visited | {marker},
         )
-        return effect_name, targets, True, is_dynamic
+        return effect_name, targets, True, dynamic_code
 
     if _is_dynamic_callable_name(graph, scope_id=scope_id, name=name):
-        return _DYNAMIC_EFFECT_MARKER, (), False, True
+        return _DYNAMIC_EFFECT_MARKER, (), False, "dynamic_effect_call"
+    if name in _FORBIDDEN_RUNTIME_CALLS:
+        return _DYNAMIC_EFFECT_MARKER, (), False, "forbidden_runtime_access"
     if name in side_effect_calls:
-        return name, (), False, False
+        return name, (), False, None
     return (
         None,
         _resolve_binding(graph, scope_id=scope_id, name=name),
         False,
-        False,
+        None,
     )
 
 
@@ -1233,6 +1233,7 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
         dynamic_code = _dynamic_call_code(node.func)
         if dynamic_code is not None:
             self._record_dynamic(node, dynamic_code)
+            self.visit(node.func)
             return
 
         self.visit(node.func)
@@ -1400,6 +1401,7 @@ _FORBIDDEN_RUNTIME_CALLS = {
     "getattr",
     "vars",
     "dir",
+    "__import__",
 }
 _INTROSPECTION_MODULES = {"inspect", "gc", "builtins", "__builtins__"}
 _SENSITIVE_RUNTIME_ATTRIBUTES = {
