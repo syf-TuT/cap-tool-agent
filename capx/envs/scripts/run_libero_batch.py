@@ -142,6 +142,10 @@ class LiberoBatchLaunchArgs:
     use_oracle_code: bool | None = None
 
 
+def _parse_args(cli_args: list[str] | None = None) -> LiberoBatchLaunchArgs:
+    return tyro.cli(LiberoBatchLaunchArgs, args=cli_args)
+
+
 def main(args: LiberoBatchLaunchArgs) -> None:
     # Load base configuration
     if not os.path.exists(args.base_config_path):
@@ -271,4 +275,4 @@ def main(args: LiberoBatchLaunchArgs) -> None:
 
 
 if __name__ == "__main__":
-    tyro.cli(main)
+    main(_parse_args())

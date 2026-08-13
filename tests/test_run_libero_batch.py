@@ -8,6 +8,27 @@ import pytest
 from capx.envs.scripts import run_libero_batch
 
 
+def test_parse_args_uses_top_level_cli_options() -> None:
+    args = run_libero_batch._parse_args(
+        [
+            "--task-ids",
+            "7",
+            "0",
+            "--base-config-path",
+            "custom.yaml",
+            "--output-dir",
+            "custom-output",
+            "--total-trials",
+            "3",
+        ]
+    )
+
+    assert args.task_ids == [7, 0]
+    assert args.base_config_path == "custom.yaml"
+    assert args.output_dir == "custom-output"
+    assert args.total_trials == 3
+
+
 @pytest.mark.parametrize(
     ("n_tasks", "task_ids", "expected"),
     [
