@@ -1,7 +1,9 @@
 import capx.runtime_control as runtime_control
 from capx.runtime_control.contract import (
+    ProgramContractAnalysis,
     ProgramContractViolation,
     analyze_capsule_program_contract,
+    analyze_capsule_program_contract_details,
 )
 from capx.runtime_control.normalizer import segment_python_code_groups
 from capx.runtime_control.segmenter import segment_python_code
@@ -36,6 +38,60 @@ open_gripper()
 """
 
     assert _analyze(source) == []
+
+
+def test_contract_details_mark_helper_calls_but_not_pure_definitions_effectful():
+    source = """\
+def move():
+    close_gripper()
+move()
+"""
+    regions = segment_python_code(source)
+    groups = segment_python_code_groups(
+        source,
+        regions,
+        max_regions_per_group=1,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    analysis = analyze_capsule_program_contract_details(
+        source,
+        regions,
+        groups,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    assert analysis.effectful_region_ids == ("region_2",)
+    assert analysis.effectful_group_ids == ("group_2",)
+
+
+def test_contract_details_include_definition_time_and_class_body_effects():
+    source = """\
+@register(open_gripper())
+def prepare(value=close_gripper()):
+    pass
+class Bad:
+    goto_pose([0, 0, 0], [1, 0, 0, 0])
+"""
+    regions = segment_python_code(source)
+    groups = segment_python_code_groups(
+        source,
+        regions,
+        max_regions_per_group=1,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    analysis = analyze_capsule_program_contract_details(
+        source,
+        regions,
+        groups,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    assert analysis.effectful_region_ids == tuple(
+        region.region_id for region in regions
+    )
+    assert analysis.effectful_group_ids == tuple(group.group_id for group in groups)
 
 
 def test_rejects_direct_and_transitive_effectful_helpers():
@@ -153,10 +209,15 @@ def test_violation_to_dict_uses_public_serialization_shape():
 
 
 def test_contract_types_are_exported_from_runtime_control_package():
+    assert runtime_control.ProgramContractAnalysis is ProgramContractAnalysis
     assert runtime_control.ProgramContractViolation is ProgramContractViolation
     assert (
         runtime_control.analyze_capsule_program_contract
         is analyze_capsule_program_contract
+    )
+    assert (
+        runtime_control.analyze_capsule_program_contract_details
+        is analyze_capsule_program_contract_details
     )
 
 

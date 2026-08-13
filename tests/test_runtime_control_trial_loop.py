@@ -153,6 +153,27 @@ class FakeCustomMoveCapsuleEnv(FakeIncompleteCapsuleEnv):
         self._apis = {"fake": self.api}
 
 
+class FakeGripperApi:
+    def __init__(self):
+        self.calls = []
+
+    def functions(self):
+        return {"close_gripper": self.close_gripper}
+
+    def side_effect_functions(self):
+        return {"close_gripper"}
+
+    def close_gripper(self):
+        self.calls.append("close_gripper")
+
+
+class FakeGripperCapsuleEnv(FakeIncompleteCapsuleEnv):
+    def __init__(self):
+        self.api = FakeGripperApi()
+        self.low_level_env = object()
+        self._apis = {"fake": self.api}
+
+
 class FakeTraceFailureApi(FakeApi):
     def functions(self):
         functions = dict(super().functions())
@@ -1265,49 +1286,11 @@ def test_program_contract_guard_only_blocks_side_effect_execution_units():
         start_line=1,
         end_line=2,
     )
-    pure_region = CodeRegion(
-        region_id="region_1",
-        start_line=1,
-        end_line=1,
-        source="x = 1\n",
-    )
-    effect_region = CodeRegion(
-        region_id="region_2",
-        start_line=2,
-        end_line=2,
-        source='custom_move("target")\n',
-    )
-    pure_group = CodeRegionGroup(
-        group_id="group_1",
-        start_line=1,
-        end_line=1,
-        source=pure_region.source,
-        region_ids=[pure_region.region_id],
-        primitive_calls=[],
-        defined_names=["x"],
-        used_names=[],
-        has_robot_side_effect=False,
-    )
-    effect_group = CodeRegionGroup(
-        group_id="group_2",
-        start_line=2,
-        end_line=2,
-        source=effect_region.source,
-        region_ids=[effect_region.region_id],
-        primitive_calls=["custom_move"],
-        defined_names=[],
-        used_names=["custom_move"],
-        has_robot_side_effect=True,
-    )
-    regions = {item.region_id: item for item in [pure_region, effect_region]}
-    groups = {item.group_id: item for item in [pure_group, effect_group]}
-
     blocked = _program_contract_guard_event(
         RuntimeAction("run_group", {"group_id": "group_2"}),
         [violation],
-        regions,
-        groups,
-        {"custom_move"},
+        {"region_2"},
+        {"group_2"},
     )
 
     assert blocked is not None
@@ -1325,12 +1308,53 @@ def test_program_contract_guard_only_blocks_side_effect_execution_units():
             _program_contract_guard_event(
                 action,
                 [violation],
-                regions,
-                groups,
-                {"custom_move"},
+                {"region_2"},
+                {"group_2"},
             )
             is None
         )
+
+
+def test_capsule_contract_region_guard_tracks_transitive_helper_effects(tmp_path):
+    env = FakeGripperCapsuleEnv()
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "capsule_max_regions_per_group": 1,
+            "capsule_validate_program_contract": True,
+        },
+        initial_code=(
+            "def move():\n"
+            "    close_gripper()\n"
+            "move()\n"
+        ),
+        scripted_actions=[
+            {"action": "run_region", "args": {"region_id": "region_1"}},
+            {"action": "run_region", "args": {"region_id": "region_2"}},
+            {"action": "resume_from_region", "args": {"region_id": "region_2"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "invalid",
+        "invalid",
+        "success",
+    ]
+    assert trace[0]["event"]["region_id"] == "region_1"
+    assert trace[1]["event"]["region_id"] == "region_2"
+    assert trace[2]["event"]["region_id"] == "region_2"
+    assert trace[1]["event"]["evidence"]["program_contract_violations"]
+    assert trace[2]["event"]["evidence"]["program_contract_violations"]
+    assert env.api.calls == []
 
 
 def test_capsule_llm_step_reanalyzes_forced_appended_recovery(tmp_path):

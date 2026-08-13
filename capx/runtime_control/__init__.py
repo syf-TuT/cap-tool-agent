@@ -1,7 +1,9 @@
 from capx.runtime_control.checkpoints import NamespaceCheckpointStore
 from capx.runtime_control.contract import (
+    ProgramContractAnalysis,
     ProgramContractViolation,
     analyze_capsule_program_contract,
+    analyze_capsule_program_contract_details,
 )
 from capx.runtime_control.executor import CapsuleExecutor
 from capx.runtime_control.feedback import build_runtime_feedback
@@ -23,11 +25,13 @@ __all__ = [
     "CodeRegion",
     "CodeRegionGroup",
     "NamespaceCheckpointStore",
+    "ProgramContractAnalysis",
     "ProgramContractViolation",
     "RuntimeTrace",
     "build_capsule_prompt",
     "build_runtime_feedback",
     "analyze_capsule_program_contract",
+    "analyze_capsule_program_contract_details",
     "parse_runtime_action_response",
     "RuntimeAction",
     "RuntimeEvent",

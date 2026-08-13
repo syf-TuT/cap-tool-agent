@@ -35,7 +35,7 @@ from capx.runtime_control import (
     RuntimeAction,
     RuntimeEvent,
     RuntimeTrace,
-    analyze_capsule_program_contract,
+    analyze_capsule_program_contract_details,
     build_capsule_prompt,
     build_runtime_feedback,
     parse_runtime_action_response,
@@ -1397,16 +1397,28 @@ def _run_capsule_llm_step_loop(
     validate_program_contract = _coerce_config_bool(
         config.get("capsule_validate_program_contract", False)
     )
-    program_contract_violations = (
-        analyze_capsule_program_contract(
+    program_contract_analysis = (
+        analyze_capsule_program_contract_details(
             source,
             regions,
             groups,
             side_effect_calls=side_effect_calls,
         )
         if validate_program_contract and initial_syntax_error is None
-        else []
+        else None
     )
+    if program_contract_analysis is not None:
+        program_contract_violations = list(program_contract_analysis.violations)
+        contract_effectful_region_ids = set(
+            program_contract_analysis.effectful_region_ids
+        )
+        contract_effectful_group_ids = set(
+            program_contract_analysis.effectful_group_ids
+        )
+    else:
+        program_contract_violations = []
+        contract_effectful_region_ids = set()
+        contract_effectful_group_ids = set()
     trace = RuntimeTrace()
     executor = CapsuleExecutor(
         base_globals=env._build_capsule_globals(trace=trace),
@@ -1527,9 +1539,8 @@ def _run_capsule_llm_step_loop(
                 _program_contract_guard_event(
                     action,
                     program_contract_violations,
-                    region_by_id,
-                    group_by_id,
-                    side_effect_calls,
+                    contract_effectful_region_ids,
+                    contract_effectful_group_ids,
                 )
                 if validate_program_contract
                 else None
@@ -1686,16 +1697,30 @@ def _run_capsule_llm_step_loop(
             )
             region_by_id = {region.region_id: region for region in regions}
             group_by_id = {group.group_id: group for group in groups}
-            program_contract_violations = (
-                analyze_capsule_program_contract(
+            program_contract_analysis = (
+                analyze_capsule_program_contract_details(
                     source,
                     regions,
                     groups,
                     side_effect_calls=side_effect_calls,
                 )
                 if validate_program_contract
-                else []
+                else None
             )
+            if program_contract_analysis is not None:
+                program_contract_violations = list(
+                    program_contract_analysis.violations
+                )
+                contract_effectful_region_ids = set(
+                    program_contract_analysis.effectful_region_ids
+                )
+                contract_effectful_group_ids = set(
+                    program_contract_analysis.effectful_group_ids
+                )
+            else:
+                program_contract_violations = []
+                contract_effectful_region_ids = set()
+                contract_effectful_group_ids = set()
             if action.action == "append_recovery":
                 pending_recovery_actions = _runtime_actions_for_appended_recovery(
                     regions,
@@ -2129,18 +2154,20 @@ def _reward_drop_guard_event(
 def _program_contract_guard_event(
     action: RuntimeAction,
     violations: list[ProgramContractViolation],
-    region_by_id: dict[str, CodeRegion],
-    group_by_id: dict[str, CodeRegionGroup],
-    side_effect_calls: set[str],
+    effectful_region_ids: set[str],
+    effectful_group_ids: set[str],
 ) -> RuntimeEvent | None:
     if not violations:
         return None
-    if not _runtime_action_targets_side_effect_unit(
-        action,
-        region_by_id,
-        group_by_id,
-        side_effect_calls,
-    ):
+    if action.action == "run_group":
+        target_is_effectful = str(action.args.get("group_id", "")) in effectful_group_ids
+    elif action.action in {"run_region", "resume_from_region"}:
+        target_is_effectful = (
+            str(action.args.get("region_id", "")) in effectful_region_ids
+        )
+    else:
+        target_is_effectful = False
+    if not target_is_effectful:
         return None
     return RuntimeEvent(
         action=action.action,

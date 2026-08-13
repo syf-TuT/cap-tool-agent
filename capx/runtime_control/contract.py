@@ -35,6 +35,13 @@ class ProgramContractViolation:
         }
 
 
+@dataclass(frozen=True)
+class ProgramContractAnalysis:
+    violations: tuple[ProgramContractViolation, ...]
+    effectful_region_ids: tuple[str, ...]
+    effectful_group_ids: tuple[str, ...]
+
+
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
 _EFFECT_SUMMARY_LIMIT = 2
 
@@ -92,6 +99,24 @@ def analyze_capsule_program_contract(
     side_effect_calls: set[str],
 ) -> list[ProgramContractViolation]:
     """Validate that robot effects remain explicit, bounded execution steps."""
+    return list(
+        analyze_capsule_program_contract_details(
+            source,
+            regions,
+            groups,
+            side_effect_calls=side_effect_calls,
+        ).violations
+    )
+
+
+def analyze_capsule_program_contract_details(
+    source: str,
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup],
+    *,
+    side_effect_calls: set[str],
+) -> ProgramContractAnalysis:
+    """Return violations and units whose execution can reach robot effects."""
     module = ast.parse(source)
     graph = _DefinitionGraphBuilder().build(module)
     definition_analyses = _analyze_definitions(
@@ -100,6 +125,12 @@ def analyze_capsule_program_contract(
     )
     definition_summaries = _compute_definition_effect_summaries(
         definition_analyses
+    )
+    module_calls = _resolve_calls(
+        _collect_calls(module.body),
+        graph,
+        scope_id=graph.module_scope_id,
+        side_effect_calls=side_effect_calls,
     )
 
     violations = _helper_violations(
@@ -121,23 +152,33 @@ def analyze_capsule_program_contract(
     )
     violations.extend(
         _group_violations(
-            module,
-            graph,
+            module_calls,
             definition_summaries,
             regions=regions,
             groups=groups,
-            side_effect_calls=side_effect_calls,
         )
     )
-
-    return sorted(
-        set(violations),
-        key=lambda violation: (
-            violation.start_line,
-            violation.end_line,
-            violation.code,
-            violation.helper_name or "",
-        ),
+    sorted_violations = tuple(
+        sorted(
+            set(violations),
+            key=lambda violation: (
+                violation.start_line,
+                violation.end_line,
+                violation.code,
+                violation.helper_name or "",
+            ),
+        )
+    )
+    effectful_region_ids, effectful_group_ids = _effectful_executable_unit_ids(
+        module_calls,
+        definition_summaries,
+        regions=regions,
+        groups=groups,
+    )
+    return ProgramContractAnalysis(
+        violations=sorted_violations,
+        effectful_region_ids=effectful_region_ids,
+        effectful_group_ids=effectful_group_ids,
     )
 
 
@@ -529,20 +570,12 @@ def _reachable_definition_ids(
 
 
 def _group_violations(
-    module: ast.Module,
-    graph: _DefinitionGraph,
+    module_calls: list[_ResolvedCall],
     summaries: dict[int, tuple[str, ...]],
     *,
     regions: list[CodeRegion],
     groups: list[CodeRegionGroup],
-    side_effect_calls: set[str],
 ) -> list[ProgramContractViolation]:
-    module_calls = _resolve_calls(
-        _collect_calls(module.body),
-        graph,
-        scope_id=graph.module_scope_id,
-        side_effect_calls=side_effect_calls,
-    )
     violations: list[ProgramContractViolation] = []
     for group in groups:
         group_calls = [
@@ -568,6 +601,33 @@ def _group_violations(
             )
         )
     return violations
+
+
+def _effectful_executable_unit_ids(
+    module_calls: list[_ResolvedCall],
+    summaries: dict[int, tuple[str, ...]],
+    *,
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    def unit_has_effect(start_line: int, end_line: int) -> bool:
+        unit_calls = [
+            call for call in module_calls if start_line <= call.line <= end_line
+        ]
+        return bool(_materialize_effects(unit_calls, summaries, limit=1))
+
+    return (
+        tuple(
+            region.region_id
+            for region in regions
+            if unit_has_effect(region.start_line, region.end_line)
+        ),
+        tuple(
+            group.group_id
+            for group in groups
+            if unit_has_effect(group.start_line, group.end_line)
+        ),
+    )
 
 
 def _materialize_effects(
