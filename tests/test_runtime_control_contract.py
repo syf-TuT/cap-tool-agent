@@ -912,6 +912,64 @@ def test_strict_subset_rejects_loop_or_function_control_outside_scope(source):
     )
 
 
+def test_strict_subset_counts_for_target_cost_per_iteration():
+    source = """\
+def exact_budget():
+    for item in range(10000):
+        value = item
+values = [0]
+for values[exact_budget()] in range(1):
+    pass
+"""
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        "module exceeds static compute budget" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_counts_comprehension_target_cost_per_iteration():
+    source = """\
+def exact_budget():
+    for item in range(10000):
+        value = item
+values = [0]
+result = [values[0] for values[exact_budget()] in range(1)]
+"""
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        "module exceeds static compute budget" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_allows_zero_cost_name_loop_targets():
+    source = """\
+total = 0
+for item in range(9900):
+    total = item
+for first, second in [(1, 2), (3, 4)]:
+    total = first + second
+"""
+
+    assert _strict_analyze(source) == []
+
+
+def test_strict_subset_allows_small_constant_subscript_loop_target():
+    source = """\
+values = [0]
+for values[0] in range(10):
+    pass
+result = [values[0] for values[0] in range(10)]
+"""
+
+    assert _strict_analyze(source) == []
+
+
 def test_allows_pure_helpers_and_one_side_effect_per_top_level_group():
     source = """\
 def offset(p):

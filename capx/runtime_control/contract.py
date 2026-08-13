@@ -718,7 +718,11 @@ class _StrictStaticCostEstimator:
                 return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
             iterable_cost = self.expression_cost(node.iter)
             body_cost = max(1, self.block_cost(node.body))
-            loop_cost = _multiply_static_cost(bound, body_cost)
+            per_iteration_cost = _add_static_cost(
+                self.assignment_target_cost(node.target),
+                body_cost,
+            )
+            loop_cost = _multiply_static_cost(bound, per_iteration_cost)
             cost = _add_static_cost(iterable_cost, loop_cost)
             return _add_static_cost(cost, self.block_cost(node.orelse))
         if isinstance(node, (ast.While, ast.AsyncFor)):
@@ -821,12 +825,15 @@ class _StrictStaticCostEstimator:
         if isinstance(node, ast.Starred):
             return self.assignment_target_cost(node.value)
         if isinstance(node, ast.Subscript):
-            return _add_static_cost(
-                self.expression_cost(node.value),
-                self.expression_cost(node.slice),
+            return max(
+                1,
+                _add_static_cost(
+                    self.expression_cost(node.value),
+                    self.expression_cost(node.slice),
+                ),
             )
         if isinstance(node, ast.Attribute):
-            return self.expression_cost(node.value)
+            return max(1, self.expression_cost(node.value))
         return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
 
     def _call_argument_cost(self, node: ast.Call) -> int:
@@ -843,6 +850,7 @@ class _StrictStaticCostEstimator:
     ) -> int:
         product = 1
         iterable_construction_cost = 0
+        target_assignment_cost = 0
         condition_cost = 0
         for generator in node.generators:
             iterable_construction_cost = _add_static_cost(
@@ -856,6 +864,13 @@ class _StrictStaticCostEstimator:
             if bound is None:
                 return STRICT_CAPSULE_MAX_STATIC_ITERATIONS + 1
             product = _multiply_static_cost(product, bound)
+            target_assignment_cost = _add_static_cost(
+                target_assignment_cost,
+                _multiply_static_cost(
+                    product,
+                    self.assignment_target_cost(generator.target),
+                ),
+            )
             for condition in generator.ifs:
                 condition_cost = _add_static_cost(
                     condition_cost,
@@ -870,8 +885,12 @@ class _StrictStaticCostEstimator:
             result_cost = self.expression_cost(node.elt)
         per_iteration = max(1, _add_static_cost(condition_cost, result_cost))
         result_iterations_cost = _multiply_static_cost(product, per_iteration)
-        return _add_static_cost(
+        cost = _add_static_cost(
             iterable_construction_cost,
+            target_assignment_cost,
+        )
+        return _add_static_cost(
+            cost,
             result_iterations_cost,
         )
 
