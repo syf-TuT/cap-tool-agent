@@ -7,7 +7,7 @@ from capx.integrations.franka import libero as libero_module
 from capx.integrations.vision import molmo
 
 
-def test_instantiate_api_preserves_env_only_factories(monkeypatch):
+def test_instantiate_api_preserves_env_only_factories():
     factory_name = "TestEnvOnlyApiFactory"
     low_level_env = object()
     captured = []
@@ -16,7 +16,7 @@ def test_instantiate_api_preserves_env_only_factories(monkeypatch):
         captured.append(env)
         return "legacy-api"
 
-    monkeypatch.setitem(base_api._API_FACTORIES, factory_name, env_only_factory)
+    base_api.register_api(factory_name, env_only_factory)
 
     api = base_api.instantiate_api(factory_name, low_level_env, SimpleNamespace())
 
@@ -47,6 +47,28 @@ def test_franka_libero_registry_passes_molmo_config(monkeypatch):
         "use_sam3": True,
         "molmo_base_url": "http://molmo.example.test/v1",
         "molmo_model_name": "test/Molmo",
+    }
+
+
+def test_franka_libero_registry_factory_supports_direct_env_call(monkeypatch):
+    captured = {}
+
+    def fake_api(env, **kwargs):
+        captured["env"] = env
+        captured.update(kwargs)
+        return "default-api"
+
+    monkeypatch.setattr(integrations, "FrankaLiberoApi", fake_api)
+    low_level_env = object()
+
+    api = base_api.get_api("FrankaLiberoApi")(low_level_env)
+
+    assert api == "default-api"
+    assert captured == {
+        "env": low_level_env,
+        "use_sam3": True,
+        "molmo_base_url": None,
+        "molmo_model_name": None,
     }
 
 

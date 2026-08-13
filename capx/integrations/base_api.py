@@ -1,7 +1,8 @@
 import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from functools import lru_cache
+from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 
 import numpy as np
@@ -132,36 +133,46 @@ class ApiBase(ABC):
         return "\n".join(lines).strip()
 
 
-_API_FACTORIES: dict[str, Callable[..., ApiBase]] = {}
-_CONFIG_AWARE_API_FACTORIES: set[str] = set()
+@dataclass(frozen=True)
+class _ApiRegistration:
+    factory: Callable[[BaseEnv], ApiBase]
+    config_factory: Callable[[BaseEnv, Any], ApiBase] | None = None
+
+
+_API_REGISTRATIONS: dict[str, _ApiRegistration] = {}
+_API_REGISTRY_LOCK = RLock()
 
 
 def register_api(
     name: str,
-    factory: Callable[..., ApiBase],
+    factory: Callable[[BaseEnv], ApiBase],
     *,
-    accepts_config: bool = False,
+    config_factory: Callable[[BaseEnv, Any], ApiBase] | None = None,
 ) -> None:
-    _API_FACTORIES[name] = factory
-    if accepts_config:
-        _CONFIG_AWARE_API_FACTORIES.add(name)
-    else:
-        _CONFIG_AWARE_API_FACTORIES.discard(name)
+    registration = _ApiRegistration(factory=factory, config_factory=config_factory)
+    with _API_REGISTRY_LOCK:
+        _API_REGISTRATIONS[name] = registration
 
 
-@lru_cache(maxsize=256)
-def get_api(name: str) -> Callable[..., ApiBase]:
-    if name not in _API_FACTORIES:
+def _get_api_registration(name: str) -> _ApiRegistration:
+    with _API_REGISTRY_LOCK:
+        registration = _API_REGISTRATIONS.get(name)
+    if registration is None:
         raise KeyError(f"API '{name}' not registered")
-    return _API_FACTORIES[name]
+    return registration
+
+
+def get_api(name: str) -> Callable[[BaseEnv], ApiBase]:
+    return _get_api_registration(name).factory
 
 
 def instantiate_api(name: str, env: BaseEnv, config: Any) -> ApiBase:
-    factory = get_api(name)
-    if name in _CONFIG_AWARE_API_FACTORIES:
-        return factory(env, config)
-    return factory(env)
+    registration = _get_api_registration(name)
+    if registration.config_factory is not None:
+        return registration.config_factory(env, config)
+    return registration.factory(env)
 
 
 def list_apis() -> list[str]:
-    return list(_API_FACTORIES.keys())
+    with _API_REGISTRY_LOCK:
+        return list(_API_REGISTRATIONS)

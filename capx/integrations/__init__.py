@@ -135,15 +135,19 @@ except ImportError:
 
 if _libero_available:
     register_api("FrankaLiberoPrivilegedApi", FrankaLiberoPrivilegedApi)
-    register_api(
-        "FrankaLiberoApi",
-        lambda env, cfg: FrankaLiberoApi(
+
+    def _franka_libero_api_factory(env, cfg=None):
+        return FrankaLiberoApi(
             env,
             use_sam3=True,
-            molmo_base_url=cfg.molmo_base_url,
-            molmo_model_name=cfg.molmo_model_name,
-        ),
-        accepts_config=True,
+            molmo_base_url=getattr(cfg, "molmo_base_url", None),
+            molmo_model_name=getattr(cfg, "molmo_model_name", None),
+        )
+
+    register_api(
+        "FrankaLiberoApi",
+        _franka_libero_api_factory,
+        config_factory=_franka_libero_api_factory,
     )
     register_api("FrankaLiberoApiReduced", FrankaLiberoApiReduced)
     register_api("FrankaLiberoApiReducedSkillLibrary", FrankaLiberoApiReducedSkillLibrary)
