@@ -18,9 +18,7 @@ _ALLOWED_PROGRESS_MODES = ("dense", "sparse_terminal")
 def validate_progress_mode(progress_mode: str) -> str:
     if progress_mode not in _ALLOWED_PROGRESS_MODES:
         allowed = ", ".join(repr(mode) for mode in _ALLOWED_PROGRESS_MODES)
-        raise ValueError(
-            f"progress_mode must be one of {allowed}; got {progress_mode!r}"
-        )
+        raise ValueError(f"progress_mode must be one of {allowed}; got {progress_mode!r}")
     return progress_mode
 
 
@@ -140,8 +138,7 @@ def _has_successful_side_effect_trace(
             candidate_calls.intersection_update(primitive_calls)
 
     return any(
-        trace_event.get("status") == "success"
-        and trace_event.get("name") in candidate_calls
+        trace_event.get("status") == "success" and trace_event.get("name") in candidate_calls
         for trace_event in trace_events
     )
 
@@ -200,7 +197,9 @@ def _repair_hints(
         if action.action.endswith("_group"):
             hints.append("Patch the failed group unless the trace shows an upstream state error.")
         else:
-            hints.append("Patch only the failed region unless the trace shows an upstream state error.")
+            hints.append(
+                "Patch only the failed region unless the trace shows an upstream state error."
+            )
         return hints
     if status == "invalid":
         return [f"Check the {action.action} arguments and available region ids."]

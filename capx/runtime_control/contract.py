@@ -302,9 +302,7 @@ def analyze_capsule_program_contract_details(
         graph,
         side_effect_calls=side_effect_calls,
     )
-    definition_summaries = _compute_definition_effect_summaries(
-        definition_analyses
-    )
+    definition_summaries = _compute_definition_effect_summaries(definition_analyses)
     module_calls = _resolve_calls(
         _collect_calls(module.body),
         graph,
@@ -387,9 +385,7 @@ def analyze_capsule_strict_subset(
     """Validate the fail-closed Python subset used by non-privileged Capsules."""
     module = ast.parse(source)
     direct_helpers = tuple(
-        statement
-        for statement in module.body
-        if isinstance(statement, ast.FunctionDef)
+        statement for statement in module.body if isinstance(statement, ast.FunctionDef)
     )
     preflight_violations = _preflight_capsule_strict_module(
         module,
@@ -399,9 +395,7 @@ def analyze_capsule_strict_subset(
     if preflight_violations:
         return preflight_violations
     safe_calls = (
-        set(STRICT_CAPSULE_SAFE_BUILTINS)
-        if safe_builtin_calls is None
-        else set(safe_builtin_calls)
+        set(STRICT_CAPSULE_SAFE_BUILTINS) if safe_builtin_calls is None else set(safe_builtin_calls)
     )
     public_calls = set(public_api_calls) | set(side_effect_calls)
     helper_names, pure_helper_names, helper_issues = _prove_strict_helper_purity(
@@ -504,15 +498,11 @@ def _prove_strict_helper_purity(
         helpers_by_name.setdefault(helper.name, []).append(helper)
     helper_names = set(helpers_by_name)
 
-    dependencies: dict[str, set[str]] = {
-        helper_name: set() for helper_name in helper_names
-    }
+    dependencies: dict[str, set[str]] = {helper_name: set() for helper_name in helper_names}
     unsafe_reasons: dict[str, str] = {}
     for helper_name, definitions in helpers_by_name.items():
         if len(definitions) > 1:
-            unsafe_reasons[helper_name] = (
-                f"helper name '{helper_name}' is defined more than once"
-            )
+            unsafe_reasons[helper_name] = f"helper name '{helper_name}' is defined more than once"
             continue
 
         helper = definitions[0]
@@ -521,14 +511,13 @@ def _prove_strict_helper_purity(
             if not isinstance(call.func, ast.Name):
                 unsafe_reasons.setdefault(
                     helper_name,
-                    f"helper '{helper_name}' contains a non-direct call and is not provably pure"
+                    f"helper '{helper_name}' contains a non-direct call and is not provably pure",
                 )
                 continue
             called_name = call.func.id
             if called_name in side_effect_calls:
                 unsafe_reasons.setdefault(
-                    helper_name,
-                    f"helper '{helper_name}' calls robot side effect '{called_name}'"
+                    helper_name, f"helper '{helper_name}' calls robot side effect '{called_name}'"
                 )
                 continue
             if called_name in helper_names:
@@ -539,7 +528,7 @@ def _prove_strict_helper_purity(
             unsafe_reasons.setdefault(
                 helper_name,
                 f"helper '{helper_name}' calls unknown callable '{called_name}' "
-                "and is not provably pure"
+                "and is not provably pure",
             )
 
     recursive_helpers = _strict_recursive_helper_names(dependencies)
@@ -581,10 +570,7 @@ def _prove_strict_helper_purity(
         recursive_reason = f"recursive helper '{helper_name}' is unsupported"
         if unsafe_reasons[helper_name] == recursive_reason:
             continue
-        issues.extend(
-            (helper, recursive_reason)
-            for helper in helpers_by_name[helper_name]
-        )
+        issues.extend((helper, recursive_reason) for helper in helpers_by_name[helper_name])
     return helper_names, pure_helper_names, issues
 
 
@@ -592,13 +578,10 @@ def _strict_recursive_helper_names(
     dependencies: dict[str, set[str]],
 ) -> set[str]:
     ordered_names = sorted(dependencies)
-    index_by_name = {
-        helper_name: index for index, helper_name in enumerate(ordered_names)
-    }
+    index_by_name = {helper_name: index for index, helper_name in enumerate(ordered_names)}
     adjacency = {
         index_by_name[helper_name]: [
-            index_by_name[dependency]
-            for dependency in sorted(helper_dependencies)
+            index_by_name[dependency] for dependency in sorted(helper_dependencies)
         ]
         for helper_name, helper_dependencies in dependencies.items()
     }
@@ -623,9 +606,7 @@ def _strict_static_compute_violations(
     groups: list[CodeRegionGroup],
 ) -> list[ProgramContractViolation]:
     helpers_by_name = {
-        helper.name: helper
-        for helper in direct_helpers
-        if helper.name in pure_helper_names
+        helper.name: helper for helper in direct_helpers if helper.name in pure_helper_names
     }
     estimator = _StrictStaticCostEstimator(helpers_by_name)
     violations: list[ProgramContractViolation] = []
@@ -966,13 +947,9 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         self.helper_names = helper_names
         self.pure_helper_names = pure_helper_names
         self.direct_helper_node_ids = direct_helper_node_ids
-        self.allowed_calls = (
-            public_api_calls | safe_builtin_calls | pure_helper_names
-        )
+        self.allowed_calls = public_api_calls | safe_builtin_calls | pure_helper_names
         self.protected_callable_names = (
-            self.allowed_calls
-            | helper_names
-            | _STRICT_CAPSULE_FORBIDDEN_CALLABLES
+            self.allowed_calls | helper_names | _STRICT_CAPSULE_FORBIDDEN_CALLABLES
         )
         self.violations: list[ProgramContractViolation] = []
         self._helper_stack: list[str] = []
@@ -991,8 +968,7 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
             dict.fromkeys(
                 child.id
                 for child in ast.walk(node)
-                if isinstance(child, ast.Name)
-                and child.id in self.side_effect_calls
+                if isinstance(child, ast.Name) and child.id in self.side_effect_calls
             )
         )
         self.violations.append(
@@ -1005,17 +981,14 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
                 groups=self.groups,
                 side_effects=side_effects,
                 helper_name=(
-                    helper_name
-                    or (self._helper_stack[-1] if self._helper_stack else None)
+                    helper_name or (self._helper_stack[-1] if self._helper_stack else None)
                 ),
             )
         )
 
     def reject_misplaced_helpers(self, module: ast.Module) -> None:
         for node in ast.walk(module):
-            if isinstance(node, ast.FunctionDef) and (
-                id(node) not in self.direct_helper_node_ids
-            ):
+            if isinstance(node, ast.FunctionDef) and (id(node) not in self.direct_helper_node_ids):
                 self._emit(
                     node,
                     "nested or conditional helper definitions must be direct module statements",
@@ -1041,8 +1014,7 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
             return
         if not isinstance(
             node,
-            _STRICT_CAPSULE_ALLOWED_NODES
-            + _STRICT_CAPSULE_ALLOWED_NODE_BASES,
+            _STRICT_CAPSULE_ALLOWED_NODES + _STRICT_CAPSULE_ALLOWED_NODE_BASES,
         ):
             self._emit(node, f"syntax '{type(node).__name__}' is not allowed")
             return
@@ -1061,9 +1033,7 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         if identifier_reason is not None:
             self._emit(node, identifier_reason)
         elif node.name in (
-            self.public_api_calls
-            | self.safe_builtin_calls
-            | _STRICT_CAPSULE_FORBIDDEN_CALLABLES
+            self.public_api_calls | self.safe_builtin_calls | _STRICT_CAPSULE_FORBIDDEN_CALLABLES
         ):
             self._emit(node, f"callable '{node.name}' cannot be redefined")
 
@@ -1111,10 +1081,7 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
             return
         if isinstance(node.ctx, ast.Store) and node.id in self.protected_callable_names:
             self._emit(node, f"assignment cannot rebind callable '{node.id}'")
-        elif (
-            isinstance(node.ctx, ast.Load)
-            and node.id in self.protected_callable_names
-        ):
+        elif isinstance(node.ctx, ast.Load) and node.id in self.protected_callable_names:
             self._emit(
                 node,
                 f"callable '{node.id}' may only be used as a direct call",
@@ -1157,10 +1124,7 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
                         )
             if _strict_call_consumes_iterable(node, name):
                 bound = _static_iteration_bound(node.args[0])
-                if (
-                    bound is None
-                    or bound > STRICT_CAPSULE_MAX_STATIC_ITERATIONS
-                ):
+                if bound is None or bound > STRICT_CAPSULE_MAX_STATIC_ITERATIONS:
                     self._emit(
                         node.args[0],
                         f"iterable consumer '{name}' requires a statically bounded "
@@ -1331,8 +1295,7 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         if product > STRICT_CAPSULE_MAX_ITERATIONS:
             self._emit(
                 iterable,
-                "nested iteration budget exceeds "
-                f"{STRICT_CAPSULE_MAX_ITERATIONS} items",
+                f"nested iteration budget exceeds {STRICT_CAPSULE_MAX_ITERATIONS} items",
             )
             return None
         return product
@@ -1345,6 +1308,7 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
                 self._visit_exception_type(element)
             return
         self.visit(node)
+
 
 def _function_arguments(arguments: ast.arguments) -> tuple[ast.arg, ...]:
     return (
@@ -1459,11 +1423,7 @@ def _static_integer_literal(node: ast.expr) -> int | None:
         and isinstance(node.operand, ast.Constant)
         and type(node.operand.value) is int
     ):
-        return (
-            node.operand.value
-            if isinstance(node.op, ast.UAdd)
-            else -node.operand.value
-        )
+        return node.operand.value if isinstance(node.op, ast.UAdd) else -node.operand.value
     return None
 
 
@@ -1523,19 +1483,13 @@ class _DefinitionGraphBuilder:
                 body_scope_id=body_scope_id,
                 is_top_level=is_top_level,
             )
-            self._scopes[body_scope_id].dynamic_callable_names.update(
-                _argument_names(node.args)
-            )
-            self._scopes[defining_scope_id].bindings.setdefault(
-                node.name, []
-            ).append(definition_id)
+            self._scopes[body_scope_id].dynamic_callable_names.update(_argument_names(node.args))
+            self._scopes[defining_scope_id].bindings.setdefault(node.name, []).append(definition_id)
             definition_ids.append(definition_id)
 
         for definition_id in definition_ids:
             definition = self._definitions[definition_id]
-            local_nodes = _collect_scope_function_definitions(
-                definition.node.body
-            )
+            local_nodes = _collect_scope_function_definitions(definition.node.body)
             self._register_definitions(
                 local_nodes,
                 defining_scope_id=definition.body_scope_id,
@@ -1597,9 +1551,7 @@ class _DefinitionGraphBuilder:
             body_scope_id=body_scope_id,
             is_top_level=is_top_level,
         )
-        self._scopes[body_scope_id].dynamic_callable_names.update(
-            _argument_names(node.args)
-        )
+        self._scopes[body_scope_id].dynamic_callable_names.update(_argument_names(node.args))
         return definition_id
 
 
@@ -1677,21 +1629,15 @@ class _ScopeAliasAssignmentVisitor(ast.NodeVisitor):
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         if isinstance(node.target, ast.Name):
-            self.assignments.append(
-                (node.target.id, node.value, node.lineno, node.col_offset)
-            )
+            self.assignments.append((node.target.id, node.value, node.lineno, node.col_offset))
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         if isinstance(node.target, ast.Name):
-            self.assignments.append(
-                (node.target.id, None, node.lineno, node.col_offset)
-            )
+            self.assignments.append((node.target.id, None, node.lineno, node.col_offset))
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         if isinstance(node.target, ast.Name):
-            self.assignments.append(
-                (node.target.id, node.value, node.lineno, node.col_offset)
-            )
+            self.assignments.append((node.target.id, node.value, node.lineno, node.col_offset))
         self.visit(node.value)
 
 
@@ -1900,9 +1846,7 @@ def _resolve_alias_binding(
     while current_scope_id is not None:
         scope = graph.scopes[current_scope_id]
         applicable = [
-            binding
-            for binding in scope.aliases.get(name, ())
-            if binding.line <= maximum_line
+            binding for binding in scope.aliases.get(name, ()) if binding.line <= maximum_line
         ]
         if applicable:
             return max(applicable, key=lambda item: (item.line, item.column))
@@ -1932,9 +1876,7 @@ def _compute_definition_effect_summaries(
     """Return memoized cap-two summaries for every definition, including pure ones."""
     adjacency = {
         definition_id: _ordered_unique(
-            target_id
-            for call in analysis.calls
-            for target_id in call.target_definition_ids
+            target_id for call in analysis.calls for target_id in call.target_definition_ids
         )
         for definition_id, analysis in analyses.items()
     }
@@ -1964,9 +1906,7 @@ def _compute_definition_effect_summaries(
                             None,
                         )
                     )
-                for target_index, target_id in enumerate(
-                    call.target_definition_ids
-                ):
+                for target_index, target_id in enumerate(call.target_definition_ids):
                     target_component_id = component_by_definition[target_id]
                     if target_component_id == component_id:
                         continue
@@ -2024,13 +1964,9 @@ def _strongly_connected_components(
         for target_id in adjacency[definition_id]:
             if target_id not in indices:
                 connect(target_id)
-                low_links[definition_id] = min(
-                    low_links[definition_id], low_links[target_id]
-                )
+                low_links[definition_id] = min(low_links[definition_id], low_links[target_id])
             elif target_id in on_stack:
-                low_links[definition_id] = min(
-                    low_links[definition_id], indices[target_id]
-                )
+                low_links[definition_id] = min(low_links[definition_id], indices[target_id])
 
         if low_links[definition_id] != indices[definition_id]:
             return
@@ -2067,9 +2003,7 @@ def _helper_violations(
         violations.append(
             _build_violation(
                 code="effectful_helper",
-                message=(
-                    f"Helper '{definition.name}' can execute a robot side effect"
-                ),
+                message=(f"Helper '{definition.name}' can execute a robot side effect"),
                 start_line=start_line,
                 end_line=end_line,
                 regions=regions,
@@ -2088,8 +2022,7 @@ def _mark_effectful_class_attribute_calls(
     effectful_method_names = {
         call.class_method_name.rsplit(".", 1)[-1]
         for call in calls
-        if call.class_method_name is not None
-        and _materialize_effects([call], summaries, limit=1)
+        if call.class_method_name is not None and _materialize_effects([call], summaries, limit=1)
     }
     return [
         replace(
@@ -2097,8 +2030,7 @@ def _mark_effectful_class_attribute_calls(
             effect_name=_DYNAMIC_EFFECT_MARKER,
             dynamic_code="dynamic_effect_call",
         )
-        if call.class_method_name is None
-        and call.attribute_name in effectful_method_names
+        if call.class_method_name is None and call.attribute_name in effectful_method_names
         else call
         for call in calls
     ]
@@ -2114,11 +2046,7 @@ def _call_contract_violations(
     groups: list[CodeRegionGroup],
 ) -> list[ProgramContractViolation]:
     root_ids = set(graph.top_level_definition_ids)
-    root_ids.update(
-        target_id
-        for call in module_calls
-        for target_id in call.target_definition_ids
-    )
+    root_ids.update(target_id for call in module_calls for target_id in call.target_definition_ids)
     reachable_ids = _reachable_definition_ids(tuple(sorted(root_ids)), analyses)
     calls = list(module_calls)
     for definition_id in reachable_ids:
@@ -2129,9 +2057,9 @@ def _call_contract_violations(
     lambda_calls: dict[tuple[int, int], list[_ResolvedCall]] = {}
     for call in calls:
         if call.class_method_name is not None and call.class_method_span is not None:
-            class_calls.setdefault(
-                (call.class_method_name, call.class_method_span), []
-            ).append(call)
+            class_calls.setdefault((call.class_method_name, call.class_method_span), []).append(
+                call
+            )
         if call.lambda_span is not None:
             lambda_calls.setdefault(call.lambda_span, []).append(call)
 
@@ -2189,10 +2117,7 @@ def _call_contract_violations(
                 "Callable/private runtime introspection is forbidden in Capsule "
                 "programs; use only the documented public API functions directly"
                 if call.dynamic_code == "forbidden_runtime_access"
-                else (
-                    "Dynamic runtime access can bypass Capsule tracing and "
-                    "side-effect guards"
-                )
+                else ("Dynamic runtime access can bypass Capsule tracing and side-effect guards")
             )
             violations.append(
                 _build_violation(
@@ -2234,8 +2159,7 @@ def _control_flow_violations(
     side_effect_calls: set[str],
 ) -> list[ProgramContractViolation]:
     cases: list[tuple[ast.AST, int]] = [
-        (node, graph.module_scope_id)
-        for node in _collect_control_flow_nodes(module.body)
+        (node, graph.module_scope_id) for node in _collect_control_flow_nodes(module.body)
     ]
     for definition_id in _reachable_definition_ids(
         graph.top_level_definition_ids,
@@ -2244,9 +2168,7 @@ def _control_flow_violations(
         definition = graph.definitions[definition_id]
         cases.extend(
             (node, definition.body_scope_id)
-            for node in _collect_control_flow_nodes(
-                _definition_body_nodes(definition.node)
-            )
+            for node in _collect_control_flow_nodes(_definition_body_nodes(definition.node))
         )
 
     violations: list[ProgramContractViolation] = []
@@ -2309,9 +2231,7 @@ def _group_violations(
     violations: list[ProgramContractViolation] = []
     for group in groups:
         group_calls = [
-            call
-            for call in module_calls
-            if group.start_line <= call.line <= group.end_line
+            call for call in module_calls if group.start_line <= call.line <= group.end_line
         ]
         effects = _materialize_effects(group_calls, summaries)
         if len(effects) <= 1:
@@ -2320,8 +2240,7 @@ def _group_violations(
             _build_violation(
                 code="multiple_effects_in_group",
                 message=(
-                    f"Execution group '{group.group_id}' contains multiple robot "
-                    "side-effect calls"
+                    f"Execution group '{group.group_id}' contains multiple robot side-effect calls"
                 ),
                 start_line=group.start_line,
                 end_line=group.end_line,
@@ -2341,9 +2260,7 @@ def _effectful_executable_unit_ids(
     groups: list[CodeRegionGroup],
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     def unit_has_effect(start_line: int, end_line: int) -> bool:
-        unit_calls = [
-            call for call in module_calls if start_line <= call.line <= end_line
-        ]
+        unit_calls = [call for call in module_calls if start_line <= call.line <= end_line]
         return bool(_materialize_effects(unit_calls, summaries, limit=1))
 
     return (
@@ -2353,9 +2270,7 @@ def _effectful_executable_unit_ids(
             if unit_has_effect(region.start_line, region.end_line)
         ),
         tuple(
-            group.group_id
-            for group in groups
-            if unit_has_effect(group.start_line, group.end_line)
+            group.group_id for group in groups if unit_has_effect(group.start_line, group.end_line)
         ),
     )
 
@@ -2419,13 +2334,9 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
         self._visit_definition_time_expressions(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        local_names = {
-            name
-            for name, _, _, _ in _collect_scope_alias_assignments(node.body)
-        }
+        local_names = {name for name, _, _, _ in _collect_scope_alias_assignments(node.body)}
         local_names.update(
-            definition.name
-            for definition in _collect_scope_function_definitions(node.body)
+            definition.name for definition in _collect_scope_function_definitions(node.body)
         )
         self._class_local_callable_names.append(local_names)
         self._class_names.append(node.name)
@@ -2438,9 +2349,7 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self._visit_definition_time_expressions(statement)
                 method_name = ".".join([*self._class_names, statement.name])
-                self._active_class_methods.append(
-                    (method_name, _node_span(statement))
-                )
+                self._active_class_methods.append((method_name, _node_span(statement)))
                 for method_statement in statement.body:
                     self.visit(method_statement)
                 self._active_class_methods.pop()
@@ -2498,14 +2407,9 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
             )
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        if any(
-            not _assignment_target_is_precise(target, node.value)
-            for target in node.targets
-        ):
+        if any(not _assignment_target_is_precise(target, node.value) for target in node.targets):
             for candidate in ast.walk(node.value):
-                if not isinstance(candidate, ast.Name) or not isinstance(
-                    candidate.ctx, ast.Load
-                ):
+                if not isinstance(candidate, ast.Name) or not isinstance(candidate.ctx, ast.Load):
                     continue
                 self.calls.append(
                     _CallOccurrence(
@@ -2605,9 +2509,7 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
         if node.args.kwarg is not None:
             arguments.append(node.args.kwarg)
         expressions.extend(
-            argument.annotation
-            for argument in arguments
-            if argument.annotation is not None
+            argument.annotation for argument in arguments if argument.annotation is not None
         )
         if node.returns is not None:
             expressions.append(node.returns)
