@@ -1,25 +1,94 @@
+from __future__ import annotations
+
+import copy
 import os
-# Force weights_only=False for PyTorch loading of legacy files
-os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 import sys
-import shutil
-import tempfile
-import time
 import traceback
 from dataclasses import dataclass, field
-import yaml
-import pathlib
+from typing import Any, Callable, Mapping
 
 import tyro
+import yaml
+
 from capx.envs.launch import LaunchArgs
 from capx.envs.launch import main as launch_main
 
-# Import Libero to discover tasks
-try:
-    from libero import benchmark
-except ImportError:
-    print("Error: Libero not found. Make sure it is installed and PYTHONPATH is set.")
-    sys.exit(1)
+# Force weights_only=False for PyTorch loading of legacy files.
+os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+
+
+def _load_benchmark_dict() -> Mapping[str, Callable[[], Any]]:
+    try:
+        from libero import benchmark
+    except ImportError as exc:
+        raise RuntimeError(
+            "LIBERO is not installed; run this command in the dedicated LIBERO environment."
+        ) from exc
+    return benchmark.get_benchmark_dict()
+
+
+def _select_task_ids(n_tasks: int, task_ids: list[int] | None) -> list[int]:
+    if isinstance(n_tasks, bool) or not isinstance(n_tasks, int) or n_tasks < 0:
+        raise ValueError(f"n_tasks must be a non-negative integer, got {n_tasks!r}")
+    if task_ids is None:
+        return list(range(n_tasks))
+
+    selected: list[int] = []
+    seen: set[int] = set()
+    for task_id in task_ids:
+        if (
+            isinstance(task_id, bool)
+            or not isinstance(task_id, int)
+            or task_id < 0
+            or task_id >= n_tasks
+        ):
+            raise ValueError(
+                f"task ID {task_id!r} is outside the valid range [0, {n_tasks})"
+            )
+        if task_id not in seen:
+            selected.append(task_id)
+            seen.add(task_id)
+    return selected
+
+
+def _collect_tasks(
+    benchmark_dict: Mapping[str, Callable[[], Any]],
+    suite_names: list[str],
+    task_ids: list[int] | None,
+) -> list[tuple[str, int, str, int]]:
+    selected_suites: list[tuple[str, Any, list[int]]] = []
+    for suite_name in suite_names:
+        if suite_name not in benchmark_dict:
+            print(f"Warning: Suite '{suite_name}' not found in Libero benchmarks.")
+            continue
+
+        task_suite = benchmark_dict[suite_name]()
+        num_tasks = task_suite.n_tasks
+        print(f"Suite {suite_name} has {num_tasks} tasks.")
+        selected_suites.append(
+            (suite_name, task_suite, _select_task_ids(num_tasks, task_ids))
+        )
+
+    tasks_to_run: list[tuple[str, int, str, int]] = []
+    for suite_name, task_suite, selected_task_ids in selected_suites:
+        for task_id in selected_task_ids:
+            task = task_suite.get_task(task_id)
+            task_name = task.name
+
+            try:
+                init_states = task_suite.get_task_init_states(task_id)
+                assert init_states is not None, f"No initial states found for task {task_name}"
+                num_trials = len(init_states)
+            except Exception as exc:
+                print(
+                    f"Warning: Could not determine init states for {task_name}, "
+                    f"defaulting to 50. Error: {exc}"
+                )
+                num_trials = 50
+
+            tasks_to_run.append((suite_name, task_id, task_name, num_trials))
+
+    return tasks_to_run
 
 
 @dataclass
@@ -41,6 +110,9 @@ class LiberoBatchLaunchArgs:
         ]
     )
 
+    # Optional task IDs to run from each selected suite (all tasks by default)
+    task_ids: list[int] | None = None
+
     # Models to run (copied from run_batch.py default)
     models: list[str] = field(
         default_factory=lambda: [
@@ -61,6 +133,7 @@ class LiberoBatchLaunchArgs:
     api_key: str | None = None
     use_visual_feedback: bool | None = None
     use_img_differencing: bool | None = None
+    use_wrist_camera: bool | None = None
     use_legacy_multi_turn_decision_prompt: bool | None = None
     total_trials: int | None = None
     num_workers: int | None = None
@@ -70,8 +143,6 @@ class LiberoBatchLaunchArgs:
 
 
 def main(args: LiberoBatchLaunchArgs) -> None:
-    benchmark_dict = benchmark.get_benchmark_dict()
-    
     # Load base configuration
     if not os.path.exists(args.base_config_path):
         print(f"Error: Base config file not found: {args.base_config_path}")
@@ -79,37 +150,11 @@ def main(args: LiberoBatchLaunchArgs) -> None:
         
     with open(args.base_config_path, "r") as f:
         base_config = yaml.safe_load(f)
-    
-    tasks_to_run = []
+
+    benchmark_dict = _load_benchmark_dict()
     
     print(f"Collecting tasks for suites: {args.suites}")
-    
-    for suite_name in args.suites:
-        if suite_name not in benchmark_dict:
-            print(f"Warning: Suite '{suite_name}' not found in Libero benchmarks.")
-            continue
-            
-        task_suite = benchmark_dict[suite_name]()
-        num_tasks = task_suite.n_tasks
-        
-        print(f"Suite {suite_name} has {num_tasks} tasks.")
-        
-        for task_id in range(num_tasks):
-            task = task_suite.get_task(task_id)
-            task_name = task.name
-            
-            # Determine number of initial states (trials)
-            try:
-                # We force weights_only=False because Libero checkpoints might be old
-                import torch
-                init_states = task_suite.get_task_init_states(task_id)
-                assert init_states is not None, f"No initial states found for task {task_name}"
-                num_trials = len(init_states)
-            except Exception as e:
-                print(f"Warning: Could not determine init states for {task_name}, defaulting to 50. Error: {e}")
-                num_trials = 50
-
-            tasks_to_run.append((suite_name, task_id, task_name, num_trials))
+    tasks_to_run = _collect_tasks(benchmark_dict, args.suites, args.task_ids)
 
     print(f"Total tasks to run: {len(tasks_to_run)}")
     
@@ -133,10 +178,7 @@ def main(args: LiberoBatchLaunchArgs) -> None:
             print(f"{'-' * 80}\n")
             
             # Construct config from base template
-            config = base_config.copy()
-            
             # Deep copy to ensure we don't modify the shared base_config for subsequent runs
-            import copy
             config = copy.deepcopy(base_config)
 
             # Inject task details
@@ -195,6 +237,7 @@ def main(args: LiberoBatchLaunchArgs) -> None:
                 api_key=args.api_key,
                 use_visual_feedback=args.use_visual_feedback,
                 use_img_differencing=args.use_img_differencing,
+                use_wrist_camera=args.use_wrist_camera,
                 use_legacy_multi_turn_decision_prompt=args.use_legacy_multi_turn_decision_prompt,
                 total_trials=args.total_trials,
                 num_workers=args.num_workers,

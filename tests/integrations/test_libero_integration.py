@@ -12,7 +12,7 @@ class FakeEnv:
 
     def reset(self, seed=None, options=None):  # noqa: D401, ARG002
         self._t = 0
-        return {"image": None}, {}
+        return {"image": None}
 
     def seed(self, s: int) -> None:  # noqa: D401, ARG002
         pass
@@ -36,7 +36,7 @@ def test_load_libero_task(monkeypatch: object) -> None:
         def get_task_init_states(self, task_id: int):  # noqa: D401
             return [None]
 
-    def get_benchmark_dict():  # noqa: D401
+    def get_benchmark_dict(help: bool = False):  # noqa: D401, ARG001
         return {"libero_10": lambda: FakeSuite()}
 
     # Define FakeOffEnv before injection
@@ -46,18 +46,16 @@ def test_load_libero_task(monkeypatch: object) -> None:
 
     # Create fake package/module hierarchy for libero
     libero_pkg = types.ModuleType("libero")
-    libero_libero = types.ModuleType("libero.libero")
-    envs_mod = types.ModuleType("libero.libero.envs")
-    utils_mod = types.ModuleType("libero.libero.utils")
+    envs_mod = types.ModuleType("libero.envs")
+    utils_mod = types.ModuleType("libero.utils")
     # Attach attributes
-    libero_libero.benchmark = types.SimpleNamespace(get_benchmark_dict=get_benchmark_dict)  # type: ignore[attr-defined]
+    libero_pkg.benchmark = types.SimpleNamespace(get_benchmark_dict=get_benchmark_dict)  # type: ignore[attr-defined]
     envs_mod.OffScreenRenderEnv = FakeOffEnv  # type: ignore[attr-defined]
     utils_mod.get_libero_path = lambda name: "/x"  # type: ignore[attr-defined]
     # Register in sys.modules
     monkeypatch.setitem(sys.modules, "libero", libero_pkg)
-    monkeypatch.setitem(sys.modules, "libero.libero", libero_libero)
-    monkeypatch.setitem(sys.modules, "libero.libero.envs", envs_mod)
-    monkeypatch.setitem(sys.modules, "libero.libero.utils", utils_mod)
+    monkeypatch.setitem(sys.modules, "libero.envs", envs_mod)
+    monkeypatch.setitem(sys.modules, "libero.utils", utils_mod)
 
     # No need to patch attributes on lib_mod; load_libero_task imports from the injected modules above
 
