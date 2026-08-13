@@ -20,6 +20,7 @@ import io
 import json
 import os
 import time
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
@@ -1384,6 +1385,15 @@ def _run_capsule_llm_step_loop(
     progress_mode = validate_progress_mode(
         str(config.get("capsule_progress_mode", "dense"))
     )
+    prompt_state_level = _validate_capsule_state_level(
+        str(config.get("capsule_prompt_state_level", "full")),
+        config_name="capsule_prompt_state_level",
+    )
+    diagnostic_state_level = _validate_capsule_state_level(
+        str(config.get("capsule_diagnostic_state_level", "none")),
+        config_name="capsule_diagnostic_state_level",
+        allow_none=True,
+    )
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
     output_dir = config.get("output_dir")
     if output_dir:
@@ -1477,6 +1487,7 @@ def _run_capsule_llm_step_loop(
     if initial_syntax_error is not None:
         history.append(_initial_syntax_error_history_entry(initial_syntax_error))
     step_metrics: list[dict[str, Any]] = []
+    diagnostic_states: list[dict[str, Any]] = []
     prompts: list[list[dict[str, Any]]] = []
     failed = False
     finished = False
@@ -1510,7 +1521,12 @@ def _run_capsule_llm_step_loop(
 
     for step_id in range(1, max_steps + 1):
         action: RuntimeAction | None = None
-        before_state = _capsule_state_snapshot(env)
+        before_state = _capsule_state_snapshot(env, state_level=prompt_state_level)
+        diagnostic_before_state = (
+            _capsule_state_snapshot(env, state_level=diagnostic_state_level)
+            if diagnostic_state_level != "none"
+            else None
+        )
         source_unit_for_feedback = None
         consumes_recovery_side_effect = False
         forced_recovery_action = False
@@ -1662,7 +1678,17 @@ def _run_capsule_llm_step_loop(
                 side_effect_calls,
             )
 
-        after_state = _capsule_state_snapshot(env)
+        after_state = _capsule_state_snapshot(env, state_level=prompt_state_level)
+        if diagnostic_before_state is not None:
+            diagnostic_states.append(
+                {
+                    "step_id": step_id,
+                    "state_before": diagnostic_before_state,
+                    "state_after": _capsule_state_snapshot(
+                        env, state_level=diagnostic_state_level
+                    ),
+                }
+            )
         trace_events = event.evidence.get("trace_events", [])
         feedback_action = action if action is not None else RuntimeAction(action="invalid", args={})
         feedback = build_runtime_feedback(
@@ -1831,6 +1857,13 @@ def _run_capsule_llm_step_loop(
         with open(metrics_path, "w") as f:
             for metric in step_metrics:
                 f.write(json.dumps(metric, default=str) + "\n")
+        if diagnostic_state_level != "none":
+            diagnostics_path = os.path.join(
+                output_dir, f"capsule_diagnostics_trial_{trial:02d}.jsonl"
+            )
+            with open(diagnostics_path, "w") as f:
+                for diagnostic_state in diagnostic_states:
+                    f.write(json.dumps(diagnostic_state, default=str) + "\n")
 
     if config.get("record_video"):
         info_step = {
@@ -2783,7 +2816,29 @@ def _safe_compute_reward(env: CodeExecutionEnvBase) -> float:
         return 0.0
 
 
-def _capsule_state_snapshot(env: CodeExecutionEnvBase) -> dict[str, Any]:
+def _validate_capsule_state_level(
+    state_level: str,
+    *,
+    config_name: str = "state_level",
+    allow_none: bool = False,
+) -> str:
+    allowed = ("none", "full", "proprioceptive") if allow_none else (
+        "full",
+        "proprioceptive",
+    )
+    if state_level not in allowed:
+        raise ValueError(
+            f"{config_name} must use one of the allowed values: {', '.join(allowed)}"
+        )
+    return state_level
+
+
+def _capsule_state_snapshot(
+    env: CodeExecutionEnvBase,
+    *,
+    state_level: str = "full",
+) -> dict[str, Any]:
+    _validate_capsule_state_level(state_level)
     snapshot: dict[str, Any] = {
         "reward": _safe_compute_reward(env),
         "task_completed": _safe_task_completed(env),
@@ -2804,9 +2859,10 @@ def _capsule_state_snapshot(env: CodeExecutionEnvBase) -> dict[str, Any]:
     if current_joints is not None:
         snapshot["robot_joint_pos"] = _jsonable_metric_value(current_joints)
 
-    object_poses = _capsule_object_pose_snapshot(low_level_env)
-    if object_poses:
-        snapshot["object_poses"] = object_poses
+    if state_level == "full":
+        object_poses = _capsule_object_pose_snapshot(low_level_env)
+        if object_poses:
+            snapshot["object_poses"] = object_poses
 
     return snapshot
 
@@ -2912,6 +2968,16 @@ def _jsonable_metric_value(value: Any) -> Any:
 
 
 def _capsule_object_pose_snapshot(low_level_env: Any) -> dict[str, Any]:
+    get_all_object_poses = getattr(low_level_env, "_get_all_object_poses", None)
+    if callable(get_all_object_poses):
+        try:
+            raw_object_poses = get_all_object_poses()
+        except Exception:
+            raw_object_poses = None
+        normalized_poses = _normalize_named_object_poses(raw_object_poses)
+        if normalized_poses:
+            return normalized_poses
+
     robosuite_env = getattr(low_level_env, "robosuite_env", None)
     sim = getattr(robosuite_env, "sim", None)
     if robosuite_env is None or sim is None:
@@ -2932,9 +2998,32 @@ def _capsule_object_pose_snapshot(low_level_env: Any) -> dict[str, Any]:
         except Exception as exc:
             object_poses[attr_name] = {
                 "body": root_body,
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": type(exc).__name__,
             }
     return object_poses
+
+
+def _normalize_named_object_poses(raw_object_poses: Any) -> dict[str, Any]:
+    if not isinstance(raw_object_poses, Mapping):
+        return {}
+
+    normalized: dict[str, Any] = {}
+    for object_name, raw_pose in raw_object_poses.items():
+        if isinstance(raw_pose, Mapping):
+            pose = {
+                str(key): _jsonable_metric_value(value)
+                for key, value in raw_pose.items()
+            }
+        elif isinstance(raw_pose, (list, tuple)) and len(raw_pose) == 2:
+            position, quaternion_wxyz = raw_pose
+            pose = {
+                "pos": _jsonable_metric_value(position),
+                "quat_wxyz": _jsonable_metric_value(quaternion_wxyz),
+            }
+        else:
+            continue
+        normalized[str(object_name)] = pose
+    return normalized
 
 
 def _safe_task_completed(env: CodeExecutionEnvBase) -> bool | None:

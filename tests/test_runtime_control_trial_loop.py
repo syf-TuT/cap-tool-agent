@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import capx.envs.trial as trial_module
+import numpy as np
 import pytest
 from capx.envs.trial import (
     _describe_initial_scene,
@@ -210,6 +211,34 @@ class FakeVideoCapsuleEnv(FakeCapsuleEnv):
         return ["frame-1", "frame-2"]
 
 
+class FakeLiberoLowLevelEnv:
+    def __init__(self):
+        self._step_count = 3
+        self._sim_step_count = 12
+        self._gripper_fraction = np.float32(0.25)
+        self.gripper_link_wxyz_xyz = np.array(
+            [1.0, 0.0, 0.0, 0.0, 0.4, -0.2, 0.3], dtype=np.float32
+        )
+        self._current_joints = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+
+    def task_completed(self):
+        return False
+
+    def _get_all_object_poses(self):
+        return {
+            "alphabet_soup": (
+                np.array([0.2, 0.1, 0.05]),
+                np.array([1.0, 0.0, 0.0, 0.0]),
+            )
+        }
+
+
+class FakeLiberoCapsuleEnv(FakeIncompleteCapsuleEnv):
+    def __init__(self):
+        super().__init__()
+        self.low_level_env = FakeLiberoLowLevelEnv()
+
+
 def _record_current_stage():
     context = get_trial_llm_context()
     assert context is not None
@@ -241,6 +270,147 @@ def _capsule_step_metrics(path):
 
 def _json_string_payload(value: str) -> str:
     return json.dumps(value)[1:-1]
+
+
+def test_capsule_state_level_proprioceptive_excludes_object_truth():
+    snapshot = trial_module._capsule_state_snapshot(
+        FakeLiberoCapsuleEnv(), state_level="proprioceptive"
+    )
+
+    assert snapshot["reward"] == 0.0
+    assert snapshot["task_completed"] is False
+    assert snapshot["step_count"] == 3
+    assert snapshot["sim_step_count"] == 12
+    assert snapshot["gripper_fraction"] == pytest.approx(0.25)
+    assert snapshot["gripper_wxyz_xyz"] == pytest.approx(
+        [1.0, 0.0, 0.0, 0.0, 0.4, -0.2, 0.3]
+    )
+    assert snapshot["robot_joint_pos"] == pytest.approx([0.1, 0.2, 0.3])
+    assert "object_poses" not in snapshot
+
+
+def test_capsule_state_level_full_includes_jsonable_libero_object_poses():
+    snapshot = trial_module._capsule_state_snapshot(
+        FakeLiberoCapsuleEnv(), state_level="full"
+    )
+
+    assert snapshot["object_poses"]["alphabet_soup"] == {
+        "pos": [0.2, 0.1, 0.05],
+        "quat_wxyz": [1.0, 0.0, 0.0, 0.0],
+    }
+    json.dumps(snapshot)
+
+
+def test_capsule_state_level_rejects_invalid_value():
+    with pytest.raises(ValueError, match=r"allowed.*full.*proprioceptive"):
+        trial_module._capsule_state_snapshot(
+            FakeLiberoCapsuleEnv(), state_level="privileged"
+        )
+
+
+def test_capsule_state_level_snapshots_do_not_share_nested_values():
+    env = FakeLiberoCapsuleEnv()
+    public_state = trial_module._capsule_state_snapshot(env, state_level="full")
+    diagnostic_state = trial_module._capsule_state_snapshot(env, state_level="full")
+
+    public_state["robot_joint_pos"][0] = 99.0
+    public_state["object_poses"]["alphabet_soup"]["pos"][0] = 88.0
+    public_state["object_poses"]["alphabet_soup"]["new"] = {"nested": ["changed"]}
+
+    assert diagnostic_state["robot_joint_pos"][0] == pytest.approx(0.1)
+    assert diagnostic_state["object_poses"]["alphabet_soup"] == {
+        "pos": [0.2, 0.1, 0.05],
+        "quat_wxyz": [1.0, 0.0, 0.0, 0.0],
+    }
+
+
+def test_capsule_llm_step_separates_prompt_and_diagnostic_state_artifacts(tmp_path):
+    trial_module._run_capsule_llm_step_loop(
+        FakeLiberoCapsuleEnv(),
+        trial=2,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_prompt_state_level": "proprioceptive",
+            "capsule_diagnostic_state_level": "full",
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    ordinary_paths = [
+        tmp_path / "capsule_prompts_trial_02.json",
+        tmp_path / "capsule_trace_trial_02.json",
+        tmp_path / "capsule_step_metrics_trial_02.jsonl",
+    ]
+    for path in ordinary_paths:
+        artifact = path.read_text()
+        assert "alphabet_soup" not in artifact
+        assert '"pos": [0.2, 0.1, 0.05]' not in artifact
+
+    diagnostic_path = tmp_path / "capsule_diagnostics_trial_02.jsonl"
+    rows = [json.loads(line) for line in diagnostic_path.read_text().splitlines()]
+    assert [row["step_id"] for row in rows] == [1, 2]
+    assert rows[0]["state_before"]["object_poses"]["alphabet_soup"] == {
+        "pos": [0.2, 0.1, 0.05],
+        "quat_wxyz": [1.0, 0.0, 0.0, 0.0],
+    }
+    assert rows[1]["state_after"]["object_poses"]["alphabet_soup"] == {
+        "pos": [0.2, 0.1, 0.05],
+        "quat_wxyz": [1.0, 0.0, 0.0, 0.0],
+    }
+
+
+def test_capsule_llm_step_diagnostic_state_artifact_none_writes_no_file(tmp_path):
+    trial_module._run_capsule_llm_step_loop(
+        FakeLiberoCapsuleEnv(),
+        trial=3,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "capsule_diagnostic_state_level": "none",
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[{"action": "finish", "args": {}}],
+    )
+
+    assert not (tmp_path / "capsule_diagnostics_trial_03.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    ("config_key", "state_level"),
+    [
+        ("capsule_prompt_state_level", "none"),
+        ("capsule_diagnostic_state_level", "privileged"),
+    ],
+)
+def test_capsule_llm_step_rejects_invalid_configured_state_level_before_action(
+    tmp_path, config_key, state_level
+):
+    env = FakeLiberoCapsuleEnv()
+
+    with pytest.raises(ValueError, match=r"allowed"):
+        trial_module._run_capsule_llm_step_loop(
+            env,
+            trial=4,
+            args=SimpleNamespace(model="test", use_oracle_code=False),
+            config={
+                "output_dir": str(tmp_path),
+                "max_capsule_steps": 1,
+                config_key: state_level,
+            },
+            initial_code='move_to("blocked")\n',
+            scripted_actions=[
+                {"action": "run_group", "args": {"group_id": "group_1"}}
+            ],
+        )
+
+    assert env.api.moved is False
 
 
 def test_initial_generation_query_uses_initial_code_stage(tmp_path, monkeypatch):
