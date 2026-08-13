@@ -459,6 +459,30 @@ def test_capsule_prompt_compact_history_bounds_inspected_variable_summaries():
     assert len(text) < 20000
 
 
+def test_compact_history_only_redacts_explicit_binary_markers():
+    history = [
+        {"step_id": 1, "event": {"message": "metadata: safe status"}},
+        {"step_id": 2, "event": {"message": "literal base64,short remains"}},
+        {
+            "step_id": 3,
+            "event": {"message": "image data:image/png;base64," + "A" * 100},
+        },
+        {
+            "step_id": 4,
+            "event": {"message": "blob BASE64, AAAAAAAA" + "B" * 100},
+        },
+    ]
+
+    summary = _summarize_history_for_prompt(history, max_entries=4)
+
+    assert summary[0]["message"] == "metadata: safe status"
+    assert summary[1]["message"] == "literal base64,short remains"
+    assert summary[2]["message"] == "image <redacted binary data>"
+    assert summary[3]["message"] == "blob <redacted binary data>"
+    assert "A" * 20 not in json.dumps(summary)
+    assert "B" * 20 not in json.dumps(summary)
+
+
 def test_compact_history_bounds_all_text_and_primitive_call_lists():
     payload = "data:image/png;base64," + "A" * 10000
     history = [

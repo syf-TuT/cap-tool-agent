@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from heapq import nsmallest
 from itertools import islice
 from typing import Any
@@ -27,6 +28,11 @@ _HISTORY_MESSAGE_MAX_CHARS = 240
 _HISTORY_PRIMITIVE_MAX_ITEMS = 8
 _HISTORY_PRIMITIVE_NAME_MAX_CHARS = 80
 _MINIMAL_FALLBACK_MIN_PROMPT_CHARS = 4096
+_DATA_URL_TEXT = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])data:(?:[-A-Za-z0-9.+]+/[-A-Za-z0-9.+]+)?"
+    r"(?:;[-A-Za-z0-9.+]+(?:=[-A-Za-z0-9.+]*)?)*;base64,"
+)
+_STANDALONE_BASE64_PAYLOAD = re.compile(r"(?i)(?<![A-Za-z0-9_])base64,(?=\s*[A-Za-z0-9+/_=-]{8})")
 _STRICT_CAPSULE_SOURCE_CONSTRAINTS = (
     "Strict Python subset for every generated or patched source:\n"
     "- Use no imports, classes, lambdas, try, while, async, dynamic or reflective "
@@ -804,12 +810,14 @@ def _primitive_calls_from_history(entry: dict[str, Any]) -> list[str]:
 
 
 def _truncate_history_text(value: str, *, max_chars: int) -> str:
-    lowered = value.casefold()
-    binary_offsets = [
-        offset for offset in (lowered.find("data:"), lowered.find("base64,")) if offset >= 0
+    binary_matches = [
+        match
+        for match in (_DATA_URL_TEXT.search(value), _STANDALONE_BASE64_PAYLOAD.search(value))
+        if match is not None
     ]
-    if binary_offsets:
-        value = f"{value[: min(binary_offsets)]}<redacted binary data>"
+    if binary_matches:
+        offset = min(match.start() for match in binary_matches)
+        value = f"{value[:offset]}<redacted binary data>"
     if len(value) <= max_chars:
         return value
     suffix = "...<truncated>"
