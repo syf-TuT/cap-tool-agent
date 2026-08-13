@@ -68,18 +68,21 @@ never added to the LLM prompt or runtime history.
 Because this configuration sets `privileged: false`, every generated Capsule program
 must pass the strict Python-subset preflight. This enforcement is independent of
 `capsule_validate_program_contract`; setting that flag to `false` does not disable the
-strict subset. Imports, dynamic or reflective calls, callable aliases, and attribute
-calls are unavailable. The execution globals contain only restricted safe builtins and
-approved public API bindings. Programs may directly call those bindings, safe builtins,
-or proven-pure top-level helpers, and all loops and total computation must be statically
-bounded. Legacy arbitrary-Python Capsule programs are not available in non-privileged
-mode.
+strict subset. Use no imports, classes, lambdas, `try`, `while`, or async constructs.
+Dynamic or reflective calls, callable aliases, and attribute calls are unavailable. The
+execution globals contain only restricted safe builtins and approved public API
+bindings. Programs may directly call those bindings, safe builtins, or proven-pure
+top-level helpers. They may use only statically bounded `for` loops, and total
+computation must remain within the static budget. Legacy arbitrary-Python Capsule
+programs are not available in non-privileged mode.
 
 For a local source-only check, run the focused configuration test below from the
-prepared development environment. It parses the YAML and verifies the non-privileged
-prompt contract; it does not start LIBERO, MuJoCo, model servers, or a robot trial.
+prepared WSL project at `/home/capx/code/cap-x`; do not run this command from the Windows
+checkout. It parses the YAML and verifies the non-privileged prompt contract; it does
+not start LIBERO, MuJoCo, model servers, or a robot trial.
 
 ```bash
+cd /home/capx/code/cap-x
 uv run --no-sync pytest tests/test_runtime_control_config.py -q \
   -k libero_object_capsule_llm_step_yaml_uses_approved_capabilities
 ```

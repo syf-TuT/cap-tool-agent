@@ -21,11 +21,16 @@ env:
       Goal: {libero_environment_goal}
       Generate one complete executable Python program for the goal.
       The strict Python subset is mandatory for this non-privileged Capsule program.
-      Imports are forbidden. Dynamic or reflective calls, callable aliases, and attribute calls are also forbidden.
-      Use only direct calls to the public API functions and safe builtins, plus direct calls to proven-pure top-level helper functions.
-      Loops must be statically bounded, and the whole program must stay within the total static computation budget.
-      Robot side effects must be top-level, with at most one robot side-effect API call per semantic group.
-      You may write Python code comments for reasoning, but only write executable Python code and do not use code fences.
+      Use no imports, classes, lambdas, try, while, or async constructs.
+      Dynamic or reflective calls, callable aliases, and attribute calls are also forbidden.
+      Use only direct calls to the public API functions and safe builtins.
+      You may also directly call proven-pure top-level helper functions.
+      Use only statically bounded for loops.
+      Keep the whole program within the total static computation budget.
+      Robot side effects must be top-level.
+      Use at most one robot side-effect API call per semantic group.
+      You may write Python code comments for reasoning.
+      Write only executable Python code and do not use code fences.
       The public API functions below are already available in the restricted execution environment.
 
 agent_mode: capsule
