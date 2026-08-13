@@ -21,7 +21,14 @@ def build_runtime_feedback(
     trace_events: list[dict[str, Any]],
     before_state: dict[str, Any],
     after_state: dict[str, Any],
+    progress_mode: str = "dense",
 ) -> RuntimeFeedback:
+    if progress_mode not in {"dense", "sparse_terminal"}:
+        raise ValueError(
+            "progress_mode must be either 'dense' or 'sparse_terminal', "
+            f"got {progress_mode!r}"
+        )
+
     evidence = dict(event.evidence)
     evidence.update(
         {
@@ -33,6 +40,7 @@ def build_runtime_feedback(
             "reward_after": after_state.get("reward"),
             "task_completed_before": before_state.get("task_completed"),
             "task_completed_after": after_state.get("task_completed"),
+            "progress_mode": progress_mode,
         }
     )
     if region is not None:
@@ -43,7 +51,25 @@ def build_runtime_feedback(
         if hasattr(region, "has_robot_side_effect"):
             evidence["has_robot_side_effect"] = bool(region.has_robot_side_effect)
 
-    status = _feedback_status(action, event, region, before_state, after_state)
+    terminal_progress_unverified = bool(
+        progress_mode == "sparse_terminal"
+        and event.status == "success"
+        and action.action in {"run_group", "run_region", "resume_from_region"}
+        and region is not None
+        and getattr(region, "has_robot_side_effect", True)
+        and not _made_task_progress(before_state, after_state)
+    )
+    if terminal_progress_unverified:
+        evidence["terminal_progress_unverified"] = True
+
+    status = _feedback_status(
+        action,
+        event,
+        region,
+        before_state,
+        after_state,
+        progress_mode=progress_mode,
+    )
     region_id = event.region_id or (region.region_id if region is not None else None)
 
     return RuntimeFeedback(
@@ -63,6 +89,8 @@ def _feedback_status(
     region: CodeRegion | None,
     before_state: dict[str, Any],
     after_state: dict[str, Any],
+    *,
+    progress_mode: str,
 ) -> RuntimeStatus:
     if event.status in {"failed", "invalid", "warning", "skipped"}:
         return event.status
@@ -70,6 +98,8 @@ def _feedback_status(
         return event.status
     if region is not None and not _made_task_progress(before_state, after_state):
         if getattr(region, "has_robot_side_effect", True) is False:
+            return "success"
+        if progress_mode == "sparse_terminal":
             return "success"
         return "warning"
     return "success"

@@ -1476,6 +1476,7 @@ def _run_capsule_llm_step_loop(
     prompts: list[list[dict[str, Any]]] = []
     failed = False
     finished = False
+    loop_exit_reason: str | None = None
     executed_regions = 0
     best_reward_so_far: float | None = None
     executed_side_effect_regions: set[str] = set()
@@ -1498,6 +1499,10 @@ def _run_capsule_llm_step_loop(
     )
     action_prompt_char_budget = int(
         config.get("capsule_action_prompt_char_budget", 60000)
+    )
+    progress_mode = str(config.get("capsule_progress_mode", "dense"))
+    require_task_success_for_finish = _coerce_config_bool(
+        config.get("capsule_require_task_success_for_finish", False)
     )
 
     for step_id in range(1, max_steps + 1):
@@ -1572,16 +1577,22 @@ def _run_capsule_llm_step_loop(
             region_id = str(action.args.get("region_id", ""))
             group_id = str(action.args.get("group_id", ""))
             source_unit_for_feedback = region_by_id.get(region_id) or group_by_id.get(group_id)
-            event = (
-                _program_contract_guard_event(
-                    action,
-                    program_contract_violations,
-                    contract_effectful_region_ids,
-                    contract_effectful_group_ids,
-                )
-                if validate_program_contract
-                else None
+            event = _finish_success_guard_event(
+                action,
+                before_state,
+                require_task_success=require_task_success_for_finish,
             )
+            if event is None:
+                event = (
+                    _program_contract_guard_event(
+                        action,
+                        program_contract_violations,
+                        contract_effectful_region_ids,
+                        contract_effectful_group_ids,
+                    )
+                    if validate_program_contract
+                    else None
+                )
             if event is None:
                 event = _no_rollback_guard_event(
                     action,
@@ -1659,6 +1670,7 @@ def _run_capsule_llm_step_loop(
             trace_events=trace_events,
             before_state=before_state,
             after_state=after_state,
+            progress_mode=progress_mode,
         )
 
         history.append(
@@ -1693,6 +1705,7 @@ def _run_capsule_llm_step_loop(
         metric["program_contract_violation_codes"] = sorted(
             {item.code for item in program_contract_violations}
         )
+        metric["budget_exhausted"] = False
         step_metrics.append(metric)
 
         if (
@@ -1774,20 +1787,32 @@ def _run_capsule_llm_step_loop(
                 )
 
         if stop_after_failed_event and event.status in {"failed", "invalid"}:
+            loop_exit_reason = "failed_event"
             break
         reward_after = _state_reward(after_state)
-        if stop_after_task_success and (
+        if (
+            action is not None
+            and action.action == "finish"
+            and event.status == "success"
+        ):
+            finished = True
+            loop_exit_reason = "accepted_finish"
+            break
+        if (stop_after_task_success or require_task_success_for_finish) and (
             bool(after_state.get("task_completed"))
             or (reward_after is not None and reward_after >= 1.0)
         ):
-            break
-        if event.action == "finish" or (action.action == "finish" if action is not None else False):
-            finished = True
+            loop_exit_reason = "task_success"
             break
 
     reward = _safe_compute_reward(env)
     task_completed = _safe_task_completed(env)
     task_succeeded = bool(task_completed) or reward >= 1.0
+    budget_exhausted = (
+        loop_exit_reason is None and not finished and not task_succeeded
+    )
+    if budget_exhausted and step_metrics:
+        step_metrics[-1]["budget_exhausted"] = True
     sandbox_rc = 0 if task_succeeded and not failed else 1
     code_path = None
     if output_dir:
@@ -1822,14 +1847,15 @@ def _run_capsule_llm_step_loop(
         f"Capsule actions: {len(history)}\n"
         f"Executed regions: {executed_regions}\n"
         f"Reward: {reward}\n"
-        f"Task Completed: {task_completed}"
+        f"Task Completed: {task_completed}\n"
+        f"Budget Exhausted: {budget_exhausted}"
     )
     return TrialSummary(
         trial=trial,
         success=sandbox_rc == 0,
         reward=reward,
-        terminated=bool(task_completed) or reward == 1.0,
-        truncated=False,
+        terminated=task_succeeded,
+        truncated=budget_exhausted,
         sandbox_rc=sandbox_rc,
         log=log,
         task_completed=task_completed,
@@ -1837,6 +1863,30 @@ def _run_capsule_llm_step_loop(
         num_regenerations=0,
         num_finishes=1 if finished else 0,
         num_code_blocks=executed_regions,
+    )
+
+
+def _finish_success_guard_event(
+    action: RuntimeAction,
+    state: dict[str, Any],
+    *,
+    require_task_success: bool,
+) -> RuntimeEvent | None:
+    if action.action != "finish" or not require_task_success:
+        return None
+    reward = _state_reward(state)
+    if state.get("task_completed") is True or (reward is not None and reward >= 1.0):
+        return None
+    return RuntimeEvent(
+        action="finish",
+        status="warning",
+        message=(
+            "Finish rejected because the environment success predicate is not satisfied."
+        ),
+        evidence={
+            "task_completed": state.get("task_completed"),
+            "reward": reward,
+        },
     )
 
 

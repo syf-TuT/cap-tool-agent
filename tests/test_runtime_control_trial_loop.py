@@ -2902,6 +2902,107 @@ def test_capsule_trial_marks_exhausted_budget_as_failed(tmp_path):
     assert summary.num_finishes == 0
 
 
+def test_capsule_llm_step_rejects_premature_finish_and_continues(tmp_path):
+    env = FakeRewardDropCapsuleEnv()
+
+    summary = trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_require_task_success_for_finish": True,
+            "capsule_progress_mode": "sparse_terminal",
+        },
+        initial_code='move_to("recover")\n',
+        scripted_actions=[
+            {"action": "finish", "args": {}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "inspect_variables", "args": {"names": []}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert summary.reward == 1.0
+    assert summary.num_finishes == 0
+    assert [entry["event"]["action"] for entry in trace] == ["finish", "run_group"]
+    assert trace[0]["event"]["status"] == "warning"
+    assert trace[0]["feedback"]["status"] == "warning"
+
+
+def test_capsule_llm_step_stops_immediately_on_success_when_finish_guard_enabled(tmp_path):
+    env = FakeRewardDropCapsuleEnv()
+
+    summary = trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_require_task_success_for_finish": True,
+        },
+        initial_code='move_to("recover")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "inspect_variables", "args": {"names": []}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert summary.reward == 1.0
+    assert summary.num_finishes == 0
+    assert [entry["event"]["action"] for entry in trace] == ["run_group"]
+
+
+def test_capsule_llm_step_marks_budget_exhausted_without_event_failure(tmp_path):
+    summary = trial_module._run_capsule_llm_step_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+        },
+        initial_code="x = 1\nRESULT = x + 1\n",
+        scripted_actions=[
+            {"action": "run_region", "args": {"region_id": "region_1"}},
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+        ],
+    )
+
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+
+    assert summary.truncated is True
+    assert summary.failure_kind is None
+    assert metrics[-1]["budget_exhausted"] is True
+    assert "Budget Exhausted: True" in summary.log
+
+
+def test_capsule_llm_step_marks_zero_step_budget_exhausted(tmp_path):
+    summary = trial_module._run_capsule_llm_step_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 0,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[],
+    )
+
+    metrics_path = tmp_path / "capsule_step_metrics_trial_00.jsonl"
+
+    assert summary.truncated is True
+    assert summary.num_finishes == 0
+    assert metrics_path.read_text() == ""
+    assert "Budget Exhausted: True" in summary.log
+
+
 def test_capsule_trial_finish_without_completion_is_failed(tmp_path):
     summary = _run_capsule_trial(
         env=FakeIncompleteCapsuleEnv(),
