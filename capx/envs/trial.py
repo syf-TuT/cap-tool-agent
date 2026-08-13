@@ -951,10 +951,13 @@ def _get_video_differencing_feedback(
 # Initial code generation
 # ---------------------------------------------------------------------------
 
+
 def _query_initial_code(
     args: LaunchArgs,
     config: dict[str, Any],
     obs: dict[str, Any],
+    *,
+    trial: int,
     artifact_by_sha256: Mapping[str, Any] | None = None,
 ) -> tuple[str, str | None, dict | None]:
     """Query the model for the initial code generation.
@@ -963,7 +966,8 @@ def _query_initial_code(
         (raw_code, reasoning, ensemble_data)
     """
     # Save the initial prompt
-    with open(os.path.join(config["output_dir"], "initial_prompt.txt"), "w") as f:
+    artifact_name = f"initial_prompt_trial_{trial:02d}.txt"
+    with open(os.path.join(config["output_dir"], artifact_name), "w") as f:
         f.write(
             str(
                 _sanitize_multimodal_prompt(
@@ -1423,7 +1427,7 @@ def _run_capsule_auto_forward_loop(
     elif config.get("use_oracle_code", False):
         source = env.oracle_code
     else:
-        raw_code, _, _ = _query_initial_code(args, config, obs)
+        raw_code, _, _ = _query_initial_code(args, config, obs, trial=trial)
         source = "\n\n".join(_extract_code(raw_code))
 
     max_regions_per_group = int(config.get("capsule_max_regions_per_group", 20))
@@ -2200,6 +2204,7 @@ def _run_capsule_llm_step_loop(
             args,
             config,
             initial_query_obs,
+            trial=trial,
             artifact_by_sha256=visual_artifact_by_sha256,
         )
         source = "\n\n".join(_extract_code(raw_code))
@@ -4025,7 +4030,7 @@ def _run_single_trial(
         reasoning = None
         ensemble_data = None
     else:
-        raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs)
+        raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs, trial=trial)
 
     # Initialize partial artifacts for timeout recovery
     if partial_artifacts is not None:

@@ -487,6 +487,7 @@ def test_initial_generation_query_uses_initial_code_stage(tmp_path, monkeypatch)
             args,
             config,
             {"full_prompt": [{"role": "user", "content": "task"}]},
+            trial=1,
         )
 
     assert _telemetry_stages(telemetry_path) == ["initial_code"]
@@ -1025,16 +1026,50 @@ def test_query_initial_code_sanitizes_initial_prompt_multimodal_artifact(
         SimpleNamespace(model="test"),
         {"output_dir": str(tmp_path), "use_parallel_ensemble": False},
         {"full_prompt": prompt},
+        trial=0,
         artifact_by_sha256={
             record.sha256: "capsule_visuals_trial_00/step_00_main.png"
         },
     )
 
-    artifact = (tmp_path / "initial_prompt.txt").read_text()
+    artifact = (tmp_path / "initial_prompt_trial_00.txt").read_text()
     assert "image_reference" in artifact
     assert record.sha256 in artifact
     assert "data:image" not in artifact
     assert "base64," not in artifact
+
+
+def test_query_initial_code_writes_distinct_trial_scoped_prompt_artifacts(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "capx.envs.trial._query_model",
+        lambda args, live_prompt: {"content": "code", "reasoning": None},
+    )
+    config = {"output_dir": str(tmp_path), "use_parallel_ensemble": False}
+
+    _query_initial_code(
+        SimpleNamespace(model="test"),
+        config,
+        {"full_prompt": [{"role": "user", "content": "trial-one"}]},
+        trial=1,
+    )
+    _query_initial_code(
+        SimpleNamespace(model="test"),
+        config,
+        {"full_prompt": [{"role": "user", "content": "trial-two"}]},
+        trial=2,
+    )
+
+    first_artifact = (tmp_path / "initial_prompt_trial_01.txt").read_text()
+    second_artifact = (tmp_path / "initial_prompt_trial_02.txt").read_text()
+    assert "trial-one" in first_artifact
+    assert "trial-two" not in first_artifact
+    assert "trial-two" in second_artifact
+    assert "trial-one" not in second_artifact
+    assert "data:image" not in first_artifact + second_artifact
+    assert "base64," not in first_artifact + second_artifact
+    assert not (tmp_path / "initial_prompt.txt").exists()
 
 
 def test_capsule_llm_step_libero_goal_before_initial_query_and_shared_prompt_isolation(
@@ -1043,9 +1078,10 @@ def test_capsule_llm_step_libero_goal_before_initial_query_and_shared_prompt_iso
     env = _FakeLiberoGoalVisualEnv()
     captured_prompts = []
 
-    def fake_initial_code(args, config, obs, artifact_by_sha256=None):
+    def fake_initial_code(args, config, obs, *, trial, artifact_by_sha256=None):
         captured_prompts.append(
             {
+                "trial": trial,
                 "prompt": json.loads(json.dumps(obs["full_prompt"])),
                 "artifacts": dict(artifact_by_sha256 or {}),
             }
@@ -1070,6 +1106,7 @@ def test_capsule_llm_step_libero_goal_before_initial_query_and_shared_prompt_iso
 
     goal = "Pick the alphabet soup and place it in the basket"
     assert len(captured_prompts) == 2
+    assert [captured["trial"] for captured in captured_prompts] == [0, 1]
     for captured in captured_prompts:
         prompt_text = json.dumps(captured["prompt"])
         assert goal in prompt_text
@@ -1150,7 +1187,7 @@ def test_capsule_llm_step_visual_feedback_uses_current_pairs_and_sanitized_artif
     assert step_0[0].data_url not in json.dumps(live_prompts[2])
     assert step_0[1].data_url not in json.dumps(live_prompts[2])
 
-    initial_artifact = (tmp_path / "initial_prompt.txt").read_text()
+    initial_artifact = (tmp_path / "initial_prompt_trial_00.txt").read_text()
     prompt_artifact_path = tmp_path / "capsule_prompts_trial_00.json"
     prompt_artifact = prompt_artifact_path.read_text()
     for artifact in (initial_artifact, prompt_artifact):
@@ -4740,7 +4777,8 @@ def test_capsule_trial_allows_patch_of_executed_non_side_effect_group(tmp_path):
 def test_multiturn_trial_stops_after_max_regenerations(tmp_path, monkeypatch):
     decision_calls = []
 
-    def fake_initial_code(args, config, obs):
+    def fake_initial_code(args, config, obs, *, trial):
+        assert trial == 1
         return "print('initial')", None, None
 
     def fake_multi_turn_step(*args, **kwargs):
