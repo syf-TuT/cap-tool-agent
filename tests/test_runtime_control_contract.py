@@ -690,3 +690,187 @@ invoke(close_gripper)
     )
     assert analysis.effectful_region_ids
     assert analysis.effectful_group_ids
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "close_gripper.__closure__[0].cell_contents()\n",
+        "close_gripper.__self__\n",
+        "close_gripper.__globals__\n",
+        "close_gripper.__func__\n",
+        "close_gripper.__code__\n",
+        "close_gripper.__dict__\n",
+        "close_gripper.__getattribute__('__closure__')\n",
+        "vars(close_gripper)\n",
+        "dir(close_gripper)\n",
+        "builtins.vars(close_gripper)\n",
+        "inspect.getclosurevars(close_gripper)\n",
+        "gc.get_referrers(close_gripper)\n",
+    ],
+)
+def test_private_callable_introspection_fails_closed(source):
+    regions = segment_python_code(source)
+    groups = segment_python_code_groups(
+        source,
+        regions,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    analysis = analyze_capsule_program_contract_details(
+        source,
+        regions,
+        groups,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    assert any(
+        violation.code == "forbidden_runtime_access"
+        for violation in analysis.violations
+    )
+    assert analysis.effectful_region_ids == tuple(
+        region.region_id for region in regions
+    )
+    assert analysis.effectful_group_ids == tuple(group.group_id for group in groups)
+
+
+def test_effectful_class_method_marks_class_definition_and_attribute_call():
+    source = """\
+class Unsafe:
+    def act(self):
+        close_gripper()
+obj = Unsafe()
+obj.act()
+"""
+    regions = segment_python_code(source)
+    groups = segment_python_code_groups(
+        source,
+        regions,
+        max_regions_per_group=1,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    analysis = analyze_capsule_program_contract_details(
+        source,
+        regions,
+        groups,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    assert any(
+        violation.code == "effectful_helper"
+        and violation.helper_name == "Unsafe.act"
+        for violation in analysis.violations
+    )
+    assert analysis.effectful_region_ids == (
+        regions[0].region_id,
+        regions[-1].region_id,
+    )
+    assert analysis.effectful_group_ids == (
+        groups[0].group_id,
+        groups[-1].group_id,
+    )
+
+
+def test_pure_class_method_remains_allowed():
+    source = """\
+class Safe:
+    def size(self, values):
+        return len(values)
+"""
+
+    assert _analyze(source) == []
+
+
+def test_ordinary_object_attributes_and_methods_remain_allowed():
+    source = "value = obj.shape\nobj.measure()\n"
+
+    assert _analyze(source) == []
+
+
+@pytest.mark.parametrize(
+    "source,expected_effects",
+    [
+        ("(lambda: close_gripper())()\n", ("close_gripper",)),
+        (
+            "(lambda: (open_gripper(), close_gripper()))()\n",
+            ("open_gripper", "close_gripper"),
+        ),
+        ("list(map(lambda _: close_gripper(), [1]))\n", ("close_gripper",)),
+    ],
+)
+def test_invoked_or_passed_effectful_lambda_fails_closed(source, expected_effects):
+    regions = segment_python_code(source)
+    groups = segment_python_code_groups(
+        source,
+        regions,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    analysis = analyze_capsule_program_contract_details(
+        source,
+        regions,
+        groups,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    assert any(
+        violation.code == "dynamic_effect_call"
+        and violation.side_effect_calls == expected_effects[:2]
+        for violation in analysis.violations
+    )
+    assert analysis.effectful_region_ids
+    assert analysis.effectful_group_ids
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "(alias,) = (close_gripper,)\nalias()\n",
+        "[alias] = [close_gripper]\nalias()\n",
+        "(alias := close_gripper)()\n",
+        "first, *rest = [close_gripper]\nrest[0]()\n",
+    ],
+)
+def test_destructured_named_or_uncertain_alias_fails_closed(source):
+    regions = segment_python_code(source)
+    groups = segment_python_code_groups(
+        source,
+        regions,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    analysis = analyze_capsule_program_contract_details(
+        source,
+        regions,
+        groups,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    assert analysis.violations
+    assert analysis.effectful_region_ids
+    assert analysis.effectful_group_ids
+
+
+def test_unresolved_starred_assignment_containing_effect_callable_is_rejected():
+    source = "first, *rest = [close_gripper]\n"
+    regions = segment_python_code(source)
+    groups = segment_python_code_groups(
+        source,
+        regions,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    analysis = analyze_capsule_program_contract_details(
+        source,
+        regions,
+        groups,
+        side_effect_calls=SIDE_EFFECTS,
+    )
+
+    assert any(
+        violation.code == "dynamic_effect_call"
+        for violation in analysis.violations
+    )
+    assert analysis.effectful_region_ids
+    assert analysis.effectful_group_ids

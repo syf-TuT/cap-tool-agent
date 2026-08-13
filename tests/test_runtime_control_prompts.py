@@ -32,6 +32,28 @@ def test_capsule_prompt_excludes_robot_tool_list():
     assert "move_to_joints" not in text
 
 
+def test_capsule_prompt_forbids_callable_reflection_and_dynamic_access():
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[
+            CodeRegion(
+                region_id="region_1",
+                start_line=1,
+                end_line=1,
+                source="close_gripper()",
+            )
+        ],
+        history=[],
+        trace_summary={},
+    )
+
+    text = str(prompt)
+
+    assert "Do not use callable introspection" in text
+    assert "__closure__" in text
+    assert "globals()/eval()/exec()" in text
+
+
 def test_capsule_prompt_documents_patch_region_source_schema():
     prompt = build_capsule_prompt(
         task="stack cubes",

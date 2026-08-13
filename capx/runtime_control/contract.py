@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 from collections import deque
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup
@@ -56,6 +56,10 @@ class _CallOccurrence:
     end_line: int
     column: int
     dynamic_code: str | None = None
+    class_method_name: str | None = None
+    class_method_span: tuple[int, int] | None = None
+    lambda_span: tuple[int, int] | None = None
+    uncertain_assignment: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,6 +107,10 @@ class _ResolvedCall:
     target_definition_ids: tuple[int, ...] = ()
     via_alias: bool = False
     dynamic_code: str | None = None
+    attribute_name: str | None = None
+    class_method_name: str | None = None
+    class_method_span: tuple[int, int] | None = None
+    lambda_span: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +158,10 @@ def analyze_capsule_program_contract_details(
         graph,
         scope_id=graph.module_scope_id,
         side_effect_calls=side_effect_calls,
+    )
+    module_calls = _mark_effectful_class_attribute_calls(
+        module_calls,
+        definition_summaries,
     )
 
     violations = _helper_violations(
@@ -416,10 +428,8 @@ class _ScopeAliasAssignmentVisitor(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign) -> None:
         for target in node.targets:
-            if isinstance(target, ast.Name):
-                self.assignments.append(
-                    (target.id, node.value, node.lineno, node.col_offset)
-                )
+            self.assignments.extend(_assignment_alias_bindings(target, node.value))
+        self.visit(node.value)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         if isinstance(node.target, ast.Name):
@@ -432,6 +442,53 @@ class _ScopeAliasAssignmentVisitor(ast.NodeVisitor):
             self.assignments.append(
                 (node.target.id, None, node.lineno, node.col_offset)
             )
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        if isinstance(node.target, ast.Name):
+            self.assignments.append(
+                (node.target.id, node.value, node.lineno, node.col_offset)
+            )
+        self.visit(node.value)
+
+
+def _assignment_alias_bindings(
+    target: ast.expr,
+    value: ast.expr,
+) -> list[tuple[str, ast.expr | None, int, int]]:
+    if isinstance(target, ast.Name):
+        return [(target.id, value, target.lineno, target.col_offset)]
+    if isinstance(target, ast.Starred):
+        return [
+            (name, None, line, column)
+            for name, _, line, column in _assignment_alias_bindings(
+                target.value,
+                value,
+            )
+        ]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        if (
+            isinstance(value, (ast.Tuple, ast.List))
+            and len(target.elts) == len(value.elts)
+            and not any(isinstance(item, ast.Starred) for item in target.elts)
+        ):
+            return [
+                binding
+                for nested_target, nested_value in zip(
+                    target.elts,
+                    value.elts,
+                    strict=True,
+                )
+                for binding in _assignment_alias_bindings(
+                    nested_target,
+                    nested_value,
+                )
+            ]
+        return [
+            (name, None, line, column)
+            for item in target.elts
+            for name, _, line, column in _assignment_alias_bindings(item, value)
+        ]
+    return []
 
 
 def _analyze_definitions(
@@ -477,10 +534,24 @@ def _resolve_calls(
                     column=call.column,
                     effect_name=_DYNAMIC_EFFECT_MARKER,
                     dynamic_code=call.dynamic_code,
+                    class_method_name=call.class_method_name,
+                    class_method_span=call.class_method_span,
+                    lambda_span=call.lambda_span,
                 )
             )
             continue
         if not call.is_direct_name:
+            resolved.append(
+                _ResolvedCall(
+                    line=call.line,
+                    end_line=call.end_line,
+                    column=call.column,
+                    attribute_name=call.name,
+                    class_method_name=call.class_method_name,
+                    class_method_span=call.class_method_span,
+                    lambda_span=call.lambda_span,
+                )
+            )
             continue
         effect_name, targets, via_alias, is_dynamic = _resolve_callable_binding(
             graph,
@@ -498,7 +569,14 @@ def _resolve_calls(
                     effect_name=effect_name,
                     target_definition_ids=targets,
                     via_alias=via_alias,
-                    dynamic_code=("dynamic_effect_call" if is_dynamic else None),
+                    dynamic_code=(
+                        "dynamic_effect_call"
+                        if is_dynamic or call.uncertain_assignment
+                        else None
+                    ),
+                    class_method_name=call.class_method_name,
+                    class_method_span=call.class_method_span,
+                    lambda_span=call.lambda_span,
                 )
             )
     return resolved
@@ -759,6 +837,29 @@ def _helper_violations(
     return violations
 
 
+def _mark_effectful_class_attribute_calls(
+    calls: list[_ResolvedCall],
+    summaries: dict[int, tuple[str, ...]],
+) -> list[_ResolvedCall]:
+    effectful_method_names = {
+        call.class_method_name.rsplit(".", 1)[-1]
+        for call in calls
+        if call.class_method_name is not None
+        and _materialize_effects([call], summaries, limit=1)
+    }
+    return [
+        replace(
+            call,
+            effect_name=_DYNAMIC_EFFECT_MARKER,
+            dynamic_code="dynamic_effect_call",
+        )
+        if call.class_method_name is None
+        and call.attribute_name in effectful_method_names
+        else call
+        for call in calls
+    ]
+
+
 def _call_contract_violations(
     graph: _DefinitionGraph,
     analyses: dict[int, _DefinitionAnalysis],
@@ -780,16 +881,79 @@ def _call_contract_violations(
         calls.extend(analyses[definition_id].calls)
 
     violations: list[ProgramContractViolation] = []
+    class_calls: dict[tuple[str, tuple[int, int]], list[_ResolvedCall]] = {}
+    lambda_calls: dict[tuple[int, int], list[_ResolvedCall]] = {}
     for call in calls:
+        if call.class_method_name is not None and call.class_method_span is not None:
+            class_calls.setdefault(
+                (call.class_method_name, call.class_method_span), []
+            ).append(call)
+        if call.lambda_span is not None:
+            lambda_calls.setdefault(call.lambda_span, []).append(call)
+
+    for (helper_name, span), helper_calls in sorted(class_calls.items()):
+        effects = _materialize_effects(
+            helper_calls,
+            summaries,
+            limit=_EFFECT_SUMMARY_LIMIT,
+        )
+        if effects:
+            violations.append(
+                _build_violation(
+                    code="effectful_helper",
+                    message=(
+                        f"Class method '{helper_name}' can execute a robot side "
+                        "effect; class definitions are not Capsule-safe"
+                    ),
+                    start_line=span[0],
+                    end_line=span[1],
+                    regions=regions,
+                    groups=groups,
+                    side_effects=effects,
+                    helper_name=helper_name,
+                )
+            )
+
+    for span, contextual_calls in sorted(lambda_calls.items()):
+        effects = _materialize_effects(
+            contextual_calls,
+            summaries,
+            limit=_EFFECT_SUMMARY_LIMIT,
+        )
+        if effects:
+            violations.append(
+                _build_violation(
+                    code="dynamic_effect_call",
+                    message=(
+                        "An invoked or passed lambda can execute robot side "
+                        "effects; use explicit top-level public API calls"
+                    ),
+                    start_line=span[0],
+                    end_line=span[1],
+                    regions=regions,
+                    groups=groups,
+                    side_effects=effects,
+                )
+            )
+
+    for call in calls:
+        if call.class_method_name is not None or call.lambda_span is not None:
+            continue
         effects = _materialize_effects([call], summaries, limit=_EFFECT_SUMMARY_LIMIT)
         if call.dynamic_code is not None:
+            message = (
+                "Callable/private runtime introspection is forbidden in Capsule "
+                "programs; use only the documented public API functions directly"
+                if call.dynamic_code == "forbidden_runtime_access"
+                else (
+                    "Dynamic runtime access can bypass Capsule tracing and "
+                    "side-effect guards"
+                )
+            )
             violations.append(
                 _build_violation(
                     code=call.dynamic_code,
-                    message=(
-                        "Dynamic runtime access can bypass Capsule tracing and "
-                        "side-effect guards"
-                    ),
+                    message=message,
                     start_line=call.line,
                     end_line=call.end_line,
                     regions=regions,
@@ -1000,6 +1164,9 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
         self.calls: list[_CallOccurrence] = []
         self._dynamic_positions: set[tuple[int, int, str]] = set()
         self._class_local_callable_names: list[set[str]] = []
+        self._class_names: list[str] = []
+        self._active_class_methods: list[tuple[str, tuple[int, int]]] = []
+        self._active_lambda_spans: list[tuple[int, int]] = []
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._visit_definition_time_expressions(node)
@@ -1017,13 +1184,25 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
             for definition in _collect_scope_function_definitions(node.body)
         )
         self._class_local_callable_names.append(local_names)
+        self._class_names.append(node.name)
         for expression in sorted(
             [*node.decorator_list, *node.bases, *(item.value for item in node.keywords)],
             key=_source_position,
         ):
             self.visit(expression)
         for statement in node.body:
-            self.visit(statement)
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self._visit_definition_time_expressions(statement)
+                method_name = ".".join([*self._class_names, statement.name])
+                self._active_class_methods.append(
+                    (method_name, _node_span(statement))
+                )
+                for method_statement in statement.body:
+                    self.visit(method_statement)
+                self._active_class_methods.pop()
+            else:
+                self.visit(statement)
+        self._class_names.pop()
         self._class_local_callable_names.pop()
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
@@ -1035,9 +1214,13 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         for argument in node.args:
-            self.visit(argument)
+            self._visit_call_argument(argument)
         for keyword in node.keywords:
-            self.visit(keyword.value)
+            self._visit_call_argument(keyword.value)
+
+        if isinstance(node.func, ast.Lambda):
+            self._visit_effectful_lambda_context(node.func)
+            return
 
         if (
             isinstance(node.func, ast.Name)
@@ -1059,12 +1242,52 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
             self.calls.append(
                 _CallOccurrence(
                     name=name,
-                    is_direct_name=isinstance(node.func, ast.Name),
+                    is_direct_name=_is_direct_callable_reference(node.func),
                     line=node.lineno,
                     end_line=int(node.end_lineno or node.lineno),
                     column=node.col_offset,
+                    class_method_name=self._current_class_method_name(),
+                    class_method_span=self._current_class_method_span(),
+                    lambda_span=self._current_lambda_span(),
                 )
             )
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if any(
+            not _assignment_target_is_precise(target, node.value)
+            for target in node.targets
+        ):
+            for candidate in ast.walk(node.value):
+                if not isinstance(candidate, ast.Name) or not isinstance(
+                    candidate.ctx, ast.Load
+                ):
+                    continue
+                self.calls.append(
+                    _CallOccurrence(
+                        name=candidate.id,
+                        is_direct_name=True,
+                        line=node.lineno,
+                        end_line=int(node.end_lineno or node.lineno),
+                        column=node.col_offset,
+                        class_method_name=self._current_class_method_name(),
+                        class_method_span=self._current_class_method_span(),
+                        lambda_span=self._current_lambda_span(),
+                        uncertain_assignment=True,
+                    )
+                )
+        self.visit(node.value)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        if any(alias.name.split(".", 1)[0] in _INTROSPECTION_MODULES for alias in node.names):
+            self._record_dynamic(node, "forbidden_runtime_access")
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if (node.module or "").split(".", 1)[0] in _INTROSPECTION_MODULES:
+            self._record_dynamic(node, "forbidden_runtime_access")
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load) and node.id in _INTROSPECTION_MODULES:
+            self._record_dynamic(node, "forbidden_runtime_access")
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
         if _is_dynamic_runtime_subscript(node):
@@ -1074,10 +1297,22 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        if node.attr == "__wrapped__":
+        if node.attr in _SENSITIVE_RUNTIME_ATTRIBUTES:
             self._record_dynamic(node, "forbidden_runtime_access")
             return
         self.generic_visit(node)
+
+    def _visit_call_argument(self, node: ast.expr) -> None:
+        if isinstance(node, ast.Lambda):
+            self._visit_effectful_lambda_context(node)
+        else:
+            self.visit(node)
+
+    def _visit_effectful_lambda_context(self, node: ast.Lambda) -> None:
+        self.visit_Lambda(node)
+        self._active_lambda_spans.append(_node_span(node))
+        self.visit(node.body)
+        self._active_lambda_spans.pop()
 
     def _record_dynamic(self, node: ast.AST, code: str) -> None:
         line = int(getattr(node, "lineno", 1))
@@ -1094,8 +1329,20 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
                 end_line=int(getattr(node, "end_lineno", line) or line),
                 column=column,
                 dynamic_code=code,
+                class_method_name=self._current_class_method_name(),
+                class_method_span=self._current_class_method_span(),
+                lambda_span=self._current_lambda_span(),
             )
         )
+
+    def _current_class_method_name(self) -> str | None:
+        return self._active_class_methods[-1][0] if self._active_class_methods else None
+
+    def _current_class_method_span(self) -> tuple[int, int] | None:
+        return self._active_class_methods[-1][1] if self._active_class_methods else None
+
+    def _current_lambda_span(self) -> tuple[int, int] | None:
+        return self._active_lambda_spans[-1] if self._active_lambda_spans else None
 
     def _visit_definition_time_expressions(self, node: _FunctionNode) -> None:
         expressions: list[ast.expr] = [
@@ -1124,24 +1371,74 @@ class _ExecutableCallVisitor(ast.NodeVisitor):
             self.visit(expression)
 
 
-_FORBIDDEN_RUNTIME_CALLS = {"globals", "locals", "eval", "exec", "getattr"}
+def _assignment_target_is_precise(target: ast.expr, value: ast.expr) -> bool:
+    if isinstance(target, ast.Name):
+        return True
+    if isinstance(target, ast.Starred):
+        return False
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return (
+            isinstance(value, (ast.Tuple, ast.List))
+            and len(target.elts) == len(value.elts)
+            and all(
+                _assignment_target_is_precise(nested_target, nested_value)
+                for nested_target, nested_value in zip(
+                    target.elts,
+                    value.elts,
+                    strict=True,
+                )
+            )
+        )
+    return False
+
+
+_FORBIDDEN_RUNTIME_CALLS = {
+    "globals",
+    "locals",
+    "eval",
+    "exec",
+    "getattr",
+    "vars",
+    "dir",
+}
+_INTROSPECTION_MODULES = {"inspect", "gc", "builtins", "__builtins__"}
+_SENSITIVE_RUNTIME_ATTRIBUTES = {
+    "__wrapped__",
+    "__closure__",
+    "cell_contents",
+    "__globals__",
+    "__self__",
+    "__func__",
+    "__code__",
+    "__dict__",
+    "__getattribute__",
+}
 
 
 def _dynamic_call_code(node: ast.AST) -> str | None:
     if isinstance(node, ast.Name) and node.id in _FORBIDDEN_RUNTIME_CALLS:
         return "forbidden_runtime_access"
     if isinstance(node, ast.Attribute):
-        if node.attr == "__wrapped__":
+        if node.attr in _SENSITIVE_RUNTIME_ATTRIBUTES:
+            return "forbidden_runtime_access"
+        if _root_name(node) in _INTROSPECTION_MODULES:
             return "forbidden_runtime_access"
         if _contains_dynamic_runtime_root(node.value):
             return "dynamic_effect_call"
-    if isinstance(node, ast.Subscript) and _is_dynamic_runtime_subscript(node):
+    if isinstance(node, ast.Subscript):
         return "dynamic_effect_call"
     if isinstance(node, ast.Call):
         inner_name = _callable_name(node.func)
         if inner_name in _FORBIDDEN_RUNTIME_CALLS:
             return "dynamic_effect_call"
     return None
+
+
+def _root_name(node: ast.AST) -> str | None:
+    current = node
+    while isinstance(current, (ast.Attribute, ast.Subscript)):
+        current = current.value
+    return current.id if isinstance(current, ast.Name) else None
 
 
 def _is_dynamic_runtime_subscript(node: ast.Subscript) -> bool:
@@ -1266,9 +1563,17 @@ def _node_span(node: ast.AST) -> tuple[int, int]:
 def _callable_name(node: ast.AST) -> str | None:
     if isinstance(node, ast.Name):
         return node.id
+    if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+        return node.target.id
     if isinstance(node, ast.Attribute):
         return node.attr
     return None
+
+
+def _is_direct_callable_reference(node: ast.AST) -> bool:
+    return isinstance(node, ast.Name) or (
+        isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name)
+    )
 
 
 def _ordered_unique(values: Iterable[int]) -> list[int]:
