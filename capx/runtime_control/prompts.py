@@ -14,6 +14,14 @@ _CONTRACT_SAFETY_MIN_CHARS = 256
 _CONTRACT_TEXT_MAX_CHARS = 640
 _CONTRACT_ID_MAX_CHARS = 160
 _CONTRACT_LIST_MAX_ITEMS = 6
+_COMPACT_UNIT_MAX_ITEMS_BY_PHASE = (64, 16, 6, 3)
+_COMPACT_UNIT_MAX_CHARS_BY_PHASE = (8000, 3200, 1400, 700)
+_COMPACT_UNIT_LIST_MAX_ITEMS = 4
+_COMPACT_UNIT_ID_MAX_CHARS = 120
+_COMPACT_UNIT_TEXT_MAX_CHARS = 80
+_COMPACT_LEDGER_MAX_ITEMS_BY_PHASE = (32, 12, 4, 2)
+_COMPACT_LEDGER_ITEM_MAX_CHARS_BY_PHASE = (120, 100, 80, 64)
+_COMPACT_LEDGER_MAX_CHARS_BY_PHASE = (4000, 1600, 800, 512)
 _HISTORY_INSPECT_MAX_VARIABLES = 8
 _HISTORY_INSPECT_MAX_NAME_CHARS = 80
 _HISTORY_INSPECT_MAX_TEXT_CHARS = 200
@@ -142,6 +150,7 @@ def build_capsule_prompt(
         source_preview_chars=source_preview_chars,
         focused_source_max_units=focused_source_max_units,
         history_inspect_max_chars=_HISTORY_INSPECT_MAX_SERIALIZED_CHARS,
+        compact_phase=0,
         recovery_guidance=recovery_guidance,
         allowed_actions_text=allowed_actions_text,
         recovery_example_line=recovery_example_line,
@@ -172,6 +181,7 @@ def build_capsule_prompt(
             source_preview_chars=min(source_preview_chars, 80),
             focused_source_max_units=0,
             history_inspect_max_chars=_HISTORY_INSPECT_FALLBACK_SERIALIZED_CHARS,
+            compact_phase=1,
             recovery_guidance=recovery_guidance,
             allowed_actions_text=allowed_actions_text,
             recovery_example_line=recovery_example_line,
@@ -207,6 +217,7 @@ def build_capsule_prompt(
             source_preview_chars=0,
             focused_source_max_units=0,
             history_inspect_max_chars=_HISTORY_INSPECT_MINIMAL_SERIALIZED_CHARS,
+            compact_phase=2,
             recovery_guidance=recovery_guidance,
             allowed_actions_text=allowed_actions_text,
             recovery_example_line=recovery_example_line,
@@ -238,6 +249,7 @@ def build_capsule_prompt(
             source_preview_chars=0,
             focused_source_max_units=0,
             history_inspect_max_chars=0,
+            compact_phase=3,
             recovery_guidance=recovery_guidance,
             allowed_actions_text=allowed_actions_text,
             recovery_example_line=recovery_example_line,
@@ -271,6 +283,7 @@ def _build_capsule_prompt_text(
     source_preview_chars: int,
     focused_source_max_units: int,
     history_inspect_max_chars: int,
+    compact_phase: int,
     recovery_guidance: str,
     allowed_actions_text: str,
     recovery_example_line: str,
@@ -279,11 +292,11 @@ def _build_capsule_prompt_text(
     run_region_example_id: str,
 ) -> str:
     if compact_context:
-        region_data = [
+        region_units = [
             _compact_region_for_prompt(region, source_preview_chars=source_preview_chars)
             for region in regions
         ]
-        group_data = [
+        group_units = [
             _compact_group_for_prompt(group, source_preview_chars=source_preview_chars)
             for group in groups or []
         ]
@@ -304,8 +317,8 @@ def _build_capsule_prompt_text(
         history_heading = "Recent runtime history summary"
         trace_heading = "Recent primitive call trace summary"
     else:
-        region_data = [region.to_dict() for region in regions]
-        group_data = [group.to_dict() for group in groups or []]
+        region_units = [region.to_dict() for region in regions]
+        group_units = [group.to_dict() for group in groups or []]
         history_data = history[-8:]
         trace_data = trace_summary
         focused_source_data = []
@@ -314,16 +327,48 @@ def _build_capsule_prompt_text(
         history_heading = "Recent runtime history"
         trace_heading = "Primitive call trace summary"
 
-    region_data = _annotate_execution_state_for_prompt(
-        region_data,
+    region_units = _annotate_execution_state_for_prompt(
+        region_units,
         id_key="region_id",
         executed_ids=set(side_effect_ledger["executed_side_effect_regions"]),
     )
-    group_data = _annotate_execution_state_for_prompt(
-        group_data,
+    group_units = _annotate_execution_state_for_prompt(
+        group_units,
         id_key="group_id",
         executed_ids=set(side_effect_ledger["executed_side_effect_groups"]),
     )
+    ledger_data = side_effect_ledger
+    if compact_context:
+        phase_index = min(compact_phase, len(_COMPACT_UNIT_MAX_ITEMS_BY_PHASE) - 1)
+        unit_max_items = _COMPACT_UNIT_MAX_ITEMS_BY_PHASE[phase_index]
+        unit_max_chars = _COMPACT_UNIT_MAX_CHARS_BY_PHASE[phase_index]
+        region_data = _compact_unit_envelope(
+            region_units,
+            id_key="region_id",
+            history=history,
+            example_unit_id=run_region_example_id,
+            executed_ids=set(side_effect_ledger["executed_side_effect_regions"]),
+            max_items=unit_max_items,
+            max_chars=unit_max_chars,
+        )
+        group_data = _compact_unit_envelope(
+            group_units,
+            id_key="group_id",
+            history=history,
+            example_unit_id=run_group_example_id,
+            executed_ids=set(side_effect_ledger["executed_side_effect_groups"]),
+            max_items=unit_max_items,
+            max_chars=unit_max_chars,
+        )
+        ledger_data = _compact_side_effect_ledger(
+            side_effect_ledger,
+            max_items=_COMPACT_LEDGER_MAX_ITEMS_BY_PHASE[phase_index],
+            item_max_chars=_COMPACT_LEDGER_ITEM_MAX_CHARS_BY_PHASE[phase_index],
+            max_chars=_COMPACT_LEDGER_MAX_CHARS_BY_PHASE[phase_index],
+        )
+    else:
+        region_data = region_units
+        group_data = group_units
     group_text = ""
     if group_data:
         group_text = f"{group_heading}:\n{json.dumps(group_data, indent=2, default=str)}\n\n"
@@ -352,7 +397,7 @@ def _build_capsule_prompt_text(
         f"{trace_heading}:\n"
         f"{json.dumps(trace_data, indent=2, default=str)}\n\n"
         "Side-effect execution ledger:\n"
-        f"{json.dumps(side_effect_ledger, indent=2, default=str)}\n\n"
+        f"{json.dumps(ledger_data, indent=2, default=str)}\n\n"
         f"{contract_violation_text}"
         f"{focused_source_text}"
         "Choose exactly one runtime-control action. These actions control source-code "
@@ -793,12 +838,223 @@ def _compact_group_for_prompt(
         "group_id": group.group_id,
         "source_span": {"start_line": group.start_line, "end_line": group.end_line},
         "source_preview": _source_preview(group.source, max_chars=source_preview_chars),
-        "region_ids": list(group.region_ids),
-        "primitive_calls": list(group.primitive_calls),
-        "defined_names": list(group.defined_names),
-        "used_names": list(group.used_names),
+        "region_ids": _bound_compact_unit_string_list(group.region_ids),
+        "primitive_calls": _bound_compact_unit_string_list(group.primitive_calls),
+        "defined_names": _bound_compact_unit_string_list(group.defined_names),
+        "used_names": _bound_compact_unit_string_list(group.used_names),
         "has_robot_side_effect": group.has_robot_side_effect,
     }
+
+
+def _bound_compact_unit_string_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [
+        _truncate_contract_text(item, max_chars=_COMPACT_UNIT_TEXT_MAX_CHARS)
+        for item in value[:_COMPACT_UNIT_LIST_MAX_ITEMS]
+    ]
+
+
+def _compact_unit_envelope(
+    units: list[dict[str, Any]],
+    *,
+    id_key: str,
+    history: list[dict[str, Any]],
+    example_unit_id: str,
+    executed_ids: set[str],
+    max_items: int,
+    max_chars: int,
+) -> dict[str, Any] | None:
+    if not units:
+        return None
+    total_count = len(units)
+    selected: list[dict[str, Any]] = []
+    for unit in _prioritized_compact_units(
+        units,
+        id_key=id_key,
+        history=history,
+        example_unit_id=example_unit_id,
+        executed_ids=executed_ids,
+    ):
+        if len(selected) >= max_items:
+            break
+        bounded_unit = _bound_compact_unit(unit, id_key=id_key)
+        candidate_units = [*selected, bounded_unit]
+        candidate = _compact_unit_envelope_data(total_count, candidate_units)
+        if len(json.dumps(candidate, indent=2, default=str)) > max_chars:
+            minimal_unit = _minimal_compact_unit(unit, id_key=id_key)
+            candidate_units = [*selected, minimal_unit]
+            candidate = _compact_unit_envelope_data(total_count, candidate_units)
+            if len(json.dumps(candidate, indent=2, default=str)) > max_chars:
+                continue
+        selected = candidate_units
+    return _compact_unit_envelope_data(total_count, selected)
+
+
+def _compact_unit_envelope_data(
+    total_count: int,
+    units: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "total_count": total_count,
+        "units": units,
+        "omitted_count": total_count - len(units),
+    }
+
+
+def _prioritized_compact_units(
+    units: list[dict[str, Any]],
+    *,
+    id_key: str,
+    history: list[dict[str, Any]],
+    example_unit_id: str,
+    executed_ids: set[str],
+) -> list[dict[str, Any]]:
+    unit_by_id: dict[str, dict[str, Any]] = {}
+    for unit in units:
+        unit_id = unit.get(id_key)
+        if isinstance(unit_id, str) and unit_id not in unit_by_id:
+            unit_by_id[unit_id] = unit
+
+    priority_ids: list[str] = []
+    for entry in reversed(history):
+        event = entry.get("event") if isinstance(entry.get("event"), dict) else {}
+        feedback = entry.get("feedback") if isinstance(entry.get("feedback"), dict) else {}
+        if (feedback.get("status") or event.get("status")) not in {"failed", "invalid"}:
+            continue
+        action = entry.get("action") if isinstance(entry.get("action"), dict) else {}
+        unit_id = _action_unit_id(action, event, feedback)
+        if isinstance(unit_id, str):
+            priority_ids.append(unit_id)
+    priority_ids.append(example_unit_id)
+    priority_ids.extend(sorted(executed_ids & unit_by_id.keys()))
+
+    source_order = sorted(
+        units,
+        key=lambda unit: _compact_unit_source_key(unit, id_key=id_key),
+    )
+    priority_ids.extend(unit[id_key] for unit in source_order if isinstance(unit.get(id_key), str))
+
+    prioritized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for unit_id in priority_ids:
+        unit = unit_by_id.get(unit_id)
+        if unit is None or unit_id in seen:
+            continue
+        prioritized.append(unit)
+        seen.add(unit_id)
+    return prioritized
+
+
+def _compact_unit_source_key(unit: dict[str, Any], *, id_key: str) -> tuple[int, int, str]:
+    source_span = unit.get("source_span")
+    if not isinstance(source_span, dict):
+        source_span = {}
+    start_line = source_span.get("start_line")
+    end_line = source_span.get("end_line")
+    return (
+        start_line if isinstance(start_line, int) else 2**63 - 1,
+        end_line if isinstance(end_line, int) else 2**63 - 1,
+        str(unit.get(id_key, "")),
+    )
+
+
+def _bound_compact_unit(unit: dict[str, Any], *, id_key: str) -> dict[str, Any]:
+    bounded = {
+        id_key: _truncate_contract_text(
+            unit.get(id_key),
+            max_chars=_COMPACT_UNIT_ID_MAX_CHARS,
+        ),
+        "source_span": unit.get("source_span"),
+    }
+    source_preview = unit.get("source_preview")
+    if isinstance(source_preview, str):
+        bounded["source_preview"] = _truncate_contract_text(
+            source_preview,
+            max_chars=_COMPACT_UNIT_TEXT_MAX_CHARS,
+        )
+    for key in ("region_ids", "primitive_calls", "defined_names", "used_names"):
+        if key in unit:
+            bounded[key] = _bound_compact_unit_string_list(unit[key])
+    if "has_robot_side_effect" in unit:
+        bounded["has_robot_side_effect"] = unit["has_robot_side_effect"] is True
+    for key in ("unit_id", "execution_state", "recovery_required"):
+        value = unit.get(key)
+        if isinstance(value, str):
+            bounded[key] = _truncate_contract_text(
+                value,
+                max_chars=_COMPACT_UNIT_ID_MAX_CHARS,
+            )
+    for key in ("run_allowed", "patch_allowed"):
+        if isinstance(unit.get(key), bool):
+            bounded[key] = unit[key]
+    return bounded
+
+
+def _minimal_compact_unit(unit: dict[str, Any], *, id_key: str) -> dict[str, Any]:
+    minimal = {
+        id_key: _truncate_contract_text(
+            unit.get(id_key),
+            max_chars=_COMPACT_UNIT_ID_MAX_CHARS,
+        )
+    }
+    for key in ("unit_id", "execution_state", "recovery_required"):
+        value = unit.get(key)
+        if isinstance(value, str):
+            minimal[key] = _truncate_contract_text(
+                value,
+                max_chars=_COMPACT_UNIT_ID_MAX_CHARS,
+            )
+    for key in ("run_allowed", "patch_allowed"):
+        if isinstance(unit.get(key), bool):
+            minimal[key] = unit[key]
+    return minimal
+
+
+def _compact_side_effect_ledger(
+    side_effect_ledger: dict[str, list[str]],
+    *,
+    max_items: int,
+    item_max_chars: int,
+    max_chars: int,
+) -> dict[str, Any]:
+    item_limit = max_items
+    char_limit = item_max_chars
+    while True:
+        compact = _side_effect_ledger_with_limits(
+            side_effect_ledger,
+            max_items=item_limit,
+            item_max_chars=char_limit,
+        )
+        if len(json.dumps(compact, indent=2, default=str)) <= max_chars:
+            return compact
+        if item_limit > 1:
+            item_limit -= 1
+            continue
+        if char_limit > 8:
+            char_limit = max(8, char_limit // 2)
+            continue
+        return compact
+
+
+def _side_effect_ledger_with_limits(
+    side_effect_ledger: dict[str, list[str]],
+    *,
+    max_items: int,
+    item_max_chars: int,
+) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in ("executed_side_effect_groups", "executed_side_effect_regions"):
+        values = side_effect_ledger[key]
+        selected = [
+            _truncate_contract_text(value, max_chars=item_max_chars) for value in values[:max_items]
+        ]
+        compact[key] = selected
+        omitted_count = len(values) - len(selected)
+        if omitted_count:
+            compact[f"{key}_total_count"] = len(values)
+            compact[f"{key}_omitted_count"] = omitted_count
+    return compact
 
 
 def _normalize_side_effect_ledger(

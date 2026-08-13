@@ -229,6 +229,11 @@ def _json_string_payload(value: str) -> str:
     return json.dumps(value)[1:-1]
 
 
+def _prompt_json_section(text: str, heading: str, next_heading: str) -> dict:
+    section = text.split(f"{heading}:\n", 1)[1].split(f"\n\n{next_heading}:", 1)[0]
+    return json.loads(section)
+
+
 def test_capsule_prompt_compact_context_omits_full_region_and_group_source():
     long_region_source = "x = 1\n" + "\n".join(f"value_{idx} = {idx}" for idx in range(80))
     long_group_source = long_region_source + "\nmove_to(value_79)"
@@ -1067,6 +1072,131 @@ def test_capsule_prompt_dynamically_bounds_contract_context_with_strict_constrai
     assert '"code": "effectful_helper_0_' in text
     assert "Strict Python subset" in text
     assert "before running any robot effects" in text
+
+
+def test_capsule_prompt_bounds_aggregate_compact_region_units():
+    regions = [
+        CodeRegion(
+            region_id=f"region_{index}",
+            start_line=index + 1,
+            end_line=index + 1,
+            source=f"value_{index} = {index}",
+        )
+        for index in range(1000)
+    ]
+    history = [
+        {
+            "step_id": 1,
+            "action": {"action": "run_region", "args": {"region_id": "region_997"}},
+            "event": {"status": "failed", "region_id": "region_997"},
+        }
+    ]
+
+    prompt = build_capsule_prompt(
+        task="close the gripper",
+        regions=regions,
+        history=history,
+        trace_summary={},
+        contract_violations=[
+            {
+                "code": "effectful_helper",
+                "message": "repair before running robot effects",
+            }
+        ],
+        side_effect_ledger={"executed_side_effect_regions": ["region_998"]},
+        strict_subset=True,
+        compact_context=True,
+        prompt_char_budget=6500,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+    serialized = json.dumps(prompt, default=str)
+    region_envelope = _prompt_json_section(
+        text,
+        "Compact generated code regions",
+        "Recent runtime history summary",
+    )
+    region_ids = [unit["region_id"] for unit in region_envelope["units"]]
+
+    assert len(serialized) <= 6500
+    assert region_envelope["total_count"] == 1000
+    assert region_envelope["omitted_count"] > 0
+    assert region_ids[:3] == ["region_997", "region_0", "region_998"]
+    assert "Side-effect execution ledger" in text
+    assert "Capsule-ready program contract violations" in text
+    assert "before running any robot effects" in text
+    assert "Strict Python subset" in text
+
+
+def test_capsule_prompt_bounds_groups_and_large_side_effect_ledger():
+    long_name = "payload_" + "X" * 500
+    groups = [
+        CodeRegionGroup(
+            group_id=f"group_{index}",
+            start_line=index + 1,
+            end_line=index + 1,
+            source=f"value_{index} = {index}",
+            region_ids=[f"region_{index}_{item}_{long_name}" for item in range(20)],
+            primitive_calls=[f"primitive_{item}_{long_name}" for item in range(20)],
+            defined_names=[f"defined_{item}_{long_name}" for item in range(20)],
+            used_names=[f"used_{item}_{long_name}" for item in range(20)],
+            has_robot_side_effect=True,
+        )
+        for index in range(1000)
+    ]
+    history = [
+        {
+            "step_id": 1,
+            "action": {"action": "run_group", "args": {"group_id": "group_997"}},
+            "feedback": {"status": "invalid", "region_id": "group_997"},
+        }
+    ]
+    executed_groups = ["group_998", *[f"zz_executed_{index}_{long_name}" for index in range(999)]]
+    executed_regions = [f"zz_region_{index}_{long_name}" for index in range(1000)]
+
+    prompt = build_capsule_prompt(
+        task="close the gripper",
+        regions=[CodeRegion(region_id="region_0", start_line=1, end_line=1, source="x = 1")],
+        groups=groups,
+        history=history,
+        trace_summary={},
+        contract_violations=[
+            {
+                "code": "effectful_helper",
+                "message": "repair before running robot effects",
+            }
+        ],
+        side_effect_ledger={
+            "executed_side_effect_groups": executed_groups,
+            "executed_side_effect_regions": executed_regions,
+        },
+        strict_subset=True,
+        compact_context=True,
+        prompt_char_budget=6500,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+    serialized = json.dumps(prompt, default=str)
+    group_envelope = _prompt_json_section(
+        text,
+        "Compact effect-bounded execution units (preferred run_group targets)",
+        "Compact generated code regions",
+    )
+    group_ids = [unit["group_id"] for unit in group_envelope["units"]]
+    executed_group = next(unit for unit in group_envelope["units"] if unit["group_id"] == "group_998")
+
+    assert len(serialized) <= 6500
+    assert group_envelope["total_count"] == 1000
+    assert group_envelope["omitted_count"] > 0
+    assert group_ids[:3] == ["group_997", "group_0", "group_998"]
+    assert executed_group["unit_id"] == "group_998"
+    assert executed_group["run_allowed"] is False
+    assert '"executed_side_effect_groups_total_count": 1000' in text
+    assert '"executed_side_effect_groups_omitted_count":' in text
+    assert "X" * 300 not in serialized
+    assert "Capsule-ready program contract violations" in text
+    assert "before running any robot effects" in text
+    assert "Strict Python subset" in text
 
 
 def test_recovery_prompt_is_local_and_bounded():
