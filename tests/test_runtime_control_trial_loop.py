@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -616,6 +617,80 @@ def test_sanitize_capsule_visual_prompt_removes_unstructured_base64_payload():
     assert "base64," not in serialized
 
 
+@pytest.mark.parametrize(
+    "unsafe_data_url",
+    [
+        "data:image/png;base64,U0VD-UkVU",
+        "DATA:IMAGE/PNG;BASE64,U0VDUkVU",
+        "data:image/png;base64,U0VD \n UkVU",
+        "data:image/png;base64,U0VD$UkVU",
+    ],
+)
+def test_sanitize_capsule_visual_prompt_fail_closes_malformed_data_urls(
+    unsafe_data_url,
+):
+    prompt = [{"role": "user", "content": f"before {unsafe_data_url} after"}]
+
+    sanitized = _sanitize_multimodal_prompt(prompt, {})
+
+    serialized = json.dumps(sanitized)
+    assert "U0VD" not in serialized
+    assert "UkVU" not in serialized
+    assert "data:" not in serialized.lower()
+    assert "base64," not in serialized.lower()
+
+
+def test_sanitize_capsule_visual_prompt_recurses_tuples_and_rejects_unsafe_paths():
+    records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=False)
+    record = records[0]
+    prompt = (
+        {
+            "role": "user",
+            "content": (
+                {"type": "image_url", "image_url": {"url": record.data_url}},
+                ("data:image/png;base64,U0VDUkVU",),
+            ),
+        },
+    )
+
+    sanitized = _sanitize_multimodal_prompt(
+        prompt,
+        {record.sha256: {"path": "../secret.png", "camera": "main"}},
+    )
+
+    assert isinstance(sanitized, list)
+    assert isinstance(sanitized[0]["content"], list)
+    assert isinstance(sanitized[0]["content"][1], list)
+    serialized = json.dumps(sanitized)
+    assert "data:" not in serialized.lower()
+    assert "base64," not in serialized.lower()
+    assert "secret.png" not in serialized
+    assert sanitized[0]["content"][0]["image_reference"]["path"] is None
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "/absolute/secret.png",
+        "../secret.png",
+        "a/../../b.png",
+        r"C:\secret.png",
+        r"\\server\share\secret.png",
+    ],
+)
+def test_sanitize_capsule_visual_prompt_omits_unsafe_artifact_paths(unsafe_path):
+    records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=False)
+    record = records[0]
+    prompt = [{"type": "image_url", "image_url": {"url": record.data_url}}]
+
+    sanitized = _sanitize_multimodal_prompt(
+        prompt, {record.sha256: unsafe_path}
+    )
+
+    assert sanitized[0]["image_reference"]["path"] is None
+    assert unsafe_path not in json.dumps(sanitized)
+
+
 def test_sanitize_capsule_visual_prompt_identifies_legacy_main_and_wrist_labels():
     records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=True)
     prompt = [
@@ -684,6 +759,79 @@ def test_save_capsule_visuals_reports_directory_creation_failure(tmp_path):
 
     assert artifact_by_sha256 == {}
     assert errors == [{"camera": "all", "error": "save_failed"}]
+
+
+def test_save_capsule_visuals_rejects_camera_name_outside_allowlist(tmp_path):
+    records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=False)
+    unsafe_record = replace(records[0], camera="../escaped")
+
+    artifact_by_sha256, errors = _save_capsule_visuals(
+        [unsafe_record], tmp_path, trial_id=0, step_id=0
+    )
+
+    assert artifact_by_sha256 == {}
+    assert errors == [{"camera": "unknown", "error": "invalid_camera"}]
+    assert list(tmp_path.rglob("*.png")) == []
+
+
+def test_save_capsule_visuals_revalidates_public_record_before_writing(tmp_path):
+    records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=False)
+    invalid_bytes = b"not a png"
+    invalid_record = replace(
+        records[0],
+        data_url="data:image/png;base64," + base64.b64encode(invalid_bytes).decode(),
+        sha256=hashlib.sha256(invalid_bytes).hexdigest(),
+    )
+
+    artifact_by_sha256, errors = _save_capsule_visuals(
+        [invalid_record], tmp_path, trial_id=0, step_id=0
+    )
+
+    assert artifact_by_sha256 == {}
+    assert errors == [{"camera": "main", "error": "save_failed"}]
+    assert list(tmp_path.rglob("*.png")) == []
+
+
+def test_capsule_visual_rejects_data_url_with_non_token_base64_parameter():
+    records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=False)
+    record = records[0]
+    malformed = record.data_url.replace(";base64,", ";base64evil,")
+
+    with pytest.raises(ValueError, match="base64"):
+        trial_module._capsule_visual_from_payload("main", malformed, record.image)
+
+
+def test_capsule_visual_rejects_non_png_media_type():
+    records, _ = _capture_capsule_visuals(_FakeCapsuleVisualEnv(), use_wrist_camera=False)
+    record = records[0]
+    wrong_media_type = record.data_url.replace("data:image/png", "data:text/plain")
+
+    with pytest.raises(ValueError, match="PNG"):
+        trial_module._capsule_visual_from_payload(
+            "main", wrong_media_type, record.image
+        )
+
+
+def test_capsule_visual_rejects_decoded_bytes_that_are_not_png():
+    data_url = "data:image/png;base64," + base64.b64encode(b"not a png").decode()
+
+    with pytest.raises(ValueError, match="PNG"):
+        trial_module._capsule_visual_from_payload(
+            "main", data_url, Image.new("RGB", (1, 1))
+        )
+
+
+@pytest.mark.parametrize(
+    "supplied_image",
+    [Image.new("RGB", (9, 9)), Image.new("RGBA", (3, 2))],
+    ids=["dimensions", "mode"],
+)
+def test_capsule_visual_rejects_pil_metadata_mismatch(supplied_image):
+    env = _FakeCapsuleVisualEnv()
+    data_url, _ = trial_module._get_visual_feedback(env, use_wrist_camera=False)
+
+    with pytest.raises(ValueError, match="metadata"):
+        trial_module._capsule_visual_from_payload("main", data_url, supplied_image)
 
 
 def test_query_initial_code_sanitizes_initial_prompt_multimodal_artifact(

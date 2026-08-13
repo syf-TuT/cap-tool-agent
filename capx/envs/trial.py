@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import binascii
 import copy
 import gc
 import hashlib
@@ -24,7 +25,7 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import numpy as np
@@ -271,11 +272,21 @@ def _visual_payloads(value: Any) -> list[Any]:
 
 
 def _decode_image_data_url(data_url: str) -> tuple[str, bytes]:
-    header, encoded = data_url.split(",", 1)
-    if not header.startswith("data:") or ";base64" not in header:
+    if not isinstance(data_url, str) or "," not in data_url:
         raise ValueError("visual payload is not a base64 data URL")
-    media_type = header[5:].split(";", 1)[0] or "application/octet-stream"
-    return media_type, base64.b64decode(encoded, validate=True)
+    header, encoded = data_url.split(",", 1)
+    header_parts = header.split(";")
+    if not header_parts or header_parts[0].casefold() != "data:image/png":
+        raise ValueError("visual payload must use the PNG media type")
+    parameters = [parameter.casefold() for parameter in header_parts[1:]]
+    if not parameters or parameters[-1] != "base64" or parameters.count("base64") != 1:
+        raise ValueError("visual payload must use a standalone base64 parameter")
+    compact_payload = re.sub(r"\s+", "", encoded)
+    try:
+        png_bytes = base64.b64decode(compact_payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("visual payload contains invalid base64") from exc
+    return "image/png", png_bytes
 
 
 def _capsule_visual_from_payload(
@@ -286,6 +297,21 @@ def _capsule_visual_from_payload(
     if not isinstance(data_url, str) or not isinstance(image, Image.Image):
         raise ValueError("visual capture returned no image")
     _, png_bytes = _decode_image_data_url(data_url)
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as decoded_image:
+            if decoded_image.format != "PNG":
+                raise ValueError("visual payload is not a PNG")
+            decoded_image.verify()
+        with Image.open(io.BytesIO(png_bytes)) as decoded_image:
+            decoded_image.load()
+            decoded_size = decoded_image.size
+            decoded_mode = decoded_image.mode
+    except (OSError, ValueError) as exc:
+        raise ValueError("visual payload must decode to a valid PNG") from exc
+    if decoded_mode not in {"RGB", "RGBA"}:
+        raise ValueError("visual PNG must use RGB or RGBA mode")
+    if image.size != decoded_size or image.mode != decoded_mode:
+        raise ValueError("visual PNG and supplied PIL metadata do not match")
     independent_image = image.copy()
     width, height = independent_image.size
     return CapsuleVisual(
@@ -402,25 +428,34 @@ def _attach_capsule_visuals(
     return attached
 
 
-_DATA_URL_PATTERN = re.compile(
-    r"data:(?P<media>[-\w.+/]+);base64,(?P<payload>[A-Za-z0-9+/=]+)"
+_SUSPICIOUS_BINARY_TEXT = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?:data:|base64,)"
 )
 
 
 def _sanitize_text_data_urls(value: str) -> str:
-    def replacement(match: re.Match[str]) -> str:
-        try:
-            payload = base64.b64decode(match.group("payload"), validate=True)
-        except (ValueError, TypeError):
-            payload = match.group("payload").encode("utf-8")
-        digest = hashlib.sha256(payload).hexdigest()
-        return f"[image_reference sha256={digest}]"
+    match = _SUSPICIOUS_BINARY_TEXT.search(value)
+    if match is None:
+        return value
+    return f"{value[:match.start()]}[binary_payload_redacted]"
 
-    sanitized = _DATA_URL_PATTERN.sub(replacement, value)
-    if "base64," in sanitized:
-        prefix, _, _ = sanitized.partition("base64,")
-        return f"{prefix}[binary_payload_redacted]"
-    return sanitized
+
+def _safe_relative_artifact_path(value: Any) -> str | None:
+    if not isinstance(value, (str, os.PathLike)):
+        return None
+    raw_path = os.fspath(value)
+    if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+        return None
+    normalized = raw_path.replace("\\", "/")
+    if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+        return None
+    artifact_path = PurePosixPath(normalized)
+    if ".." in artifact_path.parts:
+        return None
+    canonical = artifact_path.as_posix()
+    if canonical in {"", "."} or canonical != normalized:
+        return None
+    return canonical
 
 
 def _image_reference_metadata(
@@ -448,9 +483,12 @@ def _image_reference_metadata(
     artifact = artifact_by_sha256.get(digest)
     artifact_metadata = artifact if isinstance(artifact, Mapping) else {}
     path = artifact_metadata.get("path") if artifact_metadata else artifact
+    artifact_camera = artifact_metadata.get("camera", camera)
+    if artifact_camera not in {"main", "wrist"}:
+        artifact_camera = camera if camera in {"main", "wrist"} else "unknown"
     return {
-        "camera": artifact_metadata.get("camera", camera),
-        "path": str(path).replace("\\", "/") if path is not None else None,
+        "camera": artifact_camera,
+        "path": _safe_relative_artifact_path(path),
         "width": artifact_metadata.get("width", width),
         "height": artifact_metadata.get("height", height),
         "sha256": digest,
@@ -466,7 +504,7 @@ def _sanitize_multimodal_prompt(
     artifacts = artifact_by_sha256 or {}
 
     def sanitize(value: Any, *, camera: str = "unknown") -> Any:
-        if isinstance(value, list):
+        if isinstance(value, (list, tuple)):
             sanitized_items = []
             next_camera = camera
             image_count = 0
@@ -531,11 +569,17 @@ def _save_capsule_visuals(
         return {}, [_capsule_capture_error("all", "save_failed")]
 
     for record in records:
+        if record.camera not in {"main", "wrist"}:
+            errors.append(_capsule_capture_error("unknown", "invalid_camera"))
+            continue
         relative_path = Path(visual_dir.name) / f"step_{step_id:02d}_{record.camera}.png"
         try:
+            validated_record = _capsule_visual_from_payload(
+                record.camera, record.data_url, record.image
+            )
+            if validated_record.metadata() != record.metadata():
+                raise ValueError("visual record metadata mismatch")
             _, png_bytes = _decode_image_data_url(record.data_url)
-            if hashlib.sha256(png_bytes).hexdigest() != record.sha256:
-                raise ValueError("visual payload hash mismatch")
             (output_root / relative_path).write_bytes(png_bytes)
             artifact_by_sha256[record.sha256] = relative_path.as_posix()
         except (OSError, ValueError, TypeError):
