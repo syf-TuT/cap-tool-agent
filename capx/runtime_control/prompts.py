@@ -35,6 +35,7 @@ def build_capsule_prompt(
     groups: list[CodeRegionGroup] | None = None,
     history: list[dict[str, Any]],
     trace_summary: dict[str, Any],
+    contract_violations: list[dict[str, Any]] | None = None,
     side_effect_ledger: dict[str, Any] | None = None,
     recovery_observation_functions: set[str] | None = None,
     compact_context: bool = False,
@@ -97,6 +98,7 @@ def build_capsule_prompt(
         groups=groups,
         history=history,
         trace_summary=trace_summary,
+        contract_violations=contract_violations,
         side_effect_ledger=normalized_side_effect_ledger,
         compact_context=compact_context,
         history_max_entries=history_max_entries,
@@ -117,6 +119,7 @@ def build_capsule_prompt(
             groups=groups,
             history=history,
             trace_summary=trace_summary,
+            contract_violations=contract_violations,
             side_effect_ledger=normalized_side_effect_ledger,
             compact_context=True,
             history_max_entries=min(history_max_entries, 2),
@@ -147,6 +150,7 @@ def _build_capsule_prompt_text(
     groups: list[CodeRegionGroup] | None,
     history: list[dict[str, Any]],
     trace_summary: dict[str, Any],
+    contract_violations: list[dict[str, Any]] | None,
     side_effect_ledger: dict[str, Any],
     compact_context: bool,
     history_max_entries: int,
@@ -216,6 +220,14 @@ def _build_capsule_prompt_text(
             "Focused source for recent failed or invalid units:\n"
             f"{json.dumps(focused_source_data, indent=2, default=str)}\n\n"
         )
+    contract_violation_text = ""
+    if contract_violations:
+        contract_violation_text = (
+            "Capsule-ready program contract violations:\n"
+            f"{json.dumps(contract_violations, default=str)}\n"
+            "Patch these violations before running any robot effects. Do not execute "
+            "a robot-side-effect region or group until the program contract is repaired.\n\n"
+        )
     prompt_text = (
         "Task:\n"
         f"{task}\n\n"
@@ -228,6 +240,7 @@ def _build_capsule_prompt_text(
         f"{json.dumps(trace_data, indent=2, default=str)}\n\n"
         "Side-effect execution ledger:\n"
         f"{json.dumps(side_effect_ledger, indent=2, default=str)}\n\n"
+        f"{contract_violation_text}"
         f"{focused_source_text}"
         "Choose exactly one runtime-control action. These actions control source-code "
         "execution, inspection, and local source patches. They do "

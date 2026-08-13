@@ -510,6 +510,53 @@ def test_capsule_prompt_budget_fallback_omits_large_focused_failed_source():
     assert _json_string_payload(failed_source) not in text
 
 
+def test_capsule_prompt_contract_violations_survive_compact_budget_fallback():
+    violations = [
+        {
+            "code": "effectful_helper",
+            "message": "Helper 'move_cube' can execute a robot side effect",
+            "source_span": {"start_line": 3, "end_line": 5},
+            "region_ids": ["region_2"],
+            "group_ids": ["group_1"],
+            "side_effect_calls": ["move_to"],
+            "helper_name": "move_cube",
+        }
+    ]
+
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[
+            CodeRegion(
+                region_id="region_1",
+                start_line=1,
+                end_line=1,
+                source="x = 1",
+            )
+        ],
+        history=[
+            {
+                "step_id": index,
+                "event": {"status": "failed", "message": "x" * 1000},
+            }
+            for index in range(10)
+        ],
+        trace_summary={"events": [{"name": "move_to"}] * 20},
+        contract_violations=violations,
+        compact_context=True,
+        prompt_char_budget=1,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+
+    assert "Capsule-ready program contract violations" in text
+    assert '"code": "effectful_helper"' in text
+    assert "Helper 'move_cube' can execute a robot side effect" in text
+    assert '"start_line": 3' in text
+    assert '"end_line": 5' in text
+    assert '"group_ids": ["group_1"]' in text
+    assert "before running any robot effects" in text
+
+
 def test_recovery_prompt_is_local_and_bounded():
     groups = [
         CodeRegionGroup(

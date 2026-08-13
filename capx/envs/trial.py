@@ -31,9 +31,11 @@ from capx.runtime_control import (
     CapsuleExecutor,
     CodeRegion,
     CodeRegionGroup,
+    ProgramContractViolation,
     RuntimeAction,
     RuntimeEvent,
     RuntimeTrace,
+    analyze_capsule_program_contract,
     build_capsule_prompt,
     build_runtime_feedback,
     parse_runtime_action_response,
@@ -1392,6 +1394,19 @@ def _run_capsule_llm_step_loop(
         groups = fallback_groups if use_semantic_groups else []
     region_by_id = {region.region_id: region for region in regions}
     group_by_id = {group.group_id: group for group in groups}
+    validate_program_contract = _coerce_config_bool(
+        config.get("capsule_validate_program_contract", False)
+    )
+    program_contract_violations = (
+        analyze_capsule_program_contract(
+            source,
+            regions,
+            groups,
+            side_effect_calls=side_effect_calls,
+        )
+        if validate_program_contract and initial_syntax_error is None
+        else []
+    )
     trace = RuntimeTrace()
     executor = CapsuleExecutor(
         base_globals=env._build_capsule_globals(trace=trace),
@@ -1457,6 +1472,9 @@ def _run_capsule_llm_step_loop(
                     groups=groups if use_semantic_groups else None,
                     history=history,
                     trace_summary=executor.trace.summary() if executor.trace is not None else {},
+                    contract_violations=[
+                        item.to_dict() for item in program_contract_violations
+                    ],
                     side_effect_ledger={
                         "executed_side_effect_groups": sorted(executed_side_effect_groups),
                         "executed_side_effect_regions": sorted(executed_side_effect_regions),
@@ -1505,12 +1523,24 @@ def _run_capsule_llm_step_loop(
             region_id = str(action.args.get("region_id", ""))
             group_id = str(action.args.get("group_id", ""))
             source_unit_for_feedback = region_by_id.get(region_id) or group_by_id.get(group_id)
-            event = _no_rollback_guard_event(
-                action,
-                executed_side_effect_regions,
-                executed_side_effect_groups,
-                recovery_observation_functions=recovery_observation_functions,
+            event = (
+                _program_contract_guard_event(
+                    action,
+                    program_contract_violations,
+                    region_by_id,
+                    group_by_id,
+                    side_effect_calls,
+                )
+                if validate_program_contract
+                else None
             )
+            if event is None:
+                event = _no_rollback_guard_event(
+                    action,
+                    executed_side_effect_regions,
+                    executed_side_effect_groups,
+                    recovery_observation_functions=recovery_observation_functions,
+                )
             if event is None:
                 event = _reward_drop_guard_event(
                     action,
@@ -1627,6 +1657,13 @@ def _run_capsule_llm_step_loop(
         metric["action_prompt_compact_context"] = llm_step_compact_context
         metric["action_prompt_char_budget"] = action_prompt_char_budget_metric
         metric["action_prompt_over_budget"] = action_prompt_over_budget
+        metric["program_contract_valid"] = not program_contract_violations
+        metric["program_contract_violation_count"] = len(
+            program_contract_violations
+        )
+        metric["program_contract_violation_codes"] = sorted(
+            {item.code for item in program_contract_violations}
+        )
         step_metrics.append(metric)
 
         if (
@@ -1649,6 +1686,16 @@ def _run_capsule_llm_step_loop(
             )
             region_by_id = {region.region_id: region for region in regions}
             group_by_id = {group.group_id: group for group in groups}
+            program_contract_violations = (
+                analyze_capsule_program_contract(
+                    source,
+                    regions,
+                    groups,
+                    side_effect_calls=side_effect_calls,
+                )
+                if validate_program_contract
+                else []
+            )
             if action.action == "append_recovery":
                 pending_recovery_actions = _runtime_actions_for_appended_recovery(
                     regions,
@@ -2075,6 +2122,39 @@ def _reward_drop_guard_event(
             "reward_drop_from_best": reward_drop,
             "drop_threshold": drop_threshold,
             "min_best_reward": min_best_reward,
+        },
+    )
+
+
+def _program_contract_guard_event(
+    action: RuntimeAction,
+    violations: list[ProgramContractViolation],
+    region_by_id: dict[str, CodeRegion],
+    group_by_id: dict[str, CodeRegionGroup],
+    side_effect_calls: set[str],
+) -> RuntimeEvent | None:
+    if not violations:
+        return None
+    if not _runtime_action_targets_side_effect_unit(
+        action,
+        region_by_id,
+        group_by_id,
+        side_effect_calls,
+    ):
+        return None
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=str(
+            action.args.get("group_id") or action.args.get("region_id") or ""
+        )
+        or None,
+        message=(
+            "Robot side-effect execution is blocked until the Capsule-ready "
+            "program contract is repaired."
+        ),
+        evidence={
+            "program_contract_violations": [item.to_dict() for item in violations]
         },
     )
 

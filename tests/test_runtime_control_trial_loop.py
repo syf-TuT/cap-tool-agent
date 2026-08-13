@@ -10,6 +10,7 @@ from capx.envs.trial import (
     _get_visual_differencing_feedback,
     _handle_multi_turn_step,
     _no_rollback_guard_event,
+    _program_contract_guard_event,
     _query_initial_code,
     _reward_drop_guard_event,
     _run_capsule_trial,
@@ -18,6 +19,7 @@ from capx.envs.trial import (
 )
 from capx.llm.client import ModelQueryArgs
 from capx.llm.context import get_trial_llm_context, trial_llm_context
+from capx.runtime_control.contract import ProgramContractViolation
 from capx.runtime_control.executor import CapsuleExecutor
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, RuntimeAction
 from capx.runtime_control.trace import wrap_function_for_trace
@@ -1161,6 +1163,220 @@ def test_capsule_llm_step_mode_keeps_existing_action_loop(tmp_path):
     assert summary.sandbox_rc == 0
     assert env.api.moved is True
     assert [entry["event"]["action"] for entry in trace] == ["run_group", "finish"]
+
+
+def test_capsule_llm_step_program_contract_blocks_effects_until_patch(tmp_path):
+    env = FakeCustomMoveCapsuleEnv()
+    source = (
+        "def move_cube():\n"
+        '    custom_move("blocked")\n'
+        "\n"
+        "move_cube()\n"
+    )
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "capsule_validate_program_contract": True,
+        },
+        initial_code=source,
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {
+                "action": "patch_group",
+                "args": {
+                    "group_id": "group_1",
+                    "source": 'custom_move("repaired")\n',
+                },
+            },
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    prompts = json.loads((tmp_path / "capsule_prompts_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "invalid",
+        "success",
+        "success",
+        "success",
+    ]
+    assert env.api.moves == ["repaired"]
+    assert "program_contract_violations" in trace[0]["event"]["evidence"]
+    assert trace[0]["event"]["evidence"]["program_contract_violations"][0][
+        "code"
+    ] == "effectful_helper"
+    assert metrics[0]["program_contract_valid"] is False
+    assert metrics[0]["program_contract_violation_count"] >= 1
+    assert "effectful_helper" in metrics[0]["program_contract_violation_codes"]
+    assert metrics[1]["program_contract_valid"] is False
+    assert metrics[2]["program_contract_valid"] is True
+    assert metrics[2]["program_contract_violation_count"] == 0
+    assert metrics[2]["program_contract_violation_codes"] == []
+    assert "Capsule-ready program contract violations" in str(prompts[0])
+    assert "Capsule-ready program contract violations" in str(prompts[1])
+    assert "Capsule-ready program contract violations" not in str(prompts[2])
+
+
+def test_capsule_llm_step_program_contract_flag_false_preserves_execution(tmp_path):
+    env = FakeCustomMoveCapsuleEnv()
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "capsule_validate_program_contract": False,
+        },
+        initial_code=(
+            "def move_cube():\n"
+            '    custom_move("legacy")\n'
+            "\n"
+            "move_cube()\n"
+        ),
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+
+    assert trace[0]["event"]["status"] == "success"
+    assert env.api.moves == ["legacy"]
+    assert metrics[0]["program_contract_valid"] is True
+    assert metrics[0]["program_contract_violation_count"] == 0
+    assert metrics[0]["program_contract_violation_codes"] == []
+
+
+def test_program_contract_guard_only_blocks_side_effect_execution_units():
+    violation = ProgramContractViolation(
+        code="effectful_helper",
+        message="helper is effectful",
+        start_line=1,
+        end_line=2,
+    )
+    pure_region = CodeRegion(
+        region_id="region_1",
+        start_line=1,
+        end_line=1,
+        source="x = 1\n",
+    )
+    effect_region = CodeRegion(
+        region_id="region_2",
+        start_line=2,
+        end_line=2,
+        source='custom_move("target")\n',
+    )
+    pure_group = CodeRegionGroup(
+        group_id="group_1",
+        start_line=1,
+        end_line=1,
+        source=pure_region.source,
+        region_ids=[pure_region.region_id],
+        primitive_calls=[],
+        defined_names=["x"],
+        used_names=[],
+        has_robot_side_effect=False,
+    )
+    effect_group = CodeRegionGroup(
+        group_id="group_2",
+        start_line=2,
+        end_line=2,
+        source=effect_region.source,
+        region_ids=[effect_region.region_id],
+        primitive_calls=["custom_move"],
+        defined_names=[],
+        used_names=["custom_move"],
+        has_robot_side_effect=True,
+    )
+    regions = {item.region_id: item for item in [pure_region, effect_region]}
+    groups = {item.group_id: item for item in [pure_group, effect_group]}
+
+    blocked = _program_contract_guard_event(
+        RuntimeAction("run_group", {"group_id": "group_2"}),
+        [violation],
+        regions,
+        groups,
+        {"custom_move"},
+    )
+
+    assert blocked is not None
+    assert blocked.status == "invalid"
+    assert blocked.region_id == "group_2"
+    assert blocked.evidence["program_contract_violations"] == [violation.to_dict()]
+    for action in [
+        RuntimeAction("run_group", {"group_id": "group_1"}),
+        RuntimeAction("patch_group", {"group_id": "group_2", "source": "x = 1"}),
+        RuntimeAction("inspect_trace", {}),
+        RuntimeAction("finish", {}),
+        RuntimeAction("append_recovery", {"source": "x = 1"}),
+    ]:
+        assert (
+            _program_contract_guard_event(
+                action,
+                [violation],
+                regions,
+                groups,
+                {"custom_move"},
+            )
+            is None
+        )
+
+
+def test_capsule_llm_step_reanalyzes_forced_appended_recovery(tmp_path):
+    env = FakeRewardDropCapsuleEnv()
+    recovery_source = (
+        "state = get_observation()\n"
+        "def recover():\n"
+        '    move_to("recover")\n'
+        "recover()\n"
+    )
+
+    trial_module._run_capsule_llm_step_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_validate_program_contract": True,
+        },
+        initial_code='move_to("bad")\n',
+        scripted_actions=[
+            {"action": "append_recovery", "args": {"source": recovery_source}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+
+    assert [entry["event"]["action"] for entry in trace] == [
+        "append_recovery",
+        "run_group",
+        "finish",
+    ]
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "invalid",
+        "success",
+    ]
+    assert env.api.moves == []
+    assert trace[1]["event"]["evidence"]["program_contract_violations"][0][
+        "code"
+    ] == "effectful_helper"
+    assert metrics[0]["program_contract_valid"] is True
+    assert metrics[1]["program_contract_valid"] is False
 
 
 def test_capsule_llm_step_uses_compact_action_prompt_by_default(tmp_path, monkeypatch):
