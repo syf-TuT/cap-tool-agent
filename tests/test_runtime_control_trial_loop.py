@@ -2714,6 +2714,44 @@ def test_capsule_llm_step_can_disable_compact_action_prompt(tmp_path, monkeypatc
     assert rows[0]["action_prompt_compact_context"] is False
 
 
+def test_capsule_llm_step_next_prompt_includes_accumulated_trace_summary(
+    tmp_path, monkeypatch
+):
+    live_prompts = []
+    responses = iter(
+        [
+            {"content": '{"action":"run_region","args":{"region_id":"region_1"}}'},
+            {"content": '{"action":"finish","args":{}}'},
+        ]
+    )
+
+    def fake_query_model(args, prompt):
+        live_prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    trial_module._run_capsule_loop(
+        FakeCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "use_parallel_ensemble": False,
+        },
+        initial_code='pose = get_pose("cube")\n',
+    )
+
+    next_prompt_text = live_prompts[1][1]["content"][0]["text"]
+
+    assert '"event_count": 1' in next_prompt_text
+    assert '"primitive_call_counts": {' in next_prompt_text
+    assert '"get_pose": 1' in next_prompt_text
+    assert '"name": "get_pose"' in next_prompt_text
+    assert "inspect_" "trace" not in next_prompt_text
+
+
 def test_capsule_llm_step_treats_string_false_as_non_compact_context(
     tmp_path, monkeypatch
 ):
