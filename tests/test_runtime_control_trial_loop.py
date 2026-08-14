@@ -3279,6 +3279,71 @@ def test_unexpected_candidate_analysis_error_propagates(tmp_path, monkeypatch):
     assert not (tmp_path / "capsule_trace_trial_00.json").exists()
 
 
+def test_declared_candidate_analysis_failure_is_rejected_atomically(
+    tmp_path, monkeypatch
+):
+    analysis_error_type = getattr(
+        trial_module, "_CandidateSourceAnalysisError", None
+    )
+    assert analysis_error_type is not None
+    assert issubclass(analysis_error_type, ValueError)
+
+    initial_source = "x = 1\n"
+    prompt_states = []
+    original_analyze = trial_module._analyze_capsule_source
+    original_build_prompt = trial_module.build_capsule_prompt
+
+    def raise_for_candidate(source, **kwargs):
+        if source != initial_source:
+            raise analysis_error_type(
+                "candidate segmentation limit exceeded",
+                evidence={"analysis_stage": "segment"},
+            )
+        return original_analyze(source, **kwargs)
+
+    def capture_prompt_state(*args, **kwargs):
+        prompt_states.append(
+            {
+                "groups": [group.to_dict() for group in kwargs["groups"]],
+                "ledger": copy.deepcopy(kwargs["side_effect_ledger"]),
+            }
+        )
+        return original_build_prompt(*args, **kwargs)
+
+    monkeypatch.setattr(trial_module, "_analyze_capsule_source", raise_for_candidate)
+    monkeypatch.setattr(trial_module, "build_capsule_prompt", capture_prompt_state)
+
+    summary = trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code=initial_source,
+        scripted_actions=[
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": "x = 2\n"},
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    event = trace[0]["event"]
+
+    assert event["status"] == "invalid"
+    assert event["evidence"]["edit_rejection_reason"] == "candidate_analysis_error"
+    assert event["evidence"]["exception_type"] == "_CandidateSourceAnalysisError"
+    assert event["evidence"]["analysis_stage"] == "segment"
+    assert event["evidence"]["source_revision_before"] == 0
+    assert event["evidence"]["source_revision_after"] == 0
+    assert event["evidence"]["source_edit_committed"] is False
+    assert event["evidence"]["lineage_reconciliation_status"] == "not_attempted"
+    assert trace[1]["source_revision"] == 0
+    assert prompt_states[0] == prompt_states[1]
+    assert Path(summary.code_path).read_text() == initial_source
+
+
 def test_candidate_analyzer_receives_defensive_set_and_boundary_copies(monkeypatch):
     source = "x = 1\n"
     public_api_calls = {"get_observation"}

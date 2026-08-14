@@ -1188,6 +1188,17 @@ class _PreparedSourceEdit:
     recovery_side_effect_budget: int | None
 
 
+class _CandidateSourceAnalysisError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.evidence = evidence or {}
+
+
 class _SourceEditRejection(ValueError):
     def __init__(
         self,
@@ -1243,16 +1254,25 @@ def _prepare_capsule_source_edit(
         line_delta=line_delta,
         old_line_count=old_line_count,
     )
-    candidate_analysis = _analyze_capsule_source(
-        candidate_source,
-        use_semantic_groups=use_semantic_groups,
-        max_regions_per_group=max_regions_per_group,
-        public_api_calls=set(public_api_calls),
-        side_effect_calls=set(side_effect_calls),
-        require_strict_subset=require_strict_subset,
-        validate_program_contract=validate_program_contract,
-        group_boundary_after_lines=set(candidate_boundaries),
-    )
+    try:
+        candidate_analysis = _analyze_capsule_source(
+            candidate_source,
+            use_semantic_groups=use_semantic_groups,
+            max_regions_per_group=max_regions_per_group,
+            public_api_calls=set(public_api_calls),
+            side_effect_calls=set(side_effect_calls),
+            require_strict_subset=require_strict_subset,
+            validate_program_contract=validate_program_contract,
+            group_boundary_after_lines=set(candidate_boundaries),
+        )
+    except _CandidateSourceAnalysisError as exc:
+        evidence = copy.deepcopy(exc.evidence)
+        evidence["exception_type"] = type(exc).__name__
+        raise _SourceEditRejection(
+            "candidate_analysis_error",
+            f"Candidate source analysis rejected the input: {exc}",
+            evidence=evidence,
+        ) from exc
 
     if candidate_analysis.syntax_error is not None:
         exc = candidate_analysis.syntax_error
@@ -1411,6 +1431,12 @@ def _analyze_capsule_source(
     validate_program_contract: bool,
     group_boundary_after_lines: set[int] | None = None,
 ) -> _CapsuleSourceAnalysis:
+    """Analyze source while preserving a narrow recoverable-failure contract.
+
+    Lower-level analyzers must explicitly raise ``_CandidateSourceAnalysisError``
+    for a known candidate-input domain failure. Ordinary programming exceptions
+    intentionally propagate to the caller.
+    """
     syntax_error: SyntaxError | None = None
     strict_preflight_violations: list[ProgramContractViolation] = []
     if require_strict_subset:
