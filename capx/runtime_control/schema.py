@@ -6,7 +6,6 @@ from typing import Any, Literal
 RuntimeActionName = Literal[
     "run_region",
     "run_group",
-    "inspect_trace",
     "inspect_variables",
     "patch_region",
     "patch_group",
@@ -19,7 +18,6 @@ RuntimeStatus = Literal["success", "failed", "warning", "invalid", "skipped"]
 SUPPORTED_ACTIONS: set[str] = {
     "run_region",
     "run_group",
-    "inspect_trace",
     "inspect_variables",
     "patch_region",
     "patch_group",

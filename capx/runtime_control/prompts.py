@@ -121,7 +121,6 @@ def build_capsule_prompt(
     allowed_actions = [
         "run_group",
         "run_region",
-        "inspect_trace",
         "inspect_variables",
         "patch_group",
         "patch_region",

@@ -69,6 +69,11 @@ def test_runtime_action_rejects_rollback_action():
         RuntimeAction.from_mapping({"action": "rollback_to_checkpoint", "args": {}})
 
 
+def test_runtime_action_rejects_removed_trace_inspection_action():
+    with pytest.raises(ValueError, match="Unsupported runtime action"):
+        RuntimeAction.from_mapping({"action": "inspect_" "trace", "args": {}})
+
+
 def test_runtime_event_is_jsonable():
     event = RuntimeEvent(
         action="run_region",

@@ -234,23 +234,6 @@ class FakePrivilegedCapsuleEnv(FakeGripperCapsuleEnv):
         self.cfg = SimpleNamespace(privileged=True)
 
 
-class FakeTraceFailureApi(FakeApi):
-    def functions(self):
-        functions = dict(super().functions())
-        functions["fail_primitive"] = self.fail_primitive
-        return functions
-
-    def fail_primitive(self):
-        raise RuntimeError("primitive failed")
-
-
-class FakeTraceFailureEnv(FakeIncompleteCapsuleEnv):
-    def __init__(self):
-        self.api = FakeTraceFailureApi()
-        self.low_level_env = object()
-        self._apis = {"fake": self.api}
-
-
 class FakeVideoCapsuleEnv(FakeCapsuleEnv):
     def __init__(self):
         super().__init__()
@@ -1258,7 +1241,7 @@ def test_capsule_llm_step_visual_feedback_clears_failed_camera_for_next_prompt(
     responses = iter(
         [
             {"content": "x = 1\n", "reasoning": None},
-            {"content": '{"action":"inspect_trace","args":{}}'},
+            {"content": '{"action":"inspect_variables","args":{"names":["x"]}}'},
             {"content": '{"action":"finish","args":{}}'},
         ]
     )
@@ -1438,7 +1421,7 @@ def test_capsule_llm_step_visual_feedback_can_keep_action_prompts_text_only(
     responses = iter(
         [
             {"content": "x = 1\n", "reasoning": None},
-            {"content": '{"action":"inspect_trace","args":{}}'},
+            {"content": '{"action":"inspect_variables","args":{"names":["x"]}}'},
             {"content": '{"action":"finish","args":{}}'},
         ]
     )
@@ -2355,7 +2338,7 @@ def test_program_contract_guard_only_blocks_side_effect_execution_units():
     for action in [
         RuntimeAction("run_group", {"group_id": "group_1"}),
         RuntimeAction("patch_group", {"group_id": "group_2", "source": "x = 1"}),
-        RuntimeAction("inspect_trace", {}),
+        RuntimeAction("inspect_variables", {"names": ["x"]}),
         RuntimeAction("finish", {}),
         RuntimeAction("append_recovery", {"source": "x = 1"}),
     ]:
@@ -4189,7 +4172,6 @@ def test_capsule_trial_writes_trace_and_feedback_artifact(tmp_path):
         scripted_actions=[
             {"action": "run_region", "args": {"region_id": "region_1"}},
             {"action": "run_region", "args": {"region_id": "region_2"}},
-            {"action": "inspect_trace", "args": {}},
             {"action": "finish", "args": {}},
         ],
     )
@@ -4197,42 +4179,8 @@ def test_capsule_trial_writes_trace_and_feedback_artifact(tmp_path):
     trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
     assert trace[0]["feedback"]["region_id"] == "region_1"
     assert trace[0]["trace_events"][0]["name"] == "get_pose"
-    assert trace[2]["event"]["evidence"]["recent_events"][0]["name"] == "get_pose"
-    assert trace[2]["event"]["evidence"]["event_count"] == 2
-    assert "events" not in trace[2]["event"]["evidence"]
-
-
-def test_inspect_trace_supports_last_n_and_failed_only(tmp_path):
-    _run_capsule_trial(
-        env=FakeTraceFailureEnv(),
-        trial=1,
-        args=SimpleNamespace(model="test", use_oracle_code=False),
-        config={
-            "capsule_control_mode": "llm_step",
-            "output_dir": str(tmp_path),
-            "max_capsule_steps": 4,
-            "use_parallel_ensemble": False,
-            "use_multimodel": False,
-        },
-        initial_code=(
-            'get_pose("cube")\n'
-            "fail_primitive()\n"
-        ),
-        scripted_actions=[
-            {"action": "run_region", "args": {"region_id": "region_1"}},
-            {"action": "run_region", "args": {"region_id": "region_2"}},
-            {"action": "inspect_trace", "args": {"last_n": 1, "failed_only": True}},
-            {"action": "finish", "args": {}},
-        ],
-    )
-
-    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
-    evidence = trace[2]["event"]["evidence"]
-
-    assert evidence["event_count"] == 2
-    assert evidence["failed_event_count"] == 1
-    assert [event["name"] for event in evidence["recent_events"]] == ["fail_primitive"]
-    assert evidence["recent_events"][0]["status"] == "failed"
+    assert trace[1]["trace_events"][0]["name"] == "move_to"
+    assert trace[2]["event"]["action"] == "finish"
 
 
 def test_capsule_trial_writes_step_metrics_jsonl(tmp_path):

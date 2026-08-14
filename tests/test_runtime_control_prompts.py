@@ -31,6 +31,20 @@ def test_capsule_prompt_excludes_robot_tool_list():
     assert "move_to_joints" not in text
 
 
+def test_capsule_prompt_excludes_removed_trace_inspection_action():
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=[],
+        trace_summary={"event_count": 1},
+    )
+
+    text = str(prompt)
+
+    assert "inspect_" "trace" not in text
+    assert '"event_count": 1' in text
+
+
 def test_capsule_prompt_forbids_callable_reflection_and_dynamic_access():
     prompt = build_capsule_prompt(
         task="stack cubes",
@@ -430,9 +444,9 @@ def test_capsule_prompt_compact_history_bounds_inspected_variable_summaries():
         },
         {
             "step_id": 4,
-            "action": {"action": "inspect_trace", "args": {}},
+            "action": {"action": "run_region", "args": {"region_id": "region_1"}},
             "event": {
-                "action": "inspect_trace",
+                "action": "run_region",
                 "status": "success",
                 "evidence": {"ordinary": "ORDINARY_EVIDENCE_MUST_NOT_APPEAR"},
             },
@@ -491,7 +505,7 @@ def test_compact_history_bounds_all_text_and_primitive_call_lists():
         {
             "step_id": "S" * 1000,
             "action": {
-                "action": "inspect_trace" + "X" * 1000,
+                "action": "run_region" + "X" * 1000,
                 "args": {"group_id": "G" * 1000},
             },
             "event": {

@@ -15,6 +15,10 @@ REMOVED_TRIAL_SYMBOLS = (
     "_insert_recovery_source_after_line",
 )
 
+REMOVED_TRACE_INSPECTION_TRIAL_SYMBOLS = (
+    "_runtime_trace_last_n",
+)
+
 REMOVED_PROMPT_SYMBOLS = (
     "build_capsule_recovery_prompt",
     "build_capsule_terminal_recovery_prompt",
@@ -27,10 +31,12 @@ REMOVED_PROMPT_SYMBOLS = (
 
 REMOVED_TEXT_TOKENS = (
     "append_recovery_insert_after_line",
+    "inspect_trace",
 )
 
 REMOVED_ACTIVE_REFERENCES = (
     *REMOVED_TRIAL_SYMBOLS,
+    *REMOVED_TRACE_INSPECTION_TRIAL_SYMBOLS,
     *REMOVED_PROMPT_SYMBOLS,
     *REMOVED_TEXT_TOKENS,
 )
@@ -42,6 +48,14 @@ def test_auto_forward_runtime_is_removed():
 
 def test_recovery_only_prompt_symbols_are_removed():
     assert not [name for name in REMOVED_PROMPT_SYMBOLS if hasattr(prompt_module, name)]
+
+
+def test_trace_inspection_runtime_is_removed():
+    assert not [
+        name
+        for name in REMOVED_TRACE_INSPECTION_TRIAL_SYMBOLS
+        if hasattr(trial_module, name)
+    ]
 
 
 def test_removed_runtime_symbols_have_no_active_references():

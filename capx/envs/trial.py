@@ -2123,25 +2123,6 @@ def _execute_runtime_action(
         event.action = "run_group"
         return event
 
-    if action.action == "inspect_trace":
-        last_n = _runtime_trace_last_n(action.args.get("last_n", 8))
-        failed_only = bool(action.args.get("failed_only", False))
-        return RuntimeEvent(
-            action=action.action,
-            status="success",
-            evidence=(
-                executor.trace.summary(max_events=last_n, failed_only=failed_only)
-                if executor.trace is not None
-                else {
-                    "event_count": 0,
-                    "primitive_call_counts": {},
-                    "failed_event_count": 0,
-                    "recent_events": [],
-                    "failed_events": [],
-                }
-            ),
-        )
-
     if action.action == "inspect_variables":
         names = action.args.get("names", [])
         if (
@@ -2729,14 +2710,6 @@ def _runtime_patch_replacement(args: dict[str, Any]) -> Any:
         if isinstance(replacement, str):
             return replacement
     return None
-
-
-def _runtime_trace_last_n(value: Any) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return 8
-    return max(0, min(parsed, 50))
 
 
 def _coerce_config_bool(value: Any) -> bool:
