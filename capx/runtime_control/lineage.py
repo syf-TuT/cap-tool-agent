@@ -88,12 +88,17 @@ def _validate_unique_current_ids(
 
 
 def _stable_key_suffix(stable_key: str, unit_kind: str) -> int:
-    match = re.fullmatch(rf"{unit_kind}_key_(\d{{6}})", stable_key)
+    match = re.fullmatch(rf"{unit_kind}_key_([0-9]+)", stable_key)
     if match is None:
         raise LineageAmbiguityError(
             f"{unit_kind} stable key format is invalid: {stable_key}"
         )
-    return int(match.group(1))
+    suffix = int(match.group(1))
+    if suffix <= 0 or stable_key != f"{unit_kind}_key_{suffix:06d}":
+        raise LineageAmbiguityError(
+            f"{unit_kind} stable key format is invalid: {stable_key}"
+        )
+    return suffix
 
 
 def _validate_lineage_units(
@@ -280,6 +285,13 @@ def reconcile_lineage(
                 "append edit must start after the old source, use an empty old span, "
                 "and add at least one line"
             )
+        suffix = current_source[len(previous_source) :]
+        if (
+            previous_source
+            and not previous_source.endswith(("\n", "\r"))
+            and not suffix.startswith(("\n", "\r\n"))
+        ):
+            raise LineageAmbiguityError("append must start on a new line")
         if any(
             group.start_line <= old_line_count < group.end_line for group in current_groups
         ):

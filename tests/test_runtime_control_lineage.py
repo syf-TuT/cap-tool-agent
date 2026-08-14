@@ -603,6 +603,60 @@ def test_append_rejects_line_ending_rewrite_of_previous_source() -> None:
         )
 
 
+def test_append_rejects_code_joined_to_existing_physical_line() -> None:
+    with pytest.raises(LineageAmbiguityError, match="new line"):
+        _reconcile(
+            edit_kind="append_recovery",
+            previous_source="x = 1",
+            current_source="x = 1; robot_move()\nextra = True",
+            previous_regions=[],
+            current_regions=[],
+            previous_groups=[],
+            current_groups=[],
+            previous_lineage=UnitLineage.create([], []),
+            edit_start_line=2,
+            edit_end_line=1,
+            line_delta=1,
+        )
+
+
+@pytest.mark.parametrize("line_boundary", ["\n", "\r\n"])
+def test_append_accepts_canonical_new_line_boundary(line_boundary: str) -> None:
+    reconciled = _reconcile(
+        edit_kind="append_recovery",
+        previous_source="x = 1",
+        current_source=f"x = 1{line_boundary}robot_move()",
+        previous_regions=[],
+        current_regions=[],
+        previous_groups=[],
+        current_groups=[],
+        previous_lineage=UnitLineage.create([], []),
+        edit_start_line=2,
+        edit_end_line=1,
+        line_delta=1,
+    )
+
+    assert reconciled == UnitLineage()
+
+
+def test_append_accepts_empty_previous_source() -> None:
+    reconciled = _reconcile(
+        edit_kind="append_recovery",
+        previous_source="",
+        current_source="robot_move()",
+        previous_regions=[],
+        current_regions=[],
+        previous_groups=[],
+        current_groups=[],
+        previous_lineage=UnitLineage.create([], []),
+        edit_start_line=1,
+        edit_end_line=0,
+        line_delta=1,
+    )
+
+    assert reconciled == UnitLineage()
+
+
 def test_reconcile_rejects_line_delta_that_disagrees_with_sources() -> None:
     with pytest.raises(LineageAmbiguityError, match="line_delta"):
         _reconcile(
@@ -733,6 +787,69 @@ def test_patch_allows_zero_line_delta_replacement() -> None:
     assert reconciled.region_key_by_id["current_before"] == "region_key_000001"
     assert reconciled.region_key_by_id["current_after"] == "region_key_000003"
     assert reconciled.region_key_by_id["replacement"] == "region_key_000004"
+
+
+def test_reconcile_allocates_canonical_key_after_six_digit_counter_limit() -> None:
+    previous_regions = [_region_at("old", 1, 1, "x = 1")]
+    previous_lineage = UnitLineage(
+        next_region_key=1_000_000,
+        region_key_by_id={"old": "region_key_999999"},
+    )
+
+    reconciled = _reconcile(
+        edit_kind="append_recovery",
+        previous_source="x = 1",
+        current_source="x = 1\ny = 2",
+        previous_regions=previous_regions,
+        current_regions=[
+            _region_at("current_old", 1, 1, "x = 1"),
+            _region_at("current_new", 2, 2, "y = 2"),
+        ],
+        previous_groups=[],
+        current_groups=[],
+        previous_lineage=previous_lineage,
+        edit_start_line=2,
+        edit_end_line=1,
+        line_delta=1,
+    )
+
+    assert reconciled.region_key_by_id == {
+        "current_old": "region_key_999999",
+        "current_new": "region_key_1000000",
+    }
+    assert reconciled.next_region_key == 1_000_001
+
+
+@pytest.mark.parametrize(
+    "invalid_key",
+    [
+        "region_key_000000",
+        "region_key_0000001",
+        "region_key_00001",
+        "region_key_not-a-number",
+    ],
+)
+def test_reconcile_rejects_noncanonical_stable_keys(invalid_key: str) -> None:
+    previous_regions = [_region_at("old", 1, 1, "x = 1")]
+    previous_lineage = UnitLineage(
+        next_region_key=2,
+        region_key_by_id={"old": invalid_key},
+    )
+
+    with pytest.raises(LineageAmbiguityError, match="region stable key format"):
+        _reconcile(
+            edit_kind="append_recovery",
+            previous_source="x = 1",
+            current_source="x = 1\ny = 2",
+            previous_regions=previous_regions,
+            current_regions=[_region_at("current", 1, 1, "x = 1")],
+            previous_groups=[],
+            current_groups=[],
+            previous_lineage=previous_lineage,
+            edit_start_line=2,
+            edit_end_line=1,
+            line_delta=1,
+        )
 
 
 def test_reconcile_rejects_unsupported_edit_kind() -> None:
