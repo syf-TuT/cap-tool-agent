@@ -57,12 +57,15 @@ from capx.runtime_control import (
     RuntimeAction,
     RuntimeEvent,
     RuntimeTrace,
+    SourceRevision,
+    UnitLineage,
     analyze_capsule_program_contract_details,
     analyze_capsule_strict_subset,
     build_capsule_prompt,
     build_runtime_feedback,
     parse_runtime_action_response,
     preflight_capsule_strict_source,
+    reconcile_lineage,
     replace_region_source,
     segment_python_code,
     segment_python_code_groups,
@@ -1217,6 +1220,7 @@ def _analyze_capsule_source(
     side_effect_calls: set[str],
     require_strict_subset: bool,
     validate_program_contract: bool,
+    group_boundary_after_lines: set[int] | None = None,
 ) -> _CapsuleSourceAnalysis:
     syntax_error: SyntaxError | None = None
     strict_preflight_violations: list[ProgramContractViolation] = []
@@ -1238,6 +1242,7 @@ def _analyze_capsule_source(
                     regions,
                     max_regions_per_group=max_regions_per_group,
                     side_effect_calls=side_effect_calls,
+                    hard_boundary_after_lines=group_boundary_after_lines,
                 )
                 if use_semantic_groups
                 else []
@@ -1525,6 +1530,9 @@ def _run_capsule_loop(
     strict_subset_violations = source_analysis.strict_subset_violations
     contract_effectful_region_ids = source_analysis.contract_effectful_region_ids
     contract_effectful_group_ids = source_analysis.contract_effectful_group_ids
+    lineage = UnitLineage.create(regions, groups)
+    source_revision = _initial_source_revision(source)
+    group_boundary_after_lines: set[int] = set()
     trace = RuntimeTrace()
     executor = CapsuleExecutor(
         base_globals=_build_capsule_execution_globals(env, trace, config),
@@ -1550,8 +1558,6 @@ def _run_capsule_loop(
     loop_exit_reason: str | None = None
     executed_regions = 0
     best_reward_so_far: float | None = None
-    executed_side_effect_regions: set[str] = set()
-    executed_side_effect_groups: set[str] = set()
     recovery_side_effect_budget = 0
     pending_recovery_actions: list[RuntimeAction] = []
     reward_drop_guard_min_best_reward = float(
@@ -1577,6 +1583,8 @@ def _run_capsule_loop(
 
     for step_id in range(1, max_steps + 1):
         action: RuntimeAction | None = None
+        action_unit_key: str | None = None
+        action_source_revision = source_revision.revision
         before_state = _capsule_state_snapshot(env, state_level=prompt_state_level)
         diagnostic_before_state = (
             _capsule_state_snapshot(env, state_level=diagnostic_state_level)
@@ -1609,10 +1617,7 @@ def _run_capsule_loop(
                     contract_violations=[
                         item.to_dict() for item in program_contract_violations
                     ],
-                    side_effect_ledger={
-                        "executed_side_effect_groups": sorted(executed_side_effect_groups),
-                        "executed_side_effect_regions": sorted(executed_side_effect_regions),
-                    },
+                    side_effect_ledger=_display_side_effect_ledger(lineage),
                     recovery_observation_functions=recovery_observation_functions,
                     strict_subset=require_strict_subset,
                     compact_context=llm_step_compact_context,
@@ -1672,6 +1677,7 @@ def _run_capsule_loop(
                     response = _query_model(action_query_args, live_prompt)
                 action = parse_runtime_action_response(response["content"])
             action.step_id = step_id
+            action_unit_key = _runtime_action_unit_key(action, lineage)
         except ValueError as exc:
             event = RuntimeEvent(
                 action="invalid",
@@ -1706,8 +1712,7 @@ def _run_capsule_loop(
             if event is None:
                 event = _no_rollback_guard_event(
                     action,
-                    executed_side_effect_regions,
-                    executed_side_effect_groups,
+                    lineage,
                     group_by_id,
                     recovery_observation_functions=recovery_observation_functions,
                 )
@@ -1767,8 +1772,7 @@ def _run_capsule_loop(
                 event,
                 region_by_id,
                 group_by_id,
-                executed_side_effect_regions,
-                executed_side_effect_groups,
+                lineage,
                 side_effect_calls,
             )
 
@@ -1840,6 +1844,8 @@ def _run_capsule_loop(
                 "trace_events": trace_events,
                 "state_before": before_state,
                 "state_after": after_state,
+                "unit_key": action_unit_key,
+                "source_revision": action_source_revision,
             }
         )
         metric, best_reward_so_far = _capsule_step_metric(
@@ -1852,6 +1858,8 @@ def _run_capsule_loop(
             best_reward_so_far=best_reward_so_far,
             recovery_execution_attempt=consumes_recovery_side_effect,
         )
+        metric["unit_key"] = action_unit_key
+        metric["source_revision"] = action_source_revision
         metric["action_prompt_chars"] = action_prompt_chars
         metric["action_prompt_compact_context"] = llm_step_compact_context
         metric["action_prompt_char_budget"] = action_prompt_char_budget_metric
@@ -1883,34 +1891,65 @@ def _run_capsule_loop(
             previous_source_line_count = len(source.splitlines())
             previous_regions = regions
             previous_groups = groups
-            source = str(event.evidence["source"])
-            source_analysis = _analyze_capsule_source(
-                source,
+            current_source = str(event.evidence["source"])
+            edit_span = _runtime_source_edit_span(
+                action,
+                previous_source,
+                current_source,
+                previous_regions,
+                previous_groups,
+            )
+            if edit_span is None:
+                raise ValueError(
+                    f"Could not determine source edit span for {action.action}"
+                )
+            edit_start_line, edit_end_line, line_delta = edit_span
+            current_group_boundaries = _updated_group_boundaries_after_edit(
+                group_boundary_after_lines,
+                action=action,
+                edit_start_line=edit_start_line,
+                edit_end_line=edit_end_line,
+                line_delta=line_delta,
+                old_line_count=previous_source_line_count,
+            )
+            current_source_analysis = _analyze_capsule_source(
+                current_source,
                 use_semantic_groups=use_semantic_groups,
                 max_regions_per_group=max_regions_per_group,
                 public_api_calls=public_api_calls,
                 side_effect_calls=side_effect_calls,
                 require_strict_subset=require_strict_subset,
                 validate_program_contract=validate_program_contract,
+                group_boundary_after_lines=current_group_boundaries,
             )
-            regions = source_analysis.regions
-            groups = source_analysis.groups
+            current_regions = current_source_analysis.regions
+            current_groups = current_source_analysis.groups
+            lineage = reconcile_lineage(
+                edit_kind=action.action,
+                previous_source=previous_source,
+                current_source=current_source,
+                previous_regions=previous_regions,
+                current_regions=current_regions,
+                previous_groups=previous_groups,
+                current_groups=current_groups,
+                previous_lineage=lineage,
+                edit_start_line=edit_start_line,
+                edit_end_line=edit_end_line,
+                line_delta=line_delta,
+            )
+            source_revision = _next_source_revision(
+                source_revision,
+                current_source,
+                edit_kind=action.action,
+                old_line_count=previous_source_line_count,
+            )
+            source = current_source
+            source_analysis = current_source_analysis
+            group_boundary_after_lines = current_group_boundaries
+            regions = current_regions
+            groups = current_groups
             region_by_id = {region.region_id: region for region in regions}
             group_by_id = {group.group_id: group for group in groups}
-            (
-                executed_side_effect_regions,
-                executed_side_effect_groups,
-            ) = _remap_executed_side_effect_ledger(
-                action,
-                previous_source,
-                source,
-                previous_regions,
-                regions,
-                previous_groups,
-                groups,
-                executed_side_effect_regions,
-                executed_side_effect_groups,
-            )
             program_contract_violations = source_analysis.contract_violations
             strict_subset_violations = source_analysis.strict_subset_violations
             contract_effectful_region_ids = (
@@ -2272,8 +2311,7 @@ def _execute_runtime_action(
 
 def _no_rollback_guard_event(
     action: RuntimeAction,
-    executed_side_effect_regions: set[str],
-    executed_side_effect_groups: set[str],
+    lineage: UnitLineage,
     group_by_id: dict[str, CodeRegionGroup] | None = None,
     *,
     recovery_observation_functions: set[str] | None = None,
@@ -2283,17 +2321,29 @@ def _no_rollback_guard_event(
     if action.action in {"run_group", "patch_group"}:
         group_id = str(action.args.get("group_id", ""))
         group = group_by_id.get(group_id)
+        if group is None:
+            return None
+        group_key = lineage.group_key_by_id.get(group_id)
+        region_keys = [
+            lineage.region_key_by_id.get(region_id) for region_id in group.region_ids
+        ]
+        if group_key is None or any(region_key is None for region_key in region_keys):
+            return _missing_side_effect_lineage_event(action.action, group_id)
         contains_executed_region = bool(
-            group is not None
-            and executed_side_effect_regions.intersection(group.region_ids)
+            lineage.executed_region_keys.intersection(region_keys)
         )
-        if group_id in executed_side_effect_groups or contains_executed_region:
+        if group_key in lineage.executed_group_keys or contains_executed_region:
             return _already_executed_side_effect_event(action.action, group_id, recovery_hint)
         return None
 
     if action.action in {"run_region", "patch_region", "resume_from_region"}:
         region_id = str(action.args.get("region_id", ""))
-        if region_id in executed_side_effect_regions:
+        if region_id not in lineage.region_key_by_id:
+            return None
+        region_key = lineage.region_key_by_id.get(region_id)
+        if region_key is None:
+            return _missing_side_effect_lineage_event(action.action, region_id)
+        if region_key in lineage.executed_region_keys:
             return _already_executed_side_effect_event(action.action, region_id, recovery_hint)
         return None
 
@@ -2447,13 +2497,38 @@ def _runtime_action_unit_id(action: RuntimeAction) -> str | None:
     return str(unit_id) if unit_id else None
 
 
+def _runtime_action_unit_key(
+    action: RuntimeAction,
+    lineage: UnitLineage,
+) -> str | None:
+    if action.action in {"run_group", "patch_group"}:
+        return lineage.group_key_by_id.get(str(action.args.get("group_id", "")))
+    if action.action in {"run_region", "patch_region", "resume_from_region"}:
+        return lineage.region_key_by_id.get(str(action.args.get("region_id", "")))
+    return None
+
+
+def _display_side_effect_ledger(lineage: UnitLineage) -> dict[str, list[str]]:
+    return {
+        "executed_side_effect_groups": sorted(
+            group_id
+            for group_id, group_key in lineage.group_key_by_id.items()
+            if group_key in lineage.executed_group_keys
+        ),
+        "executed_side_effect_regions": sorted(
+            region_id
+            for region_id, region_key in lineage.region_key_by_id.items()
+            if region_key in lineage.executed_region_keys
+        ),
+    }
+
+
 def _record_runtime_side_effect_execution(
     action: RuntimeAction,
     event: RuntimeEvent,
     region_by_id: dict[str, CodeRegion],
     group_by_id: dict[str, CodeRegionGroup],
-    executed_side_effect_regions: set[str],
-    executed_side_effect_groups: set[str],
+    lineage: UnitLineage,
     side_effect_calls: set[str],
 ) -> None:
     if event.status == "invalid" or not _event_has_side_effect_trace(
@@ -2465,11 +2540,15 @@ def _record_runtime_side_effect_execution(
         region_id = str(action.args.get("region_id", ""))
         if region_id not in region_by_id:
             return
-        executed_side_effect_regions.add(region_id)
-        executed_side_effect_groups.update(
-            group.group_id
+        region_key = lineage.region_key_by_id.get(region_id)
+        if region_key is None:
+            return
+        lineage.executed_region_keys.add(region_key)
+        lineage.executed_group_keys.update(
+            group_key
             for group in group_by_id.values()
             if region_id in group.region_ids
+            if (group_key := lineage.group_key_by_id.get(group.group_id)) is not None
         )
         return
 
@@ -2478,12 +2557,14 @@ def _record_runtime_side_effect_execution(
         group = group_by_id.get(group_id)
         if group is None:
             return
-        executed_side_effect_groups.add(group_id)
-        executed_side_effect_regions.update(group.region_ids)
-        executed_side_effect_groups.update(
-            candidate.group_id
-            for candidate in group_by_id.values()
-            if executed_side_effect_regions.intersection(candidate.region_ids)
+        group_key = lineage.group_key_by_id.get(group_id)
+        if group_key is None:
+            return
+        lineage.executed_group_keys.add(group_key)
+        lineage.executed_region_keys.update(
+            region_key
+            for region_id in group.region_ids
+            if (region_key := lineage.region_key_by_id.get(region_id)) is not None
         )
 
 
@@ -2552,6 +2633,16 @@ def _already_executed_side_effect_event(
             f"{recovery_hint}"
         ),
         evidence={"safety_failure": "side_effect_replay"},
+    )
+
+
+def _missing_side_effect_lineage_event(action_name: str, unit_id: str) -> RuntimeEvent:
+    return RuntimeEvent(
+        action=action_name,
+        status="invalid",
+        region_id=unit_id,
+        message=f"Stable lineage is unavailable for known runtime unit {unit_id}.",
+        evidence={"safety_failure": "side_effect_lineage_unavailable"},
     )
 
 
@@ -2668,6 +2759,54 @@ def _runtime_source_edit_span(
     return None
 
 
+def _updated_group_boundaries_after_edit(
+    previous_boundaries: set[int],
+    *,
+    action: RuntimeAction,
+    edit_start_line: int,
+    edit_end_line: int,
+    line_delta: int,
+    old_line_count: int,
+) -> set[int]:
+    boundaries: set[int] = set()
+    for boundary in previous_boundaries:
+        if edit_end_line <= boundary:
+            boundaries.add(boundary + line_delta)
+        elif edit_start_line > boundary:
+            boundaries.add(boundary)
+    if action.action == "append_recovery":
+        boundaries.add(old_line_count)
+    return boundaries
+
+
+def _initial_source_revision(source: str) -> SourceRevision:
+    return SourceRevision(
+        revision=0,
+        source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        edit_kind="initial",
+        parent_revision=None,
+        old_line_count=0,
+    )
+
+
+def _next_source_revision(
+    previous_revision: SourceRevision,
+    source: str,
+    *,
+    edit_kind: str,
+    old_line_count: int,
+) -> SourceRevision:
+    if edit_kind not in {"patch_region", "patch_group", "append_recovery"}:
+        raise ValueError(f"Unsupported source revision edit kind: {edit_kind}")
+    return SourceRevision(
+        revision=previous_revision.revision + 1,
+        source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        edit_kind=edit_kind,
+        parent_revision=previous_revision.revision,
+        old_line_count=old_line_count,
+    )
+
+
 def _lineage_matches_after_edit(
     previous_unit: CodeRegion | CodeRegionGroup,
     current_units: list[CodeRegion] | list[CodeRegionGroup],
@@ -2728,11 +2867,11 @@ def _append_recovery_source(
     source: str,
     recovery_source: str,
 ) -> str:
-    base = source.rstrip("\n")
     recovery = recovery_source.strip("\n")
-    if not base:
+    if not source:
         return f"{recovery}\n"
-    return f"{base}\n\n{recovery}\n"
+    separator = "" if source.endswith(("\n", "\r")) else "\n"
+    return f"{source}{separator}{recovery}\n"
 
 
 def _ast_calls_function(tree: ast.AST, function_name: str) -> bool:

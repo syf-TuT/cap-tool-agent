@@ -18,6 +18,8 @@ from capx.envs.trial import (
     _get_video_differencing_feedback,
     _get_visual_differencing_feedback,
     _handle_multi_turn_step,
+    _initial_source_revision,
+    _next_source_revision,
     _no_rollback_guard_event,
     _program_contract_guard_event,
     _query_initial_code,
@@ -33,6 +35,7 @@ from capx.llm.context import get_trial_llm_context, trial_llm_context
 from capx.runtime_control.contract import ProgramContractViolation
 from capx.runtime_control.executor import CapsuleExecutor
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, RuntimeAction
+from capx.runtime_control.lineage import SourceRevision, UnitLineage
 from capx.runtime_control.trace import wrap_function_for_trace
 
 
@@ -2465,8 +2468,16 @@ def test_capsule_no_replay_ledger_survives_patch_group_renumbering(tmp_path):
     ]
     assert "already executed robot-side-effect code" in trace[2]["event"]["message"]
     assert env.api.moves == ["same"]
+    assert [entry["unit_key"] for entry in trace] == [
+        "group_key_000002",
+        "group_key_000001",
+        "group_key_000002",
+        None,
+    ]
+    assert [entry["source_revision"] for entry in trace] == [0, 0, 1, 1]
     third_prompt_text = prompts[2][1]["content"][0]["text"]
     assert '"executed_side_effect_groups": [\n    "group_3"\n  ]' in third_prompt_text
+    assert "group_key_" not in third_prompt_text
 
 
 def test_capsule_no_replay_rejects_second_resume_from_side_effect_region(tmp_path):
@@ -2492,6 +2503,8 @@ def test_capsule_no_replay_rejects_second_resume_from_side_effect_region(tmp_pat
         "invalid",
         "success",
     ]
+    assert trace[0]["unit_key"] == "region_key_000001"
+    assert trace[1]["unit_key"] == "region_key_000001"
     assert env.api.moves == ["once"]
 
 
@@ -2525,6 +2538,8 @@ def test_capsule_region_execution_seals_containing_group(tmp_path):
         "invalid",
         "success",
     ]
+    assert trace[0]["unit_key"] == "region_key_000002"
+    assert trace[1]["unit_key"] == "group_key_000001"
     assert env.api.moves == ["once"]
     assert code == 'x = 1\ncustom_move("once")\n'
 
@@ -2552,6 +2567,8 @@ def test_capsule_resume_execution_seals_containing_group(tmp_path):
         "invalid",
         "success",
     ]
+    assert trace[0]["unit_key"] == "region_key_000002"
+    assert trace[1]["unit_key"] == "group_key_000001"
     assert env.api.moves == ["once"]
 
 
@@ -2647,6 +2664,174 @@ def test_capsule_llm_step_reanalyzes_forced_appended_recovery(tmp_path):
     ] == "effectful_helper"
     assert metrics[0]["program_contract_valid"] is True
     assert metrics[1]["program_contract_valid"] is False
+
+
+def test_capsule_append_identical_side_effect_gets_new_stable_key_and_one_run(tmp_path):
+    env = FakeRewardDropCapsuleEnv()
+
+    trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 5,
+            "capsule_max_regions_per_group": 1,
+            "capsule_reward_drop_guard_min_best_reward": 2.0,
+        },
+        initial_code='move_to("same")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {
+                "action": "append_recovery",
+                "args": {"source": 'get_observation()\nmove_to("same")'},
+            },
+            {"action": "run_group", "args": {"group_id": "group_3"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    successful_runs = [
+        entry
+        for entry in trace
+        if entry["action"]["action"] == "run_group"
+        and entry["event"]["status"] == "success"
+        and any(
+            event.get("name") == "move_to"
+            for event in entry["event"]["evidence"].get("trace_events", [])
+        )
+    ]
+
+    assert [entry["event"]["action"] for entry in trace] == [
+        "run_group",
+        "append_recovery",
+        "run_group",
+        "run_group",
+        "run_group",
+    ]
+    assert trace[-1]["event"]["status"] == "invalid"
+    assert trace[-1]["event"]["evidence"]["safety_failure"] == "side_effect_replay"
+    assert env.api.moves == ["same", "same"]
+    assert len(successful_runs) == 2
+    assert successful_runs[0]["unit_key"] != successful_runs[1]["unit_key"]
+    assert successful_runs[0]["source_revision"] == 0
+    assert successful_runs[1]["source_revision"] == 1
+    assert trace[-1]["unit_key"] == successful_runs[1]["unit_key"]
+    assert [entry["source_revision"] for entry in metrics] == [0, 0, 1, 1, 1]
+
+
+def test_capsule_group_execution_seals_region_patch_by_stable_key(tmp_path):
+    env = FakeCustomMoveCapsuleEnv()
+
+    trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code='custom_move("once")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {
+                "action": "patch_region",
+                "args": {"region_id": "region_1", "source": 'custom_move("twice")\n'},
+            },
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert trace[0]["unit_key"] == "group_key_000001"
+    assert trace[1]["unit_key"] == "region_key_000001"
+    assert trace[1]["event"]["status"] == "invalid"
+    assert trace[1]["event"]["evidence"]["safety_failure"] == "side_effect_replay"
+    assert env.api.moves == ["once"]
+
+
+def test_capsule_failed_side_effect_execution_seals_stable_key(tmp_path):
+    env = FakeCustomMoveCapsuleEnv()
+
+    trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code='custom_move("once") or (1 / 0)\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == ["failed", "invalid"]
+    assert trace[0]["unit_key"] == "group_key_000001"
+    assert trace[1]["unit_key"] == trace[0]["unit_key"]
+    assert trace[1]["event"]["evidence"]["safety_failure"] == "side_effect_replay"
+    assert env.api.moves == ["once"]
+
+
+def test_capsule_initial_group_replay_records_stable_key_and_revision(tmp_path):
+    env = FakeCustomMoveCapsuleEnv()
+
+    trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code='custom_move("once")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+
+    assert trace[0]["event"]["status"] == "success"
+    assert trace[1]["event"]["status"] == "invalid"
+    assert trace[1]["event"]["evidence"]["safety_failure"] == "side_effect_replay"
+    assert [entry["unit_key"] for entry in trace] == [
+        "group_key_000001",
+        "group_key_000001",
+    ]
+    assert [entry["source_revision"] for entry in trace] == [0, 0]
+    assert [entry["unit_key"] for entry in metrics] == [
+        "group_key_000001",
+        "group_key_000001",
+    ]
+    assert [entry["source_revision"] for entry in metrics] == [0, 0]
+    assert env.api.moves == ["once"]
+
+
+def test_source_revision_helpers_hash_and_link_committed_edit():
+    initial_source = "x = 1\n"
+    edited_source = "x = 1\ny = 2\n"
+
+    initial = _initial_source_revision(initial_source)
+    edited = _next_source_revision(
+        initial,
+        edited_source,
+        edit_kind="append_recovery",
+        old_line_count=1,
+    )
+
+    assert initial == SourceRevision(
+        revision=0,
+        source_sha256=hashlib.sha256(initial_source.encode("utf-8")).hexdigest(),
+        edit_kind="initial",
+        parent_revision=None,
+        old_line_count=0,
+    )
+    assert edited == SourceRevision(
+        revision=1,
+        source_sha256=hashlib.sha256(edited_source.encode("utf-8")).hexdigest(),
+        edit_kind="append_recovery",
+        parent_revision=0,
+        old_line_count=1,
+    )
 
 
 def test_capsule_llm_step_uses_compact_action_prompt_by_default(tmp_path, monkeypatch):
@@ -3549,10 +3734,29 @@ def test_capsule_llm_step_prompt_includes_executed_side_effect_ledger(tmp_path):
 
 
 def test_no_rollback_guard_uses_task_specific_recovery_function():
+    group = CodeRegionGroup(
+        group_id="group_1",
+        start_line=1,
+        end_line=1,
+        source='custom_move("once")\n',
+        region_ids=["region_1"],
+        primitive_calls=["custom_move"],
+        defined_names=[],
+        used_names=["custom_move"],
+        has_robot_side_effect=True,
+    )
+    region = CodeRegion(
+        region_id="region_1",
+        start_line=1,
+        end_line=1,
+        source=group.source,
+    )
+    lineage = UnitLineage.create([region], [group])
+    lineage.executed_group_keys.add("group_key_000001")
     event = _no_rollback_guard_event(
         RuntimeAction("run_group", {"group_id": "group_1"}),
-        set(),
-        {"group_1"},
+        lineage,
+        {"group_1": group},
         recovery_observation_functions={"get_handle0_pos"},
     )
 

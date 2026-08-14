@@ -35,6 +35,7 @@ def segment_python_code_groups(
     *,
     max_regions_per_group: int = 20,
     side_effect_calls: set[str] | None = None,
+    hard_boundary_after_lines: set[int] | None = None,
 ) -> list[CodeRegionGroup]:
     """Normalize structural regions into effect-bounded execution units."""
     if regions is None:
@@ -48,6 +49,7 @@ def segment_python_code_groups(
         regions,
         analyses,
         policy=GroupingPolicy(max_regions_per_group=max_regions_per_group),
+        hard_boundary_after_lines=hard_boundary_after_lines,
     )
 
 
@@ -57,6 +59,7 @@ def normalize_python_code_groups(
     analyses: list[RegionAnalysis],
     *,
     policy: GroupingPolicy,
+    hard_boundary_after_lines: set[int] | None = None,
 ) -> list[CodeRegionGroup]:
     """Apply effect-boundary policy to already-segmented code regions.
 
@@ -73,15 +76,24 @@ def normalize_python_code_groups(
     current: list[tuple[CodeRegion, _NormalizedRegionAnalysis]] = []
     current_has_effect = False
     current_has_robot_effect = False
+    hard_boundaries = hard_boundary_after_lines or set()
 
     for region, analysis in zip(regions, normalized_analyses):
         returns_to_sense = current_has_effect and not analysis.has_structural_effect
         starts_second_robot_effect = (
             current_has_robot_effect and analysis.has_robot_side_effect
         )
+        crosses_hard_boundary = bool(
+            current
+            and any(
+                current[-1][0].end_line <= boundary < region.start_line
+                for boundary in hard_boundaries
+            )
+        )
         if current and (
             starts_second_robot_effect
             or returns_to_sense
+            or crosses_hard_boundary
             or len(current) >= policy.max_regions_per_group
         ):
             groups.append(_build_group(len(groups) + 1, current))
@@ -98,7 +110,11 @@ def normalize_python_code_groups(
     if current:
         groups.append(_build_group(len(groups) + 1, current))
 
-    return _bound_group_count(groups, policy)
+    return _bound_group_count(
+        groups,
+        policy,
+        hard_boundary_after_lines=hard_boundaries,
+    )
 
 
 def _validate_normalizer_inputs(
@@ -246,11 +262,17 @@ def _build_group(
 def _bound_group_count(
     groups: list[CodeRegionGroup],
     policy: GroupingPolicy,
+    *,
+    hard_boundary_after_lines: set[int] | None = None,
 ) -> list[CodeRegionGroup]:
     if len(groups) <= policy.max_groups:
         return groups
 
-    bounded_groups = _choose_bounded_group_partition(groups, policy.max_groups)
+    bounded_groups = _choose_bounded_group_partition(
+        groups,
+        policy.max_groups,
+        hard_boundary_after_lines=hard_boundary_after_lines,
+    )
 
     return _renumber_groups(bounded_groups)
 
@@ -258,8 +280,13 @@ def _bound_group_count(
 def _choose_bounded_group_partition(
     groups: list[CodeRegionGroup],
     max_groups: int,
+    *,
+    hard_boundary_after_lines: set[int] | None = None,
 ) -> list[CodeRegionGroup]:
-    mergeable_groups = _mergeable_group_table(groups)
+    mergeable_groups = _mergeable_group_table(
+        groups,
+        hard_boundary_after_lines=hard_boundary_after_lines,
+    )
     partitions_by_count = _reachable_group_partitions(mergeable_groups)
 
     for group_count in range(max_groups, 0, -1):
@@ -277,6 +304,8 @@ def _choose_bounded_group_partition(
 
 def _mergeable_group_table(
     groups: list[CodeRegionGroup],
+    *,
+    hard_boundary_after_lines: set[int] | None = None,
 ) -> list[list[CodeRegionGroup | None]]:
     group_count = len(groups)
     mergeable_groups: list[list[CodeRegionGroup | None]] = [
@@ -293,6 +322,7 @@ def _mergeable_group_table(
                 mergeable_groups,
                 start,
                 end,
+                hard_boundary_after_lines=hard_boundary_after_lines,
             )
 
     return mergeable_groups
@@ -302,13 +332,19 @@ def _mergeable_contiguous_group(
     mergeable_groups: list[list[CodeRegionGroup | None]],
     start: int,
     end: int,
+    *,
+    hard_boundary_after_lines: set[int] | None = None,
 ) -> CodeRegionGroup | None:
     for split in range(start + 1, end):
         left = mergeable_groups[start][split]
         right = mergeable_groups[split][end]
         if left is None or right is None:
             continue
-        if _can_merge_adjacent_groups(left, right):
+        if _can_merge_adjacent_groups(
+            left,
+            right,
+            hard_boundary_after_lines=hard_boundary_after_lines,
+        ):
             return _merge_adjacent_groups(left, right)
 
     return None
@@ -339,12 +375,19 @@ def _reachable_group_partitions(
 def _can_merge_adjacent_groups(
     left: CodeRegionGroup,
     right: CodeRegionGroup,
+    *,
+    hard_boundary_after_lines: set[int] | None = None,
 ) -> bool:
     if not left.region_ids or not right.region_ids:
         return False
     if not left.source or not right.source:
         return False
     if left.end_line > right.start_line:
+        return False
+    if any(
+        left.end_line <= boundary < right.start_line
+        for boundary in (hard_boundary_after_lines or set())
+    ):
         return False
     if left.has_robot_side_effect and right.has_robot_side_effect:
         return False
