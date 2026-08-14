@@ -1,4 +1,4 @@
-# LIBERO Object Task 0 with non-privileged Capsule llm-step control.
+# LIBERO Object Task 0 with text-only, non-privileged Capsule llm-step control.
 # Usage: uv run --no-sync capx/envs/launch.py \
 #   --config-path env_configs/libero/franka_libero_object_0_capsule_llm_step.yaml
 
@@ -42,7 +42,7 @@ capsule_execution_granularity: semantic_group
 capsule_progress_mode: sparse_terminal
 capsule_require_task_success_for_finish: true
 capsule_validate_program_contract: true
-capsule_action_visual_feedback: true
+capsule_action_visual_feedback: false
 capsule_prompt_state_level: proprioceptive
 capsule_diagnostic_state_level: full
 
@@ -63,8 +63,8 @@ api_servers:
     host: 127.0.0.1
 
 record_video: true
-use_visual_feedback: true
-use_wrist_camera: true
+use_visual_feedback: false
+use_wrist_camera: false
 use_parallel_ensemble: false
 output_dir: ./outputs/franka_libero_object_0_capsule_llm_step
 

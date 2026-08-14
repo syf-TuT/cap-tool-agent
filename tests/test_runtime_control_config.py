@@ -98,11 +98,11 @@ def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
     assert data["capsule_progress_mode"] == "sparse_terminal"
     assert data["capsule_require_task_success_for_finish"] is True
     assert data["capsule_validate_program_contract"] is True
-    assert data["capsule_action_visual_feedback"] is True
+    assert data["capsule_action_visual_feedback"] is False
     assert data["capsule_prompt_state_level"] == "proprioceptive"
     assert data["capsule_diagnostic_state_level"] == "full"
-    assert data["use_visual_feedback"] is True
-    assert data["use_wrist_camera"] is True
+    assert data["use_visual_feedback"] is False
+    assert data["use_wrist_camera"] is False
     assert data["use_parallel_ensemble"] is False
     assert data["trials"] == 1
     assert data["num_workers"] == 1
@@ -126,6 +126,10 @@ def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
     assert "import numpy" not in prompt
 
     docs = " ".join((repo_root / "docs" / "libero-tasks.md").read_text().lower().split())
+    assert "text-only decision model" in docs
+    assert "images are not attached to its initial or capsule action prompts" in docs
+    assert "wrist-camera capture is disabled" in docs
+    assert "molmo remains an internal perception service used by `frankaliberoapi`" in docs
     assert "no imports, classes, lambdas, `try`, `while`, or async constructs" in docs
     assert "only statically bounded `for` loops" in docs
     assert "all loops" not in docs
@@ -138,8 +142,7 @@ def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
     assert "source .venv-molmo/bin/activate" in docs
     assert "uv sync --active --extra molmo" in docs
     assert (
-        "python -m capx.serving.vllm_server --model allenai/molmo2-8b "
-        "--host 127.0.0.1 --port 8122"
+        "python -m capx.serving.vllm_server --model allenai/molmo2-8b --host 127.0.0.1 --port 8122"
     ) in docs
     assert "sam3" in docs
     assert "point-cloud" in docs

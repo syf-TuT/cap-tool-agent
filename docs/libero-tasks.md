@@ -60,10 +60,11 @@ python capx/envs/launch.py \
 
 The `franka_libero_object_0_capsule_llm_step.yaml` configuration targets standard
 `libero_object` task 0. It uses the non-privileged `FrankaLiberoApi`, not a reduced or
-ground-truth API. The initial generation prompt and every Action LLM step receive the
-current main- and wrist-camera images. Prompt-visible state is limited to
-proprioception, while full object state is written only to diagnostic artifacts and is
-never added to the LLM prompt or runtime history.
+ground-truth API. The Capsule controller uses a text-only decision model: images are
+not attached to its initial or Capsule Action prompts, and wrist-camera capture is
+disabled. Main-camera recording remains enabled through `record_video`. Prompt-visible
+state is limited to proprioception, while full object state is written only to
+diagnostic artifacts and is never added to the LLM prompt or runtime history.
 
 Because this configuration sets `privileged: false`, every generated Capsule program
 must pass the strict Python-subset preflight. This enforcement is independent of
@@ -76,10 +77,12 @@ top-level helpers. They may use only statically bounded `for` loops, and total
 computation must remain within the static budget. Legacy arbitrary-Python Capsule
 programs are not available in non-privileged mode.
 
-This configuration also requires an external Molmo vLLM service on port 8122. It is
-not auto-started by the YAML. Use a separate Molmo service environment so the Molmo
-`torch`/vLLM dependencies do not conflict with the dedicated LIBERO environment. Do
-not assume `.venv-libero` already contains vLLM. Create the service environment once:
+Molmo remains an internal perception service used by `FrankaLiberoApi`; it is not the
+Capsule decision model. This configuration requires that external Molmo vLLM service
+on port 8122, and it is not auto-started by the YAML. Use a separate Molmo service
+environment so the Molmo `torch`/vLLM dependencies do not conflict with the dedicated
+LIBERO environment. Do not assume `.venv-libero` already contains vLLM. Create the
+service environment once:
 
 ```bash
 uv venv .venv-molmo --python 3.12
