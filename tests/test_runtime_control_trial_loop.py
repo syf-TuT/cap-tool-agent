@@ -1,4 +1,5 @@
 import base64
+import copy
 import hashlib
 import json
 from dataclasses import replace
@@ -2768,6 +2769,45 @@ def test_capsule_group_execution_seals_region_patch_by_stable_key(tmp_path):
     assert env.api.moves == ["once"]
 
 
+def test_capsule_edit_guard_classifies_missing_lineage_as_ambiguous(
+    tmp_path, monkeypatch
+):
+    original_create = UnitLineage.create
+
+    def create_without_group_key(regions, groups):
+        lineage = original_create(regions, groups)
+        del lineage.group_key_by_id["group_1"]
+        return lineage
+
+    monkeypatch.setattr(UnitLineage, "create", create_without_group_key)
+
+    summary = trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 1},
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": "x = 2\n"},
+            }
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    event = trace[0]["event"]
+
+    assert event["status"] == "invalid"
+    assert event["evidence"]["safety_failure"] == "side_effect_lineage_unavailable"
+    assert event["evidence"]["edit_rejection_reason"] == "lineage_ambiguous"
+    assert event["evidence"]["lineage_reconciliation_status"] == "ambiguous"
+    assert event["evidence"]["source_revision_before"] == 0
+    assert event["evidence"]["source_revision_after"] == 0
+    assert event["evidence"]["source_edit_committed"] is False
+    assert Path(summary.code_path).read_text() == "x = 1\n"
+
+
 def test_capsule_failed_side_effect_execution_seals_stable_key(tmp_path):
     env = FakeCustomMoveCapsuleEnv()
 
@@ -2951,9 +2991,12 @@ def test_capsule_lineage_ambiguity_rejects_edit_without_mutating_ledger(
     tmp_path, monkeypatch
 ):
     initial_source = 'custom_move("once")\nx = 1\n'
-    captured = {}
     live_lineage_states = []
+    prompt_states = []
     original_display_ledger = trial_module._display_side_effect_ledger
+    original_build_prompt = trial_module.build_capsule_prompt
+    original_reconcile = trial_module.reconcile_lineage
+    reconcile_calls = 0
 
     def lineage_state(lineage):
         return {
@@ -2969,16 +3012,43 @@ def test_capsule_lineage_ambiguity_rejects_edit_without_mutating_ledger(
         live_lineage_states.append(lineage_state(lineage))
         return original_display_ledger(lineage)
 
-    def reject_lineage(**kwargs):
+    def capture_prompt_state(*args, **kwargs):
+        prompt_states.append(
+            {
+                "groups": [group.to_dict() for group in kwargs["groups"]],
+                "ledger": copy.deepcopy(kwargs["side_effect_ledger"]),
+            }
+        )
+        return original_build_prompt(*args, **kwargs)
+
+    def corrupt_then_reject_lineage(**kwargs):
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        if reconcile_calls > 1:
+            return original_reconcile(**kwargs)
+
         lineage = kwargs["previous_lineage"]
-        captured["lineage"] = lineage
-        captured["before"] = lineage_state(lineage)
+        lineage.next_region_key = 999
+        lineage.next_group_key = 999
+        lineage.region_key_by_id["region_1"] = "region_key_999999"
+        lineage.group_key_by_id["group_1"] = "group_key_999999"
+        lineage.executed_region_keys.add("region_key_999999")
+        lineage.executed_group_keys.add("group_key_999999")
+        kwargs["previous_regions"][0].source = "CORRUPTED_REGION\n"
+        kwargs["previous_regions"][0].start_line = 999
+        kwargs["previous_regions"][0].end_line = 999
+        kwargs["previous_groups"][0].source = "CORRUPTED_GROUP\n"
+        kwargs["previous_groups"][0].start_line = 999
+        kwargs["previous_groups"][0].end_line = 999
         raise LineageAmbiguityError("candidate mapping is ambiguous")
 
-    monkeypatch.setattr(trial_module, "reconcile_lineage", reject_lineage)
+    monkeypatch.setattr(
+        trial_module, "reconcile_lineage", corrupt_then_reject_lineage
+    )
     monkeypatch.setattr(
         trial_module, "_display_side_effect_ledger", capture_live_lineage
     )
+    monkeypatch.setattr(trial_module, "build_capsule_prompt", capture_prompt_state)
 
     summary = trial_module._run_capsule_loop(
         FakeCustomMoveCapsuleEnv(),
@@ -2986,7 +3056,7 @@ def test_capsule_lineage_ambiguity_rejects_edit_without_mutating_ledger(
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
             "output_dir": str(tmp_path),
-            "max_capsule_steps": 3,
+            "max_capsule_steps": 5,
             "capsule_max_regions_per_group": 1,
         },
         initial_code=initial_source,
@@ -2994,15 +3064,19 @@ def test_capsule_lineage_ambiguity_rejects_edit_without_mutating_ledger(
             {"action": "run_group", "args": {"group_id": "group_1"}},
             {
                 "action": "patch_group",
-                "args": {"group_id": "group_2", "source": "x = 2\ny = 3\n"},
+                "args": {"group_id": "group_2", "source": "x = 2\n"},
             },
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_2", "source": "x = 2\n"},
+            },
+            {"action": "run_group", "args": {"group_id": "group_2"}},
             {"action": "finish", "args": {}},
         ],
     )
 
     trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
     event = trace[1]["event"]
-    lineage = captured["lineage"]
 
     assert event["status"] == "invalid"
     assert event["evidence"]["edit_rejection_reason"] == "lineage_ambiguous"
@@ -3011,14 +3085,29 @@ def test_capsule_lineage_ambiguity_rejects_edit_without_mutating_ledger(
     assert event["evidence"]["source_revision_after"] == 0
     assert event["evidence"]["source_edit_committed"] is False
     assert trace[2]["source_revision"] == 0
-    assert lineage_state(lineage) == captured["before"]
     assert live_lineage_states[1] == live_lineage_states[2]
-    assert Path(summary.code_path).read_text() == initial_source
+    assert prompt_states[1] == prompt_states[2]
+    assert trace[2]["event"]["status"] == "success"
+    assert trace[3]["event"]["status"] == "success"
+    assert trace[3]["unit_key"] == "group_key_000003"
+    assert "999" not in trace[3]["unit_key"]
+    assert Path(summary.code_path).read_text() == 'custom_move("once")\nx = 2\n'
 
 
 def test_capsule_append_boundary_crossing_is_rejected_atomically(tmp_path, monkeypatch):
     initial_source = "x = 1\n"
     original_analyze = trial_module._analyze_capsule_source
+    original_build_prompt = trial_module.build_capsule_prompt
+    prompt_states = []
+
+    def capture_prompt_state(*args, **kwargs):
+        prompt_states.append(
+            {
+                "groups": [group.to_dict() for group in kwargs["groups"]],
+                "ledger": copy.deepcopy(kwargs["side_effect_ledger"]),
+            }
+        )
+        return original_build_prompt(*args, **kwargs)
 
     def analyze_with_crossing_group(source, **kwargs):
         analysis = original_analyze(source, **kwargs)
@@ -3035,18 +3124,20 @@ def test_capsule_append_boundary_crossing_is_rejected_atomically(tmp_path, monke
         return analysis
 
     monkeypatch.setattr(trial_module, "_analyze_capsule_source", analyze_with_crossing_group)
+    monkeypatch.setattr(trial_module, "build_capsule_prompt", capture_prompt_state)
 
     summary = trial_module._run_capsule_loop(
         FakeIncompleteCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
-        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
         initial_code=initial_source,
         scripted_actions=[
             {
                 "action": "append_recovery",
                 "args": {"source": "get_observation()\ny = 2\n"},
             },
+            {"action": "run_group", "args": {"group_id": "group_1"}},
             {"action": "finish", "args": {}},
         ],
     )
@@ -3060,6 +3151,8 @@ def test_capsule_append_boundary_crossing_is_rejected_atomically(tmp_path, monke
     assert event["evidence"]["source_revision_after"] == 0
     assert event["evidence"]["source_edit_committed"] is False
     assert trace[1]["source_revision"] == 0
+    assert trace[1]["event"]["status"] == "success"
+    assert prompt_states[0] == prompt_states[1]
     assert Path(summary.code_path).read_text() == initial_source
 
 
@@ -3154,6 +3247,86 @@ def test_rejected_append_creates_no_pending_work_or_recovery_budget(
     assert env.api.observed is False
     assert env.api.moves == ["base"]
     assert Path(summary.code_path).read_text() == initial_source
+
+
+def test_unexpected_candidate_analysis_error_propagates(tmp_path, monkeypatch):
+    initial_source = "x = 1\n"
+    original_analyze = trial_module._analyze_capsule_source
+
+    def raise_for_candidate(source, **kwargs):
+        if source != initial_source:
+            raise TypeError("candidate analyzer bug")
+        return original_analyze(source, **kwargs)
+
+    monkeypatch.setattr(trial_module, "_analyze_capsule_source", raise_for_candidate)
+
+    with pytest.raises(TypeError, match="candidate analyzer bug"):
+        trial_module._run_capsule_loop(
+            FakeIncompleteCapsuleEnv(),
+            trial=0,
+            args=SimpleNamespace(model="test", use_oracle_code=False),
+            config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+            initial_code=initial_source,
+            scripted_actions=[
+                {
+                    "action": "patch_group",
+                    "args": {"group_id": "group_1", "source": "x = 2\n"},
+                },
+                {"action": "finish", "args": {}},
+            ],
+        )
+
+    assert not (tmp_path / "capsule_trace_trial_00.json").exists()
+
+
+def test_candidate_analyzer_receives_defensive_set_and_boundary_copies(monkeypatch):
+    source = "x = 1\n"
+    public_api_calls = {"get_observation"}
+    side_effect_calls = {"move_to"}
+    group_boundaries = {7}
+    analysis = trial_module._analyze_capsule_source(
+        source,
+        use_semantic_groups=True,
+        max_regions_per_group=20,
+        public_api_calls=public_api_calls,
+        side_effect_calls=side_effect_calls,
+        require_strict_subset=False,
+        validate_program_contract=False,
+    )
+
+    def mutate_inputs_then_fail(candidate_source, **kwargs):
+        kwargs["public_api_calls"].clear()
+        kwargs["side_effect_calls"].clear()
+        kwargs["group_boundary_after_lines"].add(999)
+        raise TypeError("candidate analyzer bug")
+
+    monkeypatch.setattr(
+        trial_module, "_analyze_capsule_source", mutate_inputs_then_fail
+    )
+
+    with pytest.raises(TypeError, match="candidate analyzer bug"):
+        trial_module._prepare_capsule_source_edit(
+            RuntimeAction(
+                "patch_group", {"group_id": "group_1", "source": "x = 2\n"}
+            ),
+            "x = 2\n",
+            source=source,
+            regions=analysis.regions,
+            groups=analysis.groups,
+            lineage=UnitLineage.create(analysis.regions, analysis.groups),
+            source_revision=_initial_source_revision(source),
+            group_boundary_after_lines=group_boundaries,
+            use_semantic_groups=True,
+            max_regions_per_group=20,
+            public_api_calls=public_api_calls,
+            side_effect_calls=side_effect_calls,
+            require_strict_subset=False,
+            validate_program_contract=False,
+        )
+
+    assert public_api_calls == {"get_observation"}
+    assert side_effect_calls == {"move_to"}
+    assert group_boundaries == {7}
 
 
 def test_capsule_llm_step_uses_compact_action_prompt_by_default(tmp_path, monkeypatch):
@@ -4059,6 +4232,22 @@ def test_append_recovery_rejects_api_without_fresh_state_capability():
 
     assert event.status == "invalid"
     assert "does not declare" in event.message
+
+
+def test_append_recovery_syntax_error_includes_source_location():
+    event = _execute_runtime_action(
+        RuntimeAction("append_recovery", {"source": "state = (\n"}),
+        CapsuleExecutor(base_globals={}),
+        "x = 1\n",
+        {},
+        recovery_observation_functions={"get_observation"},
+    )
+
+    assert event.status == "invalid"
+    assert event.evidence["exception_type"] == "SyntaxError"
+    assert event.evidence["lineno"] == 1
+    assert event.evidence["offset"] is not None
+    assert event.evidence["text"] == "state = (\n"
 
 
 def test_capsule_trial_rejects_rerun_of_executed_side_effect_group(tmp_path):

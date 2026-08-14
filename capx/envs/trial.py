@@ -1236,7 +1236,7 @@ def _prepare_capsule_source_edit(
         )
     edit_start_line, edit_end_line, line_delta = edit_span
     candidate_boundaries = _updated_group_boundaries_after_edit(
-        group_boundary_after_lines,
+        set(group_boundary_after_lines),
         action=action,
         edit_start_line=edit_start_line,
         edit_end_line=edit_end_line,
@@ -1247,11 +1247,11 @@ def _prepare_capsule_source_edit(
         candidate_source,
         use_semantic_groups=use_semantic_groups,
         max_regions_per_group=max_regions_per_group,
-        public_api_calls=public_api_calls,
-        side_effect_calls=side_effect_calls,
+        public_api_calls=set(public_api_calls),
+        side_effect_calls=set(side_effect_calls),
         require_strict_subset=require_strict_subset,
         validate_program_contract=validate_program_contract,
-        group_boundary_after_lines=candidate_boundaries,
+        group_boundary_after_lines=set(candidate_boundaries),
     )
 
     if candidate_analysis.syntax_error is not None:
@@ -1304,9 +1304,9 @@ def _prepare_capsule_source_edit(
             edit_kind=action.action,
             previous_source=source,
             current_source=candidate_source,
-            previous_regions=regions,
+            previous_regions=copy.deepcopy(regions),
             current_regions=candidate_analysis.regions,
-            previous_groups=groups,
+            previous_groups=copy.deepcopy(groups),
             current_groups=candidate_analysis.groups,
             previous_lineage=copy.deepcopy(lineage),
             edit_start_line=edit_start_line,
@@ -1962,12 +1962,6 @@ def _run_capsule_loop(
                         )
                     except _SourceEditRejection as exc:
                         rejection = exc
-                    except Exception as exc:
-                        rejection = _SourceEditRejection(
-                            "candidate_analysis_error",
-                            f"Candidate source analysis failed: {exc}",
-                            evidence={"exception_type": type(exc).__name__},
-                        )
 
                 if rejection is not None:
                     event = _source_edit_rejection_event(action, rejection)
@@ -2019,15 +2013,16 @@ def _run_capsule_loop(
                         lineage_reconciliation_status="success",
                     )
                 else:
+                    rejection_reason, lineage_status = (
+                        _source_edit_rejection_metadata(action, event)
+                    )
                     _annotate_source_edit_event(
                         event,
                         source_revision_before=action_source_revision,
                         source_revision_after=action_source_revision,
                         source_edit_committed=False,
-                        lineage_reconciliation_status="not_attempted",
-                        edit_rejection_reason=_source_edit_rejection_reason(
-                            action, event
-                        ),
+                        lineage_reconciliation_status=lineage_status,
+                        edit_rejection_reason=rejection_reason,
                     )
             safety_failed = safety_failed or _capsule_event_has_safety_failure(
                 event
@@ -2325,17 +2320,19 @@ def _source_edit_rejection_event(
     )
 
 
-def _source_edit_rejection_reason(
+def _source_edit_rejection_metadata(
     action: RuntimeAction,
     event: RuntimeEvent,
-) -> str:
+) -> tuple[str, str]:
     if event.evidence.get("safety_failure") == "side_effect_replay":
-        return "executed_unit_edit_attempt"
+        return "executed_unit_edit_attempt", "not_attempted"
+    if event.evidence.get("safety_failure") == "side_effect_lineage_unavailable":
+        return "lineage_ambiguous", "ambiguous"
     if event.evidence.get("exception_type") == "SyntaxError":
-        return "candidate_syntax_error"
+        return "candidate_syntax_error", "not_attempted"
     if action.action == "append_recovery":
-        return "invalid_recovery_source"
-    return "invalid_source_edit_action"
+        return "invalid_recovery_source", "not_attempted"
+    return "invalid_source_edit_action", "not_attempted"
 
 
 def _annotate_source_edit_event(
@@ -2490,7 +2487,12 @@ def _execute_runtime_action(
                 action=action.action,
                 status="invalid",
                 message=f"append_recovery source must parse as Python: {exc.msg}",
-                evidence={"exception_type": type(exc).__name__},
+                evidence={
+                    "exception_type": type(exc).__name__,
+                    "lineno": exc.lineno,
+                    "offset": exc.offset,
+                    "text": exc.text,
+                },
             )
         fresh_state_functions = (
             {"get_observation"}
