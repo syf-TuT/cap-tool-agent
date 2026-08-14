@@ -9,7 +9,9 @@ initial-code request timed out twice before receiving an HTTP response.
 
 ## Decision
 
-Use `2048` as the default completion budget throughout the CLI experiment path:
+Use `4096` as the default completion budget throughout the CLI experiment path. A
+2,048-token trial eliminated the transport timeout but returned HTTP 200 with no usable
+content twice, so 4,096 is the next bounded budget to test:
 
 - `LaunchArgs` in `capx/envs/launch.py`;
 - the two defensive Capsule-action fallbacks in `capx/envs/trial.py`;
@@ -22,7 +24,7 @@ tokens because changing them would broaden the behavior change beyond CLI experi
 ## Verification
 
 Add focused tests that instantiate the three CLI argument dataclasses and assert a
-2,048-token default. Verify the Capsule-action fallback source no longer introduces
+4,096-token default. Verify the Capsule-action fallback source no longer introduces
 the old 20,480-token value, then run the focused test suite. Finally, sync the committed
 change to the SeeTaCloud worktree and run one LIBERO trial without a `--max-tokens`
 override.
