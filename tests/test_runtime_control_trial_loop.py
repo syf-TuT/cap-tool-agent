@@ -3756,6 +3756,7 @@ def test_no_rollback_guard_uses_task_specific_recovery_function():
     event = _no_rollback_guard_event(
         RuntimeAction("run_group", {"group_id": "group_1"}),
         lineage,
+        {"region_1": region},
         {"group_1": group},
         recovery_observation_functions={"get_handle0_pos"},
     )
@@ -3763,6 +3764,38 @@ def test_no_rollback_guard_uses_task_specific_recovery_function():
     assert event is not None
     assert "get_handle0_pos()" in event.message
     assert "get_observation()" not in event.message
+
+
+def test_no_rollback_guard_fails_closed_only_for_known_region_missing_lineage():
+    region = CodeRegion(
+        region_id="region_1",
+        start_line=1,
+        end_line=1,
+        source="x = 1\n",
+    )
+    lineage = UnitLineage.create([region], [])
+    del lineage.region_key_by_id["region_1"]
+
+    known_event = _no_rollback_guard_event(
+        RuntimeAction("run_region", {"region_id": "region_1"}),
+        lineage,
+        {"region_1": region},
+        {},
+    )
+    unknown_event = _no_rollback_guard_event(
+        RuntimeAction("run_region", {"region_id": "region_404"}),
+        lineage,
+        {"region_1": region},
+        {},
+    )
+
+    assert known_event is not None
+    assert known_event.status == "invalid"
+    assert (
+        known_event.evidence["safety_failure"]
+        == "side_effect_lineage_unavailable"
+    )
+    assert unknown_event is None
 
 
 def test_reward_drop_guard_uses_task_specific_recovery_function():

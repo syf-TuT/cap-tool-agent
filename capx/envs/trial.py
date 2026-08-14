@@ -1713,6 +1713,7 @@ def _run_capsule_loop(
                 event = _no_rollback_guard_event(
                     action,
                     lineage,
+                    region_by_id,
                     group_by_id,
                     recovery_observation_functions=recovery_observation_functions,
                 )
@@ -2312,10 +2313,12 @@ def _execute_runtime_action(
 def _no_rollback_guard_event(
     action: RuntimeAction,
     lineage: UnitLineage,
+    region_by_id: dict[str, CodeRegion] | None = None,
     group_by_id: dict[str, CodeRegionGroup] | None = None,
     *,
     recovery_observation_functions: set[str] | None = None,
 ) -> RuntimeEvent | None:
+    region_by_id = region_by_id or {}
     group_by_id = group_by_id or {}
     recovery_hint = _recovery_instruction(recovery_observation_functions)
     if action.action in {"run_group", "patch_group"}:
@@ -2338,7 +2341,7 @@ def _no_rollback_guard_event(
 
     if action.action in {"run_region", "patch_region", "resume_from_region"}:
         region_id = str(action.args.get("region_id", ""))
-        if region_id not in lineage.region_key_by_id:
+        if region_id not in region_by_id:
             return None
         region_key = lineage.region_key_by_id.get(region_id)
         if region_key is None:
