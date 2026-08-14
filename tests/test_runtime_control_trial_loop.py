@@ -1760,7 +1760,7 @@ def test_capsule_llm_step_program_contract_blocks_effects_until_patch(tmp_path):
     assert metrics[0]["program_contract_valid"] is False
     assert metrics[0]["program_contract_violation_count"] >= 1
     assert "effectful_helper" in metrics[0]["program_contract_violation_codes"]
-    assert metrics[1]["program_contract_valid"] is False
+    assert metrics[1]["program_contract_valid"] is True
     assert metrics[2]["program_contract_valid"] is True
     assert metrics[2]["program_contract_violation_count"] == 0
     assert metrics[2]["program_contract_violation_codes"] == []
@@ -1979,7 +1979,7 @@ def test_nonprivileged_llm_step_reanalyzes_strict_source_after_patch(tmp_path):
         "success",
     ]
     assert env.api.calls == ["close_gripper"]
-    assert [row["strict_subset_valid"] for row in metrics] == [False, False, True]
+    assert [row["strict_subset_valid"] for row in metrics] == [False, True, True]
     assert metrics[-1]["program_contract_valid"] is True
     assert summary.sandbox_rc == 0
 
@@ -2659,20 +2659,25 @@ def test_capsule_llm_step_reanalyzes_forced_appended_recovery(tmp_path):
 
     assert [entry["event"]["action"] for entry in trace] == [
         "append_recovery",
-        "run_group",
         "finish",
     ]
     assert [entry["event"]["status"] for entry in trace] == [
-        "success",
         "invalid",
         "success",
     ]
     assert env.api.moves == []
-    assert trace[1]["event"]["evidence"]["program_contract_violations"][0][
+    assert trace[0]["event"]["evidence"]["edit_rejection_reason"] == (
+        "program_contract_violation"
+    )
+    assert trace[0]["event"]["evidence"]["source_revision_before"] == 0
+    assert trace[0]["event"]["evidence"]["source_revision_after"] == 0
+    assert trace[0]["event"]["evidence"]["source_edit_committed"] is False
+    assert trace[0]["event"]["evidence"]["program_contract_violations"][0][
         "code"
     ] == "effectful_helper"
     assert metrics[0]["program_contract_valid"] is True
-    assert metrics[1]["program_contract_valid"] is False
+    assert metrics[0]["source_edit_committed"] is False
+    assert metrics[1]["program_contract_valid"] is True
 
 
 def test_capsule_append_identical_side_effect_gets_new_stable_key_and_one_run(tmp_path):
@@ -2754,6 +2759,12 @@ def test_capsule_group_execution_seals_region_patch_by_stable_key(tmp_path):
     assert trace[1]["unit_key"] == "region_key_000001"
     assert trace[1]["event"]["status"] == "invalid"
     assert trace[1]["event"]["evidence"]["safety_failure"] == "side_effect_replay"
+    assert trace[1]["event"]["evidence"]["edit_rejection_reason"] == (
+        "executed_unit_edit_attempt"
+    )
+    assert trace[1]["event"]["evidence"]["source_revision_before"] == 0
+    assert trace[1]["event"]["evidence"]["source_revision_after"] == 0
+    assert trace[1]["event"]["evidence"]["source_edit_committed"] is False
     assert env.api.moves == ["once"]
 
 
@@ -2841,6 +2852,308 @@ def test_source_revision_helpers_hash_and_link_committed_edit():
         parent_revision=0,
         old_line_count=1,
     )
+
+
+def test_capsule_syntax_rejected_patch_is_atomic(tmp_path, monkeypatch):
+    initial_source = "x = 1\n"
+    prompt_states = []
+    original_build_prompt = trial_module.build_capsule_prompt
+
+    def capture_prompt_state(*args, **kwargs):
+        prompt_states.append(
+            {
+                "groups": [
+                    (
+                        group.group_id,
+                        group.start_line,
+                        group.end_line,
+                        group.source,
+                        tuple(group.region_ids),
+                    )
+                    for group in kwargs["groups"]
+                ],
+                "ledger": kwargs["side_effect_ledger"],
+            }
+        )
+        return original_build_prompt(*args, **kwargs)
+
+    monkeypatch.setattr(trial_module, "build_capsule_prompt", capture_prompt_state)
+
+    summary = trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code=initial_source,
+        scripted_actions=[
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": "x = (\n"},
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    event = trace[0]["event"]
+
+    assert event["status"] == "invalid"
+    assert event["evidence"]["edit_rejection_reason"] == "candidate_syntax_error"
+    assert event["evidence"]["source_revision_before"] == 0
+    assert event["evidence"]["source_revision_after"] == 0
+    assert event["evidence"]["source_edit_committed"] is False
+    assert event["evidence"]["lineage_reconciliation_status"] == "not_attempted"
+    assert "source" not in event["evidence"]
+    assert trace[1]["source_revision"] == 0
+    assert metrics[0]["source_revision_before"] == 0
+    assert metrics[0]["source_revision_after"] == 0
+    assert metrics[0]["source_edit_committed"] is False
+    assert prompt_states[0] == prompt_states[1]
+    assert Path(summary.code_path).read_text() == initial_source
+
+
+def test_capsule_strict_subset_rejected_patch_is_atomic(tmp_path):
+    initial_source = "x = 1\n"
+
+    summary = trial_module._run_capsule_loop(
+        FakeUnsafeNonPrivilegedCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code=initial_source,
+        scripted_actions=[
+            {
+                "action": "patch_group",
+                "args": {
+                    "group_id": "group_1",
+                    "source": "runner = close_gripper\nrunner()\n",
+                },
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    event = trace[0]["event"]
+
+    assert event["status"] == "invalid"
+    assert event["evidence"]["edit_rejection_reason"] == "strict_subset_violation"
+    assert event["evidence"]["strict_subset_violations"]
+    assert event["evidence"]["source_revision_before"] == 0
+    assert event["evidence"]["source_revision_after"] == 0
+    assert event["evidence"]["source_edit_committed"] is False
+    assert trace[1]["source_revision"] == 0
+    assert Path(summary.code_path).read_text() == initial_source
+
+
+def test_capsule_lineage_ambiguity_rejects_edit_without_mutating_ledger(
+    tmp_path, monkeypatch
+):
+    initial_source = 'custom_move("once")\nx = 1\n'
+    captured = {}
+    live_lineage_states = []
+    original_display_ledger = trial_module._display_side_effect_ledger
+
+    def lineage_state(lineage):
+        return {
+            "next_region_key": lineage.next_region_key,
+            "next_group_key": lineage.next_group_key,
+            "region_key_by_id": dict(lineage.region_key_by_id),
+            "group_key_by_id": dict(lineage.group_key_by_id),
+            "executed_region_keys": set(lineage.executed_region_keys),
+            "executed_group_keys": set(lineage.executed_group_keys),
+        }
+
+    def capture_live_lineage(lineage):
+        live_lineage_states.append(lineage_state(lineage))
+        return original_display_ledger(lineage)
+
+    def reject_lineage(**kwargs):
+        lineage = kwargs["previous_lineage"]
+        captured["lineage"] = lineage
+        captured["before"] = lineage_state(lineage)
+        raise LineageAmbiguityError("candidate mapping is ambiguous")
+
+    monkeypatch.setattr(trial_module, "reconcile_lineage", reject_lineage)
+    monkeypatch.setattr(
+        trial_module, "_display_side_effect_ledger", capture_live_lineage
+    )
+
+    summary = trial_module._run_capsule_loop(
+        FakeCustomMoveCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code=initial_source,
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_2", "source": "x = 2\ny = 3\n"},
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    event = trace[1]["event"]
+    lineage = captured["lineage"]
+
+    assert event["status"] == "invalid"
+    assert event["evidence"]["edit_rejection_reason"] == "lineage_ambiguous"
+    assert event["evidence"]["lineage_reconciliation_status"] == "ambiguous"
+    assert event["evidence"]["source_revision_before"] == 0
+    assert event["evidence"]["source_revision_after"] == 0
+    assert event["evidence"]["source_edit_committed"] is False
+    assert trace[2]["source_revision"] == 0
+    assert lineage_state(lineage) == captured["before"]
+    assert live_lineage_states[1] == live_lineage_states[2]
+    assert Path(summary.code_path).read_text() == initial_source
+
+
+def test_capsule_append_boundary_crossing_is_rejected_atomically(tmp_path, monkeypatch):
+    initial_source = "x = 1\n"
+    original_analyze = trial_module._analyze_capsule_source
+
+    def analyze_with_crossing_group(source, **kwargs):
+        analysis = original_analyze(source, **kwargs)
+        if source != initial_source:
+            analysis.groups = [
+                CodeRegionGroup(
+                    group_id="group_1",
+                    start_line=1,
+                    end_line=len(source.splitlines()),
+                    source=source,
+                    region_ids=[region.region_id for region in analysis.regions],
+                )
+            ]
+        return analysis
+
+    monkeypatch.setattr(trial_module, "_analyze_capsule_source", analyze_with_crossing_group)
+
+    summary = trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code=initial_source,
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {"source": "get_observation()\ny = 2\n"},
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    event = trace[0]["event"]
+
+    assert event["status"] == "invalid"
+    assert event["evidence"]["edit_rejection_reason"] == "append_boundary_crossed"
+    assert event["evidence"]["source_revision_before"] == 0
+    assert event["evidence"]["source_revision_after"] == 0
+    assert event["evidence"]["source_edit_committed"] is False
+    assert trace[1]["source_revision"] == 0
+    assert Path(summary.code_path).read_text() == initial_source
+
+
+def test_capsule_successful_edit_commits_candidate_once_with_revision_metadata(tmp_path):
+    candidate_source = "x = 2\ny = x + 1\n"
+
+    summary = trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": candidate_source},
+            },
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    event = trace[0]["event"]
+
+    assert event["status"] == "success"
+    assert event["evidence"]["source_revision_before"] == 0
+    assert event["evidence"]["source_revision_after"] == 1
+    assert event["evidence"]["source_edit_committed"] is True
+    assert event["evidence"]["lineage_reconciliation_status"] == "success"
+    assert trace[0]["source_revision"] == 0
+    assert trace[1]["source_revision"] == 1
+    assert metrics[0]["source_revision"] == 0
+    assert metrics[0]["source_revision_before"] == 0
+    assert metrics[0]["source_revision_after"] == 1
+    assert metrics[0]["source_edit_committed"] is True
+    assert metrics[0]["lineage_reconciliation_status"] == "success"
+    assert Path(summary.code_path).read_text() == candidate_source
+
+
+def test_rejected_append_creates_no_pending_work_or_recovery_budget(
+    tmp_path, monkeypatch
+):
+    env = FakeRewardDropCapsuleEnv()
+    observed_budgets = []
+    original_guard = trial_module._reward_drop_guard_event
+
+    def capture_recovery_budget(action, *args, **kwargs):
+        observed_budgets.append((action.action, kwargs["recovery_side_effect_budget"]))
+        return original_guard(action, *args, **kwargs)
+
+    monkeypatch.setattr(trial_module, "_reward_drop_guard_event", capture_recovery_budget)
+
+    recovery_source = (
+        "state = get_observation()\n"
+        "def recover():\n"
+        '    move_to("recover")\n'
+        "recover()\n"
+    )
+    initial_source = 'move_to("base")\n'
+
+    summary = trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_validate_program_contract": True,
+        },
+        initial_code=initial_source,
+        scripted_actions=[
+            {"action": "append_recovery", "args": {"source": recovery_source}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["action"] for entry in trace] == [
+        "append_recovery",
+        "run_group",
+        "finish",
+    ]
+    assert trace[0]["event"]["status"] == "invalid"
+    assert trace[0]["event"]["evidence"]["edit_rejection_reason"] == (
+        "program_contract_violation"
+    )
+    assert ("run_group", 0) in observed_budgets
+    assert env.api.observed is False
+    assert env.api.moves == ["base"]
+    assert Path(summary.code_path).read_text() == initial_source
 
 
 def test_capsule_llm_step_uses_compact_action_prompt_by_default(tmp_path, monkeypatch):

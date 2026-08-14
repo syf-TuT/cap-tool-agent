@@ -1175,6 +1175,194 @@ class _CapsuleSourceAnalysis:
     contract_effectful_group_ids: set[str]
 
 
+@dataclass
+class _PreparedSourceEdit:
+    source: str
+    analysis: _CapsuleSourceAnalysis
+    revision: SourceRevision
+    lineage: UnitLineage
+    group_boundary_after_lines: set[int]
+    region_by_id: dict[str, CodeRegion]
+    group_by_id: dict[str, CodeRegionGroup]
+    pending_recovery_actions: list[RuntimeAction]
+    recovery_side_effect_budget: int | None
+
+
+class _SourceEditRejection(ValueError):
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        *,
+        evidence: dict[str, Any] | None = None,
+        lineage_reconciliation_status: str = "not_attempted",
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+        self.evidence = evidence or {}
+        self.lineage_reconciliation_status = lineage_reconciliation_status
+
+
+def _prepare_capsule_source_edit(
+    action: RuntimeAction,
+    candidate_source: str,
+    *,
+    source: str,
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup],
+    lineage: UnitLineage,
+    source_revision: SourceRevision,
+    group_boundary_after_lines: set[int],
+    use_semantic_groups: bool,
+    max_regions_per_group: int,
+    public_api_calls: set[str],
+    side_effect_calls: set[str],
+    require_strict_subset: bool,
+    validate_program_contract: bool,
+) -> _PreparedSourceEdit:
+    old_line_count = len(source.splitlines())
+    edit_span = _runtime_source_edit_span(
+        action,
+        source,
+        candidate_source,
+        regions,
+        groups,
+    )
+    if edit_span is None:
+        raise _SourceEditRejection(
+            "invalid_source_edit_action",
+            f"Could not determine source edit span for {action.action}.",
+        )
+    edit_start_line, edit_end_line, line_delta = edit_span
+    candidate_boundaries = _updated_group_boundaries_after_edit(
+        group_boundary_after_lines,
+        action=action,
+        edit_start_line=edit_start_line,
+        edit_end_line=edit_end_line,
+        line_delta=line_delta,
+        old_line_count=old_line_count,
+    )
+    candidate_analysis = _analyze_capsule_source(
+        candidate_source,
+        use_semantic_groups=use_semantic_groups,
+        max_regions_per_group=max_regions_per_group,
+        public_api_calls=public_api_calls,
+        side_effect_calls=side_effect_calls,
+        require_strict_subset=require_strict_subset,
+        validate_program_contract=validate_program_contract,
+        group_boundary_after_lines=candidate_boundaries,
+    )
+
+    if candidate_analysis.syntax_error is not None:
+        exc = candidate_analysis.syntax_error
+        raise _SourceEditRejection(
+            "candidate_syntax_error",
+            f"Candidate source is invalid Python: {exc}",
+            evidence={
+                "exception_type": type(exc).__name__,
+                "lineno": exc.lineno,
+                "offset": exc.offset,
+                "text": exc.text,
+            },
+        )
+    if candidate_analysis.strict_subset_violations:
+        serialized = [
+            item.to_dict() for item in candidate_analysis.strict_subset_violations
+        ]
+        raise _SourceEditRejection(
+            "strict_subset_violation",
+            "Candidate source violates the strict Capsule Python subset.",
+            evidence={
+                "strict_subset_violations": serialized,
+                "program_contract_violations": serialized,
+            },
+        )
+    if (
+        validate_program_contract or require_strict_subset
+    ) and candidate_analysis.contract_violations:
+        raise _SourceEditRejection(
+            "program_contract_violation",
+            "Candidate source violates the Capsule-ready program contract.",
+            evidence={
+                "program_contract_violations": [
+                    item.to_dict() for item in candidate_analysis.contract_violations
+                ]
+            },
+        )
+    if action.action == "append_recovery" and any(
+        group.start_line <= old_line_count < group.end_line
+        for group in candidate_analysis.groups
+    ):
+        raise _SourceEditRejection(
+            "append_boundary_crossed",
+            "Candidate group crosses the boundary between old and appended source.",
+        )
+
+    try:
+        candidate_lineage = reconcile_lineage(
+            edit_kind=action.action,
+            previous_source=source,
+            current_source=candidate_source,
+            previous_regions=regions,
+            current_regions=candidate_analysis.regions,
+            previous_groups=groups,
+            current_groups=candidate_analysis.groups,
+            previous_lineage=copy.deepcopy(lineage),
+            edit_start_line=edit_start_line,
+            edit_end_line=edit_end_line,
+            line_delta=line_delta,
+        )
+    except LineageAmbiguityError as exc:
+        raise _SourceEditRejection(
+            "lineage_ambiguous",
+            f"Candidate source lineage is ambiguous: {exc}",
+            evidence={"exception_type": type(exc).__name__},
+            lineage_reconciliation_status="ambiguous",
+        ) from exc
+
+    candidate_revision = _next_source_revision(
+        source_revision,
+        candidate_source,
+        edit_kind=action.action,
+        old_line_count=old_line_count,
+    )
+    region_by_id = {
+        region.region_id: region for region in candidate_analysis.regions
+    }
+    group_by_id = {group.group_id: group for group in candidate_analysis.groups}
+    pending_recovery_actions: list[RuntimeAction] = []
+    candidate_recovery_budget: int | None = None
+    if action.action == "append_recovery":
+        pending_recovery_actions = _runtime_actions_for_appended_recovery(
+            candidate_analysis.regions,
+            candidate_analysis.groups,
+            use_semantic_groups=use_semantic_groups,
+            insert_after_line=old_line_count,
+        )
+        candidate_recovery_budget = max(
+            1,
+            _count_side_effect_runtime_actions(
+                pending_recovery_actions,
+                region_by_id,
+                group_by_id,
+                side_effect_calls,
+            ),
+        )
+
+    return _PreparedSourceEdit(
+        source=candidate_source,
+        analysis=candidate_analysis,
+        revision=candidate_revision,
+        lineage=candidate_lineage,
+        group_boundary_after_lines=candidate_boundaries,
+        region_by_id=region_by_id,
+        group_by_id=group_by_id,
+        pending_recovery_actions=pending_recovery_actions,
+        recovery_side_effect_budget=candidate_recovery_budget,
+    )
+
+
 def _capsule_requires_strict_subset(env: CodeExecutionEnvBase) -> bool:
     env_config = getattr(env, "cfg", None)
     privileged = (
@@ -1751,6 +1939,96 @@ def _run_capsule_loop(
                 )
                 if consumes_recovery_side_effect:
                     recovery_side_effect_budget -= 1
+            if action.action in {"patch_region", "patch_group", "append_recovery"}:
+                prepared_source_edit: _PreparedSourceEdit | None = None
+                rejection: _SourceEditRejection | None = None
+                if event.status == "success":
+                    try:
+                        prepared_source_edit = _prepare_capsule_source_edit(
+                            action,
+                            str(event.evidence["source"]),
+                            source=source,
+                            regions=regions,
+                            groups=groups,
+                            lineage=lineage,
+                            source_revision=source_revision,
+                            group_boundary_after_lines=group_boundary_after_lines,
+                            use_semantic_groups=use_semantic_groups,
+                            max_regions_per_group=max_regions_per_group,
+                            public_api_calls=public_api_calls,
+                            side_effect_calls=side_effect_calls,
+                            require_strict_subset=require_strict_subset,
+                            validate_program_contract=validate_program_contract,
+                        )
+                    except _SourceEditRejection as exc:
+                        rejection = exc
+                    except Exception as exc:
+                        rejection = _SourceEditRejection(
+                            "candidate_analysis_error",
+                            f"Candidate source analysis failed: {exc}",
+                            evidence={"exception_type": type(exc).__name__},
+                        )
+
+                if rejection is not None:
+                    event = _source_edit_rejection_event(action, rejection)
+                    _annotate_source_edit_event(
+                        event,
+                        source_revision_before=action_source_revision,
+                        source_revision_after=action_source_revision,
+                        source_edit_committed=False,
+                        lineage_reconciliation_status=(
+                            rejection.lineage_reconciliation_status
+                        ),
+                        edit_rejection_reason=rejection.reason,
+                    )
+                elif prepared_source_edit is not None:
+                    source = prepared_source_edit.source
+                    source_analysis = prepared_source_edit.analysis
+                    source_revision = prepared_source_edit.revision
+                    lineage = prepared_source_edit.lineage
+                    group_boundary_after_lines = (
+                        prepared_source_edit.group_boundary_after_lines
+                    )
+                    regions = source_analysis.regions
+                    groups = source_analysis.groups
+                    region_by_id = prepared_source_edit.region_by_id
+                    group_by_id = prepared_source_edit.group_by_id
+                    program_contract_violations = source_analysis.contract_violations
+                    strict_subset_violations = source_analysis.strict_subset_violations
+                    contract_effectful_region_ids = (
+                        source_analysis.contract_effectful_region_ids
+                    )
+                    contract_effectful_group_ids = (
+                        source_analysis.contract_effectful_group_ids
+                    )
+                    if not program_contract_violations:
+                        recoverable_failed = False
+                    if action.action == "append_recovery":
+                        pending_recovery_actions = (
+                            prepared_source_edit.pending_recovery_actions
+                        )
+                        recovery_side_effect_budget = max(
+                            recovery_side_effect_budget,
+                            prepared_source_edit.recovery_side_effect_budget or 0,
+                        )
+                    _annotate_source_edit_event(
+                        event,
+                        source_revision_before=action_source_revision,
+                        source_revision_after=source_revision.revision,
+                        source_edit_committed=True,
+                        lineage_reconciliation_status="success",
+                    )
+                else:
+                    _annotate_source_edit_event(
+                        event,
+                        source_revision_before=action_source_revision,
+                        source_revision_after=action_source_revision,
+                        source_edit_committed=False,
+                        lineage_reconciliation_status="not_attempted",
+                        edit_rejection_reason=_source_edit_rejection_reason(
+                            action, event
+                        ),
+                    )
             safety_failed = safety_failed or _capsule_event_has_safety_failure(
                 event
             )
@@ -1767,8 +2045,6 @@ def _run_capsule_loop(
                 group = group_by_id.get(group_id)
                 if event.status != "invalid":
                     executed_regions += len(group.region_ids) if group is not None else 0
-            elif action.action == "append_recovery" and event.status == "success":
-                recovery_side_effect_budget = 1
             _record_runtime_side_effect_execution(
                 action,
                 event,
@@ -1862,6 +2138,14 @@ def _run_capsule_loop(
         )
         metric["unit_key"] = action_unit_key
         metric["source_revision"] = action_source_revision
+        for field in (
+            "source_revision_before",
+            "source_revision_after",
+            "source_edit_committed",
+            "lineage_reconciliation_status",
+            "edit_rejection_reason",
+        ):
+            metric[field] = event.evidence.get(field)
         metric["action_prompt_chars"] = action_prompt_chars
         metric["action_prompt_compact_context"] = llm_step_compact_context
         metric["action_prompt_char_budget"] = action_prompt_char_budget_metric
@@ -1883,104 +2167,6 @@ def _run_capsule_loop(
         )
         metric["budget_exhausted"] = False
         step_metrics.append(metric)
-
-        if (
-            action is not None
-            and action.action in {"patch_region", "patch_group", "append_recovery"}
-            and event.status == "success"
-        ):
-            previous_source = source
-            previous_source_line_count = len(source.splitlines())
-            previous_regions = regions
-            previous_groups = groups
-            current_source = str(event.evidence["source"])
-            edit_span = _runtime_source_edit_span(
-                action,
-                previous_source,
-                current_source,
-                previous_regions,
-                previous_groups,
-            )
-            if edit_span is None:
-                raise ValueError(
-                    f"Could not determine source edit span for {action.action}"
-                )
-            edit_start_line, edit_end_line, line_delta = edit_span
-            current_group_boundaries = _updated_group_boundaries_after_edit(
-                group_boundary_after_lines,
-                action=action,
-                edit_start_line=edit_start_line,
-                edit_end_line=edit_end_line,
-                line_delta=line_delta,
-                old_line_count=previous_source_line_count,
-            )
-            current_source_analysis = _analyze_capsule_source(
-                current_source,
-                use_semantic_groups=use_semantic_groups,
-                max_regions_per_group=max_regions_per_group,
-                public_api_calls=public_api_calls,
-                side_effect_calls=side_effect_calls,
-                require_strict_subset=require_strict_subset,
-                validate_program_contract=validate_program_contract,
-                group_boundary_after_lines=current_group_boundaries,
-            )
-            current_regions = current_source_analysis.regions
-            current_groups = current_source_analysis.groups
-            lineage = reconcile_lineage(
-                edit_kind=action.action,
-                previous_source=previous_source,
-                current_source=current_source,
-                previous_regions=previous_regions,
-                current_regions=current_regions,
-                previous_groups=previous_groups,
-                current_groups=current_groups,
-                previous_lineage=lineage,
-                edit_start_line=edit_start_line,
-                edit_end_line=edit_end_line,
-                line_delta=line_delta,
-            )
-            source_revision = _next_source_revision(
-                source_revision,
-                current_source,
-                edit_kind=action.action,
-                old_line_count=previous_source_line_count,
-            )
-            source = current_source
-            source_analysis = current_source_analysis
-            group_boundary_after_lines = current_group_boundaries
-            regions = current_regions
-            groups = current_groups
-            region_by_id = {region.region_id: region for region in regions}
-            group_by_id = {group.group_id: group for group in groups}
-            program_contract_violations = source_analysis.contract_violations
-            strict_subset_violations = source_analysis.strict_subset_violations
-            contract_effectful_region_ids = (
-                source_analysis.contract_effectful_region_ids
-            )
-            contract_effectful_group_ids = (
-                source_analysis.contract_effectful_group_ids
-            )
-            if (
-                source_analysis.syntax_error is None
-                and not program_contract_violations
-            ):
-                recoverable_failed = False
-            if action.action == "append_recovery":
-                pending_recovery_actions = _runtime_actions_for_appended_recovery(
-                    regions,
-                    groups,
-                    use_semantic_groups=use_semantic_groups,
-                    insert_after_line=previous_source_line_count,
-                )
-                recovery_side_effect_budget = max(
-                    recovery_side_effect_budget,
-                    _count_side_effect_runtime_actions(
-                        pending_recovery_actions,
-                        region_by_id,
-                        group_by_id,
-                        side_effect_calls,
-                    ),
-                )
 
         if stop_after_failed_event and event.status in {"failed", "invalid"}:
             loop_exit_reason = "failed_event"
@@ -2124,6 +2310,55 @@ def _validate_patched_source(
             },
         )
     return None
+
+
+def _source_edit_rejection_event(
+    action: RuntimeAction,
+    rejection: _SourceEditRejection,
+) -> RuntimeEvent:
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=_runtime_action_unit_id(action),
+        message=rejection.message,
+        evidence=dict(rejection.evidence),
+    )
+
+
+def _source_edit_rejection_reason(
+    action: RuntimeAction,
+    event: RuntimeEvent,
+) -> str:
+    if event.evidence.get("safety_failure") == "side_effect_replay":
+        return "executed_unit_edit_attempt"
+    if event.evidence.get("exception_type") == "SyntaxError":
+        return "candidate_syntax_error"
+    if action.action == "append_recovery":
+        return "invalid_recovery_source"
+    return "invalid_source_edit_action"
+
+
+def _annotate_source_edit_event(
+    event: RuntimeEvent,
+    *,
+    source_revision_before: int,
+    source_revision_after: int,
+    source_edit_committed: bool,
+    lineage_reconciliation_status: str,
+    edit_rejection_reason: str | None = None,
+) -> None:
+    if not source_edit_committed:
+        event.evidence.pop("source", None)
+    event.evidence.update(
+        {
+            "source_revision_before": source_revision_before,
+            "source_revision_after": source_revision_after,
+            "source_edit_committed": source_edit_committed,
+            "lineage_reconciliation_status": lineage_reconciliation_status,
+        }
+    )
+    if edit_rejection_reason is not None:
+        event.evidence["edit_rejection_reason"] = edit_rejection_reason
 
 
 def _execute_runtime_action(
@@ -2707,87 +2942,6 @@ def _missing_side_effect_lineage_event(action_name: str, unit_id: str) -> Runtim
     )
 
 
-def _remap_executed_side_effect_ledger(
-    action: RuntimeAction,
-    previous_source: str,
-    current_source: str,
-    previous_regions: list[CodeRegion],
-    current_regions: list[CodeRegion],
-    previous_groups: list[CodeRegionGroup],
-    current_groups: list[CodeRegionGroup],
-    executed_region_ids: set[str],
-    executed_group_ids: set[str],
-) -> tuple[set[str], set[str]]:
-    edit_span = _runtime_source_edit_span(
-        action,
-        previous_source,
-        current_source,
-        previous_regions,
-        previous_groups,
-    )
-    if edit_span is None:
-        return (
-            {region.region_id for region in current_regions},
-            {group.group_id for group in current_groups},
-        )
-    edit_start_line, edit_end_line, line_delta = edit_span
-    previous_region_by_id = {
-        region.region_id: region for region in previous_regions
-    }
-    remapped_region_ids: set[str] = set()
-    lineage_unresolved = False
-    for region_id in executed_region_ids:
-        previous_region = previous_region_by_id.get(region_id)
-        if previous_region is None:
-            lineage_unresolved = True
-            continue
-        matches = _lineage_matches_after_edit(
-            previous_region,
-            current_regions,
-            edit_start_line=edit_start_line,
-            edit_end_line=edit_end_line,
-            line_delta=line_delta,
-            id_attribute="region_id",
-        )
-        if not matches:
-            lineage_unresolved = True
-        remapped_region_ids.update(matches)
-
-    anchored_group_ids = {
-        group.group_id
-        for group in previous_groups
-        if executed_region_ids.intersection(group.region_ids)
-    }
-    previous_group_by_id = {group.group_id: group for group in previous_groups}
-    remapped_group_ids: set[str] = set()
-    for group_id in executed_group_ids - anchored_group_ids:
-        previous_group = previous_group_by_id.get(group_id)
-        if previous_group is None:
-            lineage_unresolved = True
-            continue
-        matches = _lineage_matches_after_edit(
-            previous_group,
-            current_groups,
-            edit_start_line=edit_start_line,
-            edit_end_line=edit_end_line,
-            line_delta=line_delta,
-            id_attribute="group_id",
-        )
-        if not matches:
-            lineage_unresolved = True
-        remapped_group_ids.update(matches)
-
-    if lineage_unresolved:
-        remapped_region_ids.update(region.region_id for region in current_regions)
-        remapped_group_ids.update(group.group_id for group in current_groups)
-    remapped_group_ids.update(
-        group.group_id
-        for group in current_groups
-        if remapped_region_ids.intersection(group.region_ids)
-    )
-    return remapped_region_ids, remapped_group_ids
-
-
 def _runtime_source_edit_span(
     action: RuntimeAction,
     previous_source: str,
@@ -2866,42 +3020,6 @@ def _next_source_revision(
         parent_revision=previous_revision.revision,
         old_line_count=old_line_count,
     )
-
-
-def _lineage_matches_after_edit(
-    previous_unit: CodeRegion | CodeRegionGroup,
-    current_units: list[CodeRegion] | list[CodeRegionGroup],
-    *,
-    edit_start_line: int,
-    edit_end_line: int,
-    line_delta: int,
-    id_attribute: str,
-) -> set[str]:
-    if previous_unit.end_line < edit_start_line:
-        expected_start = previous_unit.start_line
-        expected_end = previous_unit.end_line
-    elif previous_unit.start_line > edit_end_line:
-        expected_start = previous_unit.start_line + line_delta
-        expected_end = previous_unit.end_line + line_delta
-    else:
-        return set()
-
-    exact_source_candidates = [
-        unit
-        for unit in current_units
-        if unit.source.rstrip("\n") == previous_unit.source.rstrip("\n")
-    ]
-    expected_candidates = [
-        unit
-        for unit in exact_source_candidates
-        if unit.start_line == expected_start and unit.end_line == expected_end
-    ]
-    matches = (
-        expected_candidates
-        if len(expected_candidates) == 1
-        else exact_source_candidates
-    )
-    return {str(getattr(unit, id_attribute)) for unit in matches}
 
 
 def _runtime_patch_replacement(args: dict[str, Any]) -> Any:
