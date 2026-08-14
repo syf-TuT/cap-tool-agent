@@ -5,7 +5,6 @@ from capx.runtime_control.prompts import (
     _summarize_history_for_prompt,
     build_capsule_prompt,
     parse_runtime_action_response,
-    summarize_terminal_state_for_recovery,
 )
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup
 
@@ -1213,27 +1212,3 @@ def test_capsule_prompt_defaults_to_legacy_without_strict_constraints():
     )
 
     assert "Strict Python subset" not in prompt[1]["content"][0]["text"]
-
-
-def test_summarize_terminal_state_for_recovery_compacts_object_geometry():
-    summary = summarize_terminal_state_for_recovery(
-        {
-            "reward": 0.003,
-            "task_completed": False,
-            "gripper_fraction": 1.0,
-            "gripper_wxyz_xyz": [1, 0, 0, 0, 0.1, 0.2, 0.3],
-            "object_poses": {
-                "cubeA": {"pos": [0.08, -0.01, 0.82]},
-                "cubeB": {"pos": [0.12, -0.02, 0.82]},
-            },
-        }
-    )
-
-    assert summary["reward"] == 0.003
-    assert summary["task_completed"] is False
-    assert summary["gripper"]["open_fraction"] == 1.0
-    assert summary["objects"]["cubeA"]["pos_xyz"] == [0.08, -0.01, 0.82]
-    pair = summary["object_pair_geometry"][0]
-    assert pair["pair"] == "cubeA <-> cubeB"
-    assert pair["xy_distance"] > 0
-    assert pair["z_delta"] == 0.0

@@ -575,26 +575,6 @@ def _truncate_contract_text(value: Any, *, max_chars: int) -> str:
     return f"{text[: max_chars - len(suffix)]}{suffix}"
 
 
-def summarize_terminal_state_for_recovery(terminal_state: dict[str, Any]) -> dict[str, Any]:
-    summary: dict[str, Any] = {
-        "reward": terminal_state.get("reward"),
-        "task_completed": terminal_state.get("task_completed"),
-    }
-    if "gripper_fraction" in terminal_state or "gripper_wxyz_xyz" in terminal_state:
-        summary["gripper"] = {
-            "open_fraction": terminal_state.get("gripper_fraction"),
-            "pose_wxyz_xyz": _rounded_sequence(terminal_state.get("gripper_wxyz_xyz")),
-        }
-
-    objects = _terminal_object_positions(terminal_state)
-    if objects:
-        summary["objects"] = objects
-        pair_geometry = _terminal_object_pair_geometry(objects)
-        if pair_geometry:
-            summary["object_pair_geometry"] = pair_geometry
-    return summary
-
-
 def _source_preview(source: str, *, max_chars: int) -> str:
     if max_chars <= 0:
         return ""
@@ -1173,61 +1153,6 @@ def _prompt_text_over_budget(prompt_text: str, prompt_char_budget: int | None) -
         and prompt_char_budget > 0
         and len(json.dumps(_capsule_prompt_messages(prompt_text), default=str)) > prompt_char_budget
     )
-
-
-def _terminal_object_positions(terminal_state: dict[str, Any]) -> dict[str, Any]:
-    object_poses = terminal_state.get("object_poses")
-    if not isinstance(object_poses, dict):
-        return {}
-    objects: dict[str, Any] = {}
-    for name in sorted(object_poses):
-        pose = object_poses.get(name)
-        if not isinstance(pose, dict):
-            continue
-        pos = _rounded_sequence(pose.get("pos"))
-        if pos is None:
-            continue
-        objects[str(name)] = {"pos_xyz": pos}
-    return objects
-
-
-def _terminal_object_pair_geometry(objects: dict[str, Any]) -> list[dict[str, Any]]:
-    names = sorted(objects)
-    pair_geometry: list[dict[str, Any]] = []
-    for left_index, left_name in enumerate(names):
-        left_pos = objects[left_name].get("pos_xyz")
-        if not _is_xyz(left_pos):
-            continue
-        for right_name in names[left_index + 1 :]:
-            right_pos = objects[right_name].get("pos_xyz")
-            if not _is_xyz(right_pos):
-                continue
-            dx = float(right_pos[0]) - float(left_pos[0])
-            dy = float(right_pos[1]) - float(left_pos[1])
-            dz = float(right_pos[2]) - float(left_pos[2])
-            pair_geometry.append(
-                {
-                    "pair": f"{left_name} <-> {right_name}",
-                    "xy_distance": round((dx * dx + dy * dy) ** 0.5, 4),
-                    "z_delta": round(dz, 4),
-                }
-            )
-    return pair_geometry
-
-
-def _rounded_sequence(value: Any) -> list[float] | None:
-    if not isinstance(value, (list, tuple)):
-        return None
-    rounded: list[float] = []
-    for item in value:
-        if not isinstance(item, (int, float)):
-            return None
-        rounded.append(round(float(item), 4))
-    return rounded
-
-
-def _is_xyz(value: Any) -> bool:
-    return isinstance(value, list) and len(value) == 3
 
 
 def _bound_trace_summary(trace_summary: dict[str, Any], *, max_events: int) -> dict[str, Any]:
