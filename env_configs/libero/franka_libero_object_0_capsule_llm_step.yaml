@@ -36,7 +36,6 @@ env:
       The public API functions below are already available in the restricted execution environment.
 
 agent_mode: capsule
-capsule_control_mode: llm_step
 max_capsule_steps: 24
 capsule_execution_granularity: semantic_group
 capsule_progress_mode: sparse_terminal

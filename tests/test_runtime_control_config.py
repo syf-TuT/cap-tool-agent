@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from capx.envs.tasks.base import CodeExecEnvConfig
@@ -93,7 +94,7 @@ def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
     assert cfg["molmo_base_url"] == "http://127.0.0.1:8122/v1"
     assert cfg["molmo_model_name"] == "allenai/Molmo2-8B"
     assert data["agent_mode"] == "capsule"
-    assert data["capsule_control_mode"] == "llm_step"
+    assert "capsule_control_mode" not in data
     assert data["max_capsule_steps"] == 24
     assert data["capsule_progress_mode"] == "sparse_terminal"
     assert data["capsule_require_task_success_for_finish"] is True
@@ -212,7 +213,7 @@ def test_load_config_reads_capsule_fields():
     assert config["agent_mode"] == "capsule"
     assert config["max_capsule_steps"] == 12
     assert config["max_regenerations"] is None
-    assert config["capsule_control_mode"] == "auto_forward"
+    assert "capsule_control_mode" not in config
     assert config["checkpoint_policy"] == "region"
     assert config["rollback_policy"] == "none"
     assert config["capsule_execution_granularity"] == "semantic_group"
@@ -335,7 +336,7 @@ capsule_max_regions_per_group: 4
     assert config["capsule_max_regions_per_group"] == 4
 
 
-def test_load_config_reads_capsule_control_mode(tmp_path):
+def test_load_config_rejects_removed_capsule_control_mode(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         """
@@ -367,9 +368,8 @@ capsule_control_mode: auto_forward
         visual_differencing_model_api_key=None,
     )
 
-    _, config, _ = _load_config(args)
-
-    assert config["capsule_control_mode"] == "auto_forward"
+    with pytest.raises(ValueError, match="capsule_control_mode has been removed"):
+        _load_config(args)
 
 
 def test_load_config_reads_compact_llm_step_prompt_fields(tmp_path):

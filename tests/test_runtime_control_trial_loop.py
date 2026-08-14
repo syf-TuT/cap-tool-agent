@@ -383,7 +383,7 @@ def test_capsule_state_level_snapshots_do_not_share_nested_values():
 
 
 def test_capsule_llm_step_separates_prompt_and_diagnostic_state_artifacts(tmp_path):
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         FakeLiberoCapsuleEnv(),
         trial=2,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -424,7 +424,7 @@ def test_capsule_llm_step_separates_prompt_and_diagnostic_state_artifacts(tmp_pa
 
 
 def test_capsule_llm_step_diagnostic_state_artifact_none_writes_no_file(tmp_path):
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         FakeLiberoCapsuleEnv(),
         trial=3,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -453,7 +453,7 @@ def test_capsule_llm_step_rejects_invalid_configured_state_level_before_action(
     env = FakeLiberoCapsuleEnv()
 
     with pytest.raises(ValueError, match=r"allowed"):
-        trial_module._run_capsule_llm_step_loop(
+        trial_module._run_capsule_loop(
             env,
             trial=4,
             args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -1091,7 +1091,7 @@ def test_capsule_llm_step_libero_goal_before_initial_query_and_shared_prompt_iso
     monkeypatch.setattr(trial_module, "_query_initial_code", fake_initial_code)
 
     for trial_id in range(2):
-        trial_module._run_capsule_llm_step_loop(
+        trial_module._run_capsule_loop(
             env,
             trial=trial_id,
             args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -1157,7 +1157,7 @@ def test_capsule_llm_step_visual_feedback_uses_current_pairs_and_sanitized_artif
     monkeypatch.setattr(trial_module, "_capture_capsule_visuals", fake_capture)
     monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         FakeCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -1275,7 +1275,7 @@ def test_capsule_llm_step_visual_feedback_clears_failed_camera_for_next_prompt(
 
     monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         FakeCapsuleEnv(),
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -1329,7 +1329,7 @@ def test_capsule_llm_step_visual_feedback_keeps_save_failures_out_of_live_prompt
 
     monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         FakeCapsuleEnv(),
         trial=5,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -1389,7 +1389,7 @@ def test_capsule_llm_step_visual_feedback_audits_terminal_refresh_failures(
         lambda records, output_dir, *, trial_id, step_id: next(saves),
     )
 
-    summary = trial_module._run_capsule_llm_step_loop(
+    summary = trial_module._run_capsule_loop(
         FakeCapsuleEnv(),
         trial=6,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -1451,7 +1451,7 @@ def test_capsule_llm_step_visual_feedback_can_keep_action_prompts_text_only(
 
     monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         FakeCapsuleEnv(),
         trial=2,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -1490,7 +1490,7 @@ def test_capsule_llm_step_visual_feedback_refreshes_after_all_action_outcomes(
 
     monkeypatch.setattr(trial_module, "_capture_capsule_visuals", fake_capture)
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         FakeIncompleteCapsuleEnv(),
         trial=3,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -1538,7 +1538,7 @@ def test_capsule_llm_step_visual_feedback_refreshes_for_forced_recovery_without_
 
     monkeypatch.setattr(trial_module, "_capture_capsule_visuals", fake_capture)
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         FakeRewardDropCapsuleEnv(),
         trial=4,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -1666,17 +1666,13 @@ def test_capsule_action_query_uses_capsule_action_stage(tmp_path, monkeypatch):
     assert _telemetry_stages(telemetry_path) == ["capsule_action"]
 
 
-def test_capsule_trial_defaults_to_auto_forward(monkeypatch):
+def test_capsule_trial_dispatches_directly_to_capsule_loop(monkeypatch):
     expected = object()
 
-    def fake_auto_forward(**kwargs):
+    def fake_capsule_loop(**kwargs):
         return expected
 
-    def fail_llm_step(**kwargs):
-        raise AssertionError("omitting capsule_control_mode should use auto_forward")
-
-    monkeypatch.setattr(trial_module, "_run_capsule_auto_forward_loop", fake_auto_forward)
-    monkeypatch.setattr(trial_module, "_run_capsule_llm_step_loop", fail_llm_step)
+    monkeypatch.setattr(trial_module, "_run_capsule_loop", fake_capsule_loop)
 
     result = _run_capsule_trial(
         env=FakeCapsuleEnv(),
@@ -2614,7 +2610,7 @@ def test_capsule_llm_step_program_contract_blocks_effects_until_patch(tmp_path):
         "move_cube()\n"
     )
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -2668,7 +2664,7 @@ def test_capsule_llm_step_program_contract_blocks_effects_until_patch(tmp_path):
 def test_capsule_llm_step_program_contract_flag_false_preserves_execution(tmp_path):
     env = FakePrivilegedCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -2699,7 +2695,7 @@ def test_capsule_llm_step_program_contract_flag_false_preserves_execution(tmp_pa
 def test_privileged_contract_flag_false_preserves_effectful_loop_execution(tmp_path):
     env = FakePrivilegedCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -2758,7 +2754,7 @@ def test_nonprivileged_llm_step_flag_false_blocks_multiple_effects_before_execut
 ):
     env = FakeUnsafeNonPrivilegedCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -2806,7 +2802,7 @@ def test_nonprivileged_llm_step_enforces_strict_subset_when_contract_flag_false(
 ):
     env = FakeUnsafeNonPrivilegedCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -2843,7 +2839,7 @@ def test_nonprivileged_llm_step_enforces_strict_subset_when_contract_flag_false(
 def test_nonprivileged_llm_step_reanalyzes_strict_source_after_patch(tmp_path):
     env = FakeSuccessfulNonPrivilegedCapsuleEnv()
 
-    summary = trial_module._run_capsule_llm_step_loop(
+    summary = trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -2900,7 +2896,7 @@ def test_llm_step_invalid_action_is_recoverable_before_task_success(
         lambda args, prompt: next(responses),
     )
 
-    summary = trial_module._run_capsule_llm_step_loop(
+    summary = trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -2925,7 +2921,7 @@ def test_llm_step_invalid_action_is_recoverable_before_task_success(
 def test_llm_step_safety_failure_stays_failed_after_append_recovery(tmp_path):
     env = FakeSuccessfulRecoveryNonPrivilegedCapsuleEnv()
 
-    summary = trial_module._run_capsule_llm_step_loop(
+    summary = trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -2975,7 +2971,7 @@ def test_nonprivileged_strict_preflight_skips_segmentation_for_helper_flood(
     monkeypatch.setattr(trial_module, "segment_python_code", fail_if_called)
     monkeypatch.setattr(trial_module, "segment_python_code_groups", fail_if_called)
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3004,7 +3000,7 @@ def test_nonprivileged_capsule_globals_block_raw_env_truth_without_prompt_leak(
 ):
     env = FakeUnsafeNonPrivilegedCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3034,7 +3030,7 @@ def test_nonprivileged_capsule_globals_block_raw_env_truth_without_prompt_leak(
 def test_nonprivileged_public_api_is_traced_and_no_replay_guarded(tmp_path):
     env = FakeUnsafeNonPrivilegedCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3076,7 +3072,7 @@ def test_capsule_contract_blocks_alias_and_dynamic_effects_before_execution(
 ):
     env = FakeUnsafeNonPrivilegedCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3121,7 +3117,7 @@ def test_capsule_contract_blocks_reflection_lambda_and_destructuring(
     env = FakeUnsafeNonPrivilegedCapsuleEnv()
     env.api.env = env.low_level_env
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3150,7 +3146,7 @@ def test_capsule_contract_blocks_reflection_lambda_and_destructuring(
 def test_capsule_contract_blocks_effectful_class_definition(tmp_path):
     env = FakeUnsafeNonPrivilegedCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3199,7 +3195,7 @@ def test_capsule_contract_blocks_forbidden_builtin_aliases(tmp_path, source):
     env = FakeUnsafeNonPrivilegedCapsuleEnv()
     env.api.env = env.low_level_env
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3264,7 +3260,7 @@ def test_program_contract_guard_only_blocks_side_effect_execution_units():
 def test_capsule_contract_region_guard_tracks_transitive_helper_effects(tmp_path):
     env = FakeGripperCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3306,7 +3302,7 @@ def test_capsule_contract_region_guard_tracks_transitive_helper_effects(tmp_path
 def test_capsule_contract_guard_blocks_effectful_comprehension(tmp_path):
     env = FakeGripperCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3334,7 +3330,7 @@ def test_capsule_contract_guard_blocks_effectful_comprehension(tmp_path):
 def test_capsule_no_replay_ledger_survives_patch_group_renumbering(tmp_path):
     env = FakeCustomMoveCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3380,7 +3376,7 @@ def test_capsule_no_replay_ledger_survives_patch_group_renumbering(tmp_path):
 def test_capsule_no_replay_rejects_second_resume_from_side_effect_region(tmp_path):
     env = FakeCustomMoveCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3406,7 +3402,7 @@ def test_capsule_no_replay_rejects_second_resume_from_side_effect_region(tmp_pat
 def test_capsule_region_execution_seals_containing_group(tmp_path):
     env = FakeCustomMoveCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3440,7 +3436,7 @@ def test_capsule_region_execution_seals_containing_group(tmp_path):
 def test_capsule_resume_execution_seals_containing_group(tmp_path):
     env = FakeCustomMoveCapsuleEnv()
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3477,7 +3473,7 @@ def test_capsule_side_effect_lineage_uses_edit_span_with_duplicate_source(tmp_pa
     )
     moved_effect_group_id = current_groups[-1].group_id
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3520,7 +3516,7 @@ def test_capsule_llm_step_reanalyzes_forced_appended_recovery(tmp_path):
         "recover()\n"
     )
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3567,7 +3563,7 @@ def test_capsule_llm_step_uses_compact_action_prompt_by_default(tmp_path, monkey
 
     monkeypatch.setattr("capx.envs.trial._query_model", fake_query_model)
 
-    summary = trial_module._run_capsule_llm_step_loop(
+    summary = trial_module._run_capsule_loop(
         FakeCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3600,7 +3596,7 @@ def test_capsule_llm_step_can_disable_compact_action_prompt(tmp_path, monkeypatc
 
     monkeypatch.setattr("capx.envs.trial._query_model", fake_query_model)
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         FakeCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3634,7 +3630,7 @@ def test_capsule_llm_step_treats_string_false_as_non_compact_context(
 
     monkeypatch.setattr("capx.envs.trial._query_model", fake_query_model)
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         FakeCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3667,7 +3663,7 @@ def test_capsule_llm_step_records_prompt_budget_overflow_after_fallback(
 
     monkeypatch.setattr("capx.envs.trial._query_model", fake_query_model)
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         FakeCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -3712,7 +3708,7 @@ def test_capsule_llm_step_compact_prompt_does_not_replay_full_patched_source(
 
     monkeypatch.setattr("capx.envs.trial._query_model", fake_query_model)
 
-    trial_module._run_capsule_llm_step_loop(
+    trial_module._run_capsule_loop(
         FakeCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -4878,7 +4874,7 @@ def test_capsule_trial_marks_exhausted_budget_as_failed(tmp_path):
 def test_capsule_llm_step_rejects_premature_finish_and_continues(tmp_path):
     env = FakeRewardDropCapsuleEnv()
 
-    summary = trial_module._run_capsule_llm_step_loop(
+    summary = trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -4912,7 +4908,7 @@ def test_capsule_llm_step_rejects_invalid_progress_mode_before_side_effect(tmp_p
     env = FakeRewardDropCapsuleEnv()
 
     with pytest.raises(ValueError, match="progress_mode.*dense.*sparse_terminal"):
-        trial_module._run_capsule_llm_step_loop(
+        trial_module._run_capsule_loop(
             env,
             trial=0,
             args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -4933,7 +4929,7 @@ def test_capsule_llm_step_rejects_invalid_progress_mode_before_side_effect(tmp_p
 def test_capsule_llm_step_stops_immediately_on_success_when_finish_guard_enabled(tmp_path):
     env = FakeRewardDropCapsuleEnv()
 
-    summary = trial_module._run_capsule_llm_step_loop(
+    summary = trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -4957,7 +4953,7 @@ def test_capsule_llm_step_stops_immediately_on_success_when_finish_guard_enabled
 
 
 def test_capsule_llm_step_marks_budget_exhausted_without_event_failure(tmp_path):
-    summary = trial_module._run_capsule_llm_step_loop(
+    summary = trial_module._run_capsule_loop(
         FakeIncompleteCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
@@ -4981,7 +4977,7 @@ def test_capsule_llm_step_marks_budget_exhausted_without_event_failure(tmp_path)
 
 
 def test_capsule_llm_step_marks_zero_step_budget_exhausted(tmp_path):
-    summary = trial_module._run_capsule_llm_step_loop(
+    summary = trial_module._run_capsule_loop(
         FakeIncompleteCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),

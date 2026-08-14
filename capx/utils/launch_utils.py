@@ -108,6 +108,11 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
     """
     config_path = os.path.expanduser(args.config_path)
     configs_dict = DictLoader.load([config_path])
+    if "capsule_control_mode" in configs_dict:
+        raise ValueError(
+            "capsule_control_mode has been removed. Capsule now always uses strict "
+            "per-action LLM control. Remove this configuration field."
+        )
 
     # Extract environment factory (don't instantiate yet - that happens per worker)
     if "env" not in configs_dict:
@@ -177,7 +182,6 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "agent_mode": configs_dict.get("agent_mode", "code"),
         "max_regenerations": configs_dict.get("max_regenerations", None),
         "max_capsule_steps": configs_dict.get("max_capsule_steps", 12),
-        "capsule_control_mode": configs_dict.get("capsule_control_mode", "auto_forward"),
         "capsule_llm_step_compact_context": configs_dict.get(
             "capsule_llm_step_compact_context", True
         ),

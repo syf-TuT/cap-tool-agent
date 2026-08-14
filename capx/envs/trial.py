@@ -1355,25 +1355,14 @@ def _run_capsule_trial(
     initial_code: str | None = None,
     scripted_actions: list[dict[str, Any]] | None = None,
 ) -> TrialSummary:
-    mode = str(config.get("capsule_control_mode", "auto_forward"))
-    if mode == "auto_forward":
-        return _run_capsule_auto_forward_loop(
-            env=env,
-            trial=trial,
-            args=args,
-            config=config,
-            initial_code=initial_code,
-        )
-    if mode == "llm_step":
-        return _run_capsule_llm_step_loop(
-            env=env,
-            trial=trial,
-            args=args,
-            config=config,
-            initial_code=initial_code,
-            scripted_actions=scripted_actions,
-        )
-    raise ValueError(f"Unsupported capsule_control_mode: {mode}")
+    return _run_capsule_loop(
+        env=env,
+        trial=trial,
+        args=args,
+        config=config,
+        initial_code=initial_code,
+        scripted_actions=scripted_actions,
+    )
 
 
 def _build_capsule_execution_globals(
@@ -2099,7 +2088,7 @@ def _run_capsule_auto_forward_loop(
     )
 
 
-def _run_capsule_llm_step_loop(
+def _run_capsule_loop(
     env: CodeExecutionEnvBase,
     trial: int,
     args: LaunchArgs,
