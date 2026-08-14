@@ -67,6 +67,7 @@ def test_compact_prompt_always_keeps_latest_post_action_observation():
             for index in range(40)
         ],
         trace_revision=12,
+        source_revision=8,
         terminal_progress_unverified=True,
     )
 
@@ -84,7 +85,8 @@ def test_compact_prompt_always_keeps_latest_post_action_observation():
     text = prompt[1]["content"][0]["text"]
 
     assert text.count("Latest post-action observation") == 1
-    assert '"source_revision": 9' in text
+    assert '"source_revision": 8' in text
+    assert '"current_source_revision": 9' in text
     assert '"step_id": 4' in text
     assert '"unit_id": "group_3"' in text
     assert '"event_status": "success"' in text
@@ -92,6 +94,9 @@ def test_compact_prompt_always_keeps_latest_post_action_observation():
     assert '"reward_delta": 0.0' in text
     assert '"failed_trace_event_count": 0' in text
     assert '"new_trace_event_count": 40' in text
+    assert '"omitted_trace_event_count": 32' in text
+    assert '"state_view_truncated": true' in text
+    assert '"trace_view_truncated": true' in text
     assert '"terminal_progress_unverified": true' in text
     assert "group_key_000003" not in text
     assert long_value not in text

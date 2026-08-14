@@ -106,6 +106,7 @@ def test_post_action_observation_exports_stable_audit_fields():
         task_completed=False,
         new_trace_events=[{"name": "move_to", "status": "success"}],
         trace_revision=7,
+        source_revision=2,
         terminal_progress_unverified=True,
     )
 
@@ -122,6 +123,7 @@ def test_post_action_observation_exports_stable_audit_fields():
         "task_completed": False,
         "new_trace_events": [{"name": "move_to", "status": "success"}],
         "trace_revision": 7,
+        "source_revision": 2,
         "terminal_progress_unverified": True,
         "safety_failure": None,
     }

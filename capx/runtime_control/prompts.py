@@ -410,7 +410,7 @@ def _build_capsule_prompt_text(
     if latest_observation is not None:
         compact_observation = _compact_post_action_observation(
             latest_observation,
-            source_revision=source_revision,
+            current_source_revision=source_revision,
         )
         latest_observation_text = (
             "Latest post-action observation:\n"
@@ -484,7 +484,7 @@ def _build_capsule_prompt_text(
 def _compact_post_action_observation(
     observation: PostActionObservation,
     *,
-    source_revision: int | None,
+    current_source_revision: int | None,
 ) -> dict[str, Any]:
     state_before = _bound_post_action_value(observation.state_before)
     state_after = _bound_post_action_value(observation.state_after)
@@ -504,6 +504,11 @@ def _compact_post_action_observation(
         for event in visible_trace_events
         if trace_budget["remaining"] > 0
     ]
+    state_view_truncated = (
+        state_before != observation.state_before
+        or state_after != observation.state_after
+    )
+    trace_view_truncated = bounded_trace_events != trace_events
     primitive_calls = _bound_history_text_list(
         [event.get("name") for event in trace_events if isinstance(event, dict)],
         max_items=_POST_ACTION_PRIMITIVE_MAX_ITEMS,
@@ -520,7 +525,7 @@ def _compact_post_action_observation(
         else None
     )
     compact = {
-        "source_revision": source_revision,
+        "source_revision": observation.source_revision,
         "step_id": observation.step_id,
         "action": _bound_history_scalar(observation.action),
         "unit_id": _bound_history_scalar(observation.unit_id),
@@ -528,6 +533,7 @@ def _compact_post_action_observation(
         "state_before": state_before,
         "state_after": state_after,
         "state_delta": state_delta,
+        "state_view_truncated": state_view_truncated,
         "reward_before": observation.reward_before,
         "reward_after": observation.reward_after,
         "reward_delta": reward_delta,
@@ -539,8 +545,14 @@ def _compact_post_action_observation(
         "new_trace_event_count": len(trace_events),
         "new_trace_events": bounded_trace_events,
         "omitted_trace_event_count": len(trace_events) - len(bounded_trace_events),
+        "trace_view_truncated": trace_view_truncated,
         "trace_revision": observation.trace_revision,
     }
+    if (
+        current_source_revision is not None
+        and current_source_revision != observation.source_revision
+    ):
+        compact["current_source_revision"] = current_source_revision
     always_included = {
         "reward_before",
         "reward_after",

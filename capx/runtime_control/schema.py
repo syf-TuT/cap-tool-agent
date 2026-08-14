@@ -128,6 +128,7 @@ class PostActionObservation:
     task_completed: bool
     new_trace_events: list[dict[str, Any]]
     trace_revision: int
+    source_revision: int
     terminal_progress_unverified: bool = False
     safety_failure: str | None = None
 

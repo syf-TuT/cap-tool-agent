@@ -248,6 +248,11 @@ class FakePrivilegedCapsuleEnv(FakeGripperCapsuleEnv):
         self.cfg = SimpleNamespace(privileged=True)
 
 
+class FakeSuccessfulPrivilegedCapsuleEnv(FakePrivilegedCapsuleEnv):
+    def compute_reward(self):
+        return 1.0 if self.api.calls else 0.0
+
+
 class FakeVideoCapsuleEnv(FakeCapsuleEnv):
     def __init__(self):
         super().__init__()
@@ -1164,7 +1169,7 @@ def test_capsule_llm_step_visual_feedback_uses_current_pairs_and_sanitized_artif
     monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
 
     trial_module._run_capsule_loop(
-        FakeCapsuleEnv(),
+        FakeIncompleteCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -1282,7 +1287,7 @@ def test_capsule_llm_step_visual_feedback_clears_failed_camera_for_next_prompt(
     monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
 
     trial_module._run_capsule_loop(
-        FakeCapsuleEnv(),
+        FakeIncompleteCapsuleEnv(),
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -1458,7 +1463,7 @@ def test_capsule_llm_step_visual_feedback_can_keep_action_prompts_text_only(
     monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
 
     trial_module._run_capsule_loop(
-        FakeCapsuleEnv(),
+        FakeIncompleteCapsuleEnv(),
         trial=2,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -1693,7 +1698,7 @@ def test_capsule_trial_dispatches_directly_to_capsule_loop(monkeypatch):
 
 
 def test_capsule_llm_step_mode_keeps_existing_action_loop(tmp_path):
-    env = FakeCapsuleEnv()
+    env = FakeIncompleteCapsuleEnv()
 
     summary = _run_capsule_trial(
         env=env,
@@ -1716,7 +1721,7 @@ def test_capsule_llm_step_mode_keeps_existing_action_loop(tmp_path):
 
     trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
 
-    assert summary.sandbox_rc == 0
+    assert summary.sandbox_rc == 1
     assert env.api.moved is True
     assert [entry["event"]["action"] for entry in trace] == ["run_group", "finish"]
 
@@ -1998,7 +2003,45 @@ def test_nonprivileged_llm_step_reanalyzes_strict_source_after_patch(tmp_path):
     assert env.api.calls == ["close_gripper"]
     assert [row["strict_subset_valid"] for row in metrics] == [False, True, True]
     assert metrics[-1]["program_contract_valid"] is True
-    assert summary.sandbox_rc == 0
+    assert summary.sandbox_rc == 1
+
+
+def test_program_contract_safety_failure_stays_sticky_after_task_success(tmp_path):
+    env = FakeSuccessfulPrivilegedCapsuleEnv()
+
+    summary = trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_validate_program_contract": True,
+        },
+        initial_code="def act():\n    close_gripper()\nact()\n",
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": "close_gripper()\n"},
+            },
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "invalid",
+        "success",
+        "success",
+    ]
+    assert trace[0]["post_action_observation"]["safety_failure"] == (
+        "program_contract_violation"
+    )
+    assert env.api.calls == ["close_gripper"]
+    assert summary.reward == 1.0
+    assert summary.sandbox_rc == 1
 
 
 def test_llm_step_invalid_action_is_recoverable_before_task_success(
@@ -2044,7 +2087,7 @@ def test_llm_step_invalid_action_is_recoverable_before_task_success(
 
 
 def test_llm_step_safety_failure_stays_failed_after_append_recovery(tmp_path):
-    env = FakeSuccessfulRecoveryNonPrivilegedCapsuleEnv()
+    env = FakeRewardDropCapsuleEnv()
 
     summary = trial_module._run_capsule_loop(
         env,
@@ -2055,14 +2098,14 @@ def test_llm_step_safety_failure_stays_failed_after_append_recovery(tmp_path):
             "max_capsule_steps": 4,
             "capsule_validate_program_contract": False,
         },
-        initial_code="close_gripper()\n",
+        initial_code='move_to("good")\n',
         scripted_actions=[
             {"action": "run_group", "args": {"group_id": "group_1"}},
             {"action": "run_group", "args": {"group_id": "group_1"}},
             {
                 "action": "append_recovery",
                 "args": {
-                    "source": "state = get_observation()\nresult = len(state)\n",
+                    "source": 'state = get_observation()\nmove_to("recover")\n',
                 },
             },
             {"action": "run_group", "args": {"group_id": "group_2"}},
@@ -2080,7 +2123,7 @@ def test_llm_step_safety_failure_stays_failed_after_append_recovery(tmp_path):
     assert trace[1]["event"]["evidence"]["safety_failure"] == (
         "side_effect_replay"
     )
-    assert env.api.calls == ["close_gripper"]
+    assert env.api.moves == ["good", "recover"]
     assert summary.reward == 1.0
     assert summary.sandbox_rc == 1
 
@@ -3374,7 +3417,7 @@ def test_capsule_llm_step_uses_compact_action_prompt_by_default(tmp_path, monkey
     monkeypatch.setattr("capx.envs.trial._query_model", fake_query_model)
 
     summary = trial_module._run_capsule_loop(
-        FakeCapsuleEnv(),
+        FakeIncompleteCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -3516,7 +3559,7 @@ def test_capsule_llm_step_next_prompt_includes_accumulated_trace_summary(
     monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
 
     trial_module._run_capsule_loop(
-        FakeCapsuleEnv(),
+        FakeIncompleteCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -3587,6 +3630,106 @@ def test_capsule_records_one_post_action_observation_per_attempted_group(
     assert observation["trace_revision"] == 1
     assert observation["terminal_progress_unverified"] is True
     assert "post_action_observation" not in audit[1]
+
+
+def test_capsule_observation_keeps_execution_revision_after_later_source_edit(
+    tmp_path, monkeypatch
+):
+    live_prompts = []
+    responses = iter(
+        [
+            {"content": '{"action":"run_group","args":{"group_id":"group_1"}}'},
+            {
+                "content": (
+                    '{"action":"append_recovery","args":'
+                    '{"source":"state = get_observation()"}}'
+                )
+            },
+            {"content": '{"action":"finish","args":{}}'},
+        ]
+    )
+
+    def fake_query_model(args, prompt):
+        live_prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code="x = 1\n",
+    )
+
+    audit = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    third_prompt_text = live_prompts[2][1]["content"][0]["text"]
+    observation_section = third_prompt_text.split(
+        "Latest post-action observation:\n", 1
+    )[1].split("Recent runtime history summary:\n", 1)[0]
+
+    assert len(live_prompts) == 3
+    assert audit[0]["post_action_observation"]["source_revision"] == 0
+    assert audit[1]["source_revision"] == 0
+    assert audit[1]["event"]["evidence"]["source_revision_after"] == 1
+    assert '"source_revision": 0' in observation_section
+    assert '"current_source_revision": 1' in observation_section
+
+
+def test_capsule_task_success_stops_before_another_default_config_query(
+    tmp_path, monkeypatch
+):
+    env = FakeSuccessfulNonPrivilegedCapsuleEnv()
+    query_count = 0
+
+    def fake_query_model(args, prompt):
+        nonlocal query_count
+        query_count += 1
+        if query_count > 1:
+            pytest.fail("task success must prevent another Action LLM query")
+        return {"content": '{"action":"run_group","args":{"group_id":"group_1"}}'}
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    summary = trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code="close_gripper()\n",
+    )
+
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    audit = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert query_count == 1
+    assert len(metrics) == 1
+    assert metrics[0]["post_action_observation_recorded"] is True
+    assert len(audit) == 1
+    assert summary.num_finishes == 0
+    assert summary.sandbox_rc == 0
+
+
+def test_capsule_run_region_metrics_report_step_trace_boundaries(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code='pose = get_pose("cube")\n',
+        scripted_actions=[
+            {"action": "run_region", "args": {"region_id": "region_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+
+    assert [row["new_trace_event_count"] for row in metrics] == [1, 0]
+    assert [row["trace_revision_before"] for row in metrics] == [0, 1]
+    assert [row["trace_revision_after"] for row in metrics] == [1, 1]
+    assert metrics[0]["post_action_observation_recorded"] is False
 
 
 def test_capsule_post_action_observation_contains_only_that_groups_new_trace_events(
@@ -3703,7 +3846,7 @@ def test_post_action_observation_normalizes_safety_guard_outcomes(evidence, expe
 
 def test_capsule_non_group_actions_do_not_record_post_action_observations(tmp_path):
     trial_module._run_capsule_loop(
-        FakeCapsuleEnv(),
+        FakeIncompleteCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
@@ -3822,7 +3965,7 @@ def test_capsule_llm_step_compact_prompt_does_not_replay_full_patched_source(
     monkeypatch.setattr("capx.envs.trial._query_model", fake_query_model)
 
     trial_module._run_capsule_loop(
-        FakeCapsuleEnv(),
+        FakeIncompleteCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -4122,7 +4265,7 @@ class FakeMultiTurnEnv:
 
 def test_capsule_trial_runs_scripted_regions(tmp_path):
     summary = _run_capsule_trial(
-        env=FakeCapsuleEnv(),
+        env=FakeIncompleteCapsuleEnv(),
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -4140,7 +4283,7 @@ def test_capsule_trial_runs_scripted_regions(tmp_path):
         ],
     )
 
-    assert summary.sandbox_rc == 0
+    assert summary.sandbox_rc == 1
     assert summary.num_code_blocks == 2
     assert summary.num_finishes == 1
 
@@ -4233,7 +4376,7 @@ def test_capsule_trial_writes_original_source_after_group_normalization(tmp_path
 
 def test_capsule_trial_patches_group_and_regroups(tmp_path):
     summary = _run_capsule_trial(
-        env=FakeCapsuleEnv(),
+        env=FakeIncompleteCapsuleEnv(),
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -4260,7 +4403,7 @@ def test_capsule_trial_patches_group_and_regroups(tmp_path):
     trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
     patched_source = Path(summary.code_path).read_text()
 
-    assert summary.sandbox_rc == 0
+    assert summary.sandbox_rc == 1
     assert trace[0]["event"]["action"] == "patch_group"
     assert trace[1]["event"]["region_id"] == "group_1"
     assert 'RESULT = "patched"' in patched_source
@@ -4268,7 +4411,7 @@ def test_capsule_trial_patches_group_and_regroups(tmp_path):
 
 def test_capsule_repairs_invalid_initial_source_with_patch_group(tmp_path):
     summary = _run_capsule_trial(
-        env=FakeCapsuleEnv(),
+        env=FakeIncompleteCapsuleEnv(),
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -4294,7 +4437,7 @@ def test_capsule_repairs_invalid_initial_source_with_patch_group(tmp_path):
 
     trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
 
-    assert summary.sandbox_rc == 0
+    assert summary.sandbox_rc == 1
     assert trace[0]["event"]["action"] == "initial_parse"
     assert trace[0]["event"]["evidence"]["exception_type"] == "SyntaxError"
     assert trace[1]["event"]["action"] == "patch_group"
@@ -4303,7 +4446,7 @@ def test_capsule_repairs_invalid_initial_source_with_patch_group(tmp_path):
 
 def test_capsule_retries_after_syntax_error_in_group_patch(tmp_path):
     summary = _run_capsule_trial(
-        env=FakeCapsuleEnv(),
+        env=FakeIncompleteCapsuleEnv(),
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -4343,7 +4486,7 @@ def test_capsule_retries_after_syntax_error_in_group_patch(tmp_path):
 
 
 def test_capsule_trial_appends_recovery_and_regroups(tmp_path):
-    env = FakeCapsuleEnv()
+    env = FakeIncompleteCapsuleEnv()
 
     summary = _run_capsule_trial(
         env=env,
@@ -4371,7 +4514,7 @@ def test_capsule_trial_appends_recovery_and_regroups(tmp_path):
     trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
     patched_source = Path(summary.code_path).read_text()
 
-    assert summary.sandbox_rc == 0
+    assert summary.sandbox_rc == 1
     assert env.api.observed is True
     assert trace[1]["event"]["action"] == "append_recovery"
     assert trace[2]["event"]["region_id"] == "group_2"
@@ -4489,7 +4632,7 @@ def test_append_recovery_syntax_error_includes_source_location():
 
 def test_capsule_trial_rejects_rerun_of_executed_side_effect_group(tmp_path):
     summary = _run_capsule_trial(
-        env=FakeCapsuleEnv(),
+        env=FakeIncompleteCapsuleEnv(),
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -4825,7 +4968,7 @@ def test_capsule_action_query_defaults_to_4096_tokens(tmp_path, monkeypatch):
 
 def test_capsule_trial_rejects_patch_of_executed_side_effect_group(tmp_path):
     summary = _run_capsule_trial(
-        env=FakeCapsuleEnv(),
+        env=FakeIncompleteCapsuleEnv(),
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -5080,8 +5223,8 @@ def test_capsule_llm_step_allows_entire_appended_recovery_block_after_reward_dro
         "success",
         "success",
         "success",
-        "success",
     ]
+    assert all(entry["event"]["action"] != "finish" for entry in trace)
     assert trace[4]["action"]["args"]["group_id"] == "group_4"
     assert trace[5]["action"]["args"]["group_id"] == "group_5"
 
@@ -5154,7 +5297,7 @@ def test_runtime_variable_summary_safely_handles_non_numpy_shape():
 
 def test_capsule_trial_allows_patch_of_executed_non_side_effect_group(tmp_path):
     summary = _run_capsule_trial(
-        env=FakeCapsuleEnv(),
+        env=FakeIncompleteCapsuleEnv(),
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -5176,7 +5319,7 @@ def test_capsule_trial_allows_patch_of_executed_non_side_effect_group(tmp_path):
     trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
     patched_source = Path(summary.code_path).read_text()
 
-    assert summary.sandbox_rc == 0
+    assert summary.sandbox_rc == 1
     assert trace[1]["event"]["status"] == "success"
     assert "x = 2" in patched_source
 
@@ -5447,7 +5590,7 @@ def test_capsule_trial_records_video_when_requested(tmp_path, monkeypatch):
 
 def test_capsule_trial_writes_trace_and_feedback_artifact(tmp_path):
     _run_capsule_trial(
-        env=FakeCapsuleEnv(),
+        env=FakeIncompleteCapsuleEnv(),
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -5474,7 +5617,7 @@ def test_capsule_trial_writes_trace_and_feedback_artifact(tmp_path):
 
 def test_capsule_trial_writes_step_metrics_jsonl(tmp_path):
     _run_capsule_trial(
-        env=FakeCapsuleEnv(),
+        env=FakeIncompleteCapsuleEnv(),
         trial=1,
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={
@@ -5497,11 +5640,11 @@ def test_capsule_trial_writes_step_metrics_jsonl(tmp_path):
     assert [row["step_id"] for row in rows] == [1, 2]
     assert rows[0]["action"] == "run_region"
     assert rows[0]["event_status"] == "success"
-    assert rows[0]["reward_before"] == 1.0
-    assert rows[0]["reward_after"] == 1.0
-    assert rows[0]["best_reward_so_far"] == 1.0
+    assert rows[0]["reward_before"] == 0.0
+    assert rows[0]["reward_after"] == 0.0
+    assert rows[0]["best_reward_so_far"] == 0.0
     assert rows[0]["reward_drop_from_best"] == 0.0
-    assert rows[0]["state_after"]["reward"] == 1.0
+    assert rows[0]["state_after"]["reward"] == 0.0
     assert [row["action_origin"] for row in rows] == ["scripted", "scripted"]
 
 

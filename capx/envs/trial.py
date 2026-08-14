@@ -1589,7 +1589,6 @@ def _run_capsule_loop(
     initial_code: str | None = None,
     scripted_actions: list[dict[str, Any]] | None = None,
     stop_after_failed_event: bool = False,
-    stop_after_task_success: bool = False,
 ) -> TrialSummary:
     progress_mode = validate_progress_mode(
         str(config.get("capsule_progress_mode", "dense"))
@@ -1776,6 +1775,7 @@ def _run_capsule_loop(
     latest_post_action_observation: PostActionObservation | None = None
 
     for step_id in range(1, max_steps + 1):
+        trace_revision_before = executor.trace.mark()
         action: RuntimeAction | None = None
         action_unit_key: str | None = None
         action_source_revision = source_revision.revision
@@ -2121,6 +2121,8 @@ def _run_capsule_loop(
             progress_mode=progress_mode,
             side_effect_calls=side_effect_calls,
         )
+        trace_revision_after = executor.trace.mark()
+        step_trace_events = executor.trace.events_since(trace_revision_before)
 
         if group_execution_trace_mark is not None and action is not None:
             observation_before_state = group_observation_before_state or before_state
@@ -2136,7 +2138,8 @@ def _run_capsule_loop(
                 reward_after=_state_reward(after_state),
                 task_completed=bool(after_state.get("task_completed")),
                 new_trace_events=copy.deepcopy(group_new_trace_events),
-                trace_revision=len(executor.trace.events),
+                trace_revision=trace_revision_after,
+                source_revision=action_source_revision,
                 terminal_progress_unverified=bool(
                     feedback.evidence.get("terminal_progress_unverified")
                 ),
@@ -2194,11 +2197,9 @@ def _run_capsule_loop(
             post_action_visual_artifact_errors
         )
         metric["post_action_observation_recorded"] = post_action_observation is not None
-        metric["new_trace_event_count"] = (
-            len(post_action_observation.new_trace_events)
-            if post_action_observation is not None
-            else 0
-        )
+        metric["new_trace_event_count"] = len(step_trace_events)
+        metric["trace_revision_before"] = trace_revision_before
+        metric["trace_revision_after"] = trace_revision_after
         _add_capsule_contract_metrics(
             metric,
             contract_violations=program_contract_violations,
@@ -2207,10 +2208,15 @@ def _run_capsule_loop(
         metric["budget_exhausted"] = False
         step_metrics.append(metric)
 
+        reward_after = _state_reward(after_state)
+        if bool(after_state.get("task_completed")) or (
+            reward_after is not None and reward_after >= 1.0
+        ):
+            loop_exit_reason = "task_success"
+            break
         if stop_after_failed_event and event.status in {"failed", "invalid"}:
             loop_exit_reason = "failed_event"
             break
-        reward_after = _state_reward(after_state)
         if (
             action is not None
             and action.action == "finish"
@@ -2218,12 +2224,6 @@ def _run_capsule_loop(
         ):
             finished = True
             loop_exit_reason = "accepted_finish"
-            break
-        if (stop_after_task_success or require_task_success_for_finish) and (
-            bool(after_state.get("task_completed"))
-            or (reward_after is not None and reward_after >= 1.0)
-        ):
-            loop_exit_reason = "task_success"
             break
 
     reward = _safe_compute_reward(env)
@@ -2763,7 +2763,7 @@ def _strict_subset_guard_event(
 
 
 def _capsule_event_has_safety_failure(event: RuntimeEvent) -> bool:
-    return bool(event.evidence.get("safety_failure"))
+    return _post_action_safety_failure(event) is not None
 
 
 def _post_action_safety_failure(event: RuntimeEvent) -> str | None:
