@@ -36,8 +36,16 @@ class RecoveryGeneration:
     start_line: int
     end_line: int
     observation_functions: tuple[str, ...]
+    observation_group_keys: set[str] = field(default_factory=set)
+    inline_observation_group_keys: set[str] = field(default_factory=set)
+    observation_region_keys: set[str] = field(default_factory=set)
+    inline_observation_region_keys: set[str] = field(default_factory=set)
+    observation_satisfied: bool = False
+    observation_trace_revision: int | None = None
     authorized_group_keys: set[str] = field(default_factory=set)
     executed_group_keys: set[str] = field(default_factory=set)
+    authorized_region_keys: set[str] = field(default_factory=set)
+    executed_region_keys: set[str] = field(default_factory=set)
     append_trace_revision: int = 0
 
 

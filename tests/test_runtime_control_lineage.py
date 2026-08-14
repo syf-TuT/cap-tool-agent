@@ -142,7 +142,9 @@ def test_recovery_generation_tracks_stable_group_authorization_independently() -
         start_line=4,
         end_line=8,
         observation_functions=("get_observation",),
+        observation_region_keys={"region_key_000004"},
         authorized_group_keys={"group_key_000004", "group_key_000005"},
+        authorized_region_keys={"region_key_000005"},
         append_trace_revision=3,
     )
     second = RecoveryGeneration(
@@ -156,11 +158,19 @@ def test_recovery_generation_tracks_stable_group_authorization_independently() -
 
     first.authorized_group_keys.remove("group_key_000004")
     first.executed_group_keys.add("group_key_000004")
+    first.authorized_region_keys.remove("region_key_000005")
+    first.executed_region_keys.add("region_key_000005")
 
     assert first.authorized_group_keys == {"group_key_000005"}
     assert first.executed_group_keys == {"group_key_000004"}
+    assert first.observation_region_keys == {"region_key_000004"}
+    assert first.authorized_region_keys == set()
+    assert first.executed_region_keys == {"region_key_000005"}
     assert second.authorized_group_keys == set()
     assert second.executed_group_keys == set()
+    assert second.observation_region_keys == set()
+    assert second.authorized_region_keys == set()
+    assert second.executed_region_keys == set()
     assert first.generation_id != second.generation_id
 
 

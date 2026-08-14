@@ -1351,16 +1351,18 @@ def _prepare_capsule_source_edit(
     candidate_recovery_generations = _prepare_recovery_generations(
         action=action,
         candidate_source=candidate_source,
+        candidate_regions=candidate_analysis.regions,
         candidate_groups=candidate_analysis.groups,
         candidate_lineage=candidate_lineage,
         candidate_revision=candidate_revision,
-        previous_generations=recovery_generations,
+        previous_generations=copy.deepcopy(recovery_generations),
         edit_start_line=edit_start_line,
         edit_end_line=edit_end_line,
         line_delta=line_delta,
         old_line_count=old_line_count,
         trace_revision=trace_revision,
         recovery_observation_functions=recovery_observation_functions,
+        side_effect_calls=side_effect_calls,
     )
 
     return _PreparedSourceEdit(
@@ -1796,7 +1798,8 @@ def _run_capsule_loop(
         recovery_execution_attempt = False
         recovery_authorization_consumed = False
         consumed_recovery_generation_id: str | None = None
-        consumed_recovery_group_key: str | None = None
+        consumed_recovery_unit_key: str | None = None
+        consumed_recovery_unit_kind: str | None = None
         action_origin = "llm"
         action_prompt_chars = 0
         action_prompt_char_budget_metric = None
@@ -1956,15 +1959,33 @@ def _run_capsule_loop(
                     group_by_id,
                     recovery_observation_functions=recovery_observation_functions,
                 )
-                if recovery_authorization is not None and _event_has_side_effect_trace(
-                    event, side_effect_calls
-                ):
-                    generation, group_key = recovery_authorization
-                    generation.authorized_group_keys.remove(group_key)
-                    generation.executed_group_keys.add(group_key)
-                    recovery_authorization_consumed = True
-                    consumed_recovery_generation_id = generation.generation_id
-                    consumed_recovery_group_key = group_key
+                prepared_trace_commit = _prepare_runtime_trace_commit(
+                    action,
+                    event,
+                    region_by_id=region_by_id,
+                    group_by_id=group_by_id,
+                    lineage=lineage,
+                    recovery_generations=recovery_generations,
+                    side_effect_calls=side_effect_calls,
+                    trace_revision=executor.trace.mark(),
+                )
+                event = prepared_trace_commit.event
+                lineage = prepared_trace_commit.lineage
+                recovery_generations = (
+                    prepared_trace_commit.recovery_generations
+                )
+                recovery_authorization_consumed = (
+                    prepared_trace_commit.authorization_consumed
+                )
+                consumed_recovery_generation_id = (
+                    prepared_trace_commit.recovery_generation_id
+                )
+                consumed_recovery_unit_key = (
+                    prepared_trace_commit.recovery_unit_key
+                )
+                consumed_recovery_unit_kind = (
+                    prepared_trace_commit.recovery_unit_kind
+                )
             if group_execution_trace_mark is not None:
                 group_new_trace_events = executor.trace.events_since(
                     group_execution_trace_mark
@@ -2071,15 +2092,6 @@ def _run_capsule_loop(
                 group = group_by_id.get(group_id)
                 if event.status != "invalid":
                     executed_regions += len(group.region_ids) if group is not None else 0
-            _record_runtime_side_effect_execution(
-                action,
-                event,
-                region_by_id,
-                group_by_id,
-                lineage,
-                side_effect_calls,
-            )
-
         after_state = _capsule_state_snapshot(env, state_level=prompt_state_level)
         if use_action_visual_feedback:
             (
@@ -2225,12 +2237,26 @@ def _run_capsule_loop(
             recovery_authorization_consumed
         )
         metric["recovery_generation_id"] = consumed_recovery_generation_id
-        metric["recovery_group_key"] = consumed_recovery_group_key
+        metric["recovery_unit_key"] = consumed_recovery_unit_key
+        metric["recovery_unit_kind"] = consumed_recovery_unit_kind
+        metric["recovery_group_key"] = (
+            consumed_recovery_unit_key
+            if consumed_recovery_unit_kind == "group"
+            else None
+        )
+        metric["recovery_region_key"] = (
+            consumed_recovery_unit_key
+            if consumed_recovery_unit_kind == "region"
+            else None
+        )
         metric["recovery_generations"] = _recovery_generation_metrics(
             recovery_generations
         )
         metric["executed_side_effect_group_keys"] = sorted(
             lineage.executed_group_keys
+        )
+        metric["executed_side_effect_region_keys"] = sorted(
+            lineage.executed_region_keys
         )
         _add_capsule_contract_metrics(
             metric,
@@ -2701,12 +2727,11 @@ def _reward_drop_guard_event(
         side_effect_calls,
     ):
         return None
-    if _recovery_authorization_for_action(
+    recovery_authorization = _recovery_authorization_for_action(
         action,
         lineage=lineage,
         recovery_generations=recovery_generations,
-    ) is not None:
-        return None
+    )
 
     current_reward = _state_reward(before_state)
     if best_reward_so_far is None or current_reward is None:
@@ -2715,6 +2740,32 @@ def _reward_drop_guard_event(
     reward_drop = best_reward_so_far - current_reward
     if best_reward_so_far < min_best_reward or reward_drop < drop_threshold:
         return None
+
+    if recovery_authorization is not None:
+        generation = recovery_authorization.generation
+        inline_observation_keys = (
+            generation.inline_observation_group_keys
+            if recovery_authorization.unit_kind == "group"
+            else generation.inline_observation_region_keys
+        )
+        if (
+            generation.observation_satisfied
+            or recovery_authorization.unit_key in inline_observation_keys
+        ):
+            return None
+        return RuntimeEvent(
+            action=action.action,
+            status="invalid",
+            region_id=_runtime_action_unit_id(action),
+            message=(
+                "Recovery side effects require fresh observation trace evidence "
+                "from their recovery generation."
+            ),
+            evidence={
+                "safety_failure": "recovery_observation_required",
+                "recovery_generation_id": generation.generation_id,
+            },
+        )
 
     unit_id = _runtime_action_unit_id(action)
     recovery_hint = _recovery_instruction(recovery_observation_functions)
@@ -2877,8 +2928,24 @@ def _recovery_generation_metrics(
             "start_line": generation.start_line,
             "end_line": generation.end_line,
             "observation_functions": list(generation.observation_functions),
+            "observation_group_keys": sorted(
+                generation.observation_group_keys
+            ),
+            "inline_observation_group_keys": sorted(
+                generation.inline_observation_group_keys
+            ),
+            "observation_region_keys": sorted(
+                generation.observation_region_keys
+            ),
+            "inline_observation_region_keys": sorted(
+                generation.inline_observation_region_keys
+            ),
+            "observation_satisfied": generation.observation_satisfied,
+            "observation_trace_revision": generation.observation_trace_revision,
             "authorized_group_keys": sorted(generation.authorized_group_keys),
             "executed_group_keys": sorted(generation.executed_group_keys),
+            "authorized_region_keys": sorted(generation.authorized_region_keys),
+            "executed_region_keys": sorted(generation.executed_region_keys),
             "append_trace_revision": generation.append_trace_revision,
         }
         for generation in generations
@@ -2907,31 +2974,184 @@ def _model_facing_capsule_history(
     ]
 
 
+@dataclass(frozen=True)
+class _RecoveryAuthorization:
+    generation: RecoveryGeneration
+    unit_key: str
+    unit_kind: str
+
+
+@dataclass(frozen=True)
+class _PreparedRuntimeTraceCommit:
+    event: RuntimeEvent
+    lineage: UnitLineage
+    recovery_generations: list[RecoveryGeneration]
+    authorization_consumed: bool
+    recovery_generation_id: str | None
+    recovery_unit_key: str | None
+    recovery_unit_kind: str | None
+
+
 def _recovery_authorization_for_action(
     action: RuntimeAction,
     *,
     lineage: UnitLineage,
     recovery_generations: list[RecoveryGeneration],
-) -> tuple[RecoveryGeneration, str] | None:
-    if action.action != "run_group":
+) -> _RecoveryAuthorization | None:
+    if action.action == "run_group":
+        unit_key = lineage.group_key_by_id.get(
+            str(action.args.get("group_id", ""))
+        )
+        unit_kind = "group"
+        authorization_field = "authorized_group_keys"
+    elif action.action in {"run_region", "resume_from_region"}:
+        unit_key = lineage.region_key_by_id.get(
+            str(action.args.get("region_id", ""))
+        )
+        unit_kind = "region"
+        authorization_field = "authorized_region_keys"
+    else:
         return None
-    group_key = lineage.group_key_by_id.get(
-        str(action.args.get("group_id", ""))
-    )
-    if group_key is None:
+    if unit_key is None:
         return None
     matches = [
         generation
         for generation in recovery_generations
-        if group_key in generation.authorized_group_keys
+        if unit_key in getattr(generation, authorization_field)
     ]
     if len(matches) > 1:
         raise LineageAmbiguityError(
-            f"Recovery group key is authorized by multiple generations: {group_key}"
+            f"Recovery {unit_kind} key is authorized by multiple generations: {unit_key}"
         )
     if not matches:
         return None
-    return matches[0], group_key
+    return _RecoveryAuthorization(matches[0], unit_key, unit_kind)
+
+
+def _record_recovery_observation_trace(
+    action: RuntimeAction,
+    event: RuntimeEvent,
+    *,
+    lineage: UnitLineage,
+    recovery_generations: list[RecoveryGeneration],
+    side_effect_calls: set[str],
+    trace_revision: int,
+) -> None:
+    if action.action == "run_group":
+        unit_key = lineage.group_key_by_id.get(
+            str(action.args.get("group_id", ""))
+        )
+        observation_field = "observation_group_keys"
+    elif action.action in {"run_region", "resume_from_region"}:
+        unit_key = lineage.region_key_by_id.get(
+            str(action.args.get("region_id", ""))
+        )
+        observation_field = "observation_region_keys"
+    else:
+        return
+    if unit_key is None:
+        return
+    trace_events = event.evidence.get("trace_events", [])
+    if not isinstance(trace_events, list):
+        return
+    for generation in recovery_generations:
+        if unit_key not in getattr(generation, observation_field):
+            continue
+        observation_indices = [
+            index
+            for index, trace_event in enumerate(trace_events)
+            if trace_event.get("name") in generation.observation_functions
+            and trace_event.get("status") == "success"
+        ]
+        side_effect_indices = [
+            index
+            for index, trace_event in enumerate(trace_events)
+            if trace_event.get("name") in side_effect_calls
+        ]
+        if (
+            side_effect_indices
+            and not generation.observation_satisfied
+            and (
+                not observation_indices
+                or min(observation_indices) > min(side_effect_indices)
+            )
+        ):
+            event.evidence["safety_failure"] = (
+                "recovery_observation_trace_order"
+            )
+            event.evidence["recovery_generation_id"] = generation.generation_id
+            continue
+        if observation_indices:
+            generation.observation_satisfied = True
+            generation.observation_trace_revision = trace_revision
+
+
+def _prepare_runtime_trace_commit(
+    action: RuntimeAction,
+    event: RuntimeEvent,
+    *,
+    region_by_id: dict[str, CodeRegion],
+    group_by_id: dict[str, CodeRegionGroup],
+    lineage: UnitLineage,
+    recovery_generations: list[RecoveryGeneration],
+    side_effect_calls: set[str],
+    trace_revision: int,
+) -> _PreparedRuntimeTraceCommit:
+    candidate_event = copy.deepcopy(event)
+    candidate_lineage = copy.deepcopy(lineage)
+    candidate_generations = copy.deepcopy(recovery_generations)
+    authorization = _recovery_authorization_for_action(
+        action,
+        lineage=candidate_lineage,
+        recovery_generations=candidate_generations,
+    )
+    generation_id = (
+        authorization.generation.generation_id
+        if authorization is not None
+        else None
+    )
+    unit_key = authorization.unit_key if authorization is not None else None
+    unit_kind = authorization.unit_kind if authorization is not None else None
+
+    _record_recovery_observation_trace(
+        action,
+        candidate_event,
+        lineage=candidate_lineage,
+        recovery_generations=candidate_generations,
+        side_effect_calls=side_effect_calls,
+        trace_revision=trace_revision,
+    )
+    has_side_effect_trace = _event_has_side_effect_trace(
+        candidate_event, side_effect_calls
+    )
+    authorization_consumed = False
+    if authorization is not None and has_side_effect_trace:
+        generation = authorization.generation
+        if authorization.unit_kind == "group":
+            generation.authorized_group_keys.remove(authorization.unit_key)
+            generation.executed_group_keys.add(authorization.unit_key)
+        else:
+            generation.authorized_region_keys.remove(authorization.unit_key)
+            generation.executed_region_keys.add(authorization.unit_key)
+        authorization_consumed = generation.observation_satisfied
+
+    _record_runtime_side_effect_execution(
+        action,
+        candidate_event,
+        region_by_id,
+        group_by_id,
+        candidate_lineage,
+        side_effect_calls,
+    )
+    return _PreparedRuntimeTraceCommit(
+        event=candidate_event,
+        lineage=candidate_lineage,
+        recovery_generations=candidate_generations,
+        authorization_consumed=authorization_consumed,
+        recovery_generation_id=generation_id,
+        recovery_unit_key=unit_key,
+        recovery_unit_kind=unit_kind,
+    )
 
 
 def _record_runtime_side_effect_execution(
@@ -3123,10 +3343,48 @@ def _next_source_revision(
     )
 
 
-def _recovery_generation_observation_functions(
+@dataclass(frozen=True)
+class _RecoveryObservationPlan:
+    functions: tuple[str, ...]
+    positions: tuple[tuple[int, int], ...]
+    side_effect_positions: tuple[tuple[int, int], ...]
+
+
+def _direct_statement_call(statement: ast.stmt) -> ast.Call | None:
+    value: ast.expr | None = None
+    if isinstance(statement, ast.Expr):
+        value = statement.value
+    elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+        value = statement.value
+    return value if isinstance(value, ast.Call) else None
+
+
+def _call_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _call_arguments_have_side_effect(
+    call: ast.Call,
+    side_effect_calls: set[str],
+) -> bool:
+    argument_roots: list[ast.AST] = [*call.args]
+    argument_roots.extend(keyword.value for keyword in call.keywords)
+    return any(
+        isinstance(node, ast.Call) and _call_name(node) in side_effect_calls
+        for root in argument_roots
+        for node in ast.walk(root)
+    )
+
+
+def _recovery_generation_observation_plan(
     source: str,
     recovery_observation_functions: set[str],
-) -> tuple[str, ...]:
+    side_effect_calls: set[str],
+) -> _RecoveryObservationPlan:
     try:
         tree = ast.parse(source)
     except SyntaxError as exc:
@@ -3140,12 +3398,28 @@ def _recovery_generation_observation_functions(
                 "text": exc.text,
             },
         ) from exc
-    return tuple(
-        sorted(
-            name
-            for name in recovery_observation_functions
-            if _ast_calls_function(tree, name)
-        )
+    direct_observations: list[tuple[str, tuple[int, int]]] = []
+    for statement in tree.body:
+        call = _direct_statement_call(statement)
+        if call is None or not isinstance(call.func, ast.Name):
+            continue
+        name = call.func.id
+        if (
+            name in recovery_observation_functions
+            and not _call_arguments_have_side_effect(call, side_effect_calls)
+        ):
+            direct_observations.append(
+                (name, (call.lineno, call.col_offset))
+            )
+    side_effect_positions = sorted(
+        (node.lineno, node.col_offset)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _call_name(node) in side_effect_calls
+    )
+    return _RecoveryObservationPlan(
+        functions=tuple(sorted({name for name, _ in direct_observations})),
+        positions=tuple(position for _, position in direct_observations),
+        side_effect_positions=tuple(side_effect_positions),
     )
 
 
@@ -3178,6 +3452,117 @@ def _recovery_side_effect_group_keys(
     return keys
 
 
+def _recovery_side_effect_region_keys(
+    *,
+    regions: list[CodeRegion],
+    lineage: UnitLineage,
+    side_effect_calls: set[str],
+    start_line: int,
+    end_line: int,
+) -> set[str]:
+    keys: set[str] = set()
+    for region in regions:
+        if (
+            region.start_line < start_line
+            or region.end_line > end_line
+            or not _region_has_side_effect_call(region, side_effect_calls)
+        ):
+            continue
+        region_key = lineage.region_key_by_id.get(region.region_id)
+        if region_key is None:
+            raise _SourceEditRejection(
+                "lineage_ambiguous",
+                f"Recovery side-effect region lacks stable lineage: {region.region_id}.",
+                lineage_reconciliation_status="ambiguous",
+            )
+        keys.add(region_key)
+    return keys
+
+
+def _recovery_observation_group_keys(
+    *,
+    plan: _RecoveryObservationPlan,
+    groups: list[CodeRegionGroup],
+    lineage: UnitLineage,
+    start_line: int,
+) -> tuple[set[str], set[str]]:
+    observation_keys: set[str] = set()
+    inline_keys: set[str] = set()
+    global_observations = [
+        (line + start_line - 1, column) for line, column in plan.positions
+    ]
+    global_side_effects = [
+        (line + start_line - 1, column)
+        for line, column in plan.side_effect_positions
+    ]
+    for group in groups:
+        observations = [
+            position
+            for position in global_observations
+            if group.start_line <= position[0] <= group.end_line
+        ]
+        if not observations:
+            continue
+        group_key = lineage.group_key_by_id.get(group.group_id)
+        if group_key is None:
+            raise _SourceEditRejection(
+                "lineage_ambiguous",
+                f"Recovery observation group lacks stable lineage: {group.group_id}.",
+                lineage_reconciliation_status="ambiguous",
+            )
+        observation_keys.add(group_key)
+        side_effects = [
+            position
+            for position in global_side_effects
+            if group.start_line <= position[0] <= group.end_line
+        ]
+        if side_effects and min(observations) < min(side_effects):
+            inline_keys.add(group_key)
+    return observation_keys, inline_keys
+
+
+def _recovery_observation_region_keys(
+    *,
+    plan: _RecoveryObservationPlan,
+    regions: list[CodeRegion],
+    lineage: UnitLineage,
+    start_line: int,
+) -> tuple[set[str], set[str]]:
+    observation_keys: set[str] = set()
+    inline_keys: set[str] = set()
+    global_observations = [
+        (line + start_line - 1, column) for line, column in plan.positions
+    ]
+    global_side_effects = [
+        (line + start_line - 1, column)
+        for line, column in plan.side_effect_positions
+    ]
+    for region in regions:
+        observations = [
+            position
+            for position in global_observations
+            if region.start_line <= position[0] <= region.end_line
+        ]
+        if not observations:
+            continue
+        region_key = lineage.region_key_by_id.get(region.region_id)
+        if region_key is None:
+            raise _SourceEditRejection(
+                "lineage_ambiguous",
+                f"Recovery observation region lacks stable lineage: {region.region_id}.",
+                lineage_reconciliation_status="ambiguous",
+            )
+        observation_keys.add(region_key)
+        side_effects = [
+            position
+            for position in global_side_effects
+            if region.start_line <= position[0] <= region.end_line
+        ]
+        if side_effects and min(observations) < min(side_effects):
+            inline_keys.add(region_key)
+    return observation_keys, inline_keys
+
+
 def _generation_source(source: str, start_line: int, end_line: int) -> str:
     lines = source.splitlines()
     return "\n".join(lines[start_line - 1 : end_line])
@@ -3193,6 +3578,7 @@ def _prepare_recovery_generations(
     *,
     action: RuntimeAction,
     candidate_source: str,
+    candidate_regions: list[CodeRegion],
     candidate_groups: list[CodeRegionGroup],
     candidate_lineage: UnitLineage,
     candidate_revision: SourceRevision,
@@ -3203,6 +3589,7 @@ def _prepare_recovery_generations(
     old_line_count: int,
     trace_revision: int,
     recovery_observation_functions: set[str],
+    side_effect_calls: set[str],
 ) -> list[RecoveryGeneration]:
     generations = copy.deepcopy(previous_generations)
     if action.action == "append_recovery":
@@ -3242,22 +3629,49 @@ def _prepare_recovery_generations(
                 generation.end_line += line_delta
 
     for generation in generations:
-        observation_functions = _recovery_generation_observation_functions(
+        observation_plan = _recovery_generation_observation_plan(
             _generation_source(
                 candidate_source,
                 generation.start_line,
                 generation.end_line,
             ),
             recovery_observation_functions,
+            side_effect_calls,
         )
-        if not observation_functions:
+        if (
+            not observation_plan.functions
+            or (
+                observation_plan.side_effect_positions
+                and min(observation_plan.positions)
+                >= min(observation_plan.side_effect_positions)
+            )
+        ):
             raise _SourceEditRejection(
-                "recovery_generation_missing_fresh_observation",
+                "recovery_generation_observation_not_unconditional",
                 (
-                    f"{generation.generation_id} must contain a fresh-state "
-                    "observation function."
+                    f"{generation.generation_id} must directly call a declared "
+                    "fresh-state observation function before recovery side effects."
                 ),
                 evidence={"generation_id": generation.generation_id},
+            )
+        observation_group_keys, inline_observation_group_keys = (
+            _recovery_observation_group_keys(
+                plan=observation_plan,
+                groups=candidate_groups,
+                lineage=candidate_lineage,
+                start_line=generation.start_line,
+            )
+        )
+        observation_region_keys: set[str] = set()
+        inline_observation_region_keys: set[str] = set()
+        if not candidate_groups:
+            observation_region_keys, inline_observation_region_keys = (
+                _recovery_observation_region_keys(
+                    plan=observation_plan,
+                    regions=candidate_regions,
+                    lineage=candidate_lineage,
+                    start_line=generation.start_line,
+                )
             )
         side_effect_keys = _recovery_side_effect_group_keys(
             groups=candidate_groups,
@@ -3279,10 +3693,46 @@ def _prepare_recovery_generations(
                 },
                 lineage_reconciliation_status="ambiguous",
             )
+        side_effect_region_keys: set[str] = set()
+        if not candidate_groups:
+            side_effect_region_keys = _recovery_side_effect_region_keys(
+                regions=candidate_regions,
+                lineage=candidate_lineage,
+                side_effect_calls=side_effect_calls,
+                start_line=generation.start_line,
+                end_line=generation.end_line,
+            )
+        missing_executed_region_keys = (
+            generation.executed_region_keys - side_effect_region_keys
+        )
+        if missing_executed_region_keys:
+            raise _SourceEditRejection(
+                "lineage_ambiguous",
+                (
+                    f"{generation.generation_id} executed region lineage is outside "
+                    "its current source span."
+                ),
+                evidence={
+                    "generation_id": generation.generation_id,
+                    "missing_executed_region_keys": sorted(
+                        missing_executed_region_keys
+                    ),
+                },
+                lineage_reconciliation_status="ambiguous",
+            )
         generation.source_revision = candidate_revision.revision
-        generation.observation_functions = observation_functions
+        generation.observation_functions = observation_plan.functions
+        generation.observation_group_keys = observation_group_keys
+        generation.inline_observation_group_keys = inline_observation_group_keys
+        generation.observation_region_keys = observation_region_keys
+        generation.inline_observation_region_keys = (
+            inline_observation_region_keys
+        )
         generation.authorized_group_keys = (
             side_effect_keys - generation.executed_group_keys
+        )
+        generation.authorized_region_keys = (
+            side_effect_region_keys - generation.executed_region_keys
         )
     return generations
 
