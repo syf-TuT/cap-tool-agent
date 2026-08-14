@@ -78,6 +78,45 @@ def test_groups_partition_regions_without_gaps_or_reordering():
     _assert_groups_partition_regions(groups, regions)
 
 
+def test_normalizer_splits_plain_regions_at_hard_boundary():
+    source = "a = 1\nb = 2\nc = 3\n"
+    regions = segment_python_code(source)
+    analyses = analyze_python_regions(source, regions, side_effect_calls=set())
+
+    groups = normalize_python_code_groups(
+        source,
+        regions,
+        analyses,
+        policy=GroupingPolicy(),
+        hard_boundary_after_lines={1},
+    )
+
+    assert [group.region_ids for group in groups] == [
+        ["region_1"],
+        ["region_2", "region_3"],
+    ]
+
+
+def test_normalizer_group_pressure_never_merges_across_hard_boundary():
+    source = "".join(f"value_{index} = {index}\n" for index in range(1, 7))
+    regions = segment_python_code(source)
+    analyses = analyze_python_regions(source, regions, side_effect_calls=set())
+
+    groups = normalize_python_code_groups(
+        source,
+        regions,
+        analyses,
+        policy=GroupingPolicy(max_regions_per_group=1, max_groups=1),
+        hard_boundary_after_lines={3},
+    )
+
+    assert [group.region_ids for group in groups] == [
+        ["region_1", "region_2", "region_3"],
+        ["region_4", "region_5", "region_6"],
+    ]
+    assert all(not (group.start_line <= 3 < group.end_line) for group in groups)
+
+
 def test_normalizer_rejects_analysis_length_mismatch():
     source = "x = 1\nmove_to(x)\n"
     regions = segment_python_code(source)

@@ -34,8 +34,17 @@ from capx.llm.client import ModelQueryArgs
 from capx.llm.context import get_trial_llm_context, trial_llm_context
 from capx.runtime_control.contract import ProgramContractViolation
 from capx.runtime_control.executor import CapsuleExecutor
-from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, RuntimeAction
-from capx.runtime_control.lineage import SourceRevision, UnitLineage
+from capx.runtime_control.lineage import (
+    LineageAmbiguityError,
+    SourceRevision,
+    UnitLineage,
+)
+from capx.runtime_control.schema import (
+    CodeRegion,
+    CodeRegionGroup,
+    RuntimeAction,
+    RuntimeEvent,
+)
 from capx.runtime_control.trace import wrap_function_for_trace
 
 
@@ -2899,6 +2908,68 @@ def test_capsule_llm_step_can_disable_compact_action_prompt(tmp_path, monkeypatc
     assert rows[0]["action_prompt_compact_context"] is False
 
 
+def test_noncompact_prompt_hides_stable_key_but_audit_trace_keeps_it(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeCustomMoveCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_llm_step_compact_context": False,
+        },
+        initial_code='custom_move("once")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    prompts = json.loads((tmp_path / "capsule_prompts_trial_00.json").read_text())
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    second_prompt_text = prompts[1][1]["content"][0]["text"]
+
+    assert "group_key_000001" not in second_prompt_text
+    assert '"source_revision"' not in second_prompt_text
+    assert '"group_id": "group_1"' in second_prompt_text
+    assert trace[0]["unit_key"] == "group_key_000001"
+
+
+def test_model_history_filter_does_not_preempt_compact_history_limit(
+    tmp_path, monkeypatch
+):
+    original_build_prompt = trial_module.build_capsule_prompt
+    observed_history = []
+
+    def capture_prompt(**kwargs):
+        observed_history.append(
+            (len(kwargs["history"]), kwargs["history_max_entries"])
+        )
+        return original_build_prompt(**kwargs)
+
+    monkeypatch.setattr(trial_module, "build_capsule_prompt", capture_prompt)
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 11,
+            "capsule_action_history_max_entries": 10,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            *[
+                {"action": "inspect_variables", "args": {"names": ["x"]}}
+                for _ in range(10)
+            ],
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    assert observed_history[-1] == (10, 10)
+
+
 def test_capsule_llm_step_next_prompt_includes_accumulated_trace_summary(
     tmp_path, monkeypatch
 ):
@@ -3796,6 +3867,134 @@ def test_no_rollback_guard_fails_closed_only_for_known_region_missing_lineage():
         == "side_effect_lineage_unavailable"
     )
     assert unknown_event is None
+
+
+@pytest.mark.parametrize("action_name", ["run_region", "patch_region", "resume_from_region"])
+def test_no_rollback_guard_rejects_region_when_containing_group_was_executed(
+    action_name,
+):
+    region = CodeRegion("region_1", 1, 1, 'custom_move("once")\n')
+    group = CodeRegionGroup(
+        group_id="group_1",
+        start_line=1,
+        end_line=1,
+        source=region.source,
+        region_ids=[region.region_id],
+        has_robot_side_effect=True,
+    )
+    lineage = UnitLineage.create([region], [group])
+    lineage.executed_group_keys.add("group_key_000001")
+
+    event = _no_rollback_guard_event(
+        RuntimeAction(action_name, {"region_id": region.region_id}),
+        lineage,
+        {region.region_id: region},
+        {group.group_id: group},
+    )
+
+    assert event is not None
+    assert event.evidence["safety_failure"] == "side_effect_replay"
+
+
+def test_no_rollback_guard_rejects_known_region_with_unmapped_containing_group():
+    region = CodeRegion("region_1", 1, 1, 'custom_move("once")\n')
+    group = CodeRegionGroup(
+        group_id="group_1",
+        start_line=1,
+        end_line=1,
+        source=region.source,
+        region_ids=[region.region_id],
+        has_robot_side_effect=True,
+    )
+    lineage = UnitLineage.create([region], [group])
+    del lineage.group_key_by_id[group.group_id]
+
+    event = _no_rollback_guard_event(
+        RuntimeAction("run_region", {"region_id": region.region_id}),
+        lineage,
+        {region.region_id: region},
+        {group.group_id: group},
+    )
+
+    assert event is not None
+    assert event.evidence["safety_failure"] == "side_effect_lineage_unavailable"
+
+
+def test_side_effect_recorder_does_not_partially_seal_region_without_group_key():
+    region = CodeRegion("region_1", 1, 1, 'custom_move("once")\n')
+    group = CodeRegionGroup(
+        group_id="group_1",
+        start_line=1,
+        end_line=1,
+        source=region.source,
+        region_ids=[region.region_id],
+        has_robot_side_effect=True,
+    )
+    lineage = UnitLineage.create([region], [group])
+    del lineage.group_key_by_id[group.group_id]
+
+    with pytest.raises(LineageAmbiguityError, match="group"):
+        trial_module._record_runtime_side_effect_execution(
+            RuntimeAction("run_region", {"region_id": region.region_id}),
+            RuntimeEvent(
+                "run_region",
+                "failed",
+                evidence={"trace_events": [{"name": "custom_move"}]},
+            ),
+            {region.region_id: region},
+            {group.group_id: group},
+            lineage,
+            {"custom_move"},
+        )
+
+    assert lineage.executed_region_keys == set()
+    assert lineage.executed_group_keys == set()
+
+
+def test_side_effect_recorder_does_not_partially_seal_group_without_region_key():
+    region = CodeRegion("region_1", 1, 1, 'custom_move("once")\n')
+    group = CodeRegionGroup(
+        group_id="group_1",
+        start_line=1,
+        end_line=1,
+        source=region.source,
+        region_ids=[region.region_id],
+        has_robot_side_effect=True,
+    )
+    lineage = UnitLineage.create([region], [group])
+    del lineage.region_key_by_id[region.region_id]
+
+    with pytest.raises(LineageAmbiguityError, match="region"):
+        trial_module._record_runtime_side_effect_execution(
+            RuntimeAction("run_group", {"group_id": group.group_id}),
+            RuntimeEvent(
+                "run_group",
+                "success",
+                evidence={"trace_events": [{"name": "custom_move"}]},
+            ),
+            {region.region_id: region},
+            {group.group_id: group},
+            lineage,
+            {"custom_move"},
+        )
+
+    assert lineage.executed_region_keys == set()
+    assert lineage.executed_group_keys == set()
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("x = 1\n\n", "x = 1\n\ny = 2\n"),
+        ("x = 1\r\n", "x = 1\r\ny = 2\n"),
+        ("x = 1", "x = 1\ny = 2\n"),
+    ],
+)
+def test_append_recovery_source_preserves_old_prefix(source, expected):
+    appended = trial_module._append_recovery_source(source, "y = 2")
+
+    assert appended == expected
+    assert appended.startswith(source)
 
 
 def test_reward_drop_guard_uses_task_specific_recovery_function():

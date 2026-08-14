@@ -53,6 +53,7 @@ from capx.runtime_control import (
     CapsuleExecutor,
     CodeRegion,
     CodeRegionGroup,
+    LineageAmbiguityError,
     ProgramContractViolation,
     RuntimeAction,
     RuntimeEvent,
@@ -1612,7 +1613,7 @@ def _run_capsule_loop(
                     task=_task_text_from_obs(obs),
                     regions=regions,
                     groups=groups if use_semantic_groups else None,
-                    history=history,
+                    history=_model_facing_capsule_history(history),
                     trace_summary=executor.trace.summary() if executor.trace is not None else {},
                     contract_violations=[
                         item.to_dict() for item in program_contract_violations
@@ -2344,9 +2345,20 @@ def _no_rollback_guard_event(
         if region_id not in region_by_id:
             return None
         region_key = lineage.region_key_by_id.get(region_id)
-        if region_key is None:
+        containing_groups = [
+            group for group in group_by_id.values() if region_id in group.region_ids
+        ]
+        containing_group_keys = [
+            lineage.group_key_by_id.get(group.group_id) for group in containing_groups
+        ]
+        if region_key is None or any(
+            group_key is None for group_key in containing_group_keys
+        ):
             return _missing_side_effect_lineage_event(action.action, region_id)
-        if region_key in lineage.executed_region_keys:
+        if (
+            region_key in lineage.executed_region_keys
+            or bool(lineage.executed_group_keys.intersection(containing_group_keys))
+        ):
             return _already_executed_side_effect_event(action.action, region_id, recovery_hint)
         return None
 
@@ -2526,6 +2538,28 @@ def _display_side_effect_ledger(lineage: UnitLineage) -> dict[str, list[str]]:
     }
 
 
+def _model_facing_capsule_history(
+    history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    allowed_fields = (
+        "step_id",
+        "action",
+        "event",
+        "feedback",
+        "trace_events",
+        "state_before",
+        "state_after",
+    )
+    return [
+        {
+            field: copy.deepcopy(entry[field])
+            for field in allowed_fields
+            if field in entry
+        }
+        for entry in history
+    ]
+
+
 def _record_runtime_side_effect_execution(
     action: RuntimeAction,
     event: RuntimeEvent,
@@ -2542,33 +2576,57 @@ def _record_runtime_side_effect_execution(
     if action.action in {"run_region", "resume_from_region"}:
         region_id = str(action.args.get("region_id", ""))
         if region_id not in region_by_id:
-            return
+            raise LineageAmbiguityError(
+                f"executed region is missing from current region table: {region_id}"
+            )
         region_key = lineage.region_key_by_id.get(region_id)
         if region_key is None:
-            return
-        lineage.executed_region_keys.add(region_key)
-        lineage.executed_group_keys.update(
-            group_key
-            for group in group_by_id.values()
-            if region_id in group.region_ids
-            if (group_key := lineage.group_key_by_id.get(group.group_id)) is not None
-        )
+            raise LineageAmbiguityError(
+                f"executed region is missing a stable region key: {region_id}"
+            )
+        containing_group_keys: set[str] = set()
+        for group in group_by_id.values():
+            if region_id not in group.region_ids:
+                continue
+            group_key = lineage.group_key_by_id.get(group.group_id)
+            if group_key is None:
+                raise LineageAmbiguityError(
+                    "containing group is missing a stable group key: "
+                    f"{group.group_id}"
+                )
+            containing_group_keys.add(group_key)
+
+        lineage.executed_region_keys.update({region_key})
+        lineage.executed_group_keys.update(containing_group_keys)
         return
 
     if action.action == "run_group":
         group_id = str(action.args.get("group_id", ""))
         group = group_by_id.get(group_id)
         if group is None:
-            return
+            raise LineageAmbiguityError(
+                f"executed group is missing from current group table: {group_id}"
+            )
         group_key = lineage.group_key_by_id.get(group_id)
         if group_key is None:
-            return
-        lineage.executed_group_keys.add(group_key)
-        lineage.executed_region_keys.update(
-            region_key
-            for region_id in group.region_ids
-            if (region_key := lineage.region_key_by_id.get(region_id)) is not None
-        )
+            raise LineageAmbiguityError(
+                f"executed group is missing a stable group key: {group_id}"
+            )
+        constituent_region_keys: set[str] = set()
+        for region_id in group.region_ids:
+            if region_id not in region_by_id:
+                raise LineageAmbiguityError(
+                    f"constituent region is missing from current region table: {region_id}"
+                )
+            region_key = lineage.region_key_by_id.get(region_id)
+            if region_key is None:
+                raise LineageAmbiguityError(
+                    f"constituent region is missing a stable region key: {region_id}"
+                )
+            constituent_region_keys.add(region_key)
+
+        lineage.executed_group_keys.update({group_key})
+        lineage.executed_region_keys.update(constituent_region_keys)
 
 
 def _event_has_side_effect_trace(event: RuntimeEvent, side_effect_calls: set[str]) -> bool:
