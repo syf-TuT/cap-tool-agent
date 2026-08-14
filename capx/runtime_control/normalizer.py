@@ -72,18 +72,28 @@ def normalize_python_code_groups(
     groups: list[CodeRegionGroup] = []
     current: list[tuple[CodeRegion, _NormalizedRegionAnalysis]] = []
     current_has_effect = False
+    current_has_robot_effect = False
 
     for region, analysis in zip(regions, normalized_analyses):
         returns_to_sense = current_has_effect and not analysis.has_structural_effect
+        starts_second_robot_effect = (
+            current_has_robot_effect and analysis.has_robot_side_effect
+        )
         if current and (
-            returns_to_sense or len(current) >= policy.max_regions_per_group
+            starts_second_robot_effect
+            or returns_to_sense
+            or len(current) >= policy.max_regions_per_group
         ):
             groups.append(_build_group(len(groups) + 1, current))
             current = []
             current_has_effect = False
+            current_has_robot_effect = False
 
         current.append((region, analysis))
         current_has_effect = current_has_effect or analysis.has_structural_effect
+        current_has_robot_effect = (
+            current_has_robot_effect or analysis.has_robot_side_effect
+        )
 
     if current:
         groups.append(_build_group(len(groups) + 1, current))
@@ -336,7 +346,7 @@ def _can_merge_adjacent_groups(
         return False
     if left.end_line > right.start_line:
         return False
-    if not left.has_robot_side_effect or not right.has_robot_side_effect:
+    if left.has_robot_side_effect and right.has_robot_side_effect:
         return False
 
     left_defined = set(left.defined_names)

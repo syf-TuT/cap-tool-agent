@@ -1134,7 +1134,7 @@ outer()
     assert _analyze(source) == []
 
 
-def test_counts_repeated_side_effect_occurrences_within_a_group():
+def test_normalized_consecutive_side_effects_do_not_violate_group_contract():
     source = """\
 goto_pose([0, 0, 0], [1, 0, 0, 0])
 goto_pose([1, 0, 0], [1, 0, 0, 0])
@@ -1147,8 +1147,7 @@ goto_pose([1, 0, 0], [1, 0, 0, 0])
         for violation in violations
         if violation.code == "multiple_effects_in_group"
     ]
-    assert len(repeated) == 1
-    assert repeated[0].side_effect_calls == ("goto_pose", "goto_pose")
+    assert repeated == []
 
 
 def test_violation_to_dict_uses_public_serialization_shape():

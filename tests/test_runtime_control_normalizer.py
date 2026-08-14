@@ -120,8 +120,7 @@ def test_normalizer_rejects_source_that_does_not_match_regions():
         )
 
 
-def test_normalizer_merges_consecutive_effects_into_sense_act_block():
-    """A group spans sense/compute plus one or more consecutive effect calls."""
+def test_normalizer_splits_consecutive_robot_effects():
     source = "\n".join(
         [
             "obs = get_observation()",
@@ -137,21 +136,15 @@ def test_normalizer_merges_consecutive_effects_into_sense_act_block():
 
     groups = segment_python_code_groups(source)
 
-    assert [group.group_id for group in groups] == ["group_1", "group_2"]
-    # sense/compute + BOTH consecutive effects stay in one block
-    assert groups[0].region_ids == [
-        "region_1",
-        "region_2",
-        "region_3",
-        "region_4",
-        "region_5",
-        "region_6",
+    assert [group.region_ids for group in groups] == [
+        ["region_1", "region_2", "region_3", "region_4", "region_5"],
+        ["region_6"],
+        ["region_7", "region_8"],
     ]
     assert "move_to_joints(pre_joints)" in groups[0].source
-    assert "close_gripper()" in groups[0].source
-    assert groups[0].has_robot_side_effect is True
-    # return-to-sense (solve_ik) after an effect opens a new block
-    assert groups[1].region_ids == ["region_7", "region_8"]
+    assert groups[1].source == "close_gripper()\n"
+    assert "lift_joints = solve_ik(grasp)" in groups[2].source
+    assert all(group.has_robot_side_effect for group in groups)
 
 
 def test_normalizer_keeps_non_side_effect_setup_in_one_group():
@@ -164,8 +157,7 @@ def test_normalizer_keeps_non_side_effect_setup_in_one_group():
     assert groups[0].has_robot_side_effect is False
 
 
-def test_normalizer_splits_cube_stack_program_into_task_phases():
-    """Realistic CaP program collapses to ~4 sense->act phases, not per-move regions."""
+def test_normalizer_splits_cube_stack_program_into_single_effect_phases():
     source = "\n".join(
         [
             "import numpy as np",
@@ -190,13 +182,20 @@ def test_normalizer_splits_cube_stack_program_into_task_phases():
         ]
     )
 
-    groups = segment_python_code_groups(source)
+    groups = segment_python_code_groups(
+        source,
+        side_effect_calls={"goto_pose", "open_gripper", "close_gripper"},
+    )
 
-    assert len(groups) == 4
-    assert groups[0].region_ids == [f"region_{i}" for i in range(1, 11)]
-    assert groups[1].region_ids == ["region_11", "region_12", "region_13"]
-    assert groups[2].region_ids == ["region_14", "region_15", "region_16", "region_17"]
-    assert groups[3].region_ids == ["region_18", "region_19"]
+    assert [group.region_ids for group in groups] == [
+        [f"region_{i}" for i in range(1, 9)],
+        ["region_9"],
+        ["region_10"],
+        ["region_11", "region_12", "region_13"],
+        ["region_14", "region_15", "region_16"],
+        ["region_17"],
+        ["region_18", "region_19"],
+    ]
 
 
 def test_normalizer_is_domain_agnostic_without_robot_primitives():
@@ -229,7 +228,7 @@ def test_normalizer_cap_fallback_allows_long_setup_block():
     assert len(groups) == 1
 
 
-def test_normalizer_reduces_many_single_effect_groups_within_policy_band():
+def test_normalizer_keeps_effect_groups_separate_above_policy_maximum():
     source = "\n".join(
         line
         for i in range(10)
@@ -248,7 +247,8 @@ def test_normalizer_reduces_many_single_effect_groups_within_policy_band():
 
     _assert_group_sources_match_member_regions(groups, regions)
     _assert_groups_partition_regions(groups, regions)
-    assert 3 <= len(groups) <= 8
+    assert len(groups) == 10
+    assert all(group.has_robot_side_effect for group in groups)
     assert "".join(group.source for group in groups) == source
 
 
@@ -295,7 +295,7 @@ def test_normalizer_keeps_same_name_replan_boundary_under_group_pressure():
     ]
 
 
-def test_normalizer_finds_safe_non_greedy_merge_path():
+def test_normalizer_does_not_merge_effectful_groups_under_group_pressure():
     source = "\n".join(
         [
             "seed = c",
@@ -321,8 +321,10 @@ def test_normalizer_finds_safe_non_greedy_merge_path():
     _assert_group_sources_match_member_regions(groups, regions)
     _assert_groups_partition_regions(groups, regions)
     assert [group.region_ids for group in groups] == [
-        ["region_1", "region_2", "region_3", "region_4"],
-        ["region_5", "region_6", "region_7", "region_8"],
+        ["region_1", "region_2"],
+        ["region_3", "region_4"],
+        ["region_5", "region_6"],
+        ["region_7", "region_8"],
     ]
 
 

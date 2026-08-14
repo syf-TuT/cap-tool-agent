@@ -59,7 +59,7 @@ sandbox return code, errors, and the output directory will be reported.
 
 No patch-degradation guard or separate LLM-step patch/execution budget is added in this change.
 If the remote trial still consumes its action budget through consecutive successful patches
-without execution, a follow-up change will adapt the Robosuite `auto_forward` recovery boundary:
-execution remains the forward path, and LLM patching is restricted to a failed local unit. That
-follow-up will be tested and reviewed independently so its effect is distinguishable from the
-normalizer correction.
+without execution, a follow-up change will add an `llm_step`-native no-progress guard and
+separate patch/execution accounting. It will not switch to, call into, or emulate the
+`auto_forward` control loop. That follow-up will be tested and reviewed independently so its
+effect is distinguishable from the normalizer correction.
