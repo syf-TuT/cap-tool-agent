@@ -55,7 +55,7 @@ class LaunchArgs:
     temperature: float = 1.0
     """Sampling temperature for code generation (higher = more random)."""
 
-    max_tokens: int = 2048
+    max_tokens: int = 4096
     """Maximum number of tokens to generate in the model response."""
 
     reasoning_effort: str = "medium"

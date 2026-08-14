@@ -4487,7 +4487,7 @@ def test_capsule_action_query_uses_separate_max_tokens(tmp_path, monkeypatch):
     assert observed_max_tokens == [512]
 
 
-def test_capsule_action_query_defaults_to_2048_tokens(tmp_path, monkeypatch):
+def test_capsule_action_query_defaults_to_4096_tokens(tmp_path, monkeypatch):
     observed_max_tokens = []
 
     def fake_query_model(args, prompt):
@@ -4510,7 +4510,7 @@ def test_capsule_action_query_defaults_to_2048_tokens(tmp_path, monkeypatch):
         initial_code="x = 1\n",
     )
 
-    assert observed_max_tokens == [2048]
+    assert observed_max_tokens == [4096]
 
 
 def test_capsule_trial_rejects_patch_of_executed_side_effect_group(tmp_path):

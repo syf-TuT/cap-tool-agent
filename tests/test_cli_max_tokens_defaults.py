@@ -13,5 +13,5 @@ from capx.envs.scripts.run_libero_batch import LiberoBatchLaunchArgs
         pytest.param(LiberoBatchLaunchArgs(), id="libero-batch"),
     ],
 )
-def test_cli_experiment_entry_points_default_to_2048_tokens(args: object) -> None:
-    assert getattr(args, "max_tokens") == 2048
+def test_cli_experiment_entry_points_default_to_4096_tokens(args: object) -> None:
+    assert getattr(args, "max_tokens") == 4096
