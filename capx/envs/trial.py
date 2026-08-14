@@ -2732,6 +2732,14 @@ def _reward_drop_guard_event(
         lineage=lineage,
         recovery_generations=recovery_generations,
     )
+    observation_guard = _recovery_observation_guard_event(
+        action,
+        recovery_authorization,
+    )
+    if observation_guard is not None:
+        return observation_guard
+    if recovery_authorization is not None:
+        return None
 
     current_reward = _state_reward(before_state)
     if best_reward_so_far is None or current_reward is None:
@@ -2740,32 +2748,6 @@ def _reward_drop_guard_event(
     reward_drop = best_reward_so_far - current_reward
     if best_reward_so_far < min_best_reward or reward_drop < drop_threshold:
         return None
-
-    if recovery_authorization is not None:
-        generation = recovery_authorization.generation
-        inline_observation_keys = (
-            generation.inline_observation_group_keys
-            if recovery_authorization.unit_kind == "group"
-            else generation.inline_observation_region_keys
-        )
-        if (
-            generation.observation_satisfied
-            or recovery_authorization.unit_key in inline_observation_keys
-        ):
-            return None
-        return RuntimeEvent(
-            action=action.action,
-            status="invalid",
-            region_id=_runtime_action_unit_id(action),
-            message=(
-                "Recovery side effects require fresh observation trace evidence "
-                "from their recovery generation."
-            ),
-            evidence={
-                "safety_failure": "recovery_observation_required",
-                "recovery_generation_id": generation.generation_id,
-            },
-        )
 
     unit_id = _runtime_action_unit_id(action)
     recovery_hint = _recovery_instruction(recovery_observation_functions)
@@ -3026,6 +3008,38 @@ def _recovery_authorization_for_action(
     if not matches:
         return None
     return _RecoveryAuthorization(matches[0], unit_key, unit_kind)
+
+
+def _recovery_observation_guard_event(
+    action: RuntimeAction,
+    authorization: _RecoveryAuthorization | None,
+) -> RuntimeEvent | None:
+    if authorization is None:
+        return None
+    generation = authorization.generation
+    inline_observation_keys = (
+        generation.inline_observation_group_keys
+        if authorization.unit_kind == "group"
+        else generation.inline_observation_region_keys
+    )
+    if (
+        generation.observation_satisfied
+        or authorization.unit_key in inline_observation_keys
+    ):
+        return None
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=_runtime_action_unit_id(action),
+        message=(
+            "Recovery side effects require fresh observation trace evidence "
+            "from their recovery generation."
+        ),
+        evidence={
+            "safety_failure": "recovery_observation_required",
+            "recovery_generation_id": generation.generation_id,
+        },
+    )
 
 
 def _record_recovery_observation_trace(

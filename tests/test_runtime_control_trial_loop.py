@@ -5757,6 +5757,62 @@ def test_recovery_side_effect_is_blocked_until_observation_group_traces(tmp_path
 
 
 @pytest.mark.parametrize(
+    ("granularity_config", "effect_action"),
+    [
+        (
+            {"capsule_max_regions_per_group": 1},
+            {"action": "run_group", "args": {"group_id": "group_3"}},
+        ),
+        (
+            {"capsule_execution_granularity": "region"},
+            {"action": "run_region", "args": {"region_id": "region_3"}},
+        ),
+    ],
+)
+def test_recovery_observation_gate_applies_without_reward_drop(
+    tmp_path, granularity_config, effect_action
+):
+    env = FakeRewardDropCapsuleEnv()
+    trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            **granularity_config,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": 'obs = get_observation()\nmove_to("recover")'
+                },
+            },
+            effect_action,
+        ],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+
+    assert rows[1]["reward_before"] == 0.0
+    assert rows[0]["best_reward_so_far"] == 0.0
+    assert rows[1]["event_status"] == "invalid"
+    assert rows[1]["event_message"] == (
+        "Recovery side effects require fresh observation trace evidence from "
+        "their recovery generation."
+    )
+    assert rows[1]["recovery_execution_attempt"] is False
+    assert rows[1]["recovery_authorization_consumed"] is False
+    assert rows[1]["recovery_generations"][0]["observation_satisfied"] is False
+    assert env.api.observed is False
+    assert env.api.moves == []
+
+
+@pytest.mark.parametrize(
     "recovery_source",
     [
         'if False:\n    obs = get_observation()\nmove_to("recover")',
@@ -5945,26 +6001,26 @@ def test_failed_recovery_before_side_effect_keeps_key_authorized(tmp_path):
                     "source": "obs = get_observation()\nmove_to(missing_name)"
                 },
             },
+            {"action": "run_group", "args": {"group_id": "group_2"}},
             {"action": "run_group", "args": {"group_id": "group_3"}},
-            {"action": "finish", "args": {}},
         ],
     )
 
     rows = _capsule_step_metrics(
         tmp_path / "capsule_step_metrics_trial_00.jsonl"
     )
-    generation = rows[1]["recovery_generations"][0]
+    generation = rows[2]["recovery_generations"][0]
 
-    assert rows[1]["event_status"] == "failed"
-    assert rows[1]["recovery_execution_attempt"] is True
-    assert rows[1]["recovery_authorization_consumed"] is False
-    assert rows[1]["recovery_generation_id"] == "recovery_generation_000001"
-    assert rows[1]["recovery_unit_key"] == "group_key_000003"
-    assert rows[1]["recovery_unit_kind"] == "group"
-    assert rows[1]["recovery_group_key"] == "group_key_000003"
+    assert rows[2]["event_status"] == "failed"
+    assert rows[2]["recovery_execution_attempt"] is True
+    assert rows[2]["recovery_authorization_consumed"] is False
+    assert rows[2]["recovery_generation_id"] == "recovery_generation_000001"
+    assert rows[2]["recovery_unit_key"] == "group_key_000003"
+    assert rows[2]["recovery_unit_kind"] == "group"
+    assert rows[2]["recovery_group_key"] == "group_key_000003"
     assert generation["authorized_group_keys"] == ["group_key_000003"]
     assert generation["executed_group_keys"] == []
-    assert rows[1]["executed_side_effect_group_keys"] == []
+    assert rows[2]["executed_side_effect_group_keys"] == []
 
 
 def test_patch_recomputes_unexecuted_recovery_keys_atomically(tmp_path):
