@@ -1184,7 +1184,6 @@ class _PreparedSourceEdit:
     group_boundary_after_lines: set[int]
     region_by_id: dict[str, CodeRegion]
     group_by_id: dict[str, CodeRegionGroup]
-    pending_recovery_actions: list[RuntimeAction]
     recovery_side_effect_budget: int | None
 
 
@@ -1331,23 +1330,29 @@ def _prepare_capsule_source_edit(
         region.region_id: region for region in candidate_analysis.regions
     }
     group_by_id = {group.group_id: group for group in candidate_analysis.groups}
-    pending_recovery_actions: list[RuntimeAction] = []
     candidate_recovery_budget: int | None = None
     if action.action == "append_recovery":
-        pending_recovery_actions = _runtime_actions_for_appended_recovery(
-            candidate_analysis.regions,
-            candidate_analysis.groups,
-            use_semantic_groups=use_semantic_groups,
-            insert_after_line=old_line_count,
-        )
+        if use_semantic_groups:
+            appended_side_effect_units = sum(
+                any(
+                    region_id in region_by_id
+                    and _region_has_side_effect_call(
+                        region_by_id[region_id], side_effect_calls
+                    )
+                    for region_id in group.region_ids
+                )
+                for group in candidate_analysis.groups
+                if group.start_line > old_line_count
+            )
+        else:
+            appended_side_effect_units = sum(
+                _region_has_side_effect_call(region, side_effect_calls)
+                for region in candidate_analysis.regions
+                if region.start_line > old_line_count
+            )
         candidate_recovery_budget = max(
             1,
-            _count_side_effect_runtime_actions(
-                pending_recovery_actions,
-                region_by_id,
-                group_by_id,
-                side_effect_calls,
-            ),
+            appended_side_effect_units,
         )
 
     return _PreparedSourceEdit(
@@ -1358,7 +1363,6 @@ def _prepare_capsule_source_edit(
         group_boundary_after_lines=candidate_boundaries,
         region_by_id=region_by_id,
         group_by_id=group_by_id,
-        pending_recovery_actions=pending_recovery_actions,
         recovery_side_effect_budget=candidate_recovery_budget,
     )
 
@@ -1748,7 +1752,6 @@ def _run_capsule_loop(
     executed_regions = 0
     best_reward_so_far: float | None = None
     recovery_side_effect_budget = 0
-    pending_recovery_actions: list[RuntimeAction] = []
     reward_drop_guard_min_best_reward = float(
         config.get("capsule_reward_drop_guard_min_best_reward", 0.6)
     )
@@ -1782,7 +1785,7 @@ def _run_capsule_loop(
         )
         source_unit_for_feedback = None
         consumes_recovery_side_effect = False
-        forced_recovery_action = False
+        action_origin = "llm"
         action_prompt_chars = 0
         action_prompt_char_budget_metric = None
         action_prompt_over_budget = False
@@ -1793,9 +1796,10 @@ def _run_capsule_loop(
         post_action_visual_artifact_errors: list[dict[str, str]] = []
 
         try:
-            if pending_recovery_actions:
-                forced_recovery_action = True
-                action = pending_recovery_actions.pop(0)
+            if script is not None and script_idx < len(script):
+                action_origin = "scripted"
+                action = RuntimeAction.from_mapping(script[script_idx])
+                script_idx += 1
             else:
                 prompt = build_capsule_prompt(
                     task=_task_text_from_obs(obs),
@@ -1854,14 +1858,6 @@ def _run_capsule_loop(
                         artifact_by_sha256=visual_artifact_by_sha256,
                     )
                 )
-
-            if action is None and script is not None:
-                if script_idx >= len(script):
-                    action = RuntimeAction(action="finish", args={})
-                else:
-                    action = RuntimeAction.from_mapping(script[script_idx])
-                    script_idx += 1
-            elif action is None:
                 with llm_call_stage("capsule_action"):
                     response = _query_model(action_query_args, live_prompt)
                 action = parse_runtime_action_response(response["content"])
@@ -1998,9 +1994,6 @@ def _run_capsule_loop(
                     if not program_contract_violations:
                         recoverable_failed = False
                     if action.action == "append_recovery":
-                        pending_recovery_actions = (
-                            prepared_source_edit.pending_recovery_actions
-                        )
                         recovery_side_effect_budget = max(
                             recovery_side_effect_budget,
                             prepared_source_edit.recovery_side_effect_budget or 0,
@@ -2029,8 +2022,6 @@ def _run_capsule_loop(
             )
             if event.status == "failed":
                 recoverable_failed = True
-            if event.status in {"failed", "invalid"} and forced_recovery_action:
-                pending_recovery_actions.clear()
             if (
                 action.action in {"run_region", "resume_from_region"}
                 and event.status != "invalid"
@@ -2133,6 +2124,7 @@ def _run_capsule_loop(
         )
         metric["unit_key"] = action_unit_key
         metric["source_revision"] = action_source_revision
+        metric["action_origin"] = action_origin
         for field in (
             "source_revision_before",
             "source_revision_after",
@@ -2879,44 +2871,6 @@ def _region_has_side_effect_call(region: CodeRegion, side_effect_calls: set[str]
     except SyntaxError:
         return False
     return any(_ast_calls_function(tree, name) for name in side_effect_calls)
-
-
-def _runtime_actions_for_appended_recovery(
-    regions: list[CodeRegion],
-    groups: list[CodeRegionGroup],
-    *,
-    use_semantic_groups: bool,
-    insert_after_line: int,
-) -> list[RuntimeAction]:
-    if use_semantic_groups:
-        return [
-            RuntimeAction("run_group", {"group_id": group.group_id})
-            for group in groups
-            if group.start_line > insert_after_line
-        ]
-    return [
-        RuntimeAction("run_region", {"region_id": region.region_id})
-        for region in regions
-        if region.start_line > insert_after_line
-    ]
-
-
-def _count_side_effect_runtime_actions(
-    actions: list[RuntimeAction],
-    region_by_id: dict[str, Any],
-    group_by_id: dict[str, Any],
-    side_effect_calls: set[str],
-) -> int:
-    return sum(
-        1
-        for action in actions
-        if _runtime_action_targets_side_effect_unit(
-            action,
-            region_by_id,
-            group_by_id,
-            side_effect_calls,
-        )
-    )
 
 
 def _already_executed_side_effect_event(

@@ -326,6 +326,15 @@ def _json_string_payload(value: str) -> str:
     return json.dumps(value)[1:-1]
 
 
+def _stub_capsule_model_actions(monkeypatch, actions):
+    responses = iter(actions)
+
+    def fake_query_model(args, prompt):
+        return {"content": json.dumps(next(responses))}
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+
 def test_capsule_state_level_proprioceptive_excludes_object_truth():
     snapshot = trial_module._capsule_state_snapshot(
         FakeLiberoCapsuleEnv(), state_level="proprioceptive"
@@ -1522,7 +1531,7 @@ def test_capsule_llm_step_visual_feedback_refreshes_after_all_action_outcomes(
     ]
 
 
-def test_capsule_llm_step_visual_feedback_refreshes_for_forced_recovery_without_prompt(
+def test_capsule_llm_step_visual_feedback_refreshes_for_scripted_recovery_without_prompt(
     tmp_path, monkeypatch
 ):
     records = [_capsule_test_visual("main", [3, 3, 3])]
@@ -1550,7 +1559,8 @@ def test_capsule_llm_step_visual_feedback_refreshes_for_forced_recovery_without_
                 "args": {
                     "source": 'obs = get_observation()\nmove_to("recover")\n'
                 },
-            }
+            },
+            {"action": "run_group", "args": {"group_id": "group_2"}},
         ],
     )
 
@@ -1558,7 +1568,7 @@ def test_capsule_llm_step_visual_feedback_refreshes_for_forced_recovery_without_
     rows = _capsule_step_metrics(
         tmp_path / "capsule_step_metrics_trial_04.jsonl"
     )
-    assert rows[0]["action_prompt_image_count"] == 1
+    assert rows[0]["action_prompt_image_count"] == 0
     assert rows[1]["action_prompt_image_count"] == 0
     assert rows[1]["action_prompt_images"] == []
     assert rows[1]["visual_capture_errors"] == []
@@ -1710,7 +1720,9 @@ def test_capsule_llm_step_mode_keeps_existing_action_loop(tmp_path):
     assert [entry["event"]["action"] for entry in trace] == ["run_group", "finish"]
 
 
-def test_capsule_llm_step_program_contract_blocks_effects_until_patch(tmp_path):
+def test_capsule_llm_step_program_contract_blocks_effects_until_patch(
+    tmp_path, monkeypatch
+):
     env = FakeCustomMoveCapsuleEnv()
     source = (
         "def move_cube():\n"
@@ -1718,6 +1730,19 @@ def test_capsule_llm_step_program_contract_blocks_effects_until_patch(tmp_path):
         "\n"
         "move_cube()\n"
     )
+    actions = [
+        {"action": "run_group", "args": {"group_id": "group_1"}},
+        {
+            "action": "patch_group",
+            "args": {
+                "group_id": "group_1",
+                "source": 'custom_move("repaired")\n',
+            },
+        },
+        {"action": "run_group", "args": {"group_id": "group_1"}},
+        {"action": "finish", "args": {}},
+    ]
+    _stub_capsule_model_actions(monkeypatch, actions)
 
     trial_module._run_capsule_loop(
         env,
@@ -1729,18 +1754,6 @@ def test_capsule_llm_step_program_contract_blocks_effects_until_patch(tmp_path):
             "capsule_validate_program_contract": True,
         },
         initial_code=source,
-        scripted_actions=[
-            {"action": "run_group", "args": {"group_id": "group_1"}},
-            {
-                "action": "patch_group",
-                "args": {
-                    "group_id": "group_1",
-                    "source": 'custom_move("repaired")\n',
-                },
-            },
-            {"action": "run_group", "args": {"group_id": "group_1"}},
-            {"action": "finish", "args": {}},
-        ],
     )
 
     trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
@@ -1859,9 +1872,13 @@ def test_nonprivileged_source_analysis_enforces_effect_structure_when_flag_false
 
 
 def test_nonprivileged_llm_step_flag_false_blocks_multiple_effects_before_execution(
-    tmp_path
+    tmp_path, monkeypatch
 ):
     env = FakeUnsafeNonPrivilegedCapsuleEnv()
+    _stub_capsule_model_actions(
+        monkeypatch,
+        [{"action": "run_group", "args": {"group_id": "group_1"}}],
+    )
 
     trial_module._run_capsule_loop(
         env,
@@ -1873,9 +1890,6 @@ def test_nonprivileged_llm_step_flag_false_blocks_multiple_effects_before_execut
             "capsule_validate_program_contract": False,
         },
         initial_code="result = (close_gripper(), close_gripper())\n",
-        scripted_actions=[
-            {"action": "run_group", "args": {"group_id": "group_1"}},
-        ],
     )
 
     trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
@@ -1907,9 +1921,13 @@ def test_nonprivileged_llm_step_flag_false_blocks_multiple_effects_before_execut
     ],
 )
 def test_nonprivileged_llm_step_enforces_strict_subset_when_contract_flag_false(
-    tmp_path, source
+    tmp_path, source, monkeypatch
 ):
     env = FakeUnsafeNonPrivilegedCapsuleEnv()
+    _stub_capsule_model_actions(
+        monkeypatch,
+        [{"action": "run_group", "args": {"group_id": "group_1"}}],
+    )
 
     trial_module._run_capsule_loop(
         env,
@@ -1921,9 +1939,6 @@ def test_nonprivileged_llm_step_enforces_strict_subset_when_contract_flag_false(
             "capsule_validate_program_contract": False,
         },
         initial_code=source,
-        scripted_actions=[
-            {"action": "run_group", "args": {"group_id": "group_1"}},
-        ],
     )
 
     trace_text = (tmp_path / "capsule_trace_trial_00.json").read_text()
@@ -2049,6 +2064,7 @@ def test_llm_step_safety_failure_stays_failed_after_append_recovery(tmp_path):
                     "source": "state = get_observation()\nresult = len(state)\n",
                 },
             },
+            {"action": "run_group", "args": {"group_id": "group_2"}},
         ],
     )
 
@@ -2436,8 +2452,23 @@ def test_capsule_contract_guard_blocks_effectful_comprehension(tmp_path):
     assert env.api.calls == []
 
 
-def test_capsule_no_replay_ledger_survives_patch_group_renumbering(tmp_path):
+def test_capsule_no_replay_ledger_survives_patch_group_renumbering(
+    tmp_path, monkeypatch
+):
     env = FakeCustomMoveCapsuleEnv()
+    actions = [
+        {"action": "run_group", "args": {"group_id": "group_2"}},
+        {
+            "action": "patch_group",
+            "args": {
+                "group_id": "group_1",
+                "source": "x = 2\ny = 3\n",
+            },
+        },
+        {"action": "run_group", "args": {"group_id": "group_3"}},
+        {"action": "finish", "args": {}},
+    ]
+    _stub_capsule_model_actions(monkeypatch, actions)
 
     trial_module._run_capsule_loop(
         env,
@@ -2453,18 +2484,6 @@ def test_capsule_no_replay_ledger_survives_patch_group_renumbering(tmp_path):
             'custom_move("same")\n'
             'custom_move("same")\n'
         ),
-        scripted_actions=[
-            {"action": "run_group", "args": {"group_id": "group_2"}},
-            {
-                "action": "patch_group",
-                "args": {
-                    "group_id": "group_1",
-                    "source": "x = 2\ny = 3\n",
-                },
-            },
-            {"action": "run_group", "args": {"group_id": "group_3"}},
-            {"action": "finish", "args": {}},
-        ],
     )
 
     trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
@@ -2582,7 +2601,9 @@ def test_capsule_resume_execution_seals_containing_group(tmp_path):
     assert env.api.moves == ["once"]
 
 
-def test_capsule_side_effect_lineage_uses_edit_span_with_duplicate_source(tmp_path):
+def test_capsule_side_effect_lineage_uses_edit_span_with_duplicate_source(
+    tmp_path, monkeypatch
+):
     env = FakeCustomMoveCapsuleEnv()
     initial_source = 'x = 1\ncustom_move("same")\n'
     replacement = 'custom_move("same")\nx = 2\n'
@@ -2595,6 +2616,16 @@ def test_capsule_side_effect_lineage_uses_edit_span_with_duplicate_source(tmp_pa
         side_effect_calls={"custom_move"},
     )
     moved_effect_group_id = current_groups[-1].group_id
+    actions = [
+        {"action": "run_group", "args": {"group_id": "group_2"}},
+        {
+            "action": "patch_group",
+            "args": {"group_id": "group_1", "source": replacement},
+        },
+        {"action": "run_group", "args": {"group_id": moved_effect_group_id}},
+        {"action": "finish", "args": {}},
+    ]
+    _stub_capsule_model_actions(monkeypatch, actions)
 
     trial_module._run_capsule_loop(
         env,
@@ -2606,15 +2637,6 @@ def test_capsule_side_effect_lineage_uses_edit_span_with_duplicate_source(tmp_pa
             "capsule_max_regions_per_group": 1,
         },
         initial_code=initial_source,
-        scripted_actions=[
-            {"action": "run_group", "args": {"group_id": "group_2"}},
-            {
-                "action": "patch_group",
-                "args": {"group_id": "group_1", "source": replacement},
-            },
-            {"action": "run_group", "args": {"group_id": moved_effect_group_id}},
-            {"action": "finish", "args": {}},
-        ],
     )
 
     trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
@@ -2701,6 +2723,8 @@ def test_capsule_append_identical_side_effect_gets_new_stable_key_and_one_run(tm
                 "action": "append_recovery",
                 "args": {"source": 'get_observation()\nmove_to("same")'},
             },
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {"action": "run_group", "args": {"group_id": "group_3"}},
             {"action": "run_group", "args": {"group_id": "group_3"}},
         ],
     )
@@ -2918,6 +2942,16 @@ def test_capsule_syntax_rejected_patch_is_atomic(tmp_path, monkeypatch):
         return original_build_prompt(*args, **kwargs)
 
     monkeypatch.setattr(trial_module, "build_capsule_prompt", capture_prompt_state)
+    _stub_capsule_model_actions(
+        monkeypatch,
+        [
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": "x = (\n"},
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
 
     summary = trial_module._run_capsule_loop(
         FakeIncompleteCapsuleEnv(),
@@ -2925,13 +2959,6 @@ def test_capsule_syntax_rejected_patch_is_atomic(tmp_path, monkeypatch):
         args=SimpleNamespace(model="test", use_oracle_code=False),
         config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
         initial_code=initial_source,
-        scripted_actions=[
-            {
-                "action": "patch_group",
-                "args": {"group_id": "group_1", "source": "x = (\n"},
-            },
-            {"action": "finish", "args": {}},
-        ],
     )
 
     trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
@@ -3049,18 +3076,9 @@ def test_capsule_lineage_ambiguity_rejects_edit_without_mutating_ledger(
         trial_module, "_display_side_effect_ledger", capture_live_lineage
     )
     monkeypatch.setattr(trial_module, "build_capsule_prompt", capture_prompt_state)
-
-    summary = trial_module._run_capsule_loop(
-        FakeCustomMoveCapsuleEnv(),
-        trial=0,
-        args=SimpleNamespace(model="test", use_oracle_code=False),
-        config={
-            "output_dir": str(tmp_path),
-            "max_capsule_steps": 5,
-            "capsule_max_regions_per_group": 1,
-        },
-        initial_code=initial_source,
-        scripted_actions=[
+    _stub_capsule_model_actions(
+        monkeypatch,
+        [
             {"action": "run_group", "args": {"group_id": "group_1"}},
             {
                 "action": "patch_group",
@@ -3073,6 +3091,18 @@ def test_capsule_lineage_ambiguity_rejects_edit_without_mutating_ledger(
             {"action": "run_group", "args": {"group_id": "group_2"}},
             {"action": "finish", "args": {}},
         ],
+    )
+
+    summary = trial_module._run_capsule_loop(
+        FakeCustomMoveCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 5,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code=initial_source,
     )
 
     trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
@@ -3125,14 +3155,9 @@ def test_capsule_append_boundary_crossing_is_rejected_atomically(tmp_path, monke
 
     monkeypatch.setattr(trial_module, "_analyze_capsule_source", analyze_with_crossing_group)
     monkeypatch.setattr(trial_module, "build_capsule_prompt", capture_prompt_state)
-
-    summary = trial_module._run_capsule_loop(
-        FakeIncompleteCapsuleEnv(),
-        trial=0,
-        args=SimpleNamespace(model="test", use_oracle_code=False),
-        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
-        initial_code=initial_source,
-        scripted_actions=[
+    _stub_capsule_model_actions(
+        monkeypatch,
+        [
             {
                 "action": "append_recovery",
                 "args": {"source": "get_observation()\ny = 2\n"},
@@ -3140,6 +3165,14 @@ def test_capsule_append_boundary_crossing_is_rejected_atomically(tmp_path, monke
             {"action": "run_group", "args": {"group_id": "group_1"}},
             {"action": "finish", "args": {}},
         ],
+    )
+
+    summary = trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code=initial_source,
     )
 
     trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
@@ -3394,7 +3427,16 @@ def test_capsule_llm_step_can_disable_compact_action_prompt(tmp_path, monkeypatc
     assert rows[0]["action_prompt_compact_context"] is False
 
 
-def test_noncompact_prompt_hides_stable_key_but_audit_trace_keeps_it(tmp_path):
+def test_noncompact_prompt_hides_stable_key_but_audit_trace_keeps_it(
+    tmp_path, monkeypatch
+):
+    _stub_capsule_model_actions(
+        monkeypatch,
+        [
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
     trial_module._run_capsule_loop(
         FakeCustomMoveCapsuleEnv(),
         trial=0,
@@ -3405,10 +3447,6 @@ def test_noncompact_prompt_hides_stable_key_but_audit_trace_keeps_it(tmp_path):
             "capsule_llm_step_compact_context": False,
         },
         initial_code='custom_move("once")\n',
-        scripted_actions=[
-            {"action": "run_group", "args": {"group_id": "group_1"}},
-            {"action": "finish", "args": {}},
-        ],
     )
 
     prompts = json.loads((tmp_path / "capsule_prompts_trial_00.json").read_text())
@@ -3434,6 +3472,16 @@ def test_model_history_filter_does_not_preempt_compact_history_limit(
         return original_build_prompt(**kwargs)
 
     monkeypatch.setattr(trial_module, "build_capsule_prompt", capture_prompt)
+    _stub_capsule_model_actions(
+        monkeypatch,
+        [
+            *[
+                {"action": "inspect_variables", "args": {"names": ["x"]}}
+                for _ in range(10)
+            ],
+            {"action": "finish", "args": {}},
+        ],
+    )
     trial_module._run_capsule_loop(
         FakeIncompleteCapsuleEnv(),
         trial=0,
@@ -3444,13 +3492,6 @@ def test_model_history_filter_does_not_preempt_compact_history_limit(
             "capsule_action_history_max_entries": 10,
         },
         initial_code="x = 1\n",
-        scripted_actions=[
-            *[
-                {"action": "inspect_variables", "args": {"names": ["x"]}}
-                for _ in range(10)
-            ],
-            {"action": "finish", "args": {}},
-        ],
     )
 
     assert observed_history[-1] == (10, 10)
@@ -3653,7 +3694,7 @@ def test_capsule_llm_step_rejects_patch_after_failed_side_effect_group(
                     "args": {"group_id": "group_1", "source": 'move_to("recover")'},
                 },
             ],
-            "max_capsule_steps": 3,
+            "max_capsule_steps": 2,
             "capsule_max_regions_per_group": 2,
             "use_parallel_ensemble": False,
             "use_multimodel": False,
@@ -3665,7 +3706,7 @@ def test_capsule_llm_step_rejects_patch_after_failed_side_effect_group(
 
     assert summary.sandbox_rc == 1
     assert env.api.moves == ["good"]
-    assert [entry["event"]["status"] for entry in trace] == ["failed", "invalid", "success"]
+    assert [entry["event"]["status"] for entry in trace] == ["failed", "invalid"]
     assert "already executed robot-side-effect code" in trace[1]["event"]["message"]
 
 
@@ -3692,7 +3733,7 @@ def test_capsule_llm_step_rejects_replay_after_failed_side_effect_region(
                 {"action": "run_region", "args": {"region_id": "region_1"}},
                 {"action": "run_region", "args": {"region_id": "region_1"}},
             ],
-            "max_capsule_steps": 3,
+            "max_capsule_steps": 2,
             "use_parallel_ensemble": False,
             "use_multimodel": False,
         },
@@ -3703,7 +3744,7 @@ def test_capsule_llm_step_rejects_replay_after_failed_side_effect_region(
 
     assert summary.sandbox_rc == 1
     assert env.api.moves == ["good"]
-    assert [entry["event"]["status"] for entry in trace] == ["failed", "invalid", "success"]
+    assert [entry["event"]["status"] for entry in trace] == ["failed", "invalid"]
     assert "already executed robot-side-effect code" in trace[1]["event"]["message"]
 
 
@@ -3748,7 +3789,7 @@ def test_capsule_llm_step_marks_failed_dynamic_side_effect_group_region(
                 {"action": "run_group", "args": {"group_id": "group_1"}},
                 {"action": "run_region", "args": {"region_id": "region_1"}},
             ],
-            "max_capsule_steps": 3,
+            "max_capsule_steps": 2,
             "capsule_max_regions_per_group": 2,
             "use_parallel_ensemble": False,
             "use_multimodel": False,
@@ -3760,7 +3801,7 @@ def test_capsule_llm_step_marks_failed_dynamic_side_effect_group_region(
 
     assert summary.sandbox_rc == 1
     assert env.api.moves == ["good"]
-    assert [entry["event"]["status"] for entry in trace] == ["failed", "invalid", "success"]
+    assert [entry["event"]["status"] for entry in trace] == ["failed", "invalid"]
     assert "already executed robot-side-effect code" in trace[1]["event"]["message"]
 
 
@@ -3787,7 +3828,7 @@ def test_capsule_llm_step_marks_failed_dynamic_side_effect_region(
                 {"action": "run_region", "args": {"region_id": "region_1"}},
                 {"action": "run_region", "args": {"region_id": "region_1"}},
             ],
-            "max_capsule_steps": 3,
+            "max_capsule_steps": 2,
             "use_parallel_ensemble": False,
             "use_multimodel": False,
         },
@@ -3798,7 +3839,7 @@ def test_capsule_llm_step_marks_failed_dynamic_side_effect_region(
 
     assert summary.sandbox_rc == 1
     assert env.api.moves == ["good"]
-    assert [entry["event"]["status"] for entry in trace] == ["failed", "invalid", "success"]
+    assert [entry["event"]["status"] for entry in trace] == ["failed", "invalid"]
     assert "already executed robot-side-effect code" in trace[1]["event"]["message"]
 
 
@@ -3843,7 +3884,7 @@ def test_capsule_llm_step_rejects_patch_after_successful_dynamic_side_effect_gro
                 {"action": "run_group", "args": {"group_id": "group_1"}},
                 {"action": "patch_region", "args": {"region_id": "region_1", "source": "x = 1"}},
             ],
-            "max_capsule_steps": 3,
+            "max_capsule_steps": 2,
             "capsule_max_regions_per_group": 2,
             "use_parallel_ensemble": False,
             "use_multimodel": False,
@@ -3855,7 +3896,7 @@ def test_capsule_llm_step_rejects_patch_after_successful_dynamic_side_effect_gro
 
     assert summary.sandbox_rc == 1
     assert env.api.moves == ["good"]
-    assert [entry["event"]["status"] for entry in trace] == ["success", "invalid", "success"]
+    assert [entry["event"]["status"] for entry in trace] == ["success", "invalid"]
     assert "already executed robot-side-effect code" in trace[1]["event"]["message"]
 
 
@@ -4183,7 +4224,7 @@ def test_append_recovery_accepts_api_declared_fresh_state_function(tmp_path):
         initial_code="x = 1\n",
         scripted_actions=[
             {"action": "append_recovery", "args": {"source": "handle = get_handle0_pos()"}},
-            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_2"}},
             {"action": "finish", "args": {}},
         ],
     )
@@ -4277,7 +4318,16 @@ def test_capsule_trial_rejects_rerun_of_executed_side_effect_group(tmp_path):
     assert "append_recovery" in trace[1]["event"]["message"]
 
 
-def test_capsule_llm_step_prompt_includes_executed_side_effect_ledger(tmp_path):
+def test_capsule_llm_step_prompt_includes_executed_side_effect_ledger(
+    tmp_path, monkeypatch
+):
+    _stub_capsule_model_actions(
+        monkeypatch,
+        [
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
     _run_capsule_trial(
         env=FakeIncompleteCapsuleEnv(),
         trial=1,
@@ -4290,10 +4340,6 @@ def test_capsule_llm_step_prompt_includes_executed_side_effect_ledger(tmp_path):
             "use_multimodel": False,
         },
         initial_code='pose = get_pose("cube")\nmove_to(pose)\n',
-        scripted_actions=[
-            {"action": "run_group", "args": {"group_id": "group_1"}},
-            {"action": "finish", "args": {}},
-        ],
     )
 
     prompts = json.loads((tmp_path / "capsule_prompts_trial_01.json").read_text())
@@ -4668,6 +4714,8 @@ def test_capsule_trial_allows_recovery_side_effect_after_append_recovery(tmp_pat
                 "action": "append_recovery",
                 "args": {"source": 'obs = get_observation()\nmove_to("recover")'},
             },
+            {"action": "run_group", "args": {"group_id": "group_3"}},
+            {"action": "run_group", "args": {"group_id": "group_4"}},
             {"action": "finish", "args": {}},
         ],
     )
@@ -4680,8 +4728,41 @@ def test_capsule_trial_allows_recovery_side_effect_after_append_recovery(tmp_pat
     assert trace[4]["event"]["status"] == "success"
 
 
-def test_capsule_llm_step_auto_executes_appended_recovery_before_next_action(tmp_path):
+def test_capsule_append_requires_new_decision_before_each_group(tmp_path, monkeypatch):
     env = FakeRewardDropCapsuleEnv()
+    query_snapshots = []
+    responses = iter(
+        [
+            {
+                "content": json.dumps(
+                    {
+                        "action": "append_recovery",
+                        "args": {
+                            "source": 'obs = get_observation()\nmove_to("recover")'
+                        },
+                    }
+                )
+            },
+            {
+                "content": json.dumps(
+                    {"action": "run_group", "args": {"group_id": "group_2"}}
+                )
+            },
+            {
+                "content": json.dumps(
+                    {"action": "run_group", "args": {"group_id": "group_3"}}
+                )
+            },
+        ]
+    )
+
+    def fake_query_model(args, prompt):
+        query_snapshots.append(
+            {"observed": env.api.observed, "moves": list(env.api.moves)}
+        )
+        return next(responses)
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
 
     summary = _run_capsule_trial(
         env=env,
@@ -4690,38 +4771,69 @@ def test_capsule_llm_step_auto_executes_appended_recovery_before_next_action(tmp
         config={
             "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
-            "max_capsule_steps": 6,
+            "max_capsule_steps": 3,
             "capsule_max_regions_per_group": 1,
             "use_parallel_ensemble": False,
             "use_multimodel": False,
         },
-        initial_code='move_to("good")\nmove_to("bad")\n',
-        scripted_actions=[
-            {"action": "run_group", "args": {"group_id": "group_1"}},
-            {"action": "run_group", "args": {"group_id": "group_2"}},
-            {
-                "action": "append_recovery",
-                "args": {"source": 'obs = get_observation()\nmove_to("recover")'},
-            },
-            {"action": "finish", "args": {}},
-        ],
+        initial_code="x = 1\n",
     )
 
     trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+    metrics = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_01.jsonl"
+    )
 
     assert summary.sandbox_rc == 0
     assert env.api.observed is True
-    assert env.api.moves == ["good", "bad", "recover"]
+    assert env.api.moves == ["recover"]
     assert [entry["event"]["action"] for entry in trace] == [
-        "run_group",
-        "run_group",
         "append_recovery",
         "run_group",
         "run_group",
-        "finish",
     ]
-    assert trace[3]["action"]["args"]["group_id"] == "group_3"
-    assert trace[4]["action"]["args"]["group_id"] == "group_4"
+    assert query_snapshots == [
+        {"observed": False, "moves": []},
+        {"observed": False, "moves": []},
+        {"observed": True, "moves": []},
+    ]
+    assert len(query_snapshots) == len(trace) == 3
+    assert [row["action_origin"] for row in metrics] == ["llm", "llm", "llm"]
+    assert all(row["action_origin"] != "pending_recovery" for row in metrics)
+
+
+def test_capsule_queries_when_script_does_not_supply_current_step(
+    tmp_path, monkeypatch
+):
+    query_calls = []
+
+    def fake_query_model(args, prompt):
+        query_calls.append(prompt)
+        return {"content": json.dumps({"action": "finish", "args": {}})}
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+        ],
+    )
+
+    metrics = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+    prompts = json.loads(
+        (tmp_path / "capsule_prompts_trial_00.json").read_text()
+    )
+
+    assert len(query_calls) == 1
+    assert len(prompts) == 1
+    assert [row["action_origin"] for row in metrics] == ["scripted", "llm"]
 
 
 def test_capsule_llm_step_allows_entire_appended_recovery_block_after_reward_drop(
@@ -4753,6 +4865,9 @@ def test_capsule_llm_step_allows_entire_appended_recovery_block_after_reward_dro
                     )
                 },
             },
+            {"action": "run_group", "args": {"group_id": "group_3"}},
+            {"action": "run_group", "args": {"group_id": "group_4"}},
+            {"action": "run_group", "args": {"group_id": "group_5"}},
             {"action": "finish", "args": {}},
         ],
     )
@@ -4796,6 +4911,8 @@ def test_capsule_metrics_split_append_source_from_recovery_execution(tmp_path):
                 "action": "append_recovery",
                 "args": {"source": 'obs = get_observation()\nmove_to("recover")'},
             },
+            {"action": "run_group", "args": {"group_id": "group_3"}},
+            {"action": "run_group", "args": {"group_id": "group_4"}},
         ],
     )
 
@@ -5189,6 +5306,7 @@ def test_capsule_trial_writes_step_metrics_jsonl(tmp_path):
     assert rows[0]["best_reward_so_far"] == 1.0
     assert rows[0]["reward_drop_from_best"] == 0.0
     assert rows[0]["state_after"]["reward"] == 1.0
+    assert [row["action_origin"] for row in rows] == ["scripted", "scripted"]
 
 
 def test_patch_region_accepts_new_source_alias():
