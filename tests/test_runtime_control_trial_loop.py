@@ -4487,6 +4487,32 @@ def test_capsule_action_query_uses_separate_max_tokens(tmp_path, monkeypatch):
     assert observed_max_tokens == [512]
 
 
+def test_capsule_action_query_defaults_to_2048_tokens(tmp_path, monkeypatch):
+    observed_max_tokens = []
+
+    def fake_query_model(args, prompt):
+        observed_max_tokens.append(args.max_tokens)
+        return {"content": '{"action": "finish", "args": {}}', "reasoning": None}
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query_model)
+
+    _run_capsule_trial(
+        env=FakeCapsuleEnv(),
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "capsule_control_mode": "llm_step",
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code="x = 1\n",
+    )
+
+    assert observed_max_tokens == [2048]
+
+
 def test_capsule_trial_rejects_patch_of_executed_side_effect_group(tmp_path):
     summary = _run_capsule_trial(
         env=FakeCapsuleEnv(),

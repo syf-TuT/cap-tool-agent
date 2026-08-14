@@ -129,7 +129,7 @@ class LiberoBatchLaunchArgs:
 
     # Other LaunchArgs overrides
     temperature: float = 1.0
-    max_tokens: int = 2048 * 10
+    max_tokens: int = 2048
     reasoning_effort: str = "medium"
     api_key: str | None = None
     use_visual_feedback: bool | None = None

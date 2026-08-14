@@ -1469,7 +1469,7 @@ def _run_capsule_auto_forward_loop(
     )
     max_steps = int(config.get("max_capsule_steps", 12))
     action_query_args = copy.copy(args)
-    default_action_max_tokens = getattr(args, "max_tokens", 2048 * 10)
+    default_action_max_tokens = getattr(args, "max_tokens", 2048)
     action_query_args.max_tokens = int(
         config.get("capsule_action_max_tokens", default_action_max_tokens)
     )
@@ -2250,7 +2250,7 @@ def _run_capsule_llm_step_loop(
     )
     max_steps = int(config.get("max_capsule_steps", 12))
     action_query_args = copy.copy(args)
-    default_action_max_tokens = getattr(args, "max_tokens", 2048 * 10)
+    default_action_max_tokens = getattr(args, "max_tokens", 2048)
     action_query_args.max_tokens = int(
         config.get("capsule_action_max_tokens", default_action_max_tokens)
     )
