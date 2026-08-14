@@ -6,7 +6,12 @@ from heapq import nsmallest
 from itertools import islice
 from typing import Any
 
-from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, RuntimeAction
+from capx.runtime_control.schema import (
+    CodeRegion,
+    CodeRegionGroup,
+    PostActionObservation,
+    RuntimeAction,
+)
 
 _CONTRACT_SAFETY_MAX_CHARS = 12000
 _CONTRACT_SAFETY_FALLBACK_MAX_CHARS = 6000
@@ -37,6 +42,10 @@ _HISTORY_SCALAR_MAX_CHARS = 120
 _HISTORY_MESSAGE_MAX_CHARS = 240
 _HISTORY_PRIMITIVE_MAX_ITEMS = 8
 _HISTORY_PRIMITIVE_NAME_MAX_CHARS = 80
+_POST_ACTION_TRACE_MAX_EVENTS = 8
+_POST_ACTION_PRIMITIVE_MAX_ITEMS = 16
+_POST_ACTION_STATE_MAX_NODES = 96
+_POST_ACTION_TRACE_MAX_NODES = 96
 _MINIMAL_FALLBACK_MIN_PROMPT_CHARS = 4096
 _DATA_URL_TEXT = re.compile(
     r"(?i)(?<![A-Za-z0-9_])data:(?:[-A-Za-z0-9.+]+/[-A-Za-z0-9.+]+)?"
@@ -90,6 +99,8 @@ def build_capsule_prompt(
     source_preview_chars: int = 240,
     focused_source_max_units: int = 0,
     prompt_char_budget: int | None = None,
+    latest_observation: PostActionObservation | None = None,
+    source_revision: int | None = None,
 ) -> list[dict[str, Any]]:
     recovery_functions = sorted(
         {"get_observation"}
@@ -156,6 +167,8 @@ def build_capsule_prompt(
         recovery_rule=recovery_rule,
         run_group_example_id=run_group_example_id,
         run_region_example_id=run_region_example_id,
+        latest_observation=latest_observation,
+        source_revision=source_revision,
     )
     if compact_context and _prompt_text_over_budget(prompt_text, prompt_char_budget):
         prompt_text = _build_capsule_prompt_text(
@@ -187,6 +200,8 @@ def build_capsule_prompt(
             recovery_rule=recovery_rule,
             run_group_example_id=run_group_example_id,
             run_region_example_id=run_region_example_id,
+            latest_observation=latest_observation,
+            source_revision=source_revision,
         )
     if (
         compact_context
@@ -223,6 +238,8 @@ def build_capsule_prompt(
             recovery_rule=recovery_rule,
             run_group_example_id=run_group_example_id,
             run_region_example_id=run_region_example_id,
+            latest_observation=latest_observation,
+            source_revision=source_revision,
         )
     if (
         compact_context
@@ -255,6 +272,8 @@ def build_capsule_prompt(
             recovery_rule=recovery_rule,
             run_group_example_id=run_group_example_id,
             run_region_example_id=run_region_example_id,
+            latest_observation=latest_observation,
+            source_revision=source_revision,
         )
     return _capsule_prompt_messages(prompt_text)
 
@@ -289,6 +308,8 @@ def _build_capsule_prompt_text(
     recovery_rule: str,
     run_group_example_id: str,
     run_region_example_id: str,
+    latest_observation: PostActionObservation | None,
+    source_revision: int | None,
 ) -> str:
     if compact_context:
         region_units = [
@@ -385,12 +406,23 @@ def _build_capsule_prompt_text(
             "Patch these violations before running any robot effects. Do not execute "
             "a robot-side-effect region or group until the program contract is repaired.\n\n"
         )
+    latest_observation_text = ""
+    if latest_observation is not None:
+        compact_observation = _compact_post_action_observation(
+            latest_observation,
+            source_revision=source_revision,
+        )
+        latest_observation_text = (
+            "Latest post-action observation:\n"
+            f"{json.dumps(compact_observation, indent=2, default=str)}\n\n"
+        )
     prompt_text = (
         "Task:\n"
         f"{task}\n\n"
         f"{group_text}"
         f"{region_heading}:\n"
         f"{json.dumps(region_data, indent=2, default=str)}\n\n"
+        f"{latest_observation_text}"
         f"{history_heading}:\n"
         f"{json.dumps(history_data, indent=2, default=str)}\n\n"
         f"{trace_heading}:\n"
@@ -447,6 +479,122 @@ def _build_capsule_prompt_text(
         "for robot primitives as tools."
     )
     return prompt_text
+
+
+def _compact_post_action_observation(
+    observation: PostActionObservation,
+    *,
+    source_revision: int | None,
+) -> dict[str, Any]:
+    state_before = _bound_post_action_value(observation.state_before)
+    state_after = _bound_post_action_value(observation.state_after)
+    state_delta = _post_action_state_delta(
+        observation.state_before,
+        observation.state_after,
+    )
+    trace_events = list(observation.new_trace_events)
+    visible_trace_events = trace_events[-_POST_ACTION_TRACE_MAX_EVENTS:]
+    trace_budget = {"remaining": _POST_ACTION_TRACE_MAX_NODES}
+    bounded_trace_events = [
+        _bound_history_runtime_value(
+            event,
+            depth=0,
+            node_budget=trace_budget,
+        )
+        for event in visible_trace_events
+        if trace_budget["remaining"] > 0
+    ]
+    primitive_calls = _bound_history_text_list(
+        [event.get("name") for event in trace_events if isinstance(event, dict)],
+        max_items=_POST_ACTION_PRIMITIVE_MAX_ITEMS,
+        max_chars=_HISTORY_PRIMITIVE_NAME_MAX_CHARS,
+    )
+    failed_trace_event_count = sum(
+        1
+        for event in trace_events
+        if isinstance(event, dict) and event.get("status") == "failed"
+    )
+    reward_delta = (
+        observation.reward_after - observation.reward_before
+        if observation.reward_before is not None and observation.reward_after is not None
+        else None
+    )
+    compact = {
+        "source_revision": source_revision,
+        "step_id": observation.step_id,
+        "action": _bound_history_scalar(observation.action),
+        "unit_id": _bound_history_scalar(observation.unit_id),
+        "event_status": observation.event_status,
+        "state_before": state_before,
+        "state_after": state_after,
+        "state_delta": state_delta,
+        "reward_before": observation.reward_before,
+        "reward_after": observation.reward_after,
+        "reward_delta": reward_delta,
+        "task_completed": observation.task_completed,
+        "terminal_progress_unverified": observation.terminal_progress_unverified,
+        "safety_failure": _bound_history_scalar(observation.safety_failure),
+        "failed_trace_event_count": failed_trace_event_count,
+        "primitive_calls": primitive_calls,
+        "new_trace_event_count": len(trace_events),
+        "new_trace_events": bounded_trace_events,
+        "omitted_trace_event_count": len(trace_events) - len(bounded_trace_events),
+        "trace_revision": observation.trace_revision,
+    }
+    always_included = {
+        "reward_before",
+        "reward_after",
+        "reward_delta",
+        "task_completed",
+        "terminal_progress_unverified",
+        "failed_trace_event_count",
+        "new_trace_event_count",
+        "omitted_trace_event_count",
+    }
+    return {
+        key: value
+        for key, value in compact.items()
+        if value not in (None, [], "") or key in always_included
+    }
+
+
+def _bound_post_action_value(value: Any) -> Any:
+    return _bound_history_runtime_value(
+        value,
+        depth=0,
+        node_budget={"remaining": _POST_ACTION_STATE_MAX_NODES},
+    )
+
+
+def _post_action_state_delta(
+    state_before: dict[str, Any],
+    state_after: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    changed: dict[str, dict[str, Any]] = {}
+    node_budget = {"remaining": _POST_ACTION_STATE_MAX_NODES}
+    for key in sorted(set(state_before) | set(state_after)):
+        before_value = state_before.get(key)
+        after_value = state_after.get(key)
+        if before_value == after_value:
+            continue
+        changed[_truncate_history_text(key, max_chars=_HISTORY_INSPECT_MAX_NAME_CHARS)] = {
+            "before": _bound_history_runtime_value(
+                before_value,
+                depth=0,
+                node_budget=node_budget,
+            ),
+            "after": _bound_history_runtime_value(
+                after_value,
+                depth=0,
+                node_budget=node_budget,
+            ),
+        }
+        if (
+            len(changed) >= _HISTORY_INSPECT_MAX_MAPPING_ITEMS
+            or node_budget["remaining"] <= 0
+        ):
+            break
+    return changed
 
 
 def _compact_contract_violations(

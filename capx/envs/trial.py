@@ -54,6 +54,7 @@ from capx.runtime_control import (
     CodeRegion,
     CodeRegionGroup,
     LineageAmbiguityError,
+    PostActionObservation,
     ProgramContractViolation,
     RuntimeAction,
     RuntimeEvent,
@@ -1772,6 +1773,7 @@ def _run_capsule_loop(
     require_task_success_for_finish = _coerce_config_bool(
         config.get("capsule_require_task_success_for_finish", False)
     )
+    latest_post_action_observation: PostActionObservation | None = None
 
     for step_id in range(1, max_steps + 1):
         action: RuntimeAction | None = None
@@ -1794,6 +1796,10 @@ def _run_capsule_loop(
         action_prompt_visual_artifact_errors: list[dict[str, str]] = []
         post_action_visual_capture_errors: list[dict[str, str]] = []
         post_action_visual_artifact_errors: list[dict[str, str]] = []
+        post_action_observation: PostActionObservation | None = None
+        group_execution_trace_mark: int | None = None
+        group_observation_before_state: dict[str, Any] | None = None
+        group_new_trace_events: list[dict[str, Any]] = []
 
         try:
             if script is not None and script_idx < len(script):
@@ -1821,6 +1827,8 @@ def _run_capsule_loop(
                     prompt_char_budget=(
                         action_prompt_char_budget if llm_step_compact_context else None
                     ),
+                    latest_observation=latest_post_action_observation,
+                    source_revision=source_revision.revision,
                 )
                 action_prompt_chars = len(json.dumps(prompt, default=str))
                 action_prompt_char_budget_metric = (
@@ -1874,6 +1882,13 @@ def _run_capsule_loop(
             region_id = str(action.args.get("region_id", ""))
             group_id = str(action.args.get("group_id", ""))
             source_unit_for_feedback = region_by_id.get(region_id) or group_by_id.get(group_id)
+            if action.action == "run_group":
+                group_execution_trace_mark = executor.trace.mark()
+                group_observation_before_state = _capsule_state_snapshot(
+                    env,
+                    state_level=prompt_state_level,
+                )
+                before_state = group_observation_before_state
             event = _finish_success_guard_event(
                 action,
                 before_state,
@@ -1935,6 +1950,10 @@ def _run_capsule_loop(
                 )
                 if consumes_recovery_side_effect:
                     recovery_side_effect_budget -= 1
+            if group_execution_trace_mark is not None:
+                group_new_trace_events = executor.trace.events_since(
+                    group_execution_trace_mark
+                )
             if action.action in {"patch_region", "patch_group", "append_recovery"}:
                 prepared_source_edit: _PreparedSourceEdit | None = None
                 rejection: _SourceEditRejection | None = None
@@ -2085,7 +2104,11 @@ def _run_capsule_loop(
                     ),
                 }
             )
-        trace_events = event.evidence.get("trace_events", [])
+        trace_events = (
+            group_new_trace_events
+            if group_execution_trace_mark is not None
+            else event.evidence.get("trace_events", [])
+        )
         feedback_action = action if action is not None else RuntimeAction(action="invalid", args={})
         feedback = build_runtime_feedback(
             step_id=step_id,
@@ -2099,19 +2122,42 @@ def _run_capsule_loop(
             side_effect_calls=side_effect_calls,
         )
 
-        history.append(
-            {
-                "step_id": step_id,
-                "action": action.to_dict() if action is not None else {"action": "invalid"},
-                "event": event.to_dict(),
-                "feedback": feedback.to_dict(),
-                "trace_events": trace_events,
-                "state_before": before_state,
-                "state_after": after_state,
-                "unit_key": action_unit_key,
-                "source_revision": action_source_revision,
-            }
-        )
+        if group_execution_trace_mark is not None and action is not None:
+            observation_before_state = group_observation_before_state or before_state
+            post_action_observation = PostActionObservation(
+                step_id=step_id,
+                action=action.action,
+                unit_id=_runtime_action_unit_id(action) or event.region_id,
+                unit_key=action_unit_key,
+                event_status=event.status,
+                state_before=copy.deepcopy(observation_before_state),
+                state_after=copy.deepcopy(after_state),
+                reward_before=_state_reward(observation_before_state),
+                reward_after=_state_reward(after_state),
+                task_completed=bool(after_state.get("task_completed")),
+                new_trace_events=copy.deepcopy(group_new_trace_events),
+                trace_revision=len(executor.trace.events),
+                terminal_progress_unverified=bool(
+                    feedback.evidence.get("terminal_progress_unverified")
+                ),
+                safety_failure=_post_action_safety_failure(event),
+            )
+            latest_post_action_observation = post_action_observation
+
+        history_entry = {
+            "step_id": step_id,
+            "action": action.to_dict() if action is not None else {"action": "invalid"},
+            "event": event.to_dict(),
+            "feedback": feedback.to_dict(),
+            "trace_events": trace_events,
+            "state_before": before_state,
+            "state_after": after_state,
+            "unit_key": action_unit_key,
+            "source_revision": action_source_revision,
+        }
+        if post_action_observation is not None:
+            history_entry["post_action_observation"] = post_action_observation.to_dict()
+        history.append(history_entry)
         metric, best_reward_so_far = _capsule_step_metric(
             step_id=step_id,
             action=action,
@@ -2146,6 +2192,12 @@ def _run_capsule_loop(
         )
         metric["post_action_visual_artifact_errors"] = (
             post_action_visual_artifact_errors
+        )
+        metric["post_action_observation_recorded"] = post_action_observation is not None
+        metric["new_trace_event_count"] = (
+            len(post_action_observation.new_trace_events)
+            if post_action_observation is not None
+            else 0
         )
         _add_capsule_contract_metrics(
             metric,
@@ -2712,6 +2764,17 @@ def _strict_subset_guard_event(
 
 def _capsule_event_has_safety_failure(event: RuntimeEvent) -> bool:
     return bool(event.evidence.get("safety_failure"))
+
+
+def _post_action_safety_failure(event: RuntimeEvent) -> str | None:
+    explicit_failure = event.evidence.get("safety_failure")
+    if explicit_failure is not None:
+        return str(explicit_failure)
+    if event.evidence.get("strict_subset_violations"):
+        return "strict_subset_violation"
+    if event.evidence.get("program_contract_violations"):
+        return "program_contract_violation"
+    return None
 
 
 def _runtime_action_targets_side_effect_unit(

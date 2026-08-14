@@ -1,6 +1,12 @@
 import pytest
 
-from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, RuntimeAction, RuntimeEvent
+from capx.runtime_control import PostActionObservation
+from capx.runtime_control.schema import (
+    CodeRegion,
+    CodeRegionGroup,
+    RuntimeAction,
+    RuntimeEvent,
+)
 
 
 def test_code_region_exports_source_span():
@@ -84,3 +90,38 @@ def test_runtime_event_is_jsonable():
     )
 
     assert event.to_dict()["status"] == "failed"
+
+
+def test_post_action_observation_exports_stable_audit_fields():
+    observation = PostActionObservation(
+        step_id=3,
+        action="run_group",
+        unit_id="group_2",
+        unit_key="group_key_000002",
+        event_status="success",
+        state_before={"reward": 0.0},
+        state_after={"reward": 0.0},
+        reward_before=0.0,
+        reward_after=0.0,
+        task_completed=False,
+        new_trace_events=[{"name": "move_to", "status": "success"}],
+        trace_revision=7,
+        terminal_progress_unverified=True,
+    )
+
+    assert observation.to_dict() == {
+        "step_id": 3,
+        "action": "run_group",
+        "unit_id": "group_2",
+        "unit_key": "group_key_000002",
+        "event_status": "success",
+        "state_before": {"reward": 0.0},
+        "state_after": {"reward": 0.0},
+        "reward_before": 0.0,
+        "reward_after": 0.0,
+        "task_completed": False,
+        "new_trace_events": [{"name": "move_to", "status": "success"}],
+        "trace_revision": 7,
+        "terminal_progress_unverified": True,
+        "safety_failure": None,
+    }

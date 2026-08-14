@@ -23,6 +23,7 @@ from capx.runtime_control.prompts import build_capsule_prompt, parse_runtime_act
 from capx.runtime_control.schema import (
     CodeRegion,
     CodeRegionGroup,
+    PostActionObservation,
     RuntimeAction,
     RuntimeEvent,
     RuntimeFeedback,
@@ -36,6 +37,7 @@ __all__ = [
     "CodeRegionGroup",
     "LineageAmbiguityError",
     "NamespaceCheckpointStore",
+    "PostActionObservation",
     "ProgramContractAnalysis",
     "ProgramContractViolation",
     "STRICT_CAPSULE_MAX_STATIC_ITERATIONS",

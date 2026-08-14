@@ -6,7 +6,7 @@ from capx.runtime_control.prompts import (
     build_capsule_prompt,
     parse_runtime_action_response,
 )
-from capx.runtime_control.schema import CodeRegion, CodeRegionGroup
+from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, PostActionObservation
 
 
 def test_parse_runtime_action_response():
@@ -43,6 +43,58 @@ def test_capsule_prompt_excludes_removed_trace_inspection_action():
 
     assert "inspect_" "trace" not in text
     assert '"event_count": 1' in text
+
+
+def test_compact_prompt_always_keeps_latest_post_action_observation():
+    long_value = "STATE-SENTINEL-" + "x" * 5000
+    observation = PostActionObservation(
+        step_id=4,
+        action="run_group",
+        unit_id="group_3",
+        unit_key="group_key_000003",
+        event_status="success",
+        state_before={"reward": 0.0, "large": long_value},
+        state_after={"reward": 0.0, "large": long_value + "changed"},
+        reward_before=0.0,
+        reward_after=0.0,
+        task_completed=False,
+        new_trace_events=[
+            {
+                "name": f"primitive_{index}",
+                "status": "success",
+                "result": long_value,
+            }
+            for index in range(40)
+        ],
+        trace_revision=12,
+        terminal_progress_unverified=True,
+    )
+
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion("region_1", 1, 1, "x = 1")],
+        groups=[CodeRegionGroup("group_3", 1, 1, "x = 1")],
+        history=[],
+        trace_summary={},
+        compact_context=True,
+        prompt_char_budget=1,
+        latest_observation=observation,
+        source_revision=9,
+    )
+    text = prompt[1]["content"][0]["text"]
+
+    assert text.count("Latest post-action observation") == 1
+    assert '"source_revision": 9' in text
+    assert '"step_id": 4' in text
+    assert '"unit_id": "group_3"' in text
+    assert '"event_status": "success"' in text
+    assert '"state_delta": {' in text
+    assert '"reward_delta": 0.0' in text
+    assert '"failed_trace_event_count": 0' in text
+    assert '"new_trace_event_count": 40' in text
+    assert '"terminal_progress_unverified": true' in text
+    assert "group_key_000003" not in text
+    assert long_value not in text
 
 
 def test_capsule_prompt_forbids_callable_reflection_and_dynamic_access():

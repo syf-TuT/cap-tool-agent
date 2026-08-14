@@ -115,6 +115,27 @@ class RuntimeEvent:
 
 
 @dataclass
+class PostActionObservation:
+    step_id: int
+    action: str
+    unit_id: str | None
+    unit_key: str | None
+    event_status: RuntimeStatus
+    state_before: dict[str, Any]
+    state_after: dict[str, Any]
+    reward_before: float | None
+    reward_after: float | None
+    task_completed: bool
+    new_trace_events: list[dict[str, Any]]
+    trace_revision: int
+    terminal_progress_unverified: bool = False
+    safety_failure: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class RuntimeFeedback:
     step_id: int
     status: RuntimeStatus

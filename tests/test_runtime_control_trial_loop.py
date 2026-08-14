@@ -22,6 +22,7 @@ from capx.envs.trial import (
     _initial_source_revision,
     _next_source_revision,
     _no_rollback_guard_event,
+    _post_action_safety_failure,
     _program_contract_guard_event,
     _query_initial_code,
     _reward_drop_guard_event,
@@ -3427,7 +3428,7 @@ def test_capsule_llm_step_can_disable_compact_action_prompt(tmp_path, monkeypatc
     assert rows[0]["action_prompt_compact_context"] is False
 
 
-def test_noncompact_prompt_hides_stable_key_but_audit_trace_keeps_it(
+def test_noncompact_observation_hides_stable_key_and_exposes_source_revision(
     tmp_path, monkeypatch
 ):
     _stub_capsule_model_actions(
@@ -3454,7 +3455,7 @@ def test_noncompact_prompt_hides_stable_key_but_audit_trace_keeps_it(
     second_prompt_text = prompts[1][1]["content"][0]["text"]
 
     assert "group_key_000001" not in second_prompt_text
-    assert '"source_revision"' not in second_prompt_text
+    assert '"source_revision": 0' in second_prompt_text
     assert '"group_id": "group_1"' in second_prompt_text
     assert trace[0]["unit_key"] == "group_key_000001"
 
@@ -3533,6 +3534,201 @@ def test_capsule_llm_step_next_prompt_includes_accumulated_trace_summary(
     assert '"get_pose": 1' in next_prompt_text
     assert '"name": "get_pose"' in next_prompt_text
     assert "inspect_" "trace" not in next_prompt_text
+
+
+def test_capsule_records_one_post_action_observation_per_attempted_group(
+    tmp_path, monkeypatch
+):
+    live_prompts = []
+    responses = iter(
+        [
+            {"content": '{"action":"run_group","args":{"group_id":"group_1"}}'},
+            {"content": '{"action":"finish","args":{}}'},
+        ]
+    )
+
+    def fake_query_model(args, prompt):
+        live_prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    trial_module._run_capsule_loop(
+        FakeCustomMoveCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_progress_mode": "sparse_terminal",
+        },
+        initial_code='custom_move("once")\n',
+    )
+
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    audit = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    first_prompt_text = live_prompts[0][1]["content"][0]["text"]
+    next_prompt_text = live_prompts[1][1]["content"][0]["text"]
+
+    assert len(live_prompts) == 2
+    assert [row["post_action_observation_recorded"] for row in metrics] == [True, False]
+    assert [row["new_trace_event_count"] for row in metrics] == [1, 0]
+    assert "Latest post-action observation" not in first_prompt_text
+    assert next_prompt_text.count("Latest post-action observation") == 1
+    assert '"name": "custom_move"' in next_prompt_text
+    assert '"terminal_progress_unverified": true' in next_prompt_text
+    observation = audit[0]["post_action_observation"]
+    assert observation["step_id"] == 1
+    assert observation["action"] == "run_group"
+    assert observation["unit_id"] == "group_1"
+    assert observation["unit_key"] == "group_key_000001"
+    assert observation["event_status"] == "success"
+    assert observation["new_trace_events"] == audit[0]["trace_events"]
+    assert observation["trace_revision"] == 1
+    assert observation["terminal_progress_unverified"] is True
+    assert "post_action_observation" not in audit[1]
+
+
+def test_capsule_post_action_observation_contains_only_that_groups_new_trace_events(
+    tmp_path, monkeypatch
+):
+    live_prompts = []
+    responses = iter(
+        [
+            {"content": '{"action":"run_group","args":{"group_id":"group_1"}}'},
+            {"content": '{"action":"run_group","args":{"group_id":"group_2"}}'},
+            {"content": '{"action":"finish","args":{}}'},
+        ]
+    )
+
+    def fake_query_model(args, prompt):
+        live_prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    trial_module._run_capsule_loop(
+        FakeCustomMoveCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code='custom_move("first")\ncustom_move("second")\n',
+    )
+
+    audit = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    first_events = audit[0]["post_action_observation"]["new_trace_events"]
+    second_events = audit[1]["post_action_observation"]["new_trace_events"]
+    third_prompt_text = live_prompts[2][1]["content"][0]["text"]
+    observation_section = third_prompt_text.split(
+        "Latest post-action observation:\n", 1
+    )[1].split("Recent runtime history summary:\n", 1)[0]
+
+    assert len(first_events) == 1
+    assert len(second_events) == 1
+    assert first_events[0]["args"][0]["repr"] == "'first'"
+    assert second_events[0]["args"][0]["repr"] == "'second'"
+    assert audit[0]["post_action_observation"]["trace_revision"] == 1
+    assert audit[1]["post_action_observation"]["trace_revision"] == 2
+    assert third_prompt_text.count("Latest post-action observation") == 1
+    assert '"step_id": 2' in observation_section
+    assert "'second'" in observation_section
+    assert "'first'" not in observation_section
+
+
+def test_capsule_guard_rejected_group_still_records_one_post_action_observation(
+    tmp_path, monkeypatch
+):
+    live_prompts = []
+    responses = iter(
+        [
+            {"content": '{"action":"run_group","args":{"group_id":"group_1"}}'},
+            {"content": '{"action":"run_group","args":{"group_id":"group_1"}}'},
+            {"content": '{"action":"finish","args":{}}'},
+        ]
+    )
+
+    def fake_query_model(args, prompt):
+        live_prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    trial_module._run_capsule_loop(
+        FakeCustomMoveCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code='custom_move("once")\n',
+    )
+
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    audit = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    third_prompt_text = live_prompts[2][1]["content"][0]["text"]
+
+    assert len(live_prompts) == 3
+    assert [row["post_action_observation_recorded"] for row in metrics] == [
+        True,
+        True,
+        False,
+    ]
+    assert [row["new_trace_event_count"] for row in metrics] == [1, 0, 0]
+    blocked_observation = audit[1]["post_action_observation"]
+    assert blocked_observation["step_id"] == 2
+    assert blocked_observation["event_status"] == "invalid"
+    assert blocked_observation["new_trace_events"] == []
+    assert blocked_observation["trace_revision"] == 1
+    assert blocked_observation["safety_failure"] == "side_effect_replay"
+    assert third_prompt_text.count("Latest post-action observation") == 1
+    assert '"step_id": 2' in third_prompt_text
+    assert '"event_status": "invalid"' in third_prompt_text
+    assert '"safety_failure": "side_effect_replay"' in third_prompt_text
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected"),
+    [
+        ({"safety_failure": "reward_drop_guard"}, "reward_drop_guard"),
+        ({"strict_subset_violations": [{"code": "unsafe"}]}, "strict_subset_violation"),
+        (
+            {"program_contract_violations": [{"code": "missing_setup"}]},
+            "program_contract_violation",
+        ),
+    ],
+)
+def test_post_action_observation_normalizes_safety_guard_outcomes(evidence, expected):
+    event = RuntimeEvent(action="run_group", status="invalid", evidence=evidence)
+
+    assert _post_action_safety_failure(event) == expected
+
+
+def test_capsule_non_group_actions_do_not_record_post_action_observations(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+            {
+                "action": "append_recovery",
+                "args": {"source": "state = get_observation()"},
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    audit = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [row["action"] for row in metrics] == [
+        "inspect_variables",
+        "append_recovery",
+        "finish",
+    ]
+    assert all(row["post_action_observation_recorded"] is False for row in metrics)
+    assert all(row["new_trace_event_count"] == 0 for row in metrics)
+    assert all("post_action_observation" not in entry for entry in audit)
 
 
 def test_capsule_llm_step_treats_string_false_as_non_compact_context(
