@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -8,6 +9,15 @@ from capx.runtime_control.schema import CodeRegion, CodeRegionGroup
 
 class LineageAmbiguityError(ValueError):
     pass
+
+
+def _first_duplicate(values: list[str]) -> str | None:
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            return value
+        seen.add(value)
+    return None
 
 
 @dataclass(frozen=True)
@@ -34,6 +44,13 @@ class UnitLineage:
         regions: list[CodeRegion],
         groups: list[CodeRegionGroup],
     ) -> UnitLineage:
+        duplicate_region_id = _first_duplicate([region.region_id for region in regions])
+        if duplicate_region_id is not None:
+            raise LineageAmbiguityError(f"duplicate region id: {duplicate_region_id}")
+        duplicate_group_id = _first_duplicate([group.group_id for group in groups])
+        if duplicate_group_id is not None:
+            raise LineageAmbiguityError(f"duplicate group id: {duplicate_group_id}")
+
         lineage = cls()
         for region in regions:
             lineage.region_key_by_id[region.region_id] = lineage.allocate_region_key()
@@ -68,6 +85,66 @@ def _validate_unique_current_ids(
         if unit_id in seen:
             raise LineageAmbiguityError(f"duplicate current {unit_kind} id: {unit_id}")
         seen.add(unit_id)
+
+
+def _stable_key_suffix(stable_key: str, unit_kind: str) -> int:
+    match = re.fullmatch(rf"{unit_kind}_key_(\d{{6}})", stable_key)
+    if match is None:
+        raise LineageAmbiguityError(
+            f"{unit_kind} stable key format is invalid: {stable_key}"
+        )
+    return int(match.group(1))
+
+
+def _validate_lineage_units(
+    *,
+    phase: str,
+    unit_kind: str,
+    units: list[CodeRegion] | list[CodeRegionGroup],
+    key_by_id: dict[str, str],
+    executed_keys: set[str],
+    next_key: int,
+) -> None:
+    unit_ids = [_unit_id(unit, unit_kind) for unit in units]
+    duplicate_id = _first_duplicate(unit_ids)
+    if duplicate_id is not None:
+        raise LineageAmbiguityError(
+            f"duplicate {phase} {unit_kind} id: {duplicate_id}"
+        )
+
+    if set(key_by_id) != set(unit_ids):
+        raise LineageAmbiguityError(
+            f"{phase} {unit_kind} map ids do not exactly match {unit_kind} units"
+        )
+
+    stable_keys = list(key_by_id.values())
+    duplicate_stable_key = _first_duplicate(stable_keys)
+    if duplicate_stable_key is not None:
+        if duplicate_stable_key in executed_keys:
+            raise LineageAmbiguityError(
+                f"executed {unit_kind} key identifies multiple previous units: "
+                f"{duplicate_stable_key}"
+            )
+        raise LineageAmbiguityError(
+            f"{phase} {unit_kind} stable keys must be unique: {duplicate_stable_key}"
+        )
+
+    stable_key_set = set(stable_keys)
+    missing_executed_keys = executed_keys - stable_key_set
+    if missing_executed_keys:
+        missing = ", ".join(sorted(missing_executed_keys))
+        raise LineageAmbiguityError(
+            f"executed {unit_kind} key is missing from {phase} lineage map: {missing}"
+        )
+
+    suffixes = [_stable_key_suffix(stable_key, unit_kind) for stable_key in stable_keys]
+    if isinstance(next_key, bool) or not isinstance(next_key, int) or next_key <= 0:
+        raise LineageAmbiguityError(f"next {unit_kind} key counter must be a positive integer")
+    maximum_suffix = max(suffixes, default=0)
+    if next_key <= maximum_suffix:
+        raise LineageAmbiguityError(
+            f"next {unit_kind} key counter must exceed existing stable keys"
+        )
 
 
 def _expected_span(
@@ -106,24 +183,6 @@ def _reconcile_units(
     allocate_key: Callable[[], str],
 ) -> None:
     _validate_unique_current_ids(current_units, unit_kind)
-
-    missing_executed_keys = executed_keys - set(previous_key_by_id.values())
-    if missing_executed_keys:
-        missing = ", ".join(sorted(missing_executed_keys))
-        raise LineageAmbiguityError(
-            f"executed {unit_kind} key is missing from previous lineage map: {missing}"
-        )
-    for executed_key in executed_keys:
-        previous_matches = [
-            previous_unit
-            for previous_unit in previous_units
-            if previous_key_by_id.get(_unit_id(previous_unit, unit_kind)) == executed_key
-        ]
-        if len(previous_matches) != 1:
-            raise LineageAmbiguityError(
-                f"executed {unit_kind} key does not identify exactly one previous unit: "
-                f"{executed_key}"
-            )
 
     mapped_executed_keys: set[str] = set()
     assigned_current_ids: set[str] = set()
@@ -202,17 +261,52 @@ def reconcile_lineage(
         raise ValueError(f"Unsupported lineage edit kind: {edit_kind}")
 
     old_lines = previous_source.splitlines()
+    current_lines = current_source.splitlines()
     old_line_count = len(old_lines)
+    actual_line_delta = len(current_lines) - old_line_count
+    if line_delta != actual_line_delta:
+        raise LineageAmbiguityError(
+            f"line_delta {line_delta} does not match source line delta {actual_line_delta}"
+        )
     if edit_kind == "append_recovery":
-        current_lines = current_source.splitlines()
-        if current_lines[:old_line_count] != old_lines:
+        if not current_source.startswith(previous_source):
             raise LineageAmbiguityError("append changed the previous source prefix")
+        if (
+            edit_start_line != old_line_count + 1
+            or edit_end_line != old_line_count
+            or actual_line_delta <= 0
+        ):
+            raise LineageAmbiguityError(
+                "append edit must start after the old source, use an empty old span, "
+                "and add at least one line"
+            )
         if any(
             group.start_line <= old_line_count < group.end_line for group in current_groups
         ):
             raise LineageAmbiguityError(
                 "current group crosses the append boundary between old and new source"
             )
+    elif not (1 <= edit_start_line <= edit_end_line <= old_line_count):
+        raise LineageAmbiguityError(
+            "patch edit span must be a valid closed interval in the previous source"
+        )
+
+    _validate_lineage_units(
+        phase="previous",
+        unit_kind="region",
+        units=previous_regions,
+        key_by_id=previous_lineage.region_key_by_id,
+        executed_keys=previous_lineage.executed_region_keys,
+        next_key=previous_lineage.next_region_key,
+    )
+    _validate_lineage_units(
+        phase="previous",
+        unit_kind="group",
+        units=previous_groups,
+        key_by_id=previous_lineage.group_key_by_id,
+        executed_keys=previous_lineage.executed_group_keys,
+        next_key=previous_lineage.next_group_key,
+    )
 
     reconciled = UnitLineage(
         next_region_key=previous_lineage.next_region_key,
@@ -247,5 +341,21 @@ def reconcile_lineage(
         executed_keys=previous_lineage.executed_group_keys,
         current_key_by_id=reconciled.group_key_by_id,
         allocate_key=reconciled.allocate_group_key,
+    )
+    _validate_lineage_units(
+        phase="output",
+        unit_kind="region",
+        units=current_regions,
+        key_by_id=reconciled.region_key_by_id,
+        executed_keys=reconciled.executed_region_keys,
+        next_key=reconciled.next_region_key,
+    )
+    _validate_lineage_units(
+        phase="output",
+        unit_kind="group",
+        units=current_groups,
+        key_by_id=reconciled.group_key_by_id,
+        executed_keys=reconciled.executed_group_keys,
+        next_key=reconciled.next_group_key,
     )
     return reconciled
