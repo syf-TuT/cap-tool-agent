@@ -3711,6 +3711,42 @@ def test_capsule_task_success_stops_before_another_default_config_query(
     assert summary.sandbox_rc == 0
 
 
+def test_capsule_successful_finish_is_accepted_without_another_query(
+    tmp_path, monkeypatch
+):
+    query_count = 0
+
+    def fake_query_model(args, prompt):
+        nonlocal query_count
+        query_count += 1
+        if query_count > 1:
+            pytest.fail("accepted finish must prevent another Action LLM query")
+        return {"content": '{"action":"finish","args":{}}'}
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    summary = trial_module._run_capsule_loop(
+        FakeCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code="x = 1\n",
+    )
+
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    audit = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert query_count == 1
+    assert len(metrics) == 1
+    assert metrics[0]["action"] == "finish"
+    assert metrics[0]["post_action_observation_recorded"] is False
+    assert [entry["event"]["status"] for entry in audit] == ["success"]
+    assert summary.reward == 1.0
+    assert summary.terminated is True
+    assert summary.num_finishes == 1
+    assert summary.sandbox_rc == 0
+
+
 def test_capsule_run_region_metrics_report_step_trace_boundaries(tmp_path):
     trial_module._run_capsule_loop(
         FakeIncompleteCapsuleEnv(),

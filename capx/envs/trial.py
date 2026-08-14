@@ -2209,14 +2209,6 @@ def _run_capsule_loop(
         step_metrics.append(metric)
 
         reward_after = _state_reward(after_state)
-        if bool(after_state.get("task_completed")) or (
-            reward_after is not None and reward_after >= 1.0
-        ):
-            loop_exit_reason = "task_success"
-            break
-        if stop_after_failed_event and event.status in {"failed", "invalid"}:
-            loop_exit_reason = "failed_event"
-            break
         if (
             action is not None
             and action.action == "finish"
@@ -2224,6 +2216,14 @@ def _run_capsule_loop(
         ):
             finished = True
             loop_exit_reason = "accepted_finish"
+            break
+        if bool(after_state.get("task_completed")) or (
+            reward_after is not None and reward_after >= 1.0
+        ):
+            loop_exit_reason = "task_success"
+            break
+        if stop_after_failed_event and event.status in {"failed", "invalid"}:
+            loop_exit_reason = "failed_event"
             break
 
     reward = _safe_compute_reward(env)
