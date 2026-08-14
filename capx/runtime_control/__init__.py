@@ -11,6 +11,7 @@ from capx.runtime_control.contract import (
 )
 from capx.runtime_control.executor import CapsuleExecutor
 from capx.runtime_control.feedback import build_runtime_feedback, validate_progress_mode
+from capx.runtime_control.lineage import LineageAmbiguityError, SourceRevision, UnitLineage
 from capx.runtime_control.normalizer import segment_python_code_groups
 from capx.runtime_control.patching import replace_region_source
 from capx.runtime_control.prompts import build_capsule_prompt, parse_runtime_action_response
@@ -28,12 +29,15 @@ __all__ = [
     "CapsuleExecutor",
     "CodeRegion",
     "CodeRegionGroup",
+    "LineageAmbiguityError",
     "NamespaceCheckpointStore",
     "ProgramContractAnalysis",
     "ProgramContractViolation",
     "STRICT_CAPSULE_MAX_STATIC_ITERATIONS",
     "STRICT_CAPSULE_SAFE_BUILTINS",
     "RuntimeTrace",
+    "SourceRevision",
+    "UnitLineage",
     "build_capsule_prompt",
     "build_runtime_feedback",
     "validate_progress_mode",
