@@ -38,6 +38,7 @@ from capx.runtime_control.contract import ProgramContractViolation
 from capx.runtime_control.executor import CapsuleExecutor
 from capx.runtime_control.lineage import (
     LineageAmbiguityError,
+    RecoveryGeneration,
     SourceRevision,
     UnitLineage,
 )
@@ -3271,18 +3272,8 @@ def test_capsule_successful_edit_commits_candidate_once_with_revision_metadata(t
     assert Path(summary.code_path).read_text() == candidate_source
 
 
-def test_rejected_append_creates_no_pending_work_or_recovery_budget(
-    tmp_path, monkeypatch
-):
+def test_rejected_append_creates_no_recovery_generation(tmp_path):
     env = FakeRewardDropCapsuleEnv()
-    observed_budgets = []
-    original_guard = trial_module._reward_drop_guard_event
-
-    def capture_recovery_budget(action, *args, **kwargs):
-        observed_budgets.append((action.action, kwargs["recovery_side_effect_budget"]))
-        return original_guard(action, *args, **kwargs)
-
-    monkeypatch.setattr(trial_module, "_reward_drop_guard_event", capture_recovery_budget)
 
     recovery_source = (
         "state = get_observation()\n"
@@ -3310,6 +3301,9 @@ def test_rejected_append_creates_no_pending_work_or_recovery_budget(
     )
 
     trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    metrics = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
 
     assert [entry["event"]["action"] for entry in trace] == [
         "append_recovery",
@@ -3320,7 +3314,7 @@ def test_rejected_append_creates_no_pending_work_or_recovery_budget(
     assert trace[0]["event"]["evidence"]["edit_rejection_reason"] == (
         "program_contract_violation"
     )
-    assert ("run_group", 0) in observed_budgets
+    assert all(row["recovery_generations"] == [] for row in metrics)
     assert env.api.observed is False
     assert env.api.moves == ["base"]
     assert Path(summary.code_path).read_text() == initial_source
@@ -3391,7 +3385,9 @@ def test_candidate_analyzer_receives_defensive_set_and_boundary_copies(monkeypat
             regions=analysis.regions,
             groups=analysis.groups,
             lineage=UnitLineage.create(analysis.regions, analysis.groups),
+            recovery_generations=[],
             source_revision=_initial_source_revision(source),
+            trace_revision=0,
             group_boundary_after_lines=group_boundaries,
             use_semantic_groups=True,
             max_regions_per_group=20,
@@ -3399,6 +3395,7 @@ def test_candidate_analyzer_receives_defensive_set_and_boundary_copies(monkeypat
             side_effect_calls=side_effect_calls,
             require_strict_subset=False,
             validate_program_contract=False,
+            recovery_observation_functions={"get_observation"},
         )
 
     assert public_api_calls == {"get_observation"}
@@ -4938,7 +4935,8 @@ def test_reward_drop_guard_uses_task_specific_recovery_function():
         0.1,
         {},
         {"group_1": group},
-        recovery_side_effect_budget=0,
+        lineage=UnitLineage.create([], [group]),
+        recovery_generations=[],
         min_best_reward=0.05,
         drop_threshold=0.03,
         recovery_observation_functions={"get_handle0_pos"},
@@ -4947,6 +4945,54 @@ def test_reward_drop_guard_uses_task_specific_recovery_function():
     assert event is not None
     assert "get_handle0_pos()" in event.message
     assert "get_observation()" not in event.message
+
+
+def test_reward_drop_guard_allows_only_targeted_authorized_stable_key():
+    groups = [
+        CodeRegionGroup(
+            group_id=f"group_{index}",
+            start_line=index,
+            end_line=index,
+            source=f"move_to({index})",
+            has_robot_side_effect=True,
+        )
+        for index in (1, 2)
+    ]
+    lineage = UnitLineage.create([], groups)
+    authorized_key = lineage.group_key_by_id["group_2"]
+    generations = [
+        RecoveryGeneration(
+            generation_id="recovery_generation_000001",
+            source_revision=1,
+            start_line=2,
+            end_line=2,
+            observation_functions=("get_observation",),
+            authorized_group_keys={authorized_key},
+        )
+    ]
+    guard_args = {
+        "before_state": {"reward": 0.1},
+        "best_reward_so_far": 0.75,
+        "region_by_id": {},
+        "group_by_id": {group.group_id: group for group in groups},
+        "lineage": lineage,
+        "recovery_generations": generations,
+        "min_best_reward": 0.6,
+        "drop_threshold": 0.25,
+    }
+
+    blocked = _reward_drop_guard_event(
+        RuntimeAction("run_group", {"group_id": "group_1"}),
+        **guard_args,
+    )
+    allowed = _reward_drop_guard_event(
+        RuntimeAction("run_group", {"group_id": "group_2"}),
+        **guard_args,
+    )
+
+    assert blocked is not None
+    assert blocked.evidence["safety_failure"] == "reward_drop_guard"
+    assert allowed is None
 
 
 def test_capsule_action_query_uses_separate_max_tokens(tmp_path, monkeypatch):
@@ -5305,6 +5351,347 @@ def test_capsule_metrics_split_append_source_from_recovery_execution(tmp_path):
     assert rows[4]["recovery_execution_trace_improved"] is True
     assert rows[4]["recovery_execution_improved"] is True
     assert rows[4]["recovery_execution_effective"] is True
+
+
+def test_append_authorizes_each_new_side_effect_group_by_stable_key(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeRewardDropCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": (
+                        'obs = get_observation()\n'
+                        'move_to("hold")\n'
+                        'move_to("recover")'
+                    )
+                },
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+    generations = rows[0]["recovery_generations"]
+
+    assert len(generations) == 1
+    assert generations[0]["generation_id"] == "recovery_generation_000001"
+    assert generations[0]["source_revision"] == 1
+    assert generations[0]["start_line"] == 2
+    assert generations[0]["end_line"] == 4
+    assert generations[0]["observation_functions"] == ["get_observation"]
+    assert generations[0]["authorized_group_keys"] == [
+        "group_key_000003",
+        "group_key_000004",
+    ]
+    assert len(set(generations[0]["authorized_group_keys"])) == 2
+    assert generations[0]["executed_group_keys"] == []
+
+
+def test_inspection_does_not_consume_recovery_authorization(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeRewardDropCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": 'obs = get_observation()\nmove_to("recover")'
+                },
+            },
+            {"action": "inspect_variables", "args": {"names": ["obs"]}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+
+    assert rows[0]["recovery_generations"] == rows[1]["recovery_generations"]
+    assert rows[1]["recovery_authorization_consumed"] is False
+
+
+def test_executing_recovery_group_consumes_only_its_stable_key(tmp_path):
+    env = FakeRewardDropCapsuleEnv()
+    trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 5,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code='move_to("good")\nmove_to("bad")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": (
+                        'obs = get_observation()\n'
+                        'move_to("hold")\n'
+                        'move_to("recover")'
+                    )
+                },
+            },
+            {"action": "run_group", "args": {"group_id": "group_4"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+    before = rows[2]["recovery_generations"][0]
+    after = rows[3]["recovery_generations"][0]
+
+    assert before["authorized_group_keys"] == [
+        "group_key_000004",
+        "group_key_000005",
+    ]
+    assert rows[3]["unit_key"] == "group_key_000004"
+    assert rows[3]["recovery_authorization_consumed"] is True
+    assert after["authorized_group_keys"] == ["group_key_000005"]
+    assert after["executed_group_keys"] == ["group_key_000004"]
+    assert "group_key_000004" in rows[3]["executed_side_effect_group_keys"]
+    assert "group_key_000005" not in rows[3]["executed_side_effect_group_keys"]
+
+
+def test_failed_recovery_before_side_effect_keeps_key_authorized(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeRewardDropCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": "obs = get_observation()\nmove_to(missing_name)"
+                },
+            },
+            {"action": "run_group", "args": {"group_id": "group_3"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+    generation = rows[1]["recovery_generations"][0]
+
+    assert rows[1]["event_status"] == "failed"
+    assert rows[1]["recovery_execution_attempt"] is True
+    assert rows[1]["recovery_authorization_consumed"] is False
+    assert generation["authorized_group_keys"] == ["group_key_000003"]
+    assert generation["executed_group_keys"] == []
+    assert rows[1]["executed_side_effect_group_keys"] == []
+
+
+def test_patch_recomputes_unexecuted_recovery_keys_atomically(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeRewardDropCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": 'obs = get_observation()\nmove_to("recover")'
+                },
+            },
+            {
+                "action": "patch_group",
+                "args": {
+                    "group_id": "group_3",
+                    "source": 'move_to("patched")\nmove_to("backup")',
+                },
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+    before = rows[0]["recovery_generations"][0]
+    after = rows[1]["recovery_generations"][0]
+
+    assert rows[1]["source_edit_committed"] is True
+    assert before["authorized_group_keys"] == ["group_key_000003"]
+    assert after["source_revision"] == 2
+    assert after["start_line"] == 2
+    assert after["end_line"] == 4
+    assert after["observation_functions"] == ["get_observation"]
+    assert after["authorized_group_keys"] == [
+        "group_key_000004",
+        "group_key_000005",
+    ]
+    assert not (
+        set(before["authorized_group_keys"])
+        & set(after["authorized_group_keys"])
+    )
+
+
+def test_rejected_recovery_patch_leaves_generation_and_source_atomic(tmp_path):
+    initial_source = "x = 1\n"
+    recovery_source = 'obs = get_observation()\nmove_to("recover")'
+    summary = trial_module._run_capsule_loop(
+        FakeRewardDropCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code=initial_source,
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {"source": recovery_source},
+            },
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_2", "source": "y = 2"},
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+
+    assert rows[1]["event_status"] == "invalid"
+    assert rows[1]["edit_rejection_reason"] == (
+        "recovery_generation_missing_fresh_observation"
+    )
+    assert rows[1]["source_revision_before"] == 1
+    assert rows[1]["source_revision_after"] == 1
+    assert rows[1]["source_edit_committed"] is False
+    assert rows[1]["recovery_generations"] == rows[0]["recovery_generations"]
+    assert Path(summary.code_path).read_text() == (
+        initial_source + recovery_source + "\n"
+    )
+
+
+def test_second_append_without_new_physical_evidence_is_rejected_atomically(
+    tmp_path,
+):
+    first_recovery = 'obs = get_observation()\nmove_to("recover")'
+    summary = trial_module._run_capsule_loop(
+        FakeRewardDropCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {"action": "append_recovery", "args": {"source": first_recovery}},
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": 'obs2 = get_observation()\nmove_to("again")'
+                },
+            },
+        ],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+
+    assert rows[2]["event_status"] == "invalid"
+    assert rows[2]["edit_rejection_reason"] == (
+        "no_new_physical_state_since_last_append"
+    )
+    assert rows[2]["source_revision_before"] == 1
+    assert rows[2]["source_revision_after"] == 1
+    assert rows[2]["source_edit_committed"] is False
+    assert rows[2]["recovery_generations"] == rows[0]["recovery_generations"]
+    assert Path(summary.code_path).read_text() == "x = 1\n" + first_recovery + "\n"
+
+
+def test_physical_trace_after_append_allows_later_append(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeRewardDropCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": 'obs = get_observation()\nmove_to("recover")'
+                },
+            },
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": 'obs2 = get_observation()\nmove_to("again")'
+                },
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+    generations = rows[2]["recovery_generations"]
+
+    assert rows[2]["source_edit_committed"] is True
+    assert rows[2]["source_revision_after"] == 2
+    assert [generation["generation_id"] for generation in generations] == [
+        "recovery_generation_000001",
+        "recovery_generation_000002",
+    ]
+    assert generations[0]["authorized_group_keys"] == ["group_key_000003"]
+    assert generations[1]["authorized_group_keys"] == ["group_key_000005"]
+    assert generations[0]["append_trace_revision"] == 0
+    assert generations[1]["append_trace_revision"] == 1
 
 
 def test_runtime_variable_summary_includes_only_small_array_values():

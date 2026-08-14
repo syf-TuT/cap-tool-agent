@@ -56,6 +56,7 @@ from capx.runtime_control import (
     LineageAmbiguityError,
     PostActionObservation,
     ProgramContractViolation,
+    RecoveryGeneration,
     RuntimeAction,
     RuntimeEvent,
     RuntimeTrace,
@@ -1185,7 +1186,7 @@ class _PreparedSourceEdit:
     group_boundary_after_lines: set[int]
     region_by_id: dict[str, CodeRegion]
     group_by_id: dict[str, CodeRegionGroup]
-    recovery_side_effect_budget: int | None
+    recovery_generations: list[RecoveryGeneration]
 
 
 class _SourceEditRejection(ValueError):
@@ -1212,7 +1213,9 @@ def _prepare_capsule_source_edit(
     regions: list[CodeRegion],
     groups: list[CodeRegionGroup],
     lineage: UnitLineage,
+    recovery_generations: list[RecoveryGeneration],
     source_revision: SourceRevision,
+    trace_revision: int,
     group_boundary_after_lines: set[int],
     use_semantic_groups: bool,
     max_regions_per_group: int,
@@ -1220,6 +1223,7 @@ def _prepare_capsule_source_edit(
     side_effect_calls: set[str],
     require_strict_subset: bool,
     validate_program_contract: bool,
+    recovery_observation_functions: set[str],
 ) -> _PreparedSourceEdit:
     old_line_count = len(source.splitlines())
     edit_span = _runtime_source_edit_span(
@@ -1235,6 +1239,19 @@ def _prepare_capsule_source_edit(
             f"Could not determine source edit span for {action.action}.",
         )
     edit_start_line, edit_end_line, line_delta = edit_span
+    if (
+        action.action == "append_recovery"
+        and recovery_generations
+        and trace_revision <= recovery_generations[-1].append_trace_revision
+    ):
+        raise _SourceEditRejection(
+            "no_new_physical_state_since_last_append",
+            (
+                "append_recovery requires new physical trace evidence after the "
+                "previous recovery append. Execute or patch the existing recovery "
+                "source first."
+            ),
+        )
     candidate_boundaries = _updated_group_boundaries_after_edit(
         set(group_boundary_after_lines),
         action=action,
@@ -1331,30 +1348,20 @@ def _prepare_capsule_source_edit(
         region.region_id: region for region in candidate_analysis.regions
     }
     group_by_id = {group.group_id: group for group in candidate_analysis.groups}
-    candidate_recovery_budget: int | None = None
-    if action.action == "append_recovery":
-        if use_semantic_groups:
-            appended_side_effect_units = sum(
-                any(
-                    region_id in region_by_id
-                    and _region_has_side_effect_call(
-                        region_by_id[region_id], side_effect_calls
-                    )
-                    for region_id in group.region_ids
-                )
-                for group in candidate_analysis.groups
-                if group.start_line > old_line_count
-            )
-        else:
-            appended_side_effect_units = sum(
-                _region_has_side_effect_call(region, side_effect_calls)
-                for region in candidate_analysis.regions
-                if region.start_line > old_line_count
-            )
-        candidate_recovery_budget = max(
-            1,
-            appended_side_effect_units,
-        )
+    candidate_recovery_generations = _prepare_recovery_generations(
+        action=action,
+        candidate_source=candidate_source,
+        candidate_groups=candidate_analysis.groups,
+        candidate_lineage=candidate_lineage,
+        candidate_revision=candidate_revision,
+        previous_generations=recovery_generations,
+        edit_start_line=edit_start_line,
+        edit_end_line=edit_end_line,
+        line_delta=line_delta,
+        old_line_count=old_line_count,
+        trace_revision=trace_revision,
+        recovery_observation_functions=recovery_observation_functions,
+    )
 
     return _PreparedSourceEdit(
         source=candidate_source,
@@ -1364,7 +1371,7 @@ def _prepare_capsule_source_edit(
         group_boundary_after_lines=candidate_boundaries,
         region_by_id=region_by_id,
         group_by_id=group_by_id,
-        recovery_side_effect_budget=candidate_recovery_budget,
+        recovery_generations=candidate_recovery_generations,
     )
 
 
@@ -1751,7 +1758,7 @@ def _run_capsule_loop(
     loop_exit_reason: str | None = None
     executed_regions = 0
     best_reward_so_far: float | None = None
-    recovery_side_effect_budget = 0
+    recovery_generations: list[RecoveryGeneration] = []
     reward_drop_guard_min_best_reward = float(
         config.get("capsule_reward_drop_guard_min_best_reward", 0.6)
     )
@@ -1786,7 +1793,10 @@ def _run_capsule_loop(
             else None
         )
         source_unit_for_feedback = None
-        consumes_recovery_side_effect = False
+        recovery_execution_attempt = False
+        recovery_authorization_consumed = False
+        consumed_recovery_generation_id: str | None = None
+        consumed_recovery_group_key: str | None = None
         action_origin = "llm"
         action_prompt_chars = 0
         action_prompt_char_budget_metric = None
@@ -1925,21 +1935,19 @@ def _run_capsule_loop(
                     region_by_id,
                     group_by_id,
                     side_effect_calls,
-                    recovery_side_effect_budget=recovery_side_effect_budget,
+                    lineage=lineage,
+                    recovery_generations=recovery_generations,
                     min_best_reward=reward_drop_guard_min_best_reward,
                     drop_threshold=reward_drop_guard_threshold,
                     recovery_observation_functions=recovery_observation_functions,
                 )
             if event is None:
-                consumes_recovery_side_effect = (
-                    recovery_side_effect_budget > 0
-                    and _runtime_action_targets_side_effect_unit(
-                        action,
-                        region_by_id,
-                        group_by_id,
-                        side_effect_calls,
-                    )
+                recovery_authorization = _recovery_authorization_for_action(
+                    action,
+                    lineage=lineage,
+                    recovery_generations=recovery_generations,
                 )
+                recovery_execution_attempt = recovery_authorization is not None
                 event = _execute_runtime_action(
                     action,
                     executor,
@@ -1948,8 +1956,15 @@ def _run_capsule_loop(
                     group_by_id,
                     recovery_observation_functions=recovery_observation_functions,
                 )
-                if consumes_recovery_side_effect:
-                    recovery_side_effect_budget -= 1
+                if recovery_authorization is not None and _event_has_side_effect_trace(
+                    event, side_effect_calls
+                ):
+                    generation, group_key = recovery_authorization
+                    generation.authorized_group_keys.remove(group_key)
+                    generation.executed_group_keys.add(group_key)
+                    recovery_authorization_consumed = True
+                    consumed_recovery_generation_id = generation.generation_id
+                    consumed_recovery_group_key = group_key
             if group_execution_trace_mark is not None:
                 group_new_trace_events = executor.trace.events_since(
                     group_execution_trace_mark
@@ -1966,7 +1981,9 @@ def _run_capsule_loop(
                             regions=regions,
                             groups=groups,
                             lineage=lineage,
+                            recovery_generations=recovery_generations,
                             source_revision=source_revision,
+                            trace_revision=executor.trace.mark(),
                             group_boundary_after_lines=group_boundary_after_lines,
                             use_semantic_groups=use_semantic_groups,
                             max_regions_per_group=max_regions_per_group,
@@ -1974,6 +1991,7 @@ def _run_capsule_loop(
                             side_effect_calls=side_effect_calls,
                             require_strict_subset=require_strict_subset,
                             validate_program_contract=validate_program_contract,
+                            recovery_observation_functions=recovery_observation_functions,
                         )
                     except _SourceEditRejection as exc:
                         rejection = exc
@@ -1995,6 +2013,9 @@ def _run_capsule_loop(
                     source_analysis = prepared_source_edit.analysis
                     source_revision = prepared_source_edit.revision
                     lineage = prepared_source_edit.lineage
+                    recovery_generations = (
+                        prepared_source_edit.recovery_generations
+                    )
                     group_boundary_after_lines = (
                         prepared_source_edit.group_boundary_after_lines
                     )
@@ -2013,9 +2034,14 @@ def _run_capsule_loop(
                     if not program_contract_violations:
                         recoverable_failed = False
                     if action.action == "append_recovery":
-                        recovery_side_effect_budget = max(
-                            recovery_side_effect_budget,
-                            prepared_source_edit.recovery_side_effect_budget or 0,
+                        generation = recovery_generations[-1]
+                        event.evidence.update(
+                            {
+                                "recovery_generation_id": generation.generation_id,
+                                "authorized_group_keys": sorted(
+                                    generation.authorized_group_keys
+                                ),
+                            }
                         )
                     _annotate_source_edit_event(
                         event,
@@ -2169,7 +2195,7 @@ def _run_capsule_loop(
             after_state=after_state,
             executed_regions=executed_regions,
             best_reward_so_far=best_reward_so_far,
-            recovery_execution_attempt=consumes_recovery_side_effect,
+            recovery_execution_attempt=recovery_execution_attempt,
         )
         metric["unit_key"] = action_unit_key
         metric["source_revision"] = action_source_revision
@@ -2200,6 +2226,17 @@ def _run_capsule_loop(
         metric["new_trace_event_count"] = len(step_trace_events)
         metric["trace_revision_before"] = trace_revision_before
         metric["trace_revision_after"] = trace_revision_after
+        metric["recovery_authorization_consumed"] = (
+            recovery_authorization_consumed
+        )
+        metric["recovery_generation_id"] = consumed_recovery_generation_id
+        metric["recovery_group_key"] = consumed_recovery_group_key
+        metric["recovery_generations"] = _recovery_generation_metrics(
+            recovery_generations
+        )
+        metric["executed_side_effect_group_keys"] = sorted(
+            lineage.executed_group_keys
+        )
         _add_capsule_contract_metrics(
             metric,
             contract_violations=program_contract_violations,
@@ -2654,13 +2691,12 @@ def _reward_drop_guard_event(
     group_by_id: dict[str, Any],
     side_effect_calls: set[str] | None = None,
     *,
-    recovery_side_effect_budget: int,
+    lineage: UnitLineage,
+    recovery_generations: list[RecoveryGeneration],
     min_best_reward: float,
     drop_threshold: float,
     recovery_observation_functions: set[str] | None = None,
 ) -> RuntimeEvent | None:
-    if recovery_side_effect_budget > 0:
-        return None
     if side_effect_calls is None:
         side_effect_calls = ROBOT_SIDE_EFFECT_CALLS
     if not _runtime_action_targets_side_effect_unit(
@@ -2669,6 +2705,12 @@ def _reward_drop_guard_event(
         group_by_id,
         side_effect_calls,
     ):
+        return None
+    if _recovery_authorization_for_action(
+        action,
+        lineage=lineage,
+        recovery_generations=recovery_generations,
+    ) is not None:
         return None
 
     current_reward = _state_reward(before_state)
@@ -2830,6 +2872,24 @@ def _display_side_effect_ledger(lineage: UnitLineage) -> dict[str, list[str]]:
     }
 
 
+def _recovery_generation_metrics(
+    generations: list[RecoveryGeneration],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "generation_id": generation.generation_id,
+            "source_revision": generation.source_revision,
+            "start_line": generation.start_line,
+            "end_line": generation.end_line,
+            "observation_functions": list(generation.observation_functions),
+            "authorized_group_keys": sorted(generation.authorized_group_keys),
+            "executed_group_keys": sorted(generation.executed_group_keys),
+            "append_trace_revision": generation.append_trace_revision,
+        }
+        for generation in generations
+    ]
+
+
 def _model_facing_capsule_history(
     history: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -2850,6 +2910,33 @@ def _model_facing_capsule_history(
         }
         for entry in history
     ]
+
+
+def _recovery_authorization_for_action(
+    action: RuntimeAction,
+    *,
+    lineage: UnitLineage,
+    recovery_generations: list[RecoveryGeneration],
+) -> tuple[RecoveryGeneration, str] | None:
+    if action.action != "run_group":
+        return None
+    group_key = lineage.group_key_by_id.get(
+        str(action.args.get("group_id", ""))
+    )
+    if group_key is None:
+        return None
+    matches = [
+        generation
+        for generation in recovery_generations
+        if group_key in generation.authorized_group_keys
+    ]
+    if len(matches) > 1:
+        raise LineageAmbiguityError(
+            f"Recovery group key is authorized by multiple generations: {group_key}"
+        )
+    if not matches:
+        return None
+    return matches[0], group_key
 
 
 def _record_runtime_side_effect_execution(
@@ -3039,6 +3126,184 @@ def _next_source_revision(
         parent_revision=previous_revision.revision,
         old_line_count=old_line_count,
     )
+
+
+def _recovery_generation_observation_functions(
+    source: str,
+    recovery_observation_functions: set[str],
+) -> tuple[str, ...]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise _SourceEditRejection(
+            "candidate_syntax_error",
+            f"Recovery generation is invalid Python: {exc}",
+            evidence={
+                "exception_type": type(exc).__name__,
+                "lineno": exc.lineno,
+                "offset": exc.offset,
+                "text": exc.text,
+            },
+        ) from exc
+    return tuple(
+        sorted(
+            name
+            for name in recovery_observation_functions
+            if _ast_calls_function(tree, name)
+        )
+    )
+
+
+def _recovery_side_effect_group_keys(
+    *,
+    groups: list[CodeRegionGroup],
+    lineage: UnitLineage,
+    start_line: int,
+    end_line: int,
+) -> set[str]:
+    keys: set[str] = set()
+    for group in groups:
+        if (
+            not group.has_robot_side_effect
+            or group.start_line < start_line
+            or group.end_line > end_line
+        ):
+            continue
+        group_key = lineage.group_key_by_id.get(group.group_id)
+        if group_key is None:
+            raise _SourceEditRejection(
+                "lineage_ambiguous",
+                (
+                    "Recovery side-effect group is missing stable lineage: "
+                    f"{group.group_id}."
+                ),
+                lineage_reconciliation_status="ambiguous",
+            )
+        keys.add(group_key)
+    return keys
+
+
+def _generation_source(source: str, start_line: int, end_line: int) -> str:
+    lines = source.splitlines()
+    return "\n".join(lines[start_line - 1 : end_line])
+
+
+def _next_recovery_generation_id(
+    generations: list[RecoveryGeneration],
+) -> str:
+    return f"recovery_generation_{len(generations) + 1:06d}"
+
+
+def _prepare_recovery_generations(
+    *,
+    action: RuntimeAction,
+    candidate_source: str,
+    candidate_groups: list[CodeRegionGroup],
+    candidate_lineage: UnitLineage,
+    candidate_revision: SourceRevision,
+    previous_generations: list[RecoveryGeneration],
+    edit_start_line: int,
+    edit_end_line: int,
+    line_delta: int,
+    old_line_count: int,
+    trace_revision: int,
+    recovery_observation_functions: set[str],
+) -> list[RecoveryGeneration]:
+    generations = copy.deepcopy(previous_generations)
+    if action.action == "append_recovery":
+        start_line = old_line_count + 1
+        end_line = len(candidate_source.splitlines())
+        observation_functions = _recovery_generation_observation_functions(
+            _generation_source(candidate_source, start_line, end_line),
+            recovery_observation_functions,
+        )
+        if not observation_functions:
+            raise _SourceEditRejection(
+                "recovery_generation_missing_fresh_observation",
+                "Recovery generation must call a fresh-state observation function.",
+            )
+        authorized_group_keys = _recovery_side_effect_group_keys(
+            groups=candidate_groups,
+            lineage=candidate_lineage,
+            start_line=start_line,
+            end_line=end_line,
+        )
+        generations.append(
+            RecoveryGeneration(
+                generation_id=_next_recovery_generation_id(generations),
+                source_revision=candidate_revision.revision,
+                start_line=start_line,
+                end_line=end_line,
+                observation_functions=observation_functions,
+                authorized_group_keys=authorized_group_keys,
+                append_trace_revision=trace_revision,
+            )
+        )
+        return generations
+
+    if action.action not in {"patch_region", "patch_group"}:
+        return generations
+
+    updated: list[RecoveryGeneration] = []
+    for generation in generations:
+        start_line = generation.start_line
+        end_line = generation.end_line
+        overlaps_generation = not (
+            edit_end_line < start_line or edit_start_line > end_line
+        )
+        if edit_end_line < start_line:
+            start_line += line_delta
+            end_line += line_delta
+        elif overlaps_generation:
+            if edit_start_line < start_line or edit_end_line > end_line:
+                raise _SourceEditRejection(
+                    "recovery_generation_boundary_crossed",
+                    (
+                        "Patch crosses a recovery-generation boundary and cannot be "
+                        "reconciled safely."
+                    ),
+                )
+            end_line += line_delta
+
+        observation_functions = generation.observation_functions
+        authorized_group_keys = set(generation.authorized_group_keys)
+        if overlaps_generation:
+            observation_functions = _recovery_generation_observation_functions(
+                _generation_source(candidate_source, start_line, end_line),
+                recovery_observation_functions,
+            )
+            if not observation_functions:
+                raise _SourceEditRejection(
+                    "recovery_generation_missing_fresh_observation",
+                    (
+                        f"{generation.generation_id} must retain a fresh-state "
+                        "observation function after patching."
+                    ),
+                    evidence={"generation_id": generation.generation_id},
+                )
+            side_effect_keys = _recovery_side_effect_group_keys(
+                groups=candidate_groups,
+                lineage=candidate_lineage,
+                start_line=start_line,
+                end_line=end_line,
+            )
+            authorized_group_keys = (
+                side_effect_keys - generation.executed_group_keys
+            )
+
+        updated.append(
+            RecoveryGeneration(
+                generation_id=generation.generation_id,
+                source_revision=candidate_revision.revision,
+                start_line=start_line,
+                end_line=end_line,
+                observation_functions=observation_functions,
+                authorized_group_keys=authorized_group_keys,
+                executed_group_keys=set(generation.executed_group_keys),
+                append_trace_revision=generation.append_trace_revision,
+            )
+        )
+    return updated
 
 
 def _runtime_patch_replacement(args: dict[str, Any]) -> Any:

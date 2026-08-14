@@ -13,6 +13,7 @@ from capx.runtime_control.executor import CapsuleExecutor
 from capx.runtime_control.feedback import build_runtime_feedback, validate_progress_mode
 from capx.runtime_control.lineage import (
     LineageAmbiguityError,
+    RecoveryGeneration,
     SourceRevision,
     UnitLineage,
     reconcile_lineage,
@@ -43,6 +44,7 @@ __all__ = [
     "STRICT_CAPSULE_MAX_STATIC_ITERATIONS",
     "STRICT_CAPSULE_SAFE_BUILTINS",
     "RuntimeTrace",
+    "RecoveryGeneration",
     "SourceRevision",
     "UnitLineage",
     "reconcile_lineage",

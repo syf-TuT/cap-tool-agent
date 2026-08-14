@@ -30,6 +30,18 @@ class SourceRevision:
 
 
 @dataclass
+class RecoveryGeneration:
+    generation_id: str
+    source_revision: int
+    start_line: int
+    end_line: int
+    observation_functions: tuple[str, ...]
+    authorized_group_keys: set[str] = field(default_factory=set)
+    executed_group_keys: set[str] = field(default_factory=set)
+    append_trace_revision: int = 0
+
+
+@dataclass
 class UnitLineage:
     next_region_key: int = 1
     next_group_key: int = 1

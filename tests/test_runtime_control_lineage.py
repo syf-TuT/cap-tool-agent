@@ -4,7 +4,12 @@ import pytest
 
 import capx.runtime_control as runtime_control
 import capx.runtime_control.lineage as lineage_module
-from capx.runtime_control import LineageAmbiguityError, SourceRevision, UnitLineage
+from capx.runtime_control import (
+    LineageAmbiguityError,
+    RecoveryGeneration,
+    SourceRevision,
+    UnitLineage,
+)
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup
 
 
@@ -128,6 +133,35 @@ def test_source_revision_has_required_fields_and_is_frozen() -> None:
     assert revision.old_line_count == 41
     with pytest.raises(FrozenInstanceError):
         revision.revision = 4
+
+
+def test_recovery_generation_tracks_stable_group_authorization_independently() -> None:
+    first = RecoveryGeneration(
+        generation_id="recovery_generation_000001",
+        source_revision=2,
+        start_line=4,
+        end_line=8,
+        observation_functions=("get_observation",),
+        authorized_group_keys={"group_key_000004", "group_key_000005"},
+        append_trace_revision=3,
+    )
+    second = RecoveryGeneration(
+        generation_id="recovery_generation_000002",
+        source_revision=3,
+        start_line=9,
+        end_line=11,
+        observation_functions=("get_observation",),
+        append_trace_revision=7,
+    )
+
+    first.authorized_group_keys.remove("group_key_000004")
+    first.executed_group_keys.add("group_key_000004")
+
+    assert first.authorized_group_keys == {"group_key_000005"}
+    assert first.executed_group_keys == {"group_key_000004"}
+    assert second.authorized_group_keys == set()
+    assert second.executed_group_keys == set()
+    assert first.generation_id != second.generation_id
 
 
 def test_lineage_ambiguity_error_is_a_value_error() -> None:
