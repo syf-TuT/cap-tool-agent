@@ -5694,6 +5694,90 @@ def test_physical_trace_after_append_allows_later_append(tmp_path):
     assert generations[1]["append_trace_revision"] == 1
 
 
+def test_later_append_reconciles_all_generation_keys_after_group_bounding():
+    public_calls = {"get_observation", "move_to"}
+    side_effect_calls = {"move_to"}
+    initial_source = "base = 0\n"
+    initial_analysis = _analyze_capsule_source(
+        initial_source,
+        use_semantic_groups=True,
+        max_regions_per_group=1,
+        public_api_calls=public_calls,
+        side_effect_calls=side_effect_calls,
+        require_strict_subset=False,
+        validate_program_contract=False,
+    )
+    first_source = trial_module._append_recovery_source(
+        initial_source,
+        (
+            "obs1 = get_observation()\n"
+            "move_to(1)\n"
+            "move_to(2)\n"
+            "move_to(3)\n"
+            "move_to(4)"
+        ),
+    )
+    first = trial_module._prepare_capsule_source_edit(
+        RuntimeAction("append_recovery", {"source": "unused"}),
+        first_source,
+        source=initial_source,
+        regions=initial_analysis.regions,
+        groups=initial_analysis.groups,
+        lineage=UnitLineage.create(
+            initial_analysis.regions, initial_analysis.groups
+        ),
+        recovery_generations=[],
+        source_revision=_initial_source_revision(initial_source),
+        trace_revision=0,
+        group_boundary_after_lines=set(),
+        use_semantic_groups=True,
+        max_regions_per_group=1,
+        public_api_calls=public_calls,
+        side_effect_calls=side_effect_calls,
+        require_strict_subset=False,
+        validate_program_contract=False,
+        recovery_observation_functions={"get_observation"},
+    )
+    original_authorized_keys = set(
+        first.recovery_generations[0].authorized_group_keys
+    )
+    second_source = trial_module._append_recovery_source(
+        first.source,
+        (
+            "obs2 = get_observation()\n"
+            "move_to(5)\n"
+            "move_to(6)\n"
+            "move_to(7)\n"
+            "move_to(8)"
+        ),
+    )
+    second = trial_module._prepare_capsule_source_edit(
+        RuntimeAction("append_recovery", {"source": "unused"}),
+        second_source,
+        source=first.source,
+        regions=first.analysis.regions,
+        groups=first.analysis.groups,
+        lineage=first.lineage,
+        recovery_generations=first.recovery_generations,
+        source_revision=first.revision,
+        trace_revision=1,
+        group_boundary_after_lines=first.group_boundary_after_lines,
+        use_semantic_groups=True,
+        max_regions_per_group=1,
+        public_api_calls=public_calls,
+        side_effect_calls=side_effect_calls,
+        require_strict_subset=False,
+        validate_program_contract=False,
+        recovery_observation_functions={"get_observation"},
+    )
+    current_group_keys = set(second.lineage.group_key_by_id.values())
+    first_generation = second.recovery_generations[0]
+
+    assert first_generation.authorized_group_keys <= current_group_keys
+    assert first_generation.executed_group_keys <= current_group_keys
+    assert original_authorized_keys != first_generation.authorized_group_keys
+
+
 def test_runtime_variable_summary_includes_only_small_array_values():
     import numpy as np
 

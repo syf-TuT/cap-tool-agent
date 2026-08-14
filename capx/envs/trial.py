@@ -3213,97 +3213,83 @@ def _prepare_recovery_generations(
     if action.action == "append_recovery":
         start_line = old_line_count + 1
         end_line = len(candidate_source.splitlines())
-        observation_functions = _recovery_generation_observation_functions(
-            _generation_source(candidate_source, start_line, end_line),
-            recovery_observation_functions,
-        )
-        if not observation_functions:
-            raise _SourceEditRejection(
-                "recovery_generation_missing_fresh_observation",
-                "Recovery generation must call a fresh-state observation function.",
-            )
-        authorized_group_keys = _recovery_side_effect_group_keys(
-            groups=candidate_groups,
-            lineage=candidate_lineage,
-            start_line=start_line,
-            end_line=end_line,
-        )
         generations.append(
             RecoveryGeneration(
                 generation_id=_next_recovery_generation_id(generations),
                 source_revision=candidate_revision.revision,
                 start_line=start_line,
                 end_line=end_line,
-                observation_functions=observation_functions,
-                authorized_group_keys=authorized_group_keys,
+                observation_functions=(),
                 append_trace_revision=trace_revision,
             )
         )
-        return generations
+    elif action.action in {"patch_region", "patch_group"}:
+        for generation in generations:
+            overlaps_generation = not (
+                edit_end_line < generation.start_line
+                or edit_start_line > generation.end_line
+            )
+            if edit_end_line < generation.start_line:
+                generation.start_line += line_delta
+                generation.end_line += line_delta
+            elif overlaps_generation:
+                if (
+                    edit_start_line < generation.start_line
+                    or edit_end_line > generation.end_line
+                ):
+                    raise _SourceEditRejection(
+                        "recovery_generation_boundary_crossed",
+                        (
+                            "Patch crosses a recovery-generation boundary and cannot "
+                            "be reconciled safely."
+                        ),
+                    )
+                generation.end_line += line_delta
 
-    if action.action not in {"patch_region", "patch_group"}:
-        return generations
-
-    updated: list[RecoveryGeneration] = []
     for generation in generations:
-        start_line = generation.start_line
-        end_line = generation.end_line
-        overlaps_generation = not (
-            edit_end_line < start_line or edit_start_line > end_line
+        observation_functions = _recovery_generation_observation_functions(
+            _generation_source(
+                candidate_source,
+                generation.start_line,
+                generation.end_line,
+            ),
+            recovery_observation_functions,
         )
-        if edit_end_line < start_line:
-            start_line += line_delta
-            end_line += line_delta
-        elif overlaps_generation:
-            if edit_start_line < start_line or edit_end_line > end_line:
-                raise _SourceEditRejection(
-                    "recovery_generation_boundary_crossed",
-                    (
-                        "Patch crosses a recovery-generation boundary and cannot be "
-                        "reconciled safely."
-                    ),
-                )
-            end_line += line_delta
-
-        observation_functions = generation.observation_functions
-        authorized_group_keys = set(generation.authorized_group_keys)
-        if overlaps_generation:
-            observation_functions = _recovery_generation_observation_functions(
-                _generation_source(candidate_source, start_line, end_line),
-                recovery_observation_functions,
+        if not observation_functions:
+            raise _SourceEditRejection(
+                "recovery_generation_missing_fresh_observation",
+                (
+                    f"{generation.generation_id} must contain a fresh-state "
+                    "observation function."
+                ),
+                evidence={"generation_id": generation.generation_id},
             )
-            if not observation_functions:
-                raise _SourceEditRejection(
-                    "recovery_generation_missing_fresh_observation",
-                    (
-                        f"{generation.generation_id} must retain a fresh-state "
-                        "observation function after patching."
-                    ),
-                    evidence={"generation_id": generation.generation_id},
-                )
-            side_effect_keys = _recovery_side_effect_group_keys(
-                groups=candidate_groups,
-                lineage=candidate_lineage,
-                start_line=start_line,
-                end_line=end_line,
-            )
-            authorized_group_keys = (
-                side_effect_keys - generation.executed_group_keys
-            )
-
-        updated.append(
-            RecoveryGeneration(
-                generation_id=generation.generation_id,
-                source_revision=candidate_revision.revision,
-                start_line=start_line,
-                end_line=end_line,
-                observation_functions=observation_functions,
-                authorized_group_keys=authorized_group_keys,
-                executed_group_keys=set(generation.executed_group_keys),
-                append_trace_revision=generation.append_trace_revision,
-            )
+        side_effect_keys = _recovery_side_effect_group_keys(
+            groups=candidate_groups,
+            lineage=candidate_lineage,
+            start_line=generation.start_line,
+            end_line=generation.end_line,
         )
-    return updated
+        missing_executed_keys = generation.executed_group_keys - side_effect_keys
+        if missing_executed_keys:
+            raise _SourceEditRejection(
+                "lineage_ambiguous",
+                (
+                    f"{generation.generation_id} executed group lineage is outside "
+                    "its current source span."
+                ),
+                evidence={
+                    "generation_id": generation.generation_id,
+                    "missing_executed_group_keys": sorted(missing_executed_keys),
+                },
+                lineage_reconciliation_status="ambiguous",
+            )
+        generation.source_revision = candidate_revision.revision
+        generation.observation_functions = observation_functions
+        generation.authorized_group_keys = (
+            side_effect_keys - generation.executed_group_keys
+        )
+    return generations
 
 
 def _runtime_patch_replacement(args: dict[str, Any]) -> Any:
