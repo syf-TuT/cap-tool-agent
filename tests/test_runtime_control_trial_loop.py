@@ -5429,6 +5429,48 @@ def test_inspection_does_not_consume_recovery_authorization(tmp_path):
     assert rows[1]["recovery_authorization_consumed"] is False
 
 
+@pytest.mark.parametrize("compact_context", [True, False])
+def test_recovery_stable_keys_never_leak_into_model_prompt(
+    tmp_path, monkeypatch, compact_context
+):
+    captured_prompts = []
+
+    def finish_after_append(args, prompt):
+        captured_prompts.append(prompt)
+        return {"content": '{"action":"finish","args":{}}'}
+
+    monkeypatch.setattr(trial_module, "_query_model", finish_after_append)
+    trial_module._run_capsule_loop(
+        FakeRewardDropCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_llm_step_compact_context": compact_context,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": 'obs = get_observation()\nmove_to("recover")'
+                },
+            }
+        ],
+    )
+
+    prompt_text = json.dumps(captured_prompts[0])
+    metrics = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+
+    assert "group_key_" not in prompt_text
+    assert "region_key_" not in prompt_text
+    assert metrics[0]["recovery_generations"][0]["authorized_group_keys"]
+
+
 def test_executing_recovery_group_consumes_only_its_stable_key(tmp_path):
     env = FakeRewardDropCapsuleEnv()
     trial_module._run_capsule_loop(

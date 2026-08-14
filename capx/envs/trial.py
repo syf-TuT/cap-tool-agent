@@ -2035,13 +2035,8 @@ def _run_capsule_loop(
                         recoverable_failed = False
                     if action.action == "append_recovery":
                         generation = recovery_generations[-1]
-                        event.evidence.update(
-                            {
-                                "recovery_generation_id": generation.generation_id,
-                                "authorized_group_keys": sorted(
-                                    generation.authorized_group_keys
-                                ),
-                            }
+                        event.evidence["recovery_generation_id"] = (
+                            generation.generation_id
                         )
                     _annotate_source_edit_event(
                         event,
