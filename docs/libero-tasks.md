@@ -165,6 +165,34 @@ prompts, runtime trace JSON, per-step metrics, full-state diagnostic JSONL, and 
 artifacts contain image metadata and relative PNG paths rather than inline base64 image
 payloads.
 
+### Privileged Capsule LLM-step for standard LIBERO-Object
+
+The `env_configs/libero/franka_libero_object_0_privileged_capsule_llm_step.yaml`
+configuration also targets standard `libero_object` task 0, but uses ground-truth object
+poses through `FrankaLiberoPrivilegedApi`. It is separate from and does not change the
+non-privileged Capsule baseline above.
+
+With `capsule_prompt_state_level: full`, post-action observations created after a
+`run_group` use full ground-truth object state and are attached to subsequent Capsule
+Action prompts. The initial Action prompt has no post-action snapshot. Diagnostic
+artifacts independently use full state through `capsule_diagnostic_state_level: full`.
+Visual feedback and wrist-camera prompt capture remain disabled, while main-camera video
+recording remains enabled.
+
+Of the API/perception services, only PyRoKi on port 8116 is required and auto-started by
+this configuration. Molmo, SAM3, and Contact-GraspNet are not used; the Capsule run still
+requires its configured LLM endpoint. Run this smoke test only on a server or dedicated
+LIBERO runtime, not from the Windows checkout:
+
+```bash
+source .venv-libero/bin/activate
+MUJOCO_GL=egl TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+uv run --no-sync --active capx/envs/launch.py \
+  --config-path env_configs/libero/franka_libero_object_0_privileged_capsule_llm_step.yaml \
+  --total-trials 1 \
+  --num-workers 1
+```
+
 ## Choosing a Task
 
 Each LIBERO task is specified by a **suite name** and **task index**. The YAML config's `low_level` field follows the pattern:
