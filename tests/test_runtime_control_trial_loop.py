@@ -6679,7 +6679,7 @@ def test_rejected_recovery_patch_leaves_generation_and_source_atomic(tmp_path):
     )
 
 
-def test_second_append_without_new_physical_evidence_is_rejected_atomically(
+def test_second_append_while_recovery_is_pending_is_rejected_atomically(
     tmp_path,
     monkeypatch,
 ):
@@ -6726,7 +6726,7 @@ def test_second_append_without_new_physical_evidence_is_rejected_atomically(
 
     assert rows[2]["event_status"] == "invalid"
     assert rows[2]["edit_rejection_reason"] == (
-        "no_new_physical_state_since_last_append"
+        "recovery_generation_pending"
     )
     assert rows[2]["source_revision_before"] == 1
     assert rows[2]["source_revision_after"] == 1
@@ -6802,6 +6802,94 @@ def test_pending_recovery_blocks_unrelated_runnable_group(tmp_path):
     assert rows[1]["event_evidence"]["runnable_recovery_group_ids"] == [
         "group_2"
     ]
+
+
+def test_pending_recovery_blocks_patch_outside_latest_generation(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeRewardDropCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": 'obs = get_observation()\nmove_to("recover")'
+                },
+            },
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": "y = 2"},
+            },
+        ],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+
+    assert rows[1]["event_status"] == "invalid"
+    assert rows[1]["safety_failure"] == "recovery_generation_pending"
+    assert rows[1]["event_evidence"]["pending_recovery_group_ids"] == [
+        "group_2",
+        "group_3",
+    ]
+
+
+def test_completing_all_recovery_groups_unlocks_later_append(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 6,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": (
+                        'obs = get_observation()\n'
+                        'move_to("recover")\n'
+                        'move_to("finish")'
+                    )
+                },
+            },
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {"action": "run_group", "args": {"group_id": "group_3"}},
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": 'obs2 = get_observation()\nmove_to("too-early")'
+                },
+            },
+            {"action": "run_group", "args": {"group_id": "group_4"}},
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": 'obs2 = get_observation()\nmove_to("again")'
+                },
+            },
+        ],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+
+    assert rows[3]["event_status"] == "invalid"
+    assert rows[3]["edit_rejection_reason"] == "recovery_generation_pending"
+    assert rows[5]["event_status"] == "success"
+    assert rows[5]["source_edit_committed"] is True
+    assert len(rows[5]["recovery_generations"]) == 2
 
 
 def test_later_append_reconciles_all_generation_keys_after_group_bounding():
