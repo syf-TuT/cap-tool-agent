@@ -7085,3 +7085,175 @@ def test_capsule_trial_metrics_finalize_on_task_success(tmp_path):
     assert trial_metrics["attempted_group_count"] == 1
     assert trial_metrics["post_action_observation_count"] == 1
     assert trial_metrics["budget_exhausted"] is False
+
+
+def test_failed_group_execution_refreshes_variable_inspection_namespace(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code='x = 1\nraise RuntimeError("boom")\n',
+        scripted_actions=[
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "failed",
+        "success",
+    ]
+    assert trace[0]["event"]["evidence"]["x"]["type"] == "NoneType"
+    assert trace[2]["event"]["evidence"]["x"] == {"type": "int", "repr": "1"}
+
+
+@pytest.mark.parametrize("execution_action", ["run_region", "resume_from_region"])
+def test_failed_region_execution_refreshes_variable_inspection_namespace(
+    tmp_path, monkeypatch, execution_action
+):
+    source = 'x = 1\nraise RuntimeError("boom")\n'
+    monkeypatch.setattr(
+        trial_module,
+        "segment_python_code",
+        lambda candidate_source: [
+            CodeRegion("region_1", 1, 2, candidate_source)
+        ],
+    )
+
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_execution_granularity": "region",
+        },
+        initial_code=source,
+        scripted_actions=[
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+            {"action": execution_action, "args": {"region_id": "region_1"}},
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "failed",
+        "success",
+    ]
+    assert trace[2]["event"]["evidence"]["x"] == {"type": "int", "repr": "1"}
+
+
+def test_guard_invalid_group_does_not_refresh_variable_inspection_namespace(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+            {"action": "run_group", "args": {"group_id": "missing_group"}},
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "invalid",
+        "invalid",
+    ]
+    assert "no_new_variable_state" in trace[2]["event"]["message"]
+
+
+def test_variable_inspection_treats_duplicate_names_as_the_same_set(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+            {"action": "inspect_variables", "args": {"names": ["x", "x"]}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == ["success", "invalid"]
+    assert "no_new_variable_state" in trace[1]["event"]["message"]
+
+
+@pytest.mark.parametrize("compact_context", [False, True])
+def test_reconciliation_stable_keys_stay_in_audit_but_not_model_prompt(
+    tmp_path, monkeypatch, compact_context
+):
+    prompts = []
+    responses = iter(
+        [
+            {
+                "content": (
+                    '{"action":"patch_group","args":'
+                    '{"group_id":"group_1","source":"x = 2"}}'
+                )
+            },
+            {"content": '{"action":"finish","args":{}}'},
+        ]
+    )
+
+    def reject_reconciliation(*args, **kwargs):
+        raise trial_module._SourceEditRejection(
+            "lineage_ambiguous",
+            "Recovery lineage is ambiguous.",
+            evidence={
+                "missing_executed_group_keys": ["group_key_SECRET"],
+                "missing_executed_region_keys": ["region_key_SECRET"],
+            },
+            lineage_reconciliation_status="ambiguous",
+        )
+
+    def fake_query_model(args, prompt):
+        prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(
+        trial_module, "_prepare_capsule_source_edit", reject_reconciliation
+    )
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_llm_step_compact_context": compact_context,
+        },
+        initial_code="x = 1\n",
+    )
+
+    audit = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    next_prompt = json.dumps(prompts[1])
+
+    assert audit[0]["event"]["evidence"]["missing_executed_group_keys"] == [
+        "group_key_SECRET"
+    ]
+    assert audit[0]["event"]["evidence"]["missing_executed_region_keys"] == [
+        "region_key_SECRET"
+    ]
+    assert "missing_executed_group_keys" not in next_prompt
+    assert "missing_executed_region_keys" not in next_prompt
+    assert "group_key_SECRET" not in next_prompt
+    assert "region_key_SECRET" not in next_prompt

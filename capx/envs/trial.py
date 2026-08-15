@@ -2141,7 +2141,7 @@ def _run_capsule_loop(
                     )
             if (
                 action.action in {"run_group", "run_region", "resume_from_region"}
-                and event.status == "success"
+                and event.status != "invalid"
             ):
                 namespace_revision += 1
             if event.evidence.get("safety_failure") == "side_effect_replay":
@@ -2596,7 +2596,7 @@ def _variable_inspection_key(
         source_revision,
         trace_revision,
         namespace_revision,
-        tuple(sorted(names)),
+        tuple(sorted(set(names))),
     )
 
 
@@ -3124,12 +3124,38 @@ def _model_facing_capsule_history(
     )
     return [
         {
-            field: copy.deepcopy(entry[field])
+            field: _sanitize_model_facing_capsule_value(entry[field])
             for field in allowed_fields
             if field in entry
         }
         for entry in history
     ]
+
+
+def _sanitize_model_facing_capsule_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_model_facing_capsule_value(item)
+            for key, item in value.items()
+            if not _is_internal_stable_key_field(str(key))
+        }
+    if isinstance(value, list):
+        return [_sanitize_model_facing_capsule_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_model_facing_capsule_value(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _is_internal_stable_key_field(field: str) -> bool:
+    stable_key_suffixes = (
+        "unit_key",
+        "unit_keys",
+        "group_key",
+        "group_keys",
+        "region_key",
+        "region_keys",
+    )
+    return any(field == suffix or field.endswith(f"_{suffix}") for suffix in stable_key_suffixes)
 
 
 @dataclass(frozen=True)
