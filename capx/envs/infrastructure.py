@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
+
+
+@dataclass(frozen=True)
+class ServiceEndpoint:
+    """A TCP endpoint required before an environment can be constructed."""
+
+    name: str
+    host: str
+    port: int
 
 
 class InfrastructureFailure(RuntimeError):

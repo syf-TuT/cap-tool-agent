@@ -3,11 +3,13 @@ from __future__ import annotations
 import importlib.util
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from capx.envs import launch as launch_module
 from capx.envs import runner
-from capx.envs.infrastructure import InfrastructureFailure
+from capx.envs.infrastructure import InfrastructureFailure, ServiceReadinessError
 from capx.llm.context import llm_call_stage
 from capx.llm.errors import LLMErrorKind, LLMQueryError
 from capx.llm import client as llm_client
@@ -60,6 +62,108 @@ def test_infrastructure_failure_preserves_stable_diagnostics():
     assert failure.kind == "service_timeout"
     assert failure.message == "SAM3 timed out"
     assert failure.evidence == {"service": "sam3"}
+
+
+def test_required_service_endpoints_include_libero_molmo():
+    endpoints = runner._required_service_endpoints(
+        [{"host": "127.0.0.1", "port": 8114}],
+        {
+            "cfg": {
+                "apis": ["FrankaLiberoApi"],
+                "molmo_base_url": "http://127.0.0.1:8122/v1",
+            }
+        },
+    )
+
+    assert [(item.host, item.port) for item in endpoints] == [
+        ("127.0.0.1", 8114),
+        ("127.0.0.1", 8122),
+    ]
+
+
+def test_required_service_endpoints_ignore_molmo_for_other_apis():
+    endpoints = runner._required_service_endpoints(
+        [],
+        {
+            "cfg": {
+                "apis": ["OtherApi"],
+                "molmo_base_url": "http://molmo.example.test:8122/v1",
+            }
+        },
+    )
+
+    assert endpoints == []
+
+
+def test_start_api_servers_stops_started_processes_on_readiness_timeout(monkeypatch):
+    proc = SimpleNamespace(terminate=Mock(), join=Mock())
+    endpoint = SimpleNamespace(name="sam3", host="127.0.0.1", port=8114)
+    monkeypatch.setattr(runner, "run_server_proc", lambda config: proc)
+    monkeypatch.setattr(runner, "_service_endpoint_ready", lambda item: False)
+    monkeypatch.setattr(runner.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(ServiceReadinessError, match="not ready"):
+        runner._start_api_servers(
+            [{"host": "127.0.0.1", "port": 8114}],
+            required_endpoints=[endpoint],
+            wait_timeout=0,
+        )
+
+    proc.terminate.assert_called_once_with()
+    proc.join.assert_called_once_with(timeout=5.0)
+
+
+def test_start_api_servers_checks_external_required_endpoint(monkeypatch):
+    endpoint = SimpleNamespace(name="molmo", host="127.0.0.1", port=8122)
+    checked = []
+    monkeypatch.setattr(
+        runner,
+        "_service_endpoint_ready",
+        lambda item: checked.append(item) or True,
+    )
+
+    assert runner._start_api_servers([], required_endpoints=[endpoint]) == []
+    assert checked == [endpoint]
+
+
+def test_launch_preflights_all_required_endpoints_before_trials(monkeypatch):
+    env_factory = {"cfg": {"apis": ["FrankaLiberoApi"]}}
+    api_servers = [{"host": "127.0.0.1", "port": 8114}]
+    endpoints = [SimpleNamespace(name="sam3", host="127.0.0.1", port=8114)]
+    calls = []
+
+    monkeypatch.setattr(
+        launch_module,
+        "_load_config",
+        lambda args: (env_factory, {"web_ui": False}, api_servers),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_required_service_endpoints",
+        lambda servers, factory: calls.append((servers, factory)) or endpoints,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_start_api_servers",
+        lambda servers, *, required_endpoints: (
+            calls.append((servers, required_endpoints)) or []
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_run_headless_trials",
+        lambda *args: calls.append("trials"),
+    )
+    monkeypatch.setattr(runner, "_stop_api_servers", lambda procs: None)
+
+    launch_module.main(SimpleNamespace())
+
+    assert calls == [
+        (api_servers, env_factory),
+        (api_servers, endpoints),
+        "trials",
+    ]
 
 
 def test_runner_writes_running_result_before_invoking_trial(tmp_path, monkeypatch):

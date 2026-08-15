@@ -10,17 +10,23 @@ from __future__ import annotations
 import functools
 import os
 import signal
+import socket
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from tqdm import tqdm
 
 from capx.envs.configs.instantiate import instantiate
-from capx.envs.infrastructure import InfrastructureFailure
+from capx.envs.infrastructure import (
+    InfrastructureFailure,
+    ServiceEndpoint,
+    ServiceReadinessError,
+)
 from capx.envs.tasks.base import CodeExecutionEnvBase
 from capx.envs.trial import (
     _annotate_code_blocks,
@@ -72,46 +78,146 @@ def _trial_timeout_seconds() -> int:
 # API server helpers
 # ---------------------------------------------------------------------------
 
+
+def _service_endpoint_name(api_server: Mapping[str, Any], port: int) -> str:
+    target = str(api_server.get("_target_", ""))
+    parts = target.split(".")
+    if len(parts) > 1 and parts[-1] == "main":
+        return parts[-2]
+    return parts[-1] or f"api_server_{port}"
+
+
+def _required_service_endpoints(
+    api_servers: list | None,
+    env_factory: Mapping[str, Any],
+) -> list[ServiceEndpoint]:
+    endpoints: list[ServiceEndpoint] = []
+    for api_server in api_servers or []:
+        port = api_server.get("port")
+        if port is None:
+            continue
+        endpoint_port = int(port)
+        endpoints.append(
+            ServiceEndpoint(
+                name=_service_endpoint_name(api_server, endpoint_port),
+                host=str(api_server.get("host", "127.0.0.1")),
+                port=endpoint_port,
+            )
+        )
+
+    env_cfg = env_factory.get("cfg", {})
+    apis = env_cfg.get("apis", []) if isinstance(env_cfg, Mapping) else []
+    molmo_base_url = (
+        env_cfg.get("molmo_base_url") if isinstance(env_cfg, Mapping) else None
+    )
+    if "FrankaLiberoApi" in apis and molmo_base_url:
+        parsed = urlparse(str(molmo_base_url))
+        if parsed.hostname is None:
+            raise ValueError(f"Invalid molmo_base_url: {molmo_base_url}")
+        endpoints.append(
+            ServiceEndpoint(
+                name="molmo",
+                host=parsed.hostname,
+                port=parsed.port or (443 if parsed.scheme == "https" else 80),
+            )
+        )
+
+    deduplicated: list[ServiceEndpoint] = []
+    seen: set[tuple[str, int]] = set()
+    for endpoint in endpoints:
+        key = (endpoint.host, endpoint.port)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(endpoint)
+    return deduplicated
+
+
+def _service_endpoint_ready(endpoint: ServiceEndpoint) -> bool:
+    try:
+        with socket.create_connection((endpoint.host, endpoint.port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_for_required_services(
+    endpoints: list[ServiceEndpoint],
+    *,
+    wait_timeout: float,
+) -> None:
+    pending = list(endpoints)
+    deadline = time.monotonic() + max(0.0, wait_timeout)
+    while pending:
+        unavailable: list[ServiceEndpoint] = []
+        for endpoint in pending:
+            if _service_endpoint_ready(endpoint):
+                print(
+                    f"API server {endpoint.name} on "
+                    f"{endpoint.host}:{endpoint.port} is ready"
+                )
+            else:
+                unavailable.append(endpoint)
+        if not unavailable:
+            return
+        if time.monotonic() >= deadline:
+            unresolved = ", ".join(
+                f"{endpoint.name} ({endpoint.host}:{endpoint.port})"
+                for endpoint in unavailable
+            )
+            raise ServiceReadinessError(
+                "service_not_ready",
+                f"Required services not ready after {wait_timeout}s: {unresolved}",
+                evidence={
+                    "unresolved_endpoints": [
+                        {
+                            "name": endpoint.name,
+                            "host": endpoint.host,
+                            "port": endpoint.port,
+                        }
+                        for endpoint in unavailable
+                    ]
+                },
+            )
+        pending = unavailable
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+
+
 def _start_api_servers(
-    api_servers: list | None, wait_timeout: float = 120.0
+    api_servers: list | None,
+    *,
+    required_endpoints: list[ServiceEndpoint] | None = None,
+    wait_timeout: float = 120.0,
 ) -> list:
     """Launch any API server sub-processes defined in the config.
 
     Skips servers whose port is already in use (e.g. started externally).
     After launching, waits until all servers are accepting connections.
     """
-    import socket
-    import time
-
     procs = []
-    ports_to_wait: list[tuple[str, int]] = []
-    if api_servers is not None:
-        for api_server in api_servers:
+    endpoints = required_endpoints
+    if endpoints is None:
+        endpoints = _required_service_endpoints(api_servers, {})
+    try:
+        for api_server in api_servers or []:
             port = api_server.get("port")
             host = api_server.get("host", "127.0.0.1")
             if port is not None:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    if s.connect_ex((host, int(port))) == 0:
-                        print(f"API server on {host}:{port} already running, skipping")
-                        continue
+                endpoint = ServiceEndpoint(
+                    name=_service_endpoint_name(api_server, int(port)),
+                    host=str(host),
+                    port=int(port),
+                )
+                if _service_endpoint_ready(endpoint):
+                    print(f"API server on {host}:{port} already running, skipping")
+                    continue
             proc = run_server_proc(api_server)
             procs.append(proc)
             print(f"API server {api_server} started")
-            if port is not None:
-                ports_to_wait.append((host, int(port)))
-
-    # Wait for all launched servers to accept connections
-    if ports_to_wait:
-        deadline = time.time() + wait_timeout
-        for host, port in ports_to_wait:
-            while time.time() < deadline:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    if s.connect_ex((host, port)) == 0:
-                        print(f"API server on {host}:{port} is ready")
-                        break
-                time.sleep(1.0)
-            else:
-                print(f"WARNING: API server on {host}:{port} not ready after {wait_timeout}s")
+        _wait_for_required_services(endpoints, wait_timeout=wait_timeout)
+    except BaseException:
+        _stop_api_servers(procs)
+        raise
 
     return procs
 
