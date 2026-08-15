@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Literal
+from typing import Literal
 
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup
 
@@ -192,6 +193,22 @@ def _expected_span(
     return None
 
 
+def _unit_sources_match(
+    *,
+    previous_unit: CodeRegion | CodeRegionGroup,
+    current_unit: CodeRegion | CodeRegionGroup,
+    edit_kind: str,
+    old_line_count: int,
+) -> bool:
+    if current_unit.source == previous_unit.source:
+        return True
+    return (
+        edit_kind == "append_recovery"
+        and previous_unit.end_line == old_line_count
+        and current_unit.source.rstrip("\r\n") == previous_unit.source.rstrip("\r\n")
+    )
+
+
 def _reconcile_units(
     *,
     unit_kind: str,
@@ -232,7 +249,12 @@ def _reconcile_units(
                 for current_unit in current_units
                 if current_unit.start_line == expected_start
                 and current_unit.end_line == expected_end
-                and current_unit.source == previous_unit.source
+                and _unit_sources_match(
+                    previous_unit=previous_unit,
+                    current_unit=current_unit,
+                    edit_kind=edit_kind,
+                    old_line_count=old_line_count,
+                )
             ]
         if len(matches) > 1:
             raise LineageAmbiguityError(

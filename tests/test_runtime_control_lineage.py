@@ -253,6 +253,74 @@ def test_append_preserves_prefix_keys_and_allocates_fresh_keys_for_repeated_sour
     assert reconciled.next_group_key > 2
 
 
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_append_maps_executed_eof_units_when_only_trailing_newline_changes(
+    line_ending: str,
+) -> None:
+    previous_source = "goto_home_joint_position()"
+    current_source = f"{previous_source}{line_ending}state = get_observation()"
+    previous_regions = [_region_at("old_final_region", 1, 1, previous_source)]
+    previous_groups = [_group_at("old_final_group", 1, 1, previous_source)]
+    current_regions = [
+        _region_at("current_final_region", 1, 1, f"{previous_source}{line_ending}"),
+        _region_at("recovery_region", 2, 2, "state = get_observation()"),
+    ]
+    current_groups = [
+        _group_at("current_final_group", 1, 1, f"{previous_source}{line_ending}"),
+        _group_at("recovery_group", 2, 2, "state = get_observation()"),
+    ]
+    previous_lineage = UnitLineage.create(previous_regions, previous_groups)
+    final_region_key = previous_lineage.region_key_by_id["old_final_region"]
+    final_group_key = previous_lineage.group_key_by_id["old_final_group"]
+    previous_lineage.executed_region_keys.add(final_region_key)
+    previous_lineage.executed_group_keys.add(final_group_key)
+
+    reconciled = _reconcile(
+        edit_kind="append_recovery",
+        previous_source=previous_source,
+        current_source=current_source,
+        previous_regions=previous_regions,
+        current_regions=current_regions,
+        previous_groups=previous_groups,
+        current_groups=current_groups,
+        previous_lineage=previous_lineage,
+        edit_start_line=2,
+        edit_end_line=1,
+        line_delta=1,
+    )
+
+    assert reconciled.region_key_by_id["current_final_region"] == final_region_key
+    assert reconciled.group_key_by_id["current_final_group"] == final_group_key
+    assert reconciled.executed_region_keys == {final_region_key}
+    assert reconciled.executed_group_keys == {final_group_key}
+    assert reconciled.region_key_by_id["recovery_region"] != final_region_key
+    assert reconciled.group_key_by_id["recovery_group"] != final_group_key
+
+
+def test_append_does_not_relax_substantive_eof_source_changes() -> None:
+    previous_source = "acted()"
+    current_source = f"{previous_source}\nrecover()"
+    previous_regions = [_region_at("old_final_region", 1, 1, previous_source)]
+    previous_lineage = UnitLineage.create(previous_regions, [])
+    final_region_key = previous_lineage.region_key_by_id["old_final_region"]
+    previous_lineage.executed_region_keys.add(final_region_key)
+
+    with pytest.raises(LineageAmbiguityError, match="executed region key"):
+        _reconcile(
+            edit_kind="append_recovery",
+            previous_source=previous_source,
+            current_source=current_source,
+            previous_regions=previous_regions,
+            current_regions=[_region_at("changed_final_region", 1, 1, "changed()\n")],
+            previous_groups=[],
+            current_groups=[],
+            previous_lineage=previous_lineage,
+            edit_start_line=2,
+            edit_end_line=1,
+            line_delta=1,
+        )
+
+
 def test_append_rejects_group_that_crosses_old_and_new_source_boundary() -> None:
     previous_source = "first()\nsecond()"
     current_source = f"{previous_source}\nthird()"
