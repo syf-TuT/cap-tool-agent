@@ -108,7 +108,13 @@ def build_capsule_prompt(
         if recovery_observation_functions is None
         else recovery_observation_functions
     )
-    if recovery_functions:
+    if repair_pending:
+        recovery_guidance = (
+            "append_recovery is unavailable while source repair is pending."
+        )
+        recovery_example_line = ""
+        recovery_rule = recovery_guidance
+    elif recovery_functions:
         recovery_calls = ", ".join(f"{name}()" for name in recovery_functions)
         recovery_guidance = (
             "For recovery after robot side effects, prefer appending new recovery code with "
@@ -217,13 +223,7 @@ def build_capsule_prompt(
             if repair_pending
             else "run_region, resume_from_region, or patch_region"
         )
-    if repair_pending:
-        recovery_guidance = (
-            "append_recovery is unavailable while source repair is pending."
-        )
-        recovery_example_line = ""
-        recovery_rule = recovery_guidance
-    elif recovery_functions:
+    if recovery_functions and not repair_pending:
         allowed_actions.append("append_recovery")
     allowed_actions.append("finish")
     allowed_actions_text = ", ".join(allowed_actions)

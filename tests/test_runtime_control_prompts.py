@@ -234,6 +234,35 @@ def test_group_mode_repair_pending_prompt_quarantines_execution_actions(
     assert "append_recovery" not in allowed_actions
     assert '{"action": "run_group"' not in text
     assert '{"action": "patch_group"' in text
+    patch_example = next(
+        line for line in text.splitlines() if line.startswith('{"action": "patch_group"')
+    )
+    assert json.loads(patch_example)["action"] == "patch_group"
+
+
+def test_region_mode_repair_pending_prompt_quarantines_execution_actions():
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion("region_1", 1, 1, "x = 1")],
+        groups=None,
+        history=[],
+        trace_summary={},
+        contract_violations=[{"code": "effectful_helper"}],
+        repair_pending=True,
+    )
+    text = prompt[1]["content"][0]["text"]
+    allowed_actions = next(
+        line for line in text.splitlines() if line.startswith("Allowed actions:")
+    )
+
+    assert "patch_region" in allowed_actions
+    assert "run_region" not in allowed_actions
+    assert "resume_from_region" not in allowed_actions
+    assert '{"action": "run_region"' not in text
+    patch_example = next(
+        line for line in text.splitlines() if line.startswith('{"action": "patch_region"')
+    )
+    assert json.loads(patch_example)["action"] == "patch_region"
 
 
 @pytest.mark.parametrize("compact_context", [False, True])

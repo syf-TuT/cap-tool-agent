@@ -125,11 +125,15 @@ diagnostic remains, reject `run_group`, `run_region`, and `resume_from_region` w
 
 ```python
 evidence={
-    "safety_failure": "repair_pending",
+    # Preserve the existing strict/program-contract safety classification.
+    "safety_failure": "program_contract_violation",
     "repair_pending": True,
     "remaining_violation_count": ...,
 }
 ```
+
+Syntax-only repair state uses `repair_pending` as the safety classification. Strict-subset
+violations continue through the existing strict-subset guard for compatibility.
 
 Patch actions remain available. An accepted partial patch event reports
 `repair_pending=True` and its remaining count without marking the successful edit itself as
@@ -208,4 +212,3 @@ git add capx/envs/trial.py capx/runtime_control/prompts.py \
   tests/test_runtime_control_trial_loop.py tests/test_runtime_control_prompts.py
 git commit -m "Expose Capsule repair draft state"
 ```
-
