@@ -5942,6 +5942,18 @@ def test_recovery_stable_keys_never_leak_into_model_prompt(
 
     assert "group_key_" not in prompt_text
     assert "region_key_" not in prompt_text
+    prompt_user_text = captured_prompts[0][1]["content"][0]["text"]
+    assert '"append_recovery_available": false' in prompt_user_text
+    assert (
+        '"runnable_recovery_group_ids": [\n    "group_2"\n  ]'
+        in prompt_user_text
+    )
+    allowed_actions = next(
+        line
+        for line in prompt_user_text.splitlines()
+        if line.startswith("Allowed actions:")
+    )
+    assert "append_recovery" not in allowed_actions
     assert metrics[0]["recovery_generations"][0]["authorized_group_keys"]
 
 
@@ -6502,8 +6514,23 @@ def test_rejected_recovery_patch_leaves_generation_and_source_atomic(tmp_path):
 
 def test_second_append_without_new_physical_evidence_is_rejected_atomically(
     tmp_path,
+    monkeypatch,
 ):
     first_recovery = 'obs = get_observation()\nmove_to("recover")'
+    original_prepare = trial_module._prepare_capsule_source_edit
+    append_prepare_calls = 0
+
+    def observed_prepare(action, *args, **kwargs):
+        nonlocal append_prepare_calls
+        if action.action == "append_recovery":
+            append_prepare_calls += 1
+        return original_prepare(action, *args, **kwargs)
+
+    monkeypatch.setattr(
+        trial_module,
+        "_prepare_capsule_source_edit",
+        observed_prepare,
+    )
     summary = trial_module._run_capsule_loop(
         FakeRewardDropCapsuleEnv(),
         trial=0,
@@ -6539,6 +6566,7 @@ def test_second_append_without_new_physical_evidence_is_rejected_atomically(
     assert rows[2]["source_edit_committed"] is False
     assert rows[2]["recovery_generations"] == rows[0]["recovery_generations"]
     assert Path(summary.code_path).read_text() == "x = 1\n" + first_recovery + "\n"
+    assert append_prepare_calls == 1
 
 
 def test_physical_trace_after_append_allows_later_append(tmp_path):

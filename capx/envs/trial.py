@@ -1197,6 +1197,13 @@ class _GroupDependencyState:
     missing_by_group_id: dict[str, tuple[str, ...]]
 
 
+@dataclass(frozen=True)
+class _RecoveryActionState:
+    append_recovery_available: bool
+    append_recovery_block_reason: str | None
+    runnable_recovery_group_ids: tuple[str, ...]
+
+
 def _group_dependency_state(
     groups: list[CodeRegionGroup],
     runtime_globals: Mapping[str, Any],
@@ -1227,6 +1234,49 @@ def _group_dependency_state(
             for group_id, missing in missing_by_group_id.items()
             if missing
         },
+    )
+
+
+def _recovery_action_state(
+    groups: list[CodeRegionGroup],
+    *,
+    lineage: UnitLineage,
+    recovery_generations: list[RecoveryGeneration],
+    group_dependency_state: _GroupDependencyState,
+    trace_revision: int,
+) -> _RecoveryActionState:
+    if (
+        not recovery_generations
+        or trace_revision > recovery_generations[-1].append_trace_revision
+    ):
+        return _RecoveryActionState(True, None, ())
+
+    generation = recovery_generations[-1]
+    runnable_keys = set(generation.observation_group_keys)
+    if generation.observation_satisfied:
+        runnable_keys.update(generation.authorized_group_keys)
+    else:
+        runnable_keys.update(
+            generation.authorized_group_keys
+            & generation.inline_observation_group_keys
+        )
+    dependency_runnable = set(group_dependency_state.runnable_group_ids)
+    runnable_group_ids = tuple(
+        group.group_id
+        for group in groups
+        if (
+            group.group_id in dependency_runnable
+            and lineage.group_key_by_id.get(group.group_id) in runnable_keys
+            and lineage.group_key_by_id.get(group.group_id)
+            not in lineage.executed_group_keys
+        )
+    )
+    return _RecoveryActionState(
+        append_recovery_available=False,
+        append_recovery_block_reason=(
+            "no_new_physical_state_since_last_append"
+        ),
+        runnable_recovery_group_ids=runnable_group_ids,
     )
 
 
@@ -1300,8 +1350,8 @@ def _prepare_capsule_source_edit(
             "no_new_physical_state_since_last_append",
             (
                 "append_recovery requires new physical trace evidence after the "
-                "previous recovery append. Execute or patch the existing recovery "
-                "source first."
+                "previous recovery append. Execute the existing recovery source "
+                "first; a patch alone does not unlock another append."
             ),
         )
     candidate_boundaries = _updated_group_boundaries_after_edit(
@@ -1962,6 +2012,13 @@ def _run_capsule_loop(
         group_new_trace_events: list[dict[str, Any]] = []
         inspection_key: tuple[int, int, int, tuple[str, ...]] | None = None
         group_dependency_state = _group_dependency_state(groups, executor.globals)
+        recovery_action_state = _recovery_action_state(
+            groups,
+            lineage=lineage,
+            recovery_generations=recovery_generations,
+            group_dependency_state=group_dependency_state,
+            trace_revision=executor.trace.mark(),
+        )
 
         try:
             if script is not None and script_idx < len(script):
@@ -2001,6 +2058,15 @@ def _run_capsule_loop(
                         group_id: list(missing)
                         for group_id, missing in group_dependency_state.missing_by_group_id.items()
                     },
+                    append_recovery_available=(
+                        recovery_action_state.append_recovery_available
+                    ),
+                    append_recovery_block_reason=(
+                        recovery_action_state.append_recovery_block_reason
+                    ),
+                    runnable_recovery_group_ids=list(
+                        recovery_action_state.runnable_recovery_group_ids
+                    ),
                 )
                 action_prompt_chars = len(json.dumps(prompt, default=str))
                 action_prompt_char_budget_metric = (
@@ -2098,6 +2164,11 @@ def _run_capsule_loop(
                 event = _group_dependency_guard_event(
                     action,
                     group_dependency_state,
+                )
+            if event is None:
+                event = _append_recovery_guard_event(
+                    action,
+                    recovery_action_state,
                 )
             if event is None:
                 event = _no_rollback_guard_event(
@@ -2696,6 +2767,13 @@ def _source_edit_rejection_metadata(
     action: RuntimeAction,
     event: RuntimeEvent,
 ) -> tuple[str, str]:
+    explicit_reason = event.evidence.get("edit_rejection_reason")
+    if isinstance(explicit_reason, str) and explicit_reason:
+        lineage_status = event.evidence.get(
+            "lineage_reconciliation_status",
+            "not_attempted",
+        )
+        return explicit_reason, str(lineage_status)
     if event.evidence.get("safety_failure") == "side_effect_replay":
         return "executed_unit_edit_attempt", "not_attempted"
     if event.evidence.get("safety_failure") == "side_effect_lineage_unavailable":
@@ -3173,6 +3251,31 @@ def _group_dependency_guard_event(
             "safety_failure": "missing_group_dependencies",
             "missing_dependencies": list(missing),
             "runnable_group_ids": list(state.runnable_group_ids),
+        },
+    )
+
+
+def _append_recovery_guard_event(
+    action: RuntimeAction,
+    state: _RecoveryActionState,
+) -> RuntimeEvent | None:
+    if action.action != "append_recovery" or state.append_recovery_available:
+        return None
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=_runtime_action_unit_id(action),
+        message=(
+            "append_recovery is unavailable until a fresh physical trace is "
+            "recorded after the previous recovery append. Execute an existing "
+            "recovery group first; a patch alone does not unlock another append."
+        ),
+        evidence={
+            "safety_failure": "append_recovery_unavailable",
+            "edit_rejection_reason": state.append_recovery_block_reason,
+            "runnable_recovery_group_ids": list(
+                state.runnable_recovery_group_ids
+            ),
         },
     )
 

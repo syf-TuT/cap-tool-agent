@@ -432,6 +432,27 @@ def test_capsule_prompt_documents_append_recovery():
     assert "current physical state" in text
 
 
+def test_capsule_prompt_blocks_repeat_append_and_exposes_runnable_recovery_groups():
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion(region_id="region_1", start_line=1, end_line=1, source="x = 1")],
+        history=[],
+        trace_summary={},
+        append_recovery_available=False,
+        append_recovery_block_reason="no_new_physical_state_since_last_append",
+        runnable_recovery_group_ids=["group_3"],
+    )
+
+    text = prompt[1]["content"][0]["text"]
+    allowed_actions = next(line for line in text.splitlines() if line.startswith("Allowed actions:"))
+
+    assert "append_recovery" not in allowed_actions
+    assert '"append_recovery_available": false' in text
+    assert '"append_recovery_block_reason": "no_new_physical_state_since_last_append"' in text
+    assert '"runnable_recovery_group_ids": [\n    "group_3"\n  ]' in text
+    assert '{"action": "append_recovery", "args": {"source":' not in text
+
+
 def test_capsule_prompt_documents_task_specific_recovery_observation_functions():
     prompt = build_capsule_prompt(
         task="lift pot",

@@ -104,6 +104,9 @@ def build_capsule_prompt(
     source_revision: int | None = None,
     runnable_group_ids: list[str] | None = None,
     blocked_group_dependencies: dict[str, list[str]] | None = None,
+    append_recovery_available: bool = True,
+    append_recovery_block_reason: str | None = None,
+    runnable_recovery_group_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     recovery_functions = sorted(
         {"get_observation"}
@@ -113,6 +116,16 @@ def build_capsule_prompt(
     if repair_pending:
         recovery_guidance = (
             "append_recovery is unavailable while source repair is pending."
+        )
+        recovery_example_line = ""
+        recovery_rule = recovery_guidance
+    elif not append_recovery_available:
+        recovery_guidance = (
+            "append_recovery is unavailable until a fresh physical trace is recorded "
+            "after the previous recovery append. Continue by running one of the "
+            "runnable recovery groups shown below. If none are runnable, patch the "
+            "existing recovery source, then execute it; a patch alone does not unlock "
+            "another append."
         )
         recovery_example_line = ""
         recovery_rule = recovery_guidance
@@ -143,6 +156,11 @@ def build_capsule_prompt(
     group_availability = _normalize_group_availability(
         runnable_group_ids,
         blocked_group_dependencies,
+    )
+    recovery_availability = _normalize_recovery_availability(
+        append_recovery_available=append_recovery_available,
+        append_recovery_block_reason=append_recovery_block_reason,
+        runnable_recovery_group_ids=runnable_recovery_group_ids,
     )
     run_group_example_id = _example_group_id(
         groups or [],
@@ -237,7 +255,7 @@ def build_capsule_prompt(
             if repair_pending
             else "run_region, resume_from_region, or patch_region"
         )
-    if recovery_functions and not repair_pending:
+    if recovery_functions and not repair_pending and append_recovery_available:
         allowed_actions.append("append_recovery")
     allowed_actions.append("finish")
     allowed_actions_text = ", ".join(allowed_actions)
@@ -272,6 +290,7 @@ def build_capsule_prompt(
         latest_observation=latest_observation,
         source_revision=source_revision,
         group_availability=group_availability,
+        recovery_availability=recovery_availability,
     )
     if compact_context and _prompt_text_over_budget(prompt_text, prompt_char_budget):
         prompt_text = _build_capsule_prompt_text(
@@ -310,6 +329,7 @@ def build_capsule_prompt(
             latest_observation=latest_observation,
             source_revision=source_revision,
             group_availability=group_availability,
+            recovery_availability=recovery_availability,
         )
     if (
         compact_context
@@ -353,6 +373,7 @@ def build_capsule_prompt(
             latest_observation=latest_observation,
             source_revision=source_revision,
             group_availability=group_availability,
+            recovery_availability=recovery_availability,
         )
     if (
         compact_context
@@ -392,6 +413,7 @@ def build_capsule_prompt(
             latest_observation=latest_observation,
             source_revision=source_revision,
             group_availability=group_availability,
+            recovery_availability=recovery_availability,
         )
     return _capsule_prompt_messages(prompt_text)
 
@@ -433,6 +455,7 @@ def _build_capsule_prompt_text(
     latest_observation: PostActionObservation | None,
     source_revision: int | None,
     group_availability: dict[str, Any] | None,
+    recovery_availability: dict[str, Any] | None,
 ) -> str:
     if compact_context:
         region_units = [
@@ -532,6 +555,12 @@ def _build_capsule_prompt_text(
             "in blocked_group_dependencies are unavailable until those names are "
             "defined.\n"
         )
+    recovery_availability_text = ""
+    if recovery_availability is not None:
+        recovery_availability_text = (
+            "Runtime recovery availability:\n"
+            f"{json.dumps(recovery_availability, indent=2, default=str)}\n\n"
+        )
     focused_source_text = ""
     if focused_source_data:
         focused_source_text = (
@@ -561,6 +590,7 @@ def _build_capsule_prompt_text(
         f"{task}\n\n"
         f"{group_text}"
         f"{group_availability_text}"
+        f"{recovery_availability_text}"
         f"{region_heading}:\n"
         f"{json.dumps(region_data, indent=2, default=str)}\n\n"
         f"{latest_observation_text}"
@@ -1140,6 +1170,27 @@ def _normalize_group_availability(
             str(group_id): _ordered_prompt_strings(missing)
             for group_id, missing in blocked.items()
         },
+    }
+
+
+def _normalize_recovery_availability(
+    *,
+    append_recovery_available: bool,
+    append_recovery_block_reason: str | None,
+    runnable_recovery_group_ids: list[str] | None,
+) -> dict[str, Any] | None:
+    if (
+        append_recovery_available
+        and append_recovery_block_reason is None
+        and runnable_recovery_group_ids is None
+    ):
+        return None
+    return {
+        "append_recovery_available": append_recovery_available,
+        "append_recovery_block_reason": append_recovery_block_reason,
+        "runnable_recovery_group_ids": _ordered_prompt_strings(
+            runnable_recovery_group_ids
+        ),
     }
 
 
