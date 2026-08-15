@@ -1226,8 +1226,19 @@ def _prepare_capsule_source_edit(
     require_strict_subset: bool,
     validate_program_contract: bool,
     recovery_observation_functions: set[str],
+    current_analysis: _CapsuleSourceAnalysis | None = None,
 ) -> _PreparedSourceEdit:
     old_line_count = len(source.splitlines())
+    if (
+        current_analysis is not None
+        and _capsule_source_requires_repair(current_analysis)
+        and action.action == "append_recovery"
+    ):
+        raise _SourceEditRejection(
+            "repair_pending_append",
+            "append_recovery is unavailable while source repair is pending.",
+            evidence=_capsule_repair_state_evidence(current_analysis),
+        )
     edit_span = _runtime_source_edit_span(
         action,
         source,
@@ -1285,30 +1296,62 @@ def _prepare_capsule_source_edit(
                 "text": exc.text,
             },
         )
-    if candidate_analysis.strict_subset_violations:
-        serialized = [
-            item.to_dict() for item in candidate_analysis.strict_subset_violations
-        ]
-        raise _SourceEditRejection(
-            "strict_subset_violation",
-            "Candidate source violates the strict Capsule Python subset.",
-            evidence={
-                "strict_subset_violations": serialized,
-                "program_contract_violations": serialized,
-            },
+    candidate_violations = candidate_analysis.contract_violations
+    if candidate_violations:
+        current_violations = (
+            current_analysis.contract_violations
+            if current_analysis is not None
+            and current_analysis.syntax_error is None
+            else []
         )
-    if (
-        validate_program_contract or require_strict_subset
-    ) and candidate_analysis.contract_violations:
-        raise _SourceEditRejection(
-            "program_contract_violation",
-            "Candidate source violates the Capsule-ready program contract.",
-            evidence={
-                "program_contract_violations": [
-                    item.to_dict() for item in candidate_analysis.contract_violations
-                ]
-            },
-        )
+        if current_violations:
+            if action.action not in {"patch_group", "patch_region"}:
+                raise _SourceEditRejection(
+                    "repair_patch_required",
+                    "Source repair is pending and requires a patch action.",
+                    evidence=_capsule_repair_state_evidence(current_analysis),
+                )
+            if lineage.executed_group_keys or lineage.executed_region_keys:
+                raise _SourceEditRejection(
+                    "repair_after_side_effects",
+                    "Partial source repair is unavailable after robot side effects.",
+                    evidence=_capsule_repair_state_evidence(current_analysis),
+                )
+            if not _is_improving_capsule_repair(
+                current_violations,
+                candidate_violations,
+            ):
+                raise _SourceEditRejection(
+                    "repair_not_improving",
+                    "Candidate patch does not strictly reduce the current violations.",
+                    evidence={
+                        **_capsule_repair_state_evidence(current_analysis),
+                        "candidate_violation_count": len(candidate_violations),
+                    },
+                )
+        elif candidate_analysis.strict_subset_violations:
+            serialized = [
+                item.to_dict()
+                for item in candidate_analysis.strict_subset_violations
+            ]
+            raise _SourceEditRejection(
+                "strict_subset_violation",
+                "Candidate source violates the strict Capsule Python subset.",
+                evidence={
+                    "strict_subset_violations": serialized,
+                    "program_contract_violations": serialized,
+                },
+            )
+        elif validate_program_contract or require_strict_subset:
+            raise _SourceEditRejection(
+                "program_contract_violation",
+                "Candidate source violates the Capsule-ready program contract.",
+                evidence={
+                    "program_contract_violations": [
+                        item.to_dict() for item in candidate_violations
+                    ]
+                },
+            )
     if action.action == "append_recovery" and any(
         group.start_line <= old_line_count < group.end_line
         for group in candidate_analysis.groups
@@ -1443,6 +1486,24 @@ def _is_improving_capsule_repair(
         count <= current[fingerprint]
         for fingerprint, count in candidate.items()
     )
+
+
+def _capsule_source_requires_repair(analysis: _CapsuleSourceAnalysis) -> bool:
+    return analysis.syntax_error is not None or bool(analysis.contract_violations)
+
+
+def _capsule_remaining_violation_count(analysis: _CapsuleSourceAnalysis) -> int:
+    return len(analysis.contract_violations) + int(analysis.syntax_error is not None)
+
+
+def _capsule_repair_state_evidence(
+    analysis: _CapsuleSourceAnalysis,
+) -> dict[str, Any]:
+    remaining_count = _capsule_remaining_violation_count(analysis)
+    return {
+        "repair_pending": remaining_count > 0,
+        "remaining_violation_count": remaining_count,
+    }
 
 
 def _analyze_capsule_source(
@@ -1973,6 +2034,8 @@ def _run_capsule_loop(
                     action, strict_subset_violations
                 )
             if event is None:
+                event = _repair_pending_guard_event(action, source_analysis)
+            if event is None:
                 event = (
                     _program_contract_guard_event(
                         action,
@@ -2102,6 +2165,7 @@ def _run_capsule_loop(
                             require_strict_subset=require_strict_subset,
                             validate_program_contract=validate_program_contract,
                             recovery_observation_functions=recovery_observation_functions,
+                            current_analysis=source_analysis,
                         )
                     except _SourceEditRejection as exc:
                         rejection = exc
@@ -2157,6 +2221,9 @@ def _run_capsule_loop(
                         source_revision_after=source_revision.revision,
                         source_edit_committed=True,
                         lineage_reconciliation_status="success",
+                    )
+                    event.evidence.update(
+                        _capsule_repair_state_evidence(source_analysis)
                     )
                 else:
                     rejection_reason, lineage_status = (
@@ -2957,6 +3024,41 @@ def _reward_drop_guard_event(
             "drop_threshold": drop_threshold,
             "min_best_reward": min_best_reward,
         },
+    )
+
+
+def _repair_pending_guard_event(
+    action: RuntimeAction,
+    analysis: _CapsuleSourceAnalysis,
+) -> RuntimeEvent | None:
+    if not _capsule_source_requires_repair(analysis) or action.action not in {
+        "run_group",
+        "run_region",
+        "resume_from_region",
+    }:
+        return None
+    safety_failure = (
+        "program_contract_violation"
+        if analysis.contract_violations
+        else "repair_pending"
+    )
+    evidence: dict[str, Any] = {
+        "safety_failure": safety_failure,
+        **_capsule_repair_state_evidence(analysis),
+    }
+    if analysis.contract_violations:
+        evidence["program_contract_violations"] = [
+            violation.to_dict() for violation in analysis.contract_violations
+        ]
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=_runtime_action_unit_id(action),
+        message=(
+            "Source execution is quarantined until all pending source violations "
+            "are repaired. Patch the source before running or resuming it."
+        ),
+        evidence=evidence,
     )
 
 

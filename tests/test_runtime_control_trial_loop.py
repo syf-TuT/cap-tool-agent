@@ -1867,6 +1867,117 @@ def test_capsule_llm_step_program_contract_blocks_effects_until_patch(
     assert "Capsule-ready program contract violations" not in str(prompts[2])
 
 
+def test_capsule_quarantined_repair_draft_patches_multiple_groups_without_execution(
+    tmp_path,
+):
+    env = FakeCustomMoveCapsuleEnv()
+    source = (
+        "def first():\n"
+        '    custom_move("one")\n'
+        "first()\n"
+        "\n"
+        "def second():\n"
+        '    custom_move("two")\n'
+        "second()\n"
+    )
+
+    trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 4,
+            "capsule_validate_program_contract": True,
+        },
+        initial_code=source,
+        scripted_actions=[
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": 'custom_move("one")\n'},
+            },
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_2", "source": 'custom_move("two")\n'},
+            },
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "invalid",
+        "success",
+        "success",
+    ]
+    assert trace[0]["event"]["evidence"]["source_revision_after"] == 1
+    assert trace[0]["event"]["evidence"]["repair_pending"] is True
+    assert trace[0]["event"]["evidence"]["remaining_violation_count"] == 1
+    assert trace[1]["event"]["evidence"]["safety_failure"] == (
+        "program_contract_violation"
+    )
+    assert trace[1]["event"]["evidence"]["repair_pending"] is True
+    assert trace[1]["event"]["evidence"]["remaining_violation_count"] == 1
+    assert trace[2]["event"]["evidence"]["source_revision_after"] == 2
+    assert trace[2]["event"]["evidence"]["repair_pending"] is False
+    assert trace[2]["event"]["evidence"]["remaining_violation_count"] == 0
+    assert env.api.moves == ["one"]
+    assert metrics[0]["program_contract_violation_count"] == 1
+    assert metrics[0]["source_revision_after"] == 1
+    assert metrics[2]["program_contract_valid"] is True
+
+
+def test_capsule_non_improving_repair_patch_is_rejected_atomically(tmp_path):
+    source = (
+        "def first():\n"
+        '    custom_move("one")\n'
+        "first()\n"
+        "\n"
+        "def second():\n"
+        '    custom_move("two")\n'
+        "second()\n"
+    )
+
+    summary = trial_module._run_capsule_loop(
+        FakeCustomMoveCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "capsule_validate_program_contract": True,
+        },
+        initial_code=source,
+        scripted_actions=[
+            {
+                "action": "patch_group",
+                "args": {
+                    "group_id": "group_1",
+                    "source": (
+                        "def first():\n"
+                        '    custom_move("changed")\n'
+                        "first()\n"
+                    ),
+                },
+            }
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    event = trace[0]["event"]
+
+    assert event["status"] == "invalid"
+    assert event["evidence"]["edit_rejection_reason"] == "repair_not_improving"
+    assert event["evidence"]["source_revision_before"] == 0
+    assert event["evidence"]["source_revision_after"] == 0
+    assert event["evidence"]["source_edit_committed"] is False
+    assert Path(summary.code_path).read_text() == source
+
+
 def test_capsule_llm_step_program_contract_flag_false_preserves_execution(tmp_path):
     env = FakePrivilegedCapsuleEnv()
 
