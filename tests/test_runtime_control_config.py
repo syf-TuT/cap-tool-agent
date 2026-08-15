@@ -149,6 +149,75 @@ def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
     assert "point-cloud" in docs
 
 
+def test_libero_object_privileged_capsule_yaml_uses_ground_truth_api():
+    repo_root = Path(__file__).resolve().parents[1]
+    config_path = (
+        repo_root
+        / "env_configs"
+        / "libero"
+        / "franka_libero_object_0_privileged_capsule_llm_step.yaml"
+    )
+    data = yaml.safe_load(config_path.read_text())
+    cfg = data["env"]["cfg"]
+    low_level = cfg["low_level"]
+
+    assert data["env"]["_target_"] == (
+        "capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv"
+    )
+    assert cfg["_target_"] == "capx.envs.tasks.base.CodeExecEnvConfig"
+    assert low_level["_target_"] == "capx.envs.simulators.libero.FrankaLiberoEnv"
+    assert low_level["suite_name"] == "libero_object"
+    assert low_level["task_id"] == 0
+    assert low_level["privileged"] is True
+    assert low_level["max_steps"] == 8000
+    assert low_level["control_freq"] == 20
+    assert cfg["privileged"] is True
+    assert cfg["apis"] == ["FrankaLiberoPrivilegedApi"]
+    assert "molmo_base_url" not in cfg
+    assert "molmo_model_name" not in cfg
+    assert data["agent_mode"] == "capsule"
+    assert data["max_capsule_steps"] == 24
+    assert data["capsule_execution_granularity"] == "semantic_group"
+    assert data["capsule_progress_mode"] == "sparse_terminal"
+    assert data["capsule_require_task_success_for_finish"] is True
+    assert data["capsule_validate_program_contract"] is True
+    assert data["capsule_action_visual_feedback"] is False
+    assert data["capsule_prompt_state_level"] == "full"
+    assert data["capsule_diagnostic_state_level"] == "full"
+    assert data["use_visual_feedback"] is False
+    assert data["use_wrist_camera"] is False
+    assert data["use_parallel_ensemble"] is False
+    assert data["record_video"] is True
+    assert data["output_dir"] == (
+        "./outputs/franka_libero_object_0_privileged_capsule_llm_step"
+    )
+    assert data["trials"] == 1
+    assert data["num_workers"] == 1
+    assert data["api_servers"] == [
+        {
+            "_target_": "capx.serving.launch_pyroki_server.main",
+            "port": 8116,
+            "host": "127.0.0.1",
+            "robot": "panda_description",
+            "target_link": "panda_hand",
+        }
+    ]
+
+    prompt = cfg["prompt"].lower()
+    assert "one complete executable python program" in prompt
+    assert "ground-truth object poses" in prompt
+    assert "public api functions" in prompt
+    assert "no imports" in prompt
+    assert "do not access the internal env or apis handles" in prompt
+    assert "use only direct calls to the public api functions" in prompt
+    assert "safe builtins" in prompt
+    assert "robot side effects must be top-level" in prompt
+    assert "use at most one robot side-effect api call per semantic group" in prompt
+    assert "you may write python code comments for reasoning" in prompt
+    assert "write only executable python code" in prompt
+    assert "do not use code fences" in prompt
+
+
 def test_code_exec_env_config_defaults_molmo_service_to_unspecified():
     cfg = CodeExecEnvConfig(low_level=object(), apis=[])
 
