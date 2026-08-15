@@ -51,6 +51,85 @@ from capx.runtime_control.schema import (
 from capx.runtime_control.trace import wrap_function_for_trace
 
 
+def _repair_violation(
+    *,
+    code="strict_subset_violation",
+    message="Strict Capsule subset violation: callable aliases are unavailable",
+    start_line=1,
+    end_line=1,
+    region_ids=("region_1",),
+    group_ids=("group_1",),
+    side_effect_calls=(),
+    helper_name=None,
+):
+    return ProgramContractViolation(
+        code=code,
+        message=message,
+        start_line=start_line,
+        end_line=end_line,
+        region_ids=region_ids,
+        group_ids=group_ids,
+        side_effect_calls=side_effect_calls,
+        helper_name=helper_name,
+    )
+
+
+def test_capsule_partial_repair_progress_accepts_proper_violation_submultiset():
+    alias_violation = _repair_violation()
+    helper_violation = _repair_violation(
+        code="effectful_helper",
+        message="Helper move_cube reaches a robot side effect",
+        start_line=4,
+        end_line=6,
+        region_ids=("region_3",),
+        group_ids=("group_2",),
+        side_effect_calls=("move_to",),
+        helper_name="move_cube",
+    )
+
+    assert trial_module._is_improving_capsule_repair(
+        [alias_violation, helper_violation],
+        [helper_violation],
+    )
+
+
+def test_capsule_partial_repair_progress_ignores_span_and_temporary_unit_ids():
+    previous = _repair_violation()
+    renumbered = _repair_violation(
+        start_line=9,
+        end_line=9,
+        region_ids=("region_8",),
+        group_ids=("group_7",),
+    )
+
+    assert not trial_module._is_improving_capsule_repair(
+        [previous],
+        [renumbered],
+    )
+
+
+def test_capsule_partial_repair_progress_rejects_replacement_violation():
+    previous = _repair_violation()
+    replacement = _repair_violation(
+        code="effectful_helper",
+        message="Helper move_cube reaches a robot side effect",
+        helper_name="move_cube",
+        side_effect_calls=("move_to",),
+    )
+
+    assert not trial_module._is_improving_capsule_repair(
+        [previous],
+        [replacement],
+    )
+
+
+def test_capsule_partial_repair_progress_accepts_fully_valid_candidate():
+    assert trial_module._is_improving_capsule_repair(
+        [_repair_violation()],
+        [],
+    )
+
+
 class FakeApi:
     def __init__(self):
         self.moved = False

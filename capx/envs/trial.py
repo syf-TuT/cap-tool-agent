@@ -23,6 +23,7 @@ import json
 import os
 import re
 import time
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -1412,6 +1413,35 @@ def _sort_contract_violations(
             violation.group_ids,
             violation.side_effect_calls,
         ),
+    )
+
+
+def _capsule_violation_fingerprint(
+    violation: ProgramContractViolation,
+) -> tuple[str, str, str, tuple[str, ...]]:
+    return (
+        violation.code,
+        " ".join(violation.message.split()),
+        violation.helper_name or "",
+        tuple(sorted(violation.side_effect_calls)),
+    )
+
+
+def _is_improving_capsule_repair(
+    current_violations: list[ProgramContractViolation],
+    candidate_violations: list[ProgramContractViolation],
+) -> bool:
+    current = Counter(
+        _capsule_violation_fingerprint(violation)
+        for violation in current_violations
+    )
+    candidate = Counter(
+        _capsule_violation_fingerprint(violation)
+        for violation in candidate_violations
+    )
+    return bool(current) and candidate != current and all(
+        count <= current[fingerprint]
+        for fingerprint, count in candidate.items()
     )
 
 
