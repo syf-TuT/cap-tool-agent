@@ -1260,11 +1260,21 @@ def _recovery_action_state(
     group_dependency_state: _GroupDependencyState,
 ) -> _RecoveryActionState:
     if not recovery_generations:
-        return _RecoveryActionState(True, None, (), ())
+        return _RecoveryActionState(
+            append_recovery_available=True,
+            append_recovery_block_reason=None,
+            pending_recovery_group_ids=(),
+            runnable_recovery_group_ids=(),
+        )
 
     generation = recovery_generations[-1]
     if _recovery_generation_complete(generation):
-        return _RecoveryActionState(True, None, (), ())
+        return _RecoveryActionState(
+            append_recovery_available=True,
+            append_recovery_block_reason=None,
+            pending_recovery_group_ids=(),
+            runnable_recovery_group_ids=(),
+        )
 
     pending_keys = set(generation.authorized_group_keys)
     if not generation.observation_satisfied:
@@ -1282,7 +1292,10 @@ def _recovery_action_state(
     runnable_group_ids = []
     for group in groups:
         group_key = lineage.group_key_by_id.get(group.group_id)
-        if group_key in pending_keys and group_key not in lineage.executed_group_keys:
+        if (
+            group_key in pending_keys
+            and group_key not in lineage.executed_group_keys
+        ):
             pending_group_ids.append(group.group_id)
         if (
             group.group_id in dependency_runnable
@@ -3375,6 +3388,19 @@ def _group_dependency_guard_event(
     )
 
 
+def _pending_recovery_evidence(
+    state: _RecoveryActionState,
+) -> dict[str, Any]:
+    return {
+        "safety_failure": "recovery_generation_pending",
+        "edit_rejection_reason": state.append_recovery_block_reason,
+        "pending_recovery_group_ids": list(state.pending_recovery_group_ids),
+        "runnable_recovery_group_ids": list(
+            state.runnable_recovery_group_ids
+        ),
+    }
+
+
 def _append_recovery_guard_event(
     action: RuntimeAction,
     state: _RecoveryActionState,
@@ -3390,16 +3416,7 @@ def _append_recovery_guard_event(
             "completes. Run a runnable recovery group or patch a pending recovery "
             "group."
         ),
-        evidence={
-            "safety_failure": "recovery_generation_pending",
-            "edit_rejection_reason": state.append_recovery_block_reason,
-            "pending_recovery_group_ids": list(
-                state.pending_recovery_group_ids
-            ),
-            "runnable_recovery_group_ids": list(
-                state.runnable_recovery_group_ids
-            ),
-        },
+        evidence=_pending_recovery_evidence(state),
     )
 
 
@@ -3407,17 +3424,14 @@ def _pending_recovery_group_guard_event(
     action: RuntimeAction,
     state: _RecoveryActionState,
 ) -> RuntimeEvent | None:
-    if state.append_recovery_available:
-        return None
-    if action.action == "run_group":
-        allowed_group_ids = state.pending_recovery_group_ids
-    elif action.action == "patch_group":
-        allowed_group_ids = state.pending_recovery_group_ids
-    else:
+    if state.append_recovery_available or action.action not in {
+        "run_group",
+        "patch_group",
+    }:
         return None
 
     group_id = str(action.args.get("group_id", ""))
-    if group_id in allowed_group_ids:
+    if group_id in state.pending_recovery_group_ids:
         return None
     return RuntimeEvent(
         action=action.action,
@@ -3426,16 +3440,7 @@ def _pending_recovery_group_guard_event(
         message=(
             f"{action.action} must target the latest pending recovery transaction."
         ),
-        evidence={
-            "safety_failure": "recovery_generation_pending",
-            "edit_rejection_reason": state.append_recovery_block_reason,
-            "pending_recovery_group_ids": list(
-                state.pending_recovery_group_ids
-            ),
-            "runnable_recovery_group_ids": list(
-                state.runnable_recovery_group_ids
-            ),
-        },
+        evidence=_pending_recovery_evidence(state),
     )
 
 
