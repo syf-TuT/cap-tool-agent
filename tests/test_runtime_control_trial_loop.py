@@ -6728,3 +6728,195 @@ def test_inspect_variables_requires_names():
 
     assert event.status == "invalid"
     assert "args.names" in event.message
+
+
+def test_repeated_variable_inspection_without_revision_change_is_invalid(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code="x = 1\ny = 2\n",
+        scripted_actions=[
+            {"action": "inspect_variables", "args": {"names": ["y", "x"]}},
+            {"action": "inspect_variables", "args": {"names": ["x", "y"]}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == ["success", "invalid"]
+    assert "no_new_variable_state" in trace[1]["event"]["message"]
+
+
+def test_variable_inspection_is_allowed_after_group_changes_namespace(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "inspect_variables", "args": {"names": ["x"]}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert [entry["event"]["status"] for entry in trace] == [
+        "success",
+        "success",
+        "success",
+    ]
+    assert trace[0]["event"]["evidence"]["x"] == {
+        "type": "NoneType",
+        "repr": "None",
+    }
+    assert trace[2]["event"]["evidence"]["x"] == {"type": "int", "repr": "1"}
+
+
+def test_capsule_trial_metrics_distinguish_llm_decisions_and_provider_attempts(
+    tmp_path, monkeypatch
+):
+    def fake_query_model(args, prompt):
+        context = get_trial_llm_context()
+        assert context is not None
+        call_index = context.next_call_index()
+        for attempt, outcome, retry_scheduled in (
+            (1, "retryable_http_error", True),
+            (2, "success", False),
+        ):
+            context.record_attempt(
+                call_index=call_index,
+                attempt=attempt,
+                mode="nonstreaming",
+                http_status=503 if retry_scheduled else 200,
+                ttfb_ms=1,
+                first_content_ms=1,
+                started_monotonic=float(attempt),
+                finished_monotonic=float(attempt) + 0.001,
+                remaining_before_ms=None,
+                outcome=outcome,
+                error_kind="http_5xx" if retry_scheduled else None,
+                retry_scheduled=retry_scheduled,
+            )
+        return {"content": '{"action":"finish","args":{}}'}
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    with trial_llm_context(trial=0) as context:
+        initial_call_index = context.next_call_index()
+        context.record_attempt(
+            call_index=initial_call_index,
+            attempt=1,
+            mode="nonstreaming",
+            http_status=200,
+            ttfb_ms=1,
+            first_content_ms=1,
+            started_monotonic=0.0,
+            finished_monotonic=0.001,
+            remaining_before_ms=None,
+            outcome="success",
+            error_kind=None,
+            retry_scheduled=False,
+        )
+        summary = trial_module._run_capsule_loop(
+            FakeIncompleteCapsuleEnv(),
+            trial=0,
+            args=SimpleNamespace(model="test", use_oracle_code=False),
+            config={"output_dir": str(tmp_path), "max_capsule_steps": 1},
+            initial_code="x = 1\n",
+        )
+
+    trial_metrics = json.loads(
+        (tmp_path / "capsule_trial_metrics_trial_00.json").read_text()
+    )
+
+    assert trial_metrics == {
+        "logical_decision_count": 1,
+        "llm_decision_count": 1,
+        "scripted_decision_count": 0,
+        "provider_attempt_count": 2,
+        "attempted_group_count": 0,
+        "post_action_observation_count": 0,
+        "source_edit_attempt_count": 0,
+        "committed_source_edit_count": 0,
+        "append_attempt_count": 0,
+        "committed_append_count": 0,
+        "blocked_replay_count": 0,
+        "duplicate_variable_inspection_count": 0,
+        "budget_exhausted": False,
+    }
+    assert summary.num_finishes == 1
+    assert "Capsule Metrics:" in summary.log
+    assert "logical_decision_count" in summary.log
+
+
+def test_capsule_trial_metrics_count_group_observations_and_budget_outcomes(tmp_path):
+    summary = trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 5},
+        initial_code='move_to("first")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "inspect_variables", "args": {"names": ["missing"]}},
+            {"action": "inspect_variables", "args": {"names": ["missing"]}},
+            {
+                "action": "append_recovery",
+                "args": {"source": "state = get_observation()"},
+            },
+        ],
+    )
+
+    trial_metrics = json.loads(
+        (tmp_path / "capsule_trial_metrics_trial_00.json").read_text()
+    )
+    serialized_metrics = json.dumps(trial_metrics)
+
+    assert trial_metrics == {
+        "logical_decision_count": 5,
+        "llm_decision_count": 0,
+        "scripted_decision_count": 5,
+        "provider_attempt_count": 0,
+        "attempted_group_count": 2,
+        "post_action_observation_count": 2,
+        "source_edit_attempt_count": 1,
+        "committed_source_edit_count": 1,
+        "append_attempt_count": 1,
+        "committed_append_count": 1,
+        "blocked_replay_count": 1,
+        "duplicate_variable_inspection_count": 1,
+        "budget_exhausted": True,
+    }
+    assert summary.truncated is True
+    assert "pending_recovery" not in serialized_metrics
+    assert "auto_forward" not in serialized_metrics
+
+
+def test_capsule_trial_metrics_finalize_on_task_success(tmp_path):
+    summary = trial_module._run_capsule_loop(
+        FakeCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trial_metrics = json.loads(
+        (tmp_path / "capsule_trial_metrics_trial_00.json").read_text()
+    )
+
+    assert summary.sandbox_rc == 0
+    assert trial_metrics["logical_decision_count"] == 1
+    assert trial_metrics["attempted_group_count"] == 1
+    assert trial_metrics["post_action_observation_count"] == 1
+    assert trial_metrics["budget_exhausted"] is False

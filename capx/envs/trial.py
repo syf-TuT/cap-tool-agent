@@ -48,7 +48,7 @@ from capx.llm.client import (
 from capx.llm.client import (
     query_single_model_ensemble as _query_single_model_ensemble,
 )
-from capx.llm.context import llm_call_stage
+from capx.llm.context import get_trial_llm_context, llm_call_stage
 from capx.runtime_control import (
     CapsuleExecutor,
     CodeRegion,
@@ -1782,8 +1782,24 @@ def _run_capsule_loop(
         config.get("capsule_require_task_success_for_finish", False)
     )
     latest_post_action_observation: PostActionObservation | None = None
+    namespace_revision = 0
+    inspected_variable_states: set[tuple[int, int, int, tuple[str, ...]]] = set()
+    logical_decision_count = 0
+    llm_decision_count = 0
+    scripted_decision_count = 0
+    attempted_group_count = 0
+    post_action_observation_count = 0
+    source_edit_attempt_count = 0
+    committed_source_edit_count = 0
+    append_attempt_count = 0
+    committed_append_count = 0
+    blocked_replay_count = 0
+    duplicate_variable_inspection_count = 0
+    provider_attempt_count_baseline = _capsule_provider_attempt_count()
 
     for step_id in range(1, max_steps + 1):
+        logical_decision_count += 1
+        provider_attempt_count_before = _capsule_provider_attempt_count()
         trace_revision_before = executor.trace.mark()
         action: RuntimeAction | None = None
         action_unit_key: str | None = None
@@ -1813,13 +1829,16 @@ def _run_capsule_loop(
         group_execution_trace_mark: int | None = None
         group_observation_before_state: dict[str, Any] | None = None
         group_new_trace_events: list[dict[str, Any]] = []
+        inspection_key: tuple[int, int, int, tuple[str, ...]] | None = None
 
         try:
             if script is not None and script_idx < len(script):
                 action_origin = "scripted"
+                scripted_decision_count += 1
                 action = RuntimeAction.from_mapping(script[script_idx])
                 script_idx += 1
             else:
+                llm_decision_count += 1
                 prompt = build_capsule_prompt(
                     task=_task_text_from_obs(obs),
                     regions=regions,
@@ -1884,6 +1903,12 @@ def _run_capsule_loop(
                 action = parse_runtime_action_response(response["content"])
             action.step_id = step_id
             action_unit_key = _runtime_action_unit_key(action, lineage)
+            if action.action == "run_group":
+                attempted_group_count += 1
+            if action.action in {"patch_region", "patch_group", "append_recovery"}:
+                source_edit_attempt_count += 1
+            if action.action == "append_recovery":
+                append_attempt_count += 1
         except ValueError as exc:
             event = RuntimeEvent(
                 action="invalid",
@@ -1945,6 +1970,28 @@ def _run_capsule_loop(
                     recovery_observation_functions=recovery_observation_functions,
                 )
             if event is None:
+                inspection_key = _variable_inspection_key(
+                    action,
+                    source_revision=source_revision.revision,
+                    trace_revision=executor.trace.mark(),
+                    namespace_revision=namespace_revision,
+                )
+                if (
+                    inspection_key is not None
+                    and inspection_key in inspected_variable_states
+                ):
+                    event = RuntimeEvent(
+                        action="inspect_variables",
+                        status="invalid",
+                        message=(
+                            "no_new_variable_state: the same variables were already "
+                            "inspected without a source, trace, or namespace revision"
+                        ),
+                        evidence={
+                            "diagnostic_failure": "no_new_variable_state",
+                        },
+                    )
+            if event is None:
                 recovery_authorization = _recovery_authorization_for_action(
                     action,
                     lineage=lineage,
@@ -1959,6 +2006,12 @@ def _run_capsule_loop(
                     group_by_id,
                     recovery_observation_functions=recovery_observation_functions,
                 )
+                if (
+                    action.action == "inspect_variables"
+                    and event.status == "success"
+                    and inspection_key is not None
+                ):
+                    inspected_variable_states.add(inspection_key)
                 prepared_trace_commit = _prepare_runtime_trace_commit(
                     action,
                     event,
@@ -2059,6 +2112,9 @@ def _run_capsule_loop(
                         event.evidence["recovery_generation_id"] = (
                             generation.generation_id
                         )
+                        committed_append_count += 1
+                    committed_source_edit_count += 1
+                    namespace_revision += 1
                     _annotate_source_edit_event(
                         event,
                         source_revision_before=action_source_revision,
@@ -2078,6 +2134,15 @@ def _run_capsule_loop(
                         lineage_reconciliation_status=lineage_status,
                         edit_rejection_reason=rejection_reason,
                     )
+            if (
+                action.action in {"run_group", "run_region", "resume_from_region"}
+                and event.status == "success"
+            ):
+                namespace_revision += 1
+            if event.evidence.get("safety_failure") == "side_effect_replay":
+                blocked_replay_count += 1
+            if event.evidence.get("diagnostic_failure") == "no_new_variable_state":
+                duplicate_variable_inspection_count += 1
             safety_failed = safety_failed or _capsule_event_has_safety_failure(
                 event
             )
@@ -2178,6 +2243,7 @@ def _run_capsule_loop(
                 ),
                 safety_failure=_post_action_safety_failure(event),
             )
+            post_action_observation_count += 1
             latest_post_action_observation = post_action_observation
 
         history_entry = {
@@ -2207,6 +2273,16 @@ def _run_capsule_loop(
         metric["unit_key"] = action_unit_key
         metric["source_revision"] = action_source_revision
         metric["action_origin"] = action_origin
+        metric["logical_decision_id"] = logical_decision_count
+        metric["llm_decision_id"] = (
+            llm_decision_count if action_origin == "llm" else None
+        )
+        metric["provider_attempt_count"] = (
+            _capsule_provider_attempt_count() - provider_attempt_count_before
+        )
+        metric["group_execution_attempted"] = bool(
+            action is not None and action.action == "run_group"
+        )
         for field in (
             "source_revision_before",
             "source_revision_after",
@@ -2292,6 +2368,28 @@ def _run_capsule_loop(
     )
     if budget_exhausted and step_metrics:
         step_metrics[-1]["budget_exhausted"] = True
+    if post_action_observation_count != attempted_group_count:
+        raise AssertionError(
+            "Capsule post-action observation count must equal attempted run_group count: "
+            f"{post_action_observation_count} != {attempted_group_count}"
+        )
+    trial_metrics = {
+        "logical_decision_count": logical_decision_count,
+        "llm_decision_count": llm_decision_count,
+        "scripted_decision_count": scripted_decision_count,
+        "provider_attempt_count": (
+            _capsule_provider_attempt_count() - provider_attempt_count_baseline
+        ),
+        "attempted_group_count": attempted_group_count,
+        "post_action_observation_count": post_action_observation_count,
+        "source_edit_attempt_count": source_edit_attempt_count,
+        "committed_source_edit_count": committed_source_edit_count,
+        "append_attempt_count": append_attempt_count,
+        "committed_append_count": committed_append_count,
+        "blocked_replay_count": blocked_replay_count,
+        "duplicate_variable_inspection_count": duplicate_variable_inspection_count,
+        "budget_exhausted": budget_exhausted,
+    }
     sandbox_rc = (
         0
         if task_succeeded and not recoverable_failed and not safety_failed
@@ -2310,6 +2408,11 @@ def _run_capsule_loop(
         with open(metrics_path, "w") as f:
             for metric in step_metrics:
                 f.write(json.dumps(metric, default=str) + "\n")
+        trial_metrics_path = os.path.join(
+            output_dir, f"capsule_trial_metrics_trial_{trial:02d}.json"
+        )
+        with open(trial_metrics_path, "w") as f:
+            json.dump(trial_metrics, f, indent=2)
         if diagnostic_state_level != "none":
             diagnostics_path = os.path.join(
                 output_dir, f"capsule_diagnostics_trial_{trial:02d}.jsonl"
@@ -2346,6 +2449,7 @@ def _run_capsule_loop(
         f"Reward: {reward}\n"
         f"Task Completed: {task_completed}\n"
         f"Budget Exhausted: {budget_exhausted}\n"
+        f"Capsule Metrics: {json.dumps(trial_metrics)}\n"
         f"Visual Audit: {json.dumps(visual_audit)}"
     )
     return TrialSummary(
@@ -2458,6 +2562,37 @@ def _annotate_source_edit_event(
     )
     if edit_rejection_reason is not None:
         event.evidence["edit_rejection_reason"] = edit_rejection_reason
+
+
+def _capsule_provider_attempt_count() -> int:
+    context = get_trial_llm_context()
+    if context is None:
+        return 0
+    return int(context.summary().get("attempt_count", 0))
+
+
+def _variable_inspection_key(
+    action: RuntimeAction,
+    *,
+    source_revision: int,
+    trace_revision: int,
+    namespace_revision: int,
+) -> tuple[int, int, int, tuple[str, ...]] | None:
+    if action.action != "inspect_variables":
+        return None
+    names = action.args.get("names", [])
+    if (
+        not isinstance(names, list)
+        or not names
+        or not all(isinstance(name, str) for name in names)
+    ):
+        return None
+    return (
+        source_revision,
+        trace_revision,
+        namespace_revision,
+        tuple(sorted(names)),
+    )
 
 
 def _execute_runtime_action(
