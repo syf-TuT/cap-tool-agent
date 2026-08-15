@@ -1207,6 +1207,7 @@ class _GroupDependencyState:
 class _RecoveryActionState:
     append_recovery_available: bool
     append_recovery_block_reason: str | None
+    pending_recovery_group_ids: tuple[str, ...]
     runnable_recovery_group_ids: tuple[str, ...]
 
 
@@ -1243,21 +1244,31 @@ def _group_dependency_state(
     )
 
 
+def _recovery_generation_complete(generation: RecoveryGeneration) -> bool:
+    return (
+        generation.observation_satisfied
+        and not generation.authorized_group_keys
+        and not generation.authorized_region_keys
+    )
+
+
 def _recovery_action_state(
     groups: list[CodeRegionGroup],
     *,
     lineage: UnitLineage,
     recovery_generations: list[RecoveryGeneration],
     group_dependency_state: _GroupDependencyState,
-    trace_revision: int,
 ) -> _RecoveryActionState:
-    if (
-        not recovery_generations
-        or trace_revision > recovery_generations[-1].append_trace_revision
-    ):
-        return _RecoveryActionState(True, None, ())
+    if not recovery_generations:
+        return _RecoveryActionState(True, None, (), ())
 
     generation = recovery_generations[-1]
+    if _recovery_generation_complete(generation):
+        return _RecoveryActionState(True, None, (), ())
+
+    pending_keys = set(generation.authorized_group_keys)
+    if not generation.observation_satisfied:
+        pending_keys.update(generation.observation_group_keys)
     runnable_keys = set(generation.observation_group_keys)
     if generation.observation_satisfied:
         runnable_keys.update(generation.authorized_group_keys)
@@ -1267,9 +1278,12 @@ def _recovery_action_state(
             & generation.inline_observation_group_keys
         )
     dependency_runnable = set(group_dependency_state.runnable_group_ids)
+    pending_group_ids = []
     runnable_group_ids = []
     for group in groups:
         group_key = lineage.group_key_by_id.get(group.group_id)
+        if group_key in pending_keys and group_key not in lineage.executed_group_keys:
+            pending_group_ids.append(group.group_id)
         if (
             group.group_id in dependency_runnable
             and group_key in runnable_keys
@@ -1278,9 +1292,8 @@ def _recovery_action_state(
             runnable_group_ids.append(group.group_id)
     return _RecoveryActionState(
         append_recovery_available=False,
-        append_recovery_block_reason=(
-            "no_new_physical_state_since_last_append"
-        ),
+        append_recovery_block_reason="recovery_generation_pending",
+        pending_recovery_group_ids=tuple(pending_group_ids),
         runnable_recovery_group_ids=tuple(runnable_group_ids),
     )
 
@@ -1349,14 +1362,13 @@ def _prepare_capsule_source_edit(
     if (
         action.action == "append_recovery"
         and recovery_generations
-        and trace_revision <= recovery_generations[-1].append_trace_revision
+        and not _recovery_generation_complete(recovery_generations[-1])
     ):
         raise _SourceEditRejection(
-            "no_new_physical_state_since_last_append",
+            "recovery_generation_pending",
             (
-                "append_recovery requires new physical trace evidence after the "
-                "previous recovery append. Execute the existing recovery source "
-                "first; a patch alone does not unlock another append."
+                "append_recovery is unavailable while the latest recovery generation "
+                "still has pending observation or side-effect groups."
             ),
         )
     candidate_boundaries = _updated_group_boundaries_after_edit(
@@ -1367,6 +1379,14 @@ def _prepare_capsule_source_edit(
         line_delta=line_delta,
         old_line_count=old_line_count,
     )
+    if action.action == "append_recovery":
+        for group in groups:
+            group_key = lineage.group_key_by_id.get(group.group_id)
+            if group_key not in lineage.executed_group_keys:
+                continue
+            if group.start_line > 1:
+                candidate_boundaries.add(group.start_line - 1)
+            candidate_boundaries.add(group.end_line)
     candidate_analysis = _analyze_capsule_source(
         candidate_source,
         use_semantic_groups=use_semantic_groups,
@@ -2022,7 +2042,6 @@ def _run_capsule_loop(
             lineage=lineage,
             recovery_generations=recovery_generations,
             group_dependency_state=group_dependency_state,
-            trace_revision=executor.trace.mark(),
         )
 
         try:
@@ -2057,7 +2076,10 @@ def _run_capsule_loop(
                     latest_observation=latest_post_action_observation,
                     source_revision=source_revision.revision,
                     runnable_group_ids=list(
-                        group_dependency_state.runnable_group_ids
+                        recovery_action_state.runnable_recovery_group_ids
+                        if not recovery_action_state.append_recovery_available
+                        and use_semantic_groups
+                        else group_dependency_state.runnable_group_ids
                     ),
                     blocked_group_dependencies={
                         group_id: list(missing)
@@ -2172,6 +2194,11 @@ def _run_capsule_loop(
                 )
             if event is None:
                 event = _append_recovery_guard_event(
+                    action,
+                    recovery_action_state,
+                )
+            if event is None:
+                event = _pending_recovery_group_guard_event(
                     action,
                     recovery_action_state,
                 )
@@ -3356,13 +3383,52 @@ def _append_recovery_guard_event(
         status="invalid",
         region_id=_runtime_action_unit_id(action),
         message=(
-            "append_recovery is unavailable until a fresh physical trace is "
-            "recorded after the previous recovery append. Execute an existing "
-            "recovery group first; a patch alone does not unlock another append."
+            "append_recovery is unavailable until the latest recovery transaction "
+            "completes. Run a runnable recovery group or patch a pending recovery "
+            "group."
         ),
         evidence={
-            "safety_failure": "append_recovery_unavailable",
+            "safety_failure": "recovery_generation_pending",
             "edit_rejection_reason": state.append_recovery_block_reason,
+            "pending_recovery_group_ids": list(
+                state.pending_recovery_group_ids
+            ),
+            "runnable_recovery_group_ids": list(
+                state.runnable_recovery_group_ids
+            ),
+        },
+    )
+
+
+def _pending_recovery_group_guard_event(
+    action: RuntimeAction,
+    state: _RecoveryActionState,
+) -> RuntimeEvent | None:
+    if state.append_recovery_available:
+        return None
+    if action.action == "run_group":
+        allowed_group_ids = state.pending_recovery_group_ids
+    elif action.action == "patch_group":
+        allowed_group_ids = state.pending_recovery_group_ids
+    else:
+        return None
+
+    group_id = str(action.args.get("group_id", ""))
+    if group_id in allowed_group_ids:
+        return None
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=group_id or None,
+        message=(
+            f"{action.action} must target the latest pending recovery transaction."
+        ),
+        evidence={
+            "safety_failure": "recovery_generation_pending",
+            "edit_rejection_reason": state.append_recovery_block_reason,
+            "pending_recovery_group_ids": list(
+                state.pending_recovery_group_ids
+            ),
             "runnable_recovery_group_ids": list(
                 state.runnable_recovery_group_ids
             ),

@@ -6796,10 +6796,13 @@ def test_pending_recovery_blocks_unrelated_runnable_group(tmp_path):
     rows = _capsule_step_metrics(
         tmp_path / "capsule_step_metrics_trial_00.jsonl"
     )
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
 
     assert rows[1]["event_status"] == "invalid"
-    assert rows[1]["safety_failure"] == "recovery_generation_pending"
-    assert rows[1]["event_evidence"]["runnable_recovery_group_ids"] == [
+    assert trace[1]["event"]["evidence"]["safety_failure"] == (
+        "recovery_generation_pending"
+    )
+    assert trace[1]["event"]["evidence"]["runnable_recovery_group_ids"] == [
         "group_2"
     ]
 
@@ -6832,10 +6835,13 @@ def test_pending_recovery_blocks_patch_outside_latest_generation(tmp_path):
     rows = _capsule_step_metrics(
         tmp_path / "capsule_step_metrics_trial_00.jsonl"
     )
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
 
     assert rows[1]["event_status"] == "invalid"
-    assert rows[1]["safety_failure"] == "recovery_generation_pending"
-    assert rows[1]["event_evidence"]["pending_recovery_group_ids"] == [
+    assert trace[1]["event"]["evidence"]["safety_failure"] == (
+        "recovery_generation_pending"
+    )
+    assert trace[1]["event"]["evidence"]["pending_recovery_group_ids"] == [
         "group_2",
         "group_3",
     ]
@@ -6939,6 +6945,14 @@ def test_later_append_reconciles_all_generation_keys_after_group_bounding():
     original_authorized_keys = set(
         first.recovery_generations[0].authorized_group_keys
     )
+    first.recovery_generations[0].observation_satisfied = True
+    first.recovery_generations[0].executed_group_keys.update(
+        first.recovery_generations[0].authorized_group_keys
+    )
+    first.lineage.executed_group_keys.update(
+        first.recovery_generations[0].authorized_group_keys
+    )
+    first.recovery_generations[0].authorized_group_keys.clear()
     second_source = trial_module._append_recovery_source(
         first.source,
         (
@@ -6973,7 +6987,8 @@ def test_later_append_reconciles_all_generation_keys_after_group_bounding():
 
     assert first_generation.authorized_group_keys <= current_group_keys
     assert first_generation.executed_group_keys <= current_group_keys
-    assert original_authorized_keys != first_generation.authorized_group_keys
+    assert first_generation.authorized_group_keys == set()
+    assert first_generation.executed_group_keys == original_authorized_keys
 
 
 def test_runtime_variable_summary_includes_only_small_array_values():
