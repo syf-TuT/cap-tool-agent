@@ -35,6 +35,7 @@ from PIL import Image
 
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
+from capx.envs.trial_results import RunOutcome
 from capx.llm.client import (
     VLM_MODELS,
     ModelQueryArgs,
@@ -2288,6 +2289,9 @@ def _run_capsule_loop(
         metric["group_execution_attempted"] = bool(
             action is not None and action.action == "run_group"
         )
+        metric["robot_side_effect_executed"] = _event_has_side_effect_trace(
+            event, side_effect_calls
+        )
         for field in (
             "source_revision_before",
             "source_revision_after",
@@ -2371,6 +2375,8 @@ def _run_capsule_loop(
     budget_exhausted = (
         loop_exit_reason is None and not finished and not task_succeeded
     )
+    if loop_exit_reason is None:
+        loop_exit_reason = "task_success" if task_succeeded else "budget_exhausted"
     if budget_exhausted and step_metrics:
         step_metrics[-1]["budget_exhausted"] = True
     if post_action_observation_count != attempted_group_count:
@@ -2394,7 +2400,9 @@ def _run_capsule_loop(
         "blocked_replay_count": blocked_replay_count,
         "duplicate_variable_inspection_count": duplicate_variable_inspection_count,
         "budget_exhausted": budget_exhausted,
+        "loop_exit_reason": loop_exit_reason,
     }
+    run_outcome = _capsule_run_outcome(loop_exit_reason)
     sandbox_rc = (
         0
         if task_succeeded and not recoverable_failed and not safety_failed
@@ -2454,6 +2462,7 @@ def _run_capsule_loop(
         f"Reward: {reward}\n"
         f"Task Completed: {task_completed}\n"
         f"Budget Exhausted: {budget_exhausted}\n"
+        f"Loop Exit Reason: {loop_exit_reason}\n"
         f"Capsule Metrics: {json.dumps(trial_metrics)}\n"
         f"Visual Audit: {json.dumps(visual_audit)}"
     )
@@ -2470,6 +2479,7 @@ def _run_capsule_loop(
         num_regenerations=0,
         num_finishes=1 if finished else 0,
         num_code_blocks=executed_regions,
+        run_outcome=run_outcome.value,
     )
 
 
@@ -2574,6 +2584,15 @@ def _capsule_provider_attempt_count() -> int:
     if context is None:
         return 0
     return int(context.summary().get("attempt_count", 0))
+
+
+def _capsule_run_outcome(loop_exit_reason: str) -> RunOutcome:
+    return {
+        "accepted_finish": RunOutcome.FINISHED,
+        "task_success": RunOutcome.FINISHED,
+        "failed_event": RunOutcome.EXECUTION_FAILED,
+        "budget_exhausted": RunOutcome.TRIAL_BUDGET_EXHAUSTED,
+    }[loop_exit_reason]
 
 
 def _variable_inspection_key(

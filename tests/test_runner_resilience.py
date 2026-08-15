@@ -267,6 +267,29 @@ def test_normal_task_failure_is_finished_not_infrastructure_failure(tmp_path, mo
     assert summary.failure_kind is None
 
 
+@pytest.mark.parametrize(
+    "preclassified_outcome",
+    ["execution_failed", "trial_budget_exhausted"],
+)
+def test_runner_preserves_preclassified_trial_summary_outcome(
+    tmp_path, monkeypatch, preclassified_outcome
+):
+    def preclassified_trial(*args, **kwargs):
+        summary = _summary(reward=0.0, completed=False)
+        summary.run_outcome = preclassified_outcome
+        return summary
+
+    monkeypatch.setattr(runner, "_run_single_trial", preclassified_trial)
+
+    summary = runner._run_single_trial_with_timeout(
+        object(), 1, _args(), _config(tmp_path), None, timeout_s=450
+    )
+    result = json.loads((tmp_path / "trial_1_result.json").read_text())
+
+    assert summary.run_outcome == preclassified_outcome
+    assert result["run_outcome"] == preclassified_outcome
+
+
 def test_summary_uses_only_finished_trials_for_reward_and_reports_outcomes(tmp_path, capsys):
     summaries = [
         _summary(reward=1.0, completed=True),

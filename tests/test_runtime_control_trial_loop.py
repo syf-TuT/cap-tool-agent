@@ -6974,10 +6974,13 @@ def test_capsule_trial_metrics_distinguish_llm_decisions_and_provider_attempts(
         "blocked_replay_count": 0,
         "duplicate_variable_inspection_count": 0,
         "budget_exhausted": False,
+        "loop_exit_reason": "accepted_finish",
     }
     assert summary.num_finishes == 1
+    assert summary.run_outcome == "finished"
     assert "Capsule Metrics:" in summary.log
     assert "logical_decision_count" in summary.log
+    assert "Loop Exit Reason: accepted_finish" in summary.log
 
 
 def test_capsule_trial_metrics_count_group_observations_and_budget_outcomes(tmp_path):
@@ -7018,8 +7021,10 @@ def test_capsule_trial_metrics_count_group_observations_and_budget_outcomes(tmp_
         "blocked_replay_count": 1,
         "duplicate_variable_inspection_count": 1,
         "budget_exhausted": True,
+        "loop_exit_reason": "budget_exhausted",
     }
     assert summary.truncated is True
+    assert summary.run_outcome == "trial_budget_exhausted"
     assert "pending_recovery" not in serialized_metrics
     assert "auto_forward" not in serialized_metrics
 
@@ -7046,6 +7051,96 @@ def test_capsule_trial_metrics_finalize_on_task_success(tmp_path):
     assert trial_metrics["attempted_group_count"] == 1
     assert trial_metrics["post_action_observation_count"] == 1
     assert trial_metrics["budget_exhausted"] is False
+    assert trial_metrics["loop_exit_reason"] == "task_success"
+    assert summary.run_outcome == "finished"
+
+
+def test_capsule_trial_metrics_finalize_failed_event_outcome(tmp_path):
+    summary = trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {"action": "inspect_variables", "args": {"names": []}},
+            {"action": "finish", "args": {}},
+        ],
+        stop_after_failed_event=True,
+    )
+
+    trial_metrics = json.loads(
+        (tmp_path / "capsule_trial_metrics_trial_00.json").read_text()
+    )
+
+    assert trial_metrics["loop_exit_reason"] == "failed_event"
+    assert trial_metrics["budget_exhausted"] is False
+    assert summary.run_outcome == "execution_failed"
+    assert "Loop Exit Reason: failed_event" in summary.log
+
+
+def test_capsule_step_metric_marks_successful_robot_side_effect_execution(tmp_path):
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 1},
+        initial_code='move_to("once")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+
+    assert rows[0]["event_status"] == "success"
+    assert rows[0]["robot_side_effect_executed"] is True
+
+
+def test_capsule_step_metric_distinguishes_partial_side_effect_from_guard_replay(
+    tmp_path, monkeypatch
+):
+    def single_failing_side_effect_group(source, regions, **kwargs):
+        return [
+            CodeRegionGroup(
+                group_id="group_1",
+                start_line=1,
+                end_line=2,
+                source=source,
+                region_ids=[region.region_id for region in regions],
+                primitive_calls=["move_to"],
+                defined_names=[],
+                used_names=["move_to"],
+                has_robot_side_effect=True,
+            )
+        ]
+
+    monkeypatch.setattr(
+        trial_module,
+        "segment_python_code_groups",
+        single_failing_side_effect_group,
+    )
+
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        initial_code='move_to("once")\nraise RuntimeError("boom")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+
+    assert [row["event_status"] for row in rows] == ["failed", "invalid"]
+    assert [row["robot_side_effect_executed"] for row in rows] == [True, False]
 
 
 def test_failed_group_execution_refreshes_variable_inspection_namespace(tmp_path):

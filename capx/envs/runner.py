@@ -320,11 +320,16 @@ def _run_single_trial_with_timeout(
             summary = _run_single_trial(
                 env, trial, args, config, multi_turn_prompt, partial_artifacts=partial_artifacts
             )
+            outcome = (
+                RunOutcome(summary.run_outcome)
+                if summary.run_outcome is not None
+                else RunOutcome.FINISHED
+            )
             return _finalize_trial(
                 summary=summary,
                 writer=writer,
                 llm_context=llm_context,
-                outcome=RunOutcome.FINISHED,
+                outcome=outcome,
                 started_monotonic=trial_started_monotonic,
             )
     except TrialResultPersistenceError as exc:
