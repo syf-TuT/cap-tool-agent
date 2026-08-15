@@ -100,4 +100,3 @@ Regression coverage must prove:
 - a valid current source cannot be degraded into an invalid draft;
 - syntax-invalid candidates and executed-unit edits remain atomic rejections;
 - prompt and metrics expose repair-pending state and remaining diagnostics.
-
