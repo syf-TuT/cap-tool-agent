@@ -421,6 +421,64 @@ def _stub_capsule_model_actions(monkeypatch, actions):
     monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
 
 
+def test_run_group_blocks_missing_source_dependencies(tmp_path):
+    env = FakeIncompleteCapsuleEnv()
+
+    trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code='target = get_pose("basket")\nmove_to(target)\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    first_event = trace[0]["event"]
+    assert first_event["status"] == "invalid"
+    assert first_event["evidence"]["safety_failure"] == (
+        "missing_group_dependencies"
+    )
+    assert first_event["evidence"]["missing_dependencies"] == ["target"]
+    assert first_event["evidence"]["runnable_group_ids"] == ["group_1"]
+    assert env.api.moved is False
+
+
+def test_run_group_allows_dependency_after_prerequisite_executes(tmp_path):
+    env = FakeIncompleteCapsuleEnv()
+
+    trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code='target = get_pose("basket")\nmove_to(target)\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_group", "args": {"group_id": "group_2"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    assert [entry["event"]["status"] for entry in trace[:2]] == [
+        "success",
+        "success",
+    ]
+    assert env.api.moved is True
+
+
 def test_capsule_state_level_proprioceptive_excludes_object_truth():
     snapshot = trial_module._capsule_state_snapshot(
         FakeLiberoCapsuleEnv(), state_level="proprioceptive"

@@ -102,6 +102,8 @@ def build_capsule_prompt(
     prompt_char_budget: int | None = None,
     latest_observation: PostActionObservation | None = None,
     source_revision: int | None = None,
+    runnable_group_ids: list[str] | None = None,
+    blocked_group_dependencies: dict[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     recovery_functions = sorted(
         {"get_observation"}
@@ -138,7 +140,19 @@ def build_capsule_prompt(
         recovery_rule = recovery_guidance
     uses_semantic_groups = groups is not None
     normalized_side_effect_ledger = _normalize_side_effect_ledger(side_effect_ledger)
-    run_group_example_id = _example_group_id(groups or [], normalized_side_effect_ledger)
+    group_availability = _normalize_group_availability(
+        runnable_group_ids,
+        blocked_group_dependencies,
+    )
+    run_group_example_id = _example_group_id(
+        groups or [],
+        normalized_side_effect_ledger,
+        runnable_group_ids=(
+            group_availability["runnable_group_ids"]
+            if group_availability is not None
+            else None
+        ),
+    )
     run_region_example_id = _example_region_id(regions, normalized_side_effect_ledger)
     if uses_semantic_groups:
         if repair_pending:
@@ -257,6 +271,7 @@ def build_capsule_prompt(
         run_region_example_id=run_region_example_id,
         latest_observation=latest_observation,
         source_revision=source_revision,
+        group_availability=group_availability,
     )
     if compact_context and _prompt_text_over_budget(prompt_text, prompt_char_budget):
         prompt_text = _build_capsule_prompt_text(
@@ -294,6 +309,7 @@ def build_capsule_prompt(
             run_region_example_id=run_region_example_id,
             latest_observation=latest_observation,
             source_revision=source_revision,
+            group_availability=group_availability,
         )
     if (
         compact_context
@@ -336,6 +352,7 @@ def build_capsule_prompt(
             run_region_example_id=run_region_example_id,
             latest_observation=latest_observation,
             source_revision=source_revision,
+            group_availability=group_availability,
         )
     if (
         compact_context
@@ -374,6 +391,7 @@ def build_capsule_prompt(
             run_region_example_id=run_region_example_id,
             latest_observation=latest_observation,
             source_revision=source_revision,
+            group_availability=group_availability,
         )
     return _capsule_prompt_messages(prompt_text)
 
@@ -414,6 +432,7 @@ def _build_capsule_prompt_text(
     run_region_example_id: str,
     latest_observation: PostActionObservation | None,
     source_revision: int | None,
+    group_availability: dict[str, Any] | None,
 ) -> str:
     if compact_context:
         region_units = [
@@ -460,6 +479,11 @@ def _build_capsule_prompt_text(
         group_units,
         id_key="group_id",
         executed_ids=set(side_effect_ledger["executed_side_effect_groups"]),
+        blocked_dependencies=(
+            group_availability["blocked_group_dependencies"]
+            if group_availability is not None
+            else None
+        ),
     )
     ledger_data = side_effect_ledger
     if compact_context:
@@ -496,6 +520,18 @@ def _build_capsule_prompt_text(
     group_text = ""
     if group_data:
         group_text = f"{group_heading}:\n{json.dumps(group_data, indent=2, default=str)}\n\n"
+    group_availability_text = ""
+    group_availability_rule = ""
+    if group_availability is not None:
+        group_availability_text = (
+            "Runtime group availability:\n"
+            f"{json.dumps(group_availability, indent=2, default=str)}\n\n"
+        )
+        group_availability_rule = (
+            "- Choose run_group only from runtime runnable_group_ids; groups listed "
+            "in blocked_group_dependencies are unavailable until those names are "
+            "defined.\n"
+        )
     focused_source_text = ""
     if focused_source_data:
         focused_source_text = (
@@ -524,6 +560,7 @@ def _build_capsule_prompt_text(
         "Task:\n"
         f"{task}\n\n"
         f"{group_text}"
+        f"{group_availability_text}"
         f"{region_heading}:\n"
         f"{json.dumps(region_data, indent=2, default=str)}\n\n"
         f"{latest_observation_text}"
@@ -546,6 +583,7 @@ def _build_capsule_prompt_text(
         f"{recovery_guidance}\n\n"
         "Execution constraints:\n"
         f"{strict_source_constraints}"
+        f"{group_availability_rule}"
         "- Do not use callable introspection (__closure__, __self__, __globals__, "
         "__wrapped__, or related private attributes), globals()/eval()/exec(), "
         "vars()/dir(), inspect, gc, or dynamic API lookup. Use documented public "
@@ -984,7 +1022,13 @@ def _bound_compact_unit(unit: dict[str, Any], *, id_key: str) -> dict[str, Any]:
             source_preview,
             max_chars=_COMPACT_UNIT_TEXT_MAX_CHARS,
         )
-    for key in ("region_ids", "primitive_calls", "defined_names", "used_names"):
+    for key in (
+        "region_ids",
+        "primitive_calls",
+        "defined_names",
+        "used_names",
+        "missing_dependencies",
+    ):
         if key in unit:
             bounded[key] = _bound_compact_unit_string_list(unit[key])
     if "has_robot_side_effect" in unit:
@@ -1082,6 +1126,37 @@ def _normalize_side_effect_ledger(
     }
 
 
+def _normalize_group_availability(
+    runnable_group_ids: list[str] | None,
+    blocked_group_dependencies: dict[str, list[str]] | None,
+) -> dict[str, Any] | None:
+    if runnable_group_ids is None and blocked_group_dependencies is None:
+        return None
+    runnable = _ordered_prompt_strings(runnable_group_ids)
+    blocked = blocked_group_dependencies or {}
+    return {
+        "runnable_group_ids": runnable,
+        "blocked_group_dependencies": {
+            str(group_id): _ordered_prompt_strings(missing)
+            for group_id, missing in blocked.items()
+        },
+    }
+
+
+def _ordered_prompt_strings(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = str(item)
+        if text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
 def _string_list_for_prompt(value: Any) -> list[str]:
     if not isinstance(value, (list, tuple, set)):
         return []
@@ -1091,10 +1166,16 @@ def _string_list_for_prompt(value: Any) -> list[str]:
 def _example_group_id(
     groups: list[CodeRegionGroup],
     side_effect_ledger: dict[str, list[str]],
+    *,
+    runnable_group_ids: list[str] | None = None,
 ) -> str:
     executed_groups = set(side_effect_ledger["executed_side_effect_groups"])
+    runnable_groups = set(runnable_group_ids) if runnable_group_ids is not None else None
     for group in groups:
-        if group.group_id not in executed_groups:
+        if (
+            group.group_id not in executed_groups
+            and (runnable_groups is None or group.group_id in runnable_groups)
+        ):
             return group.group_id
     return "new_unexecuted_group_id"
 
@@ -1115,11 +1196,26 @@ def _annotate_execution_state_for_prompt(
     *,
     id_key: str,
     executed_ids: set[str],
+    blocked_dependencies: dict[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     annotated: list[dict[str, Any]] = []
     for unit in units:
         unit_data = dict(unit)
         unit_id = unit_data.get(id_key)
+        missing = (
+            blocked_dependencies.get(unit_id)
+            if isinstance(unit_id, str) and blocked_dependencies is not None
+            else None
+        )
+        if missing:
+            unit_data.update(
+                {
+                    "unit_id": unit_id,
+                    "execution_state": "blocked_missing_dependencies",
+                    "run_allowed": False,
+                    "missing_dependencies": list(missing),
+                }
+            )
         if isinstance(unit_id, str) and unit_id in executed_ids:
             unit_data.update(
                 {

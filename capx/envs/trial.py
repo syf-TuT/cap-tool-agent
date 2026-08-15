@@ -1191,6 +1191,45 @@ class _PreparedSourceEdit:
     recovery_generations: list[RecoveryGeneration]
 
 
+@dataclass(frozen=True)
+class _GroupDependencyState:
+    runnable_group_ids: tuple[str, ...]
+    missing_by_group_id: dict[str, tuple[str, ...]]
+
+
+def _group_dependency_state(
+    groups: list[CodeRegionGroup],
+    runtime_globals: Mapping[str, Any],
+) -> _GroupDependencyState:
+    source_defined_names = {
+        name for group in groups for name in group.defined_names
+    }
+    missing_by_group_id = {
+        group.group_id: tuple(
+            name
+            for name in group.used_names
+            if (
+                name in source_defined_names
+                and name not in group.defined_names
+                and name not in runtime_globals
+            )
+        )
+        for group in groups
+    }
+    return _GroupDependencyState(
+        runnable_group_ids=tuple(
+            group.group_id
+            for group in groups
+            if not missing_by_group_id[group.group_id]
+        ),
+        missing_by_group_id={
+            group_id: missing
+            for group_id, missing in missing_by_group_id.items()
+            if missing
+        },
+    )
+
+
 class _SourceEditRejection(ValueError):
     def __init__(
         self,
@@ -1922,6 +1961,7 @@ def _run_capsule_loop(
         group_observation_before_state: dict[str, Any] | None = None
         group_new_trace_events: list[dict[str, Any]] = []
         inspection_key: tuple[int, int, int, tuple[str, ...]] | None = None
+        group_dependency_state = _group_dependency_state(groups, executor.globals)
 
         try:
             if script is not None and script_idx < len(script):
@@ -1954,6 +1994,13 @@ def _run_capsule_loop(
                     ),
                     latest_observation=latest_post_action_observation,
                     source_revision=source_revision.revision,
+                    runnable_group_ids=list(
+                        group_dependency_state.runnable_group_ids
+                    ),
+                    blocked_group_dependencies={
+                        group_id: list(missing)
+                        for group_id, missing in group_dependency_state.missing_by_group_id.items()
+                    },
                 )
                 action_prompt_chars = len(json.dumps(prompt, default=str))
                 action_prompt_char_budget_metric = (
@@ -2046,6 +2093,11 @@ def _run_capsule_loop(
                     )
                     if validate_program_contract or require_strict_subset
                     else None
+                )
+            if event is None:
+                event = _group_dependency_guard_event(
+                    action,
+                    group_dependency_state,
                 )
             if event is None:
                 event = _no_rollback_guard_event(
@@ -3095,6 +3147,32 @@ def _program_contract_guard_event(
         ),
         evidence={
             "program_contract_violations": [item.to_dict() for item in violations]
+        },
+    )
+
+
+def _group_dependency_guard_event(
+    action: RuntimeAction,
+    state: _GroupDependencyState,
+) -> RuntimeEvent | None:
+    if action.action != "run_group":
+        return None
+    group_id = str(action.args.get("group_id", ""))
+    missing = state.missing_by_group_id.get(group_id)
+    if not missing:
+        return None
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=group_id,
+        message=(
+            f"{group_id} cannot run until its source dependencies are defined: "
+            f"{', '.join(missing)}."
+        ),
+        evidence={
+            "safety_failure": "missing_group_dependencies",
+            "missing_dependencies": list(missing),
+            "runnable_group_ids": list(state.runnable_group_ids),
         },
     )
 

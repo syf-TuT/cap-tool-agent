@@ -171,6 +171,55 @@ def test_capsule_prompt_prefers_group_actions_when_groups_are_available():
     assert "effect-bounded execution unit" in text
 
 
+def test_capsule_prompt_exposes_runtime_group_dependencies():
+    groups = [
+        CodeRegionGroup(
+            group_id="group_1",
+            start_line=1,
+            end_line=1,
+            source='target = get_pose("basket")',
+            region_ids=["region_1"],
+            primitive_calls=["get_pose"],
+            defined_names=["target"],
+            used_names=["get_pose"],
+        ),
+        CodeRegionGroup(
+            group_id="group_2",
+            start_line=2,
+            end_line=2,
+            source="move_to(target)",
+            region_ids=["region_2"],
+            primitive_calls=["move_to"],
+            used_names=["move_to", "target"],
+            has_robot_side_effect=True,
+        ),
+    ]
+
+    prompt = build_capsule_prompt(
+        task="move to the basket",
+        regions=[
+            CodeRegion("region_1", 1, 1, groups[0].source),
+            CodeRegion("region_2", 2, 2, groups[1].source),
+        ],
+        groups=groups,
+        history=[],
+        trace_summary={},
+        runnable_group_ids=["group_1"],
+        blocked_group_dependencies={"group_2": ["target"]},
+        compact_context=True,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+    assert '"runnable_group_ids": [' in text
+    assert '"group_1"' in text
+    assert '"blocked_group_dependencies": {' in text
+    assert '"group_2": [' in text
+    assert '"target"' in text
+    assert '"execution_state": "blocked_missing_dependencies"' in text
+    assert '"missing_dependencies": [' in text
+    assert '{"action": "run_group", "args": {"group_id": "group_1"}}' in text
+
+
 @pytest.mark.parametrize("compact_context", [False, True])
 def test_group_mode_prompt_only_advertises_group_granularity_actions(compact_context):
     prompt = build_capsule_prompt(
