@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import capx.runtime_control.prompts as prompt_module
 from capx.runtime_control.prompts import (
     _summarize_history_for_prompt,
@@ -165,8 +167,58 @@ def test_capsule_prompt_prefers_group_actions_when_groups_are_available():
     assert "semantic source chunk" not in text
     assert '{"action": "run_group", "args": {"group_id": "group_1"}}' in text
     assert '{"action": "patch_group", "args": {"group_id": "group_1", "source":' in text
-    assert "Prefer run_group over run_region" in text
+    assert "Use run_group for effect-bounded execution units" in text
     assert "effect-bounded execution unit" in text
+
+
+@pytest.mark.parametrize("compact_context", [False, True])
+def test_group_mode_prompt_only_advertises_group_granularity_actions(compact_context):
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion("region_1", 1, 1, "x = 1")],
+        groups=[CodeRegionGroup("group_1", 1, 1, "x = 1", ["region_1"])],
+        history=[],
+        trace_summary={},
+        compact_context=compact_context,
+    )
+    text = prompt[1]["content"][0]["text"]
+    allowed_actions = next(
+        line for line in text.splitlines() if line.startswith("Allowed actions:")
+    )
+
+    assert "run_group" in allowed_actions
+    assert "patch_group" in allowed_actions
+    assert "run_region" not in allowed_actions
+    assert "resume_from_region" not in allowed_actions
+    assert "patch_region" not in allowed_actions
+    assert '{"action": "run_region"' not in text
+    assert '{"action": "patch_region"' not in text
+    assert "For patch_region" not in text
+
+
+@pytest.mark.parametrize("compact_context", [False, True])
+def test_region_mode_prompt_only_advertises_region_granularity_actions(compact_context):
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion("region_1", 1, 1, "x = 1")],
+        groups=None,
+        history=[],
+        trace_summary={},
+        compact_context=compact_context,
+    )
+    text = prompt[1]["content"][0]["text"]
+    allowed_actions = next(
+        line for line in text.splitlines() if line.startswith("Allowed actions:")
+    )
+
+    assert "run_region" in allowed_actions
+    assert "resume_from_region" in allowed_actions
+    assert "patch_region" in allowed_actions
+    assert "run_group" not in allowed_actions
+    assert "patch_group" not in allowed_actions
+    assert '{"action": "run_group"' not in text
+    assert '{"action": "patch_group"' not in text
+    assert "For patch_group" not in text
 
 
 def test_capsule_prompt_marks_executed_side_effect_units_unrunnable():
@@ -227,7 +279,7 @@ def test_capsule_prompt_marks_executed_side_effect_units_unrunnable():
     assert '"execution_state": "executed_side_effect"' in text
     assert '"run_allowed": false' in text
     assert '"patch_allowed": false' in text
-    assert "Do not choose run_group, run_region, patch_group, or patch_region" in text
+    assert "Do not choose run_group or patch_group" in text
     assert '{"action": "run_group", "args": {"group_id": "group_1"}}' not in text
     assert '{"action": "run_group", "args": {"group_id": "group_2"}}' in text
 

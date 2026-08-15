@@ -1933,6 +1933,11 @@ def _run_capsule_loop(
                 require_task_success=require_task_success_for_finish,
             )
             if event is None:
+                event = _execution_granularity_guard_event(
+                    action,
+                    use_semantic_groups=use_semantic_groups,
+                )
+            if event is None:
                 event = _strict_subset_guard_event(
                     action, strict_subset_violations
                 )
@@ -2937,6 +2942,42 @@ def _program_contract_guard_event(
         ),
         evidence={
             "program_contract_violations": [item.to_dict() for item in violations]
+        },
+    )
+
+
+def _execution_granularity_guard_event(
+    action: RuntimeAction,
+    *,
+    use_semantic_groups: bool,
+) -> RuntimeEvent | None:
+    allowed_actions = (
+        {"run_group", "patch_group"}
+        if use_semantic_groups
+        else {"run_region", "resume_from_region", "patch_region"}
+    )
+    granularity_actions = {
+        "run_group",
+        "patch_group",
+        "run_region",
+        "resume_from_region",
+        "patch_region",
+    }
+    if action.action not in granularity_actions or action.action in allowed_actions:
+        return None
+    granularity = "semantic_group" if use_semantic_groups else "region"
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=_runtime_action_unit_id(action),
+        message=(
+            f"execution_granularity_mismatch: {action.action} is unavailable "
+            f"when capsule_execution_granularity={granularity}."
+        ),
+        evidence={
+            "safety_failure": "execution_granularity_mismatch",
+            "execution_granularity": granularity,
+            "allowed_granularity_actions": sorted(allowed_actions),
         },
     )
 

@@ -2437,7 +2437,7 @@ def test_capsule_contract_region_guard_tracks_transitive_helper_effects(tmp_path
         config={
             "output_dir": str(tmp_path),
             "max_capsule_steps": 4,
-            "capsule_max_regions_per_group": 1,
+            "capsule_execution_granularity": "region",
             "capsule_validate_program_contract": True,
         },
         initial_code=(
@@ -2561,7 +2561,11 @@ def test_capsule_no_replay_rejects_second_resume_from_side_effect_region(tmp_pat
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
-        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_execution_granularity": "region",
+        },
         initial_code='custom_move("once")\n',
         scripted_actions=[
             {"action": "resume_from_region", "args": {"region_id": "region_1"}},
@@ -2582,22 +2586,26 @@ def test_capsule_no_replay_rejects_second_resume_from_side_effect_region(tmp_pat
     assert env.api.moves == ["once"]
 
 
-def test_capsule_region_execution_seals_containing_group(tmp_path):
+def test_capsule_region_execution_seals_region_patch(tmp_path):
     env = FakeCustomMoveCapsuleEnv()
 
     trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
-        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_execution_granularity": "region",
+        },
         initial_code='x = 1\ncustom_move("once")\n',
         scripted_actions=[
             {"action": "run_region", "args": {"region_id": "region_2"}},
             {
-                "action": "patch_group",
+                "action": "patch_region",
                 "args": {
-                    "group_id": "group_1",
-                    "source": 'x = 2\ncustom_move("patched")\n',
+                    "region_id": "region_2",
+                    "source": 'custom_move("patched")\n',
                 },
             },
             {"action": "finish", "args": {}},
@@ -2613,23 +2621,27 @@ def test_capsule_region_execution_seals_containing_group(tmp_path):
         "success",
     ]
     assert trace[0]["unit_key"] == "region_key_000002"
-    assert trace[1]["unit_key"] == "group_key_000001"
+    assert trace[1]["unit_key"] == "region_key_000002"
     assert env.api.moves == ["once"]
     assert code == 'x = 1\ncustom_move("once")\n'
 
 
-def test_capsule_resume_execution_seals_containing_group(tmp_path):
+def test_capsule_resume_execution_seals_region_replay(tmp_path):
     env = FakeCustomMoveCapsuleEnv()
 
     trial_module._run_capsule_loop(
         env,
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
-        config={"output_dir": str(tmp_path), "max_capsule_steps": 3},
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_execution_granularity": "region",
+        },
         initial_code='x = 1\ncustom_move("once")\n',
         scripted_actions=[
             {"action": "resume_from_region", "args": {"region_id": "region_2"}},
-            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "run_region", "args": {"region_id": "region_2"}},
             {"action": "finish", "args": {}},
         ],
     )
@@ -2642,7 +2654,7 @@ def test_capsule_resume_execution_seals_containing_group(tmp_path):
         "success",
     ]
     assert trace[0]["unit_key"] == "region_key_000002"
-    assert trace[1]["unit_key"] == "group_key_000001"
+    assert trace[1]["unit_key"] == "region_key_000002"
     assert env.api.moves == ["once"]
 
 
@@ -2805,7 +2817,7 @@ def test_capsule_append_identical_side_effect_gets_new_stable_key_and_one_run(tm
     assert [entry["source_revision"] for entry in metrics] == [0, 0, 1, 1, 1]
 
 
-def test_capsule_group_execution_seals_region_patch_by_stable_key(tmp_path):
+def test_capsule_group_execution_seals_group_patch_by_stable_key(tmp_path):
     env = FakeCustomMoveCapsuleEnv()
 
     trial_module._run_capsule_loop(
@@ -2817,8 +2829,8 @@ def test_capsule_group_execution_seals_region_patch_by_stable_key(tmp_path):
         scripted_actions=[
             {"action": "run_group", "args": {"group_id": "group_1"}},
             {
-                "action": "patch_region",
-                "args": {"region_id": "region_1", "source": 'custom_move("twice")\n'},
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": 'custom_move("twice")\n'},
             },
         ],
     )
@@ -2826,7 +2838,7 @@ def test_capsule_group_execution_seals_region_patch_by_stable_key(tmp_path):
     trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
 
     assert trace[0]["unit_key"] == "group_key_000001"
-    assert trace[1]["unit_key"] == "region_key_000001"
+    assert trace[1]["unit_key"] == "group_key_000001"
     assert trace[1]["event"]["status"] == "invalid"
     assert trace[1]["event"]["evidence"]["safety_failure"] == "side_effect_replay"
     assert trace[1]["event"]["evidence"]["edit_rejection_reason"] == (
@@ -3630,6 +3642,7 @@ def test_capsule_llm_step_next_prompt_includes_accumulated_trace_summary(
         config={
             "output_dir": str(tmp_path),
             "max_capsule_steps": 2,
+            "capsule_execution_granularity": "region",
             "use_parallel_ensemble": False,
         },
         initial_code='pose = get_pose("cube")\n',
@@ -3817,7 +3830,11 @@ def test_capsule_run_region_metrics_report_step_trace_boundaries(tmp_path):
         FakeIncompleteCapsuleEnv(),
         trial=0,
         args=SimpleNamespace(model="test", use_oracle_code=False),
-        config={"output_dir": str(tmp_path), "max_capsule_steps": 2},
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_execution_granularity": "region",
+        },
         initial_code='pose = get_pose("cube")\n',
         scripted_actions=[
             {"action": "run_region", "args": {"region_id": "region_1"}},
@@ -4188,7 +4205,7 @@ def test_capsule_llm_step_rejects_replay_after_failed_side_effect_region(
     assert "already executed robot-side-effect code" in trace[1]["event"]["message"]
 
 
-def test_capsule_llm_step_marks_failed_dynamic_side_effect_group_region(
+def test_capsule_llm_step_marks_failed_dynamic_side_effect_group_replay(
     tmp_path, monkeypatch
 ):
     env = FakeCustomMoveCapsuleEnv()
@@ -4227,7 +4244,7 @@ def test_capsule_llm_step_marks_failed_dynamic_side_effect_group_region(
             "capsule_control_mode": "llm_step",
             "scripted_actions": [
                 {"action": "run_group", "args": {"group_id": "group_1"}},
-                {"action": "run_region", "args": {"region_id": "region_1"}},
+                {"action": "run_group", "args": {"group_id": "group_1"}},
             ],
             "max_capsule_steps": 2,
             "capsule_max_regions_per_group": 2,
@@ -4322,7 +4339,10 @@ def test_capsule_llm_step_rejects_patch_after_successful_dynamic_side_effect_gro
             "capsule_control_mode": "llm_step",
             "scripted_actions": [
                 {"action": "run_group", "args": {"group_id": "group_1"}},
-                {"action": "patch_region", "args": {"region_id": "region_1", "source": "x = 1"}},
+                {
+                    "action": "patch_group",
+                    "args": {"group_id": "group_1", "source": "x = 1"},
+                },
             ],
             "max_capsule_steps": 2,
             "capsule_max_regions_per_group": 2,
@@ -4373,6 +4393,7 @@ def test_capsule_trial_runs_scripted_regions(tmp_path):
             "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 4,
+            "capsule_execution_granularity": "region",
             "use_parallel_ensemble": False,
             "use_multimodel": False,
         },
@@ -4906,6 +4927,45 @@ def test_no_rollback_guard_rejects_known_region_with_unmapped_containing_group()
 
     assert event is not None
     assert event.evidence["safety_failure"] == "side_effect_lineage_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("action_name", "action_args"),
+    [
+        ("run_region", {"region_id": "region_1"}),
+        ("resume_from_region", {"region_id": "region_1"}),
+        ("run_group", {"group_id": "group_1"}),
+    ],
+)
+def test_side_effect_recorder_seals_both_region_and_group_ledgers(
+    action_name, action_args
+):
+    region = CodeRegion("region_1", 1, 1, 'custom_move("once")\n')
+    group = CodeRegionGroup(
+        group_id="group_1",
+        start_line=1,
+        end_line=1,
+        source=region.source,
+        region_ids=[region.region_id],
+        has_robot_side_effect=True,
+    )
+    lineage = UnitLineage.create([region], [group])
+
+    trial_module._record_runtime_side_effect_execution(
+        RuntimeAction(action_name, action_args),
+        RuntimeEvent(
+            action_name,
+            "success",
+            evidence={"trace_events": [{"name": "custom_move"}]},
+        ),
+        {region.region_id: region},
+        {group.group_id: group},
+        lineage,
+        {"custom_move"},
+    )
+
+    assert lineage.executed_region_keys == {"region_key_000001"}
+    assert lineage.executed_group_keys == {"group_key_000001"}
 
 
 def test_side_effect_recorder_does_not_partially_seal_region_without_group_key():
@@ -5812,6 +5872,109 @@ def test_recovery_observation_gate_applies_without_reward_drop(
     assert env.api.moves == []
 
 
+@pytest.mark.parametrize("action_name", ["run_region", "resume_from_region"])
+def test_semantic_group_mode_rejects_region_recovery_bypass(tmp_path, action_name):
+    env = FakeRewardDropCapsuleEnv()
+    trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[
+            {
+                "action": "append_recovery",
+                "args": {
+                    "source": 'obs = get_observation()\nmove_to("recover")'
+                },
+            },
+            {"action": action_name, "args": {"region_id": "region_3"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert trace[1]["event"]["status"] == "invalid"
+    assert trace[1]["event"]["evidence"]["safety_failure"] == (
+        "execution_granularity_mismatch"
+    )
+    assert env.api.observed is False
+    assert env.api.moves == []
+
+
+def test_region_mode_rejects_group_execution_action(tmp_path):
+    env = FakeRewardDropCapsuleEnv()
+    trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            "capsule_execution_granularity": "region",
+        },
+        initial_code='move_to("recover")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert trace[0]["event"]["status"] == "invalid"
+    assert trace[0]["event"]["evidence"]["safety_failure"] == (
+        "execution_granularity_mismatch"
+    )
+    assert env.api.moves == []
+
+
+@pytest.mark.parametrize(
+    ("granularity_config", "patch_action"),
+    [
+        (
+            {},
+            {
+                "action": "patch_region",
+                "args": {"region_id": "region_1", "source": "x = 2\n"},
+            },
+        ),
+        (
+            {"capsule_execution_granularity": "region"},
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": "x = 2\n"},
+            },
+        ),
+    ],
+)
+def test_execution_granularity_rejects_mismatched_patch_action(
+    tmp_path, granularity_config, patch_action
+):
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 1,
+            **granularity_config,
+        },
+        initial_code="x = 1\n",
+        scripted_actions=[patch_action],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+
+    assert trace[0]["event"]["status"] == "invalid"
+    assert trace[0]["event"]["evidence"]["safety_failure"] == (
+        "execution_granularity_mismatch"
+    )
+
+
 @pytest.mark.parametrize(
     "recovery_source",
     [
@@ -6614,6 +6777,7 @@ def test_capsule_trial_writes_trace_and_feedback_artifact(tmp_path):
             "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 4,
+            "capsule_execution_granularity": "region",
             "use_parallel_ensemble": False,
             "use_multimodel": False,
         },
@@ -6641,6 +6805,7 @@ def test_capsule_trial_writes_step_metrics_jsonl(tmp_path):
             "capsule_control_mode": "llm_step",
             "output_dir": str(tmp_path),
             "max_capsule_steps": 3,
+            "capsule_execution_granularity": "region",
             "use_parallel_ensemble": False,
             "use_multimodel": False,
         },

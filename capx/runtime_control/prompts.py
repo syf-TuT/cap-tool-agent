@@ -129,20 +129,57 @@ def build_capsule_prompt(
         )
         recovery_example_line = ""
         recovery_rule = recovery_guidance
-    allowed_actions = [
-        "run_group",
-        "run_region",
-        "inspect_variables",
-        "patch_group",
-        "patch_region",
-    ]
-    if recovery_functions:
-        allowed_actions.append("append_recovery")
-    allowed_actions.extend(["resume_from_region", "finish"])
-    allowed_actions_text = ", ".join(allowed_actions)
+    uses_semantic_groups = groups is not None
     normalized_side_effect_ledger = _normalize_side_effect_ledger(side_effect_ledger)
     run_group_example_id = _example_group_id(groups or [], normalized_side_effect_ledger)
     run_region_example_id = _example_region_id(regions, normalized_side_effect_ledger)
+    if uses_semantic_groups:
+        allowed_actions = ["run_group", "inspect_variables", "patch_group"]
+        execution_guidance = (
+            "Use run_group for effect-bounded execution units and patch_group for "
+            "local source repairs. Region-granularity actions are unavailable in "
+            "semantic_group mode."
+        )
+        execution_examples = (
+            f'{{"action": "run_group", "args": {{"group_id": "{run_group_example_id}"}}}}\n'
+            f'{{"action": "patch_group", "args": {{"group_id": "{run_group_example_id}", '
+            f'"source": "replacement Python source for the complete {run_group_example_id} '
+            'source span"}}\n'
+        )
+        patch_rule = (
+            "For patch_group, args.source must be the complete replacement Python source "
+            "for only the requested source group."
+        )
+        ledger_actions_text = "run_group or patch_group"
+    else:
+        allowed_actions = [
+            "run_region",
+            "resume_from_region",
+            "inspect_variables",
+            "patch_region",
+        ]
+        execution_guidance = (
+            "Use run_region or resume_from_region for atomic region execution and "
+            "patch_region for local source repairs. Group-granularity actions are "
+            "unavailable in region mode."
+        )
+        execution_examples = (
+            f'{{"action": "run_region", "args": {{"region_id": "{run_region_example_id}"}}}}\n'
+            f'{{"action": "resume_from_region", "args": '
+            f'{{"region_id": "{run_region_example_id}"}}}}\n'
+            f'{{"action": "patch_region", "args": {{"region_id": "{run_region_example_id}", '
+            f'"source": "replacement Python source for only {run_region_example_id}"}}}}\n'
+        )
+        patch_rule = (
+            "For patch_region, args.source must be the complete replacement Python source "
+            "for only the requested source region. Do not use new_source or patch for "
+            "patch_region replacement text."
+        )
+        ledger_actions_text = "run_region, resume_from_region, or patch_region"
+    if recovery_functions:
+        allowed_actions.append("append_recovery")
+    allowed_actions.append("finish")
+    allowed_actions_text = ", ".join(allowed_actions)
     strict_source_constraints = f"{_STRICT_CAPSULE_SOURCE_CONSTRAINTS}\n" if strict_subset else ""
 
     prompt_text = _build_capsule_prompt_text(
@@ -163,6 +200,10 @@ def build_capsule_prompt(
         compact_phase=0,
         recovery_guidance=recovery_guidance,
         allowed_actions_text=allowed_actions_text,
+        execution_guidance=execution_guidance,
+        execution_examples=execution_examples,
+        patch_rule=patch_rule,
+        ledger_actions_text=ledger_actions_text,
         recovery_example_line=recovery_example_line,
         recovery_rule=recovery_rule,
         run_group_example_id=run_group_example_id,
@@ -196,6 +237,10 @@ def build_capsule_prompt(
             compact_phase=1,
             recovery_guidance=recovery_guidance,
             allowed_actions_text=allowed_actions_text,
+            execution_guidance=execution_guidance,
+            execution_examples=execution_examples,
+            patch_rule=patch_rule,
+            ledger_actions_text=ledger_actions_text,
             recovery_example_line=recovery_example_line,
             recovery_rule=recovery_rule,
             run_group_example_id=run_group_example_id,
@@ -234,6 +279,10 @@ def build_capsule_prompt(
             compact_phase=2,
             recovery_guidance=recovery_guidance,
             allowed_actions_text=allowed_actions_text,
+            execution_guidance=execution_guidance,
+            execution_examples=execution_examples,
+            patch_rule=patch_rule,
+            ledger_actions_text=ledger_actions_text,
             recovery_example_line=recovery_example_line,
             recovery_rule=recovery_rule,
             run_group_example_id=run_group_example_id,
@@ -268,6 +317,10 @@ def build_capsule_prompt(
             compact_phase=3,
             recovery_guidance=recovery_guidance,
             allowed_actions_text=allowed_actions_text,
+            execution_guidance=execution_guidance,
+            execution_examples=execution_examples,
+            patch_rule=patch_rule,
+            ledger_actions_text=ledger_actions_text,
             recovery_example_line=recovery_example_line,
             recovery_rule=recovery_rule,
             run_group_example_id=run_group_example_id,
@@ -304,6 +357,10 @@ def _build_capsule_prompt_text(
     compact_phase: int,
     recovery_guidance: str,
     allowed_actions_text: str,
+    execution_guidance: str,
+    execution_examples: str,
+    patch_rule: str,
+    ledger_actions_text: str,
     recovery_example_line: str,
     recovery_rule: str,
     run_group_example_id: str,
@@ -436,7 +493,7 @@ def _build_capsule_prompt_text(
         "not directly perform robot manipulation.\n\n"
         "Rollback is unavailable. Previously executed robot-side-effect code may have "
         "changed the current physical state, so repairs must continue from that state. "
-        "Use a fresh observation and patch or resume code as current-state recovery; do "
+        "Use a fresh observation and continue with an allowed patch or execution action; do "
         "not assume earlier robot actions can be undone or replayed from their original "
         "preconditions. "
         f"{recovery_guidance}\n\n"
@@ -446,34 +503,21 @@ def _build_capsule_prompt_text(
         "__wrapped__, or related private attributes), globals()/eval()/exec(), "
         "vars()/dir(), inspect, gc, or dynamic API lookup. Use documented public "
         "API function names directly.\n"
-        "- Do not choose run_group, run_region, patch_group, or patch_region for units "
+        f"- Do not choose {ledger_actions_text} for units "
         "marked execution_state=executed_side_effect or listed in the side-effect "
         "execution ledger; rollback is unavailable and those actions will be invalid.\n"
         "- If additional robot-side-effect motion is needed after an executed side-effect "
         "unit, use append_recovery with a fresh-state function and continue from the "
         "current physical state.\n\n"
         f"Allowed actions: {allowed_actions_text}.\n\n"
-        "Prefer run_group over run_region when effect-bounded execution units are "
-        "available. A group is an effect-bounded source unit that may include setup "
-        "plus one robot side effect. Use patch_group for local repairs unless a "
-        "single atomic region is clearly self-contained.\n\n"
+        f"{execution_guidance}\n\n"
         "Respond with exactly one JSON object. Examples:\n"
-        f'{{"action": "run_group", "args": {{"group_id": "{run_group_example_id}"}}}}\n'
-        f'{{"action": "run_region", "args": {{"region_id": "{run_region_example_id}"}}}}\n'
+        f"{execution_examples}"
         '{"action": "inspect_variables", "args": {"names": ["variable_name"]}}\n'
-        f'{{"action": "patch_group", "args": {{"group_id": "{run_group_example_id}", '
-        f'"source": "replacement Python source for the complete {run_group_example_id} '
-        'source span"}}\n'
-        f'{{"action": "patch_region", "args": {{"region_id": "{run_region_example_id}", '
-        f'"source": "replacement Python source for only {run_region_example_id}"}}\n'
         f"{recovery_example_line}"
         "For inspect_variables, args.names must be a non-empty list of Python variable "
         "names to inspect. Do not pass region_id to inspect_variables.\n"
-        "For patch_group, args.source must be the complete replacement Python source "
-        "for only the requested source group.\n"
-        "For patch_region, args.source must be the complete replacement Python source "
-        "for only the requested source region. Do not use new_source or patch for "
-        "patch_region replacement text.\n"
+        f"{patch_rule}\n"
         f"{recovery_rule} "
         "Do not ask "
         "for robot primitives as tools."
