@@ -3110,6 +3110,12 @@ def _recovery_generation_metrics(
     ]
 
 
+_MODEL_HISTORY_INTERNAL_AUDIT_FIELDS = {
+    "missing_executed_group_keys",
+    "missing_executed_region_keys",
+}
+
+
 def _model_facing_capsule_history(
     history: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -3122,14 +3128,28 @@ def _model_facing_capsule_history(
         "state_before",
         "state_after",
     )
-    return [
-        {
+    model_history = []
+    for entry in history:
+        sanitized_entry = {
             field: _sanitize_model_facing_capsule_value(entry[field])
             for field in allowed_fields
             if field in entry
         }
-        for entry in history
-    ]
+        action = entry.get("action")
+        if isinstance(action, dict) and action.get("action") == "inspect_variables":
+            for field in ("event", "feedback"):
+                original_value = entry.get(field)
+                sanitized_value = sanitized_entry.get(field)
+                if not isinstance(original_value, dict) or not isinstance(
+                    sanitized_value, dict
+                ):
+                    continue
+                if "evidence" in original_value:
+                    sanitized_value["evidence"] = copy.deepcopy(
+                        original_value["evidence"]
+                    )
+        model_history.append(sanitized_entry)
+    return model_history
 
 
 def _sanitize_model_facing_capsule_value(value: Any) -> Any:
@@ -3137,25 +3157,13 @@ def _sanitize_model_facing_capsule_value(value: Any) -> Any:
         return {
             key: _sanitize_model_facing_capsule_value(item)
             for key, item in value.items()
-            if not _is_internal_stable_key_field(str(key))
+            if key not in _MODEL_HISTORY_INTERNAL_AUDIT_FIELDS
         }
     if isinstance(value, list):
         return [_sanitize_model_facing_capsule_value(item) for item in value]
     if isinstance(value, tuple):
         return tuple(_sanitize_model_facing_capsule_value(item) for item in value)
     return copy.deepcopy(value)
-
-
-def _is_internal_stable_key_field(field: str) -> bool:
-    stable_key_suffixes = (
-        "unit_key",
-        "unit_keys",
-        "group_key",
-        "group_keys",
-        "region_key",
-        "region_keys",
-    )
-    return any(field == suffix or field.endswith(f"_{suffix}") for suffix in stable_key_suffixes)
 
 
 @dataclass(frozen=True)

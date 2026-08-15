@@ -7257,3 +7257,93 @@ def test_reconciliation_stable_keys_stay_in_audit_but_not_model_prompt(
     assert "missing_executed_region_keys" not in next_prompt
     assert "group_key_SECRET" not in next_prompt
     assert "region_key_SECRET" not in next_prompt
+
+
+def test_model_history_preserves_inspected_variables_named_like_stable_key_fields():
+    history = [
+        {
+            "step_id": 1,
+            "action": {
+                "action": "inspect_variables",
+                "args": {"names": ["group_key", "my_region_key"]},
+            },
+            "event": {
+                "action": "inspect_variables",
+                "status": "success",
+                "evidence": {
+                    "group_key": {"type": "str", "repr": "'user-group'"},
+                    "my_region_key": {"type": "int", "repr": "7"},
+                },
+            },
+        },
+        {
+            "step_id": 2,
+            "action": {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": "x = 2"},
+            },
+            "event": {
+                "action": "patch_group",
+                "status": "invalid",
+                "evidence": {
+                    "missing_executed_group_keys": ["group_key_SECRET"],
+                    "missing_executed_region_keys": ["region_key_SECRET"],
+                },
+            },
+        },
+    ]
+
+    model_history = trial_module._model_facing_capsule_history(history)
+
+    assert model_history[0]["event"]["evidence"] == {
+        "group_key": {"type": "str", "repr": "'user-group'"},
+        "my_region_key": {"type": "int", "repr": "7"},
+    }
+    assert model_history[1]["event"]["evidence"] == {}
+    assert history[0]["event"]["evidence"]["group_key"]["repr"] == "'user-group'"
+    assert history[1]["event"]["evidence"]["missing_executed_group_keys"] == [
+        "group_key_SECRET"
+    ]
+
+
+@pytest.mark.parametrize("compact_context", [False, True])
+def test_inspected_variables_named_like_stable_keys_remain_in_next_prompt(
+    tmp_path, monkeypatch, compact_context
+):
+    prompts = []
+
+    def fake_query_model(args, prompt):
+        prompts.append(prompt)
+        return {"content": '{"action":"finish","args":{}}'}
+
+    monkeypatch.setattr(trial_module, "_query_model", fake_query_model)
+
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 3,
+            "capsule_llm_step_compact_context": compact_context,
+        },
+        initial_code=(
+            "seed = 'user'\n"
+            "group_key = seed + '-group'\n"
+            "my_region_key = 3 + 4\n"
+        ),
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {
+                "action": "inspect_variables",
+                "args": {"names": ["group_key", "my_region_key"]},
+            },
+        ],
+    )
+
+    next_prompt = prompts[0][1]["content"][0]["text"]
+
+    assert "group_key" in next_prompt
+    assert "my_region_key" in next_prompt
+    assert "user-group" in next_prompt
+    assert '"repr": "7"' in next_prompt
