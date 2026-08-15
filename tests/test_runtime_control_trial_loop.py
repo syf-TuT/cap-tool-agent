@@ -1927,8 +1927,12 @@ def test_capsule_quarantined_repair_draft_patches_multiple_groups_without_execut
     assert trace[2]["event"]["evidence"]["remaining_violation_count"] == 0
     assert env.api.moves == ["one"]
     assert metrics[0]["program_contract_violation_count"] == 1
+    assert metrics[0]["repair_pending"] is True
+    assert metrics[0]["remaining_violation_count"] == 1
     assert metrics[0]["source_revision_after"] == 1
     assert metrics[2]["program_contract_valid"] is True
+    assert metrics[2]["repair_pending"] is False
+    assert metrics[2]["remaining_violation_count"] == 0
 
 
 def test_capsule_non_improving_repair_patch_is_rejected_atomically(tmp_path):
@@ -2615,7 +2619,7 @@ def test_program_contract_guard_only_blocks_side_effect_execution_units():
         )
 
 
-def test_capsule_contract_region_guard_tracks_transitive_helper_effects(tmp_path):
+def test_capsule_repair_pending_region_guard_blocks_all_source_execution(tmp_path):
     env = FakeGripperCapsuleEnv()
 
     trial_module._run_capsule_loop(
@@ -2644,7 +2648,7 @@ def test_capsule_contract_region_guard_tracks_transitive_helper_effects(tmp_path
     trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
 
     assert [entry["event"]["status"] for entry in trace] == [
-        "success",
+        "invalid",
         "invalid",
         "invalid",
         "success",
@@ -2652,8 +2656,9 @@ def test_capsule_contract_region_guard_tracks_transitive_helper_effects(tmp_path
     assert trace[0]["event"]["region_id"] == "region_1"
     assert trace[1]["event"]["region_id"] == "region_2"
     assert trace[2]["event"]["region_id"] == "region_2"
-    assert trace[1]["event"]["evidence"]["program_contract_violations"]
-    assert trace[2]["event"]["evidence"]["program_contract_violations"]
+    for entry in trace[:3]:
+        assert entry["event"]["evidence"]["repair_pending"] is True
+        assert entry["event"]["evidence"]["program_contract_violations"]
     assert env.api.calls == []
 
 

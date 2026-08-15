@@ -93,6 +93,7 @@ def build_capsule_prompt(
     side_effect_ledger: dict[str, Any] | None = None,
     recovery_observation_functions: set[str] | None = None,
     strict_subset: bool = False,
+    repair_pending: bool = False,
     compact_context: bool = False,
     history_max_entries: int = 8,
     trace_max_events: int = 8,
@@ -134,49 +135,95 @@ def build_capsule_prompt(
     run_group_example_id = _example_group_id(groups or [], normalized_side_effect_ledger)
     run_region_example_id = _example_region_id(regions, normalized_side_effect_ledger)
     if uses_semantic_groups:
-        allowed_actions = ["run_group", "inspect_variables", "patch_group"]
-        execution_guidance = (
-            "Use run_group for effect-bounded execution units and patch_group for "
-            "local source repairs. Region-granularity actions are unavailable in "
-            "semantic_group mode."
-        )
-        execution_examples = (
-            f'{{"action": "run_group", "args": {{"group_id": "{run_group_example_id}"}}}}\n'
-            f'{{"action": "patch_group", "args": {{"group_id": "{run_group_example_id}", '
-            f'"source": "replacement Python source for the complete {run_group_example_id} '
-            'source span"}}\n'
-        )
+        if repair_pending:
+            allowed_actions = ["inspect_variables", "patch_group"]
+            execution_guidance = (
+                "Source repair is quarantined (repair_pending=true). Use patch_group "
+                "to reduce the remaining violations. run_group is unavailable until "
+                "the complete source passes validation."
+            )
+            execution_examples = (
+                f'{{"action": "patch_group", "args": '
+                f'{{"group_id": "{run_group_example_id}", '
+                f'"source": "replacement Python source for the complete '
+                f'{run_group_example_id} source span"}}}}\n'
+            )
+        else:
+            allowed_actions = ["run_group", "inspect_variables", "patch_group"]
+            execution_guidance = (
+                "Use run_group for effect-bounded execution units and patch_group for "
+                "local source repairs. Region-granularity actions are unavailable in "
+                "semantic_group mode."
+            )
+            execution_examples = (
+                f'{{"action": "run_group", "args": '
+                f'{{"group_id": "{run_group_example_id}"}}}}\n'
+                f'{{"action": "patch_group", "args": '
+                f'{{"group_id": "{run_group_example_id}", '
+                f'"source": "replacement Python source for the complete '
+                f'{run_group_example_id} source span"}}}}\n'
+            )
         patch_rule = (
             "For patch_group, args.source must be the complete replacement Python source "
             "for only the requested source group."
         )
-        ledger_actions_text = "run_group or patch_group"
+        ledger_actions_text = (
+            "patch_group" if repair_pending else "run_group or patch_group"
+        )
     else:
-        allowed_actions = [
-            "run_region",
-            "resume_from_region",
-            "inspect_variables",
-            "patch_region",
-        ]
-        execution_guidance = (
-            "Use run_region or resume_from_region for atomic region execution and "
-            "patch_region for local source repairs. Group-granularity actions are "
-            "unavailable in region mode."
-        )
-        execution_examples = (
-            f'{{"action": "run_region", "args": {{"region_id": "{run_region_example_id}"}}}}\n'
-            f'{{"action": "resume_from_region", "args": '
-            f'{{"region_id": "{run_region_example_id}"}}}}\n'
-            f'{{"action": "patch_region", "args": {{"region_id": "{run_region_example_id}", '
-            f'"source": "replacement Python source for only {run_region_example_id}"}}}}\n'
-        )
+        if repair_pending:
+            allowed_actions = ["inspect_variables", "patch_region"]
+            execution_guidance = (
+                "Source repair is quarantined (repair_pending=true). Use patch_region "
+                "to reduce the remaining violations. run_region and "
+                "resume_from_region are unavailable until the complete source passes "
+                "validation."
+            )
+            execution_examples = (
+                f'{{"action": "patch_region", "args": '
+                f'{{"region_id": "{run_region_example_id}", '
+                f'"source": "replacement Python source for only '
+                f'{run_region_example_id}"}}}}\n'
+            )
+        else:
+            allowed_actions = [
+                "run_region",
+                "resume_from_region",
+                "inspect_variables",
+                "patch_region",
+            ]
+            execution_guidance = (
+                "Use run_region or resume_from_region for atomic region execution and "
+                "patch_region for local source repairs. Group-granularity actions are "
+                "unavailable in region mode."
+            )
+            execution_examples = (
+                f'{{"action": "run_region", "args": '
+                f'{{"region_id": "{run_region_example_id}"}}}}\n'
+                f'{{"action": "resume_from_region", "args": '
+                f'{{"region_id": "{run_region_example_id}"}}}}\n'
+                f'{{"action": "patch_region", "args": '
+                f'{{"region_id": "{run_region_example_id}", '
+                f'"source": "replacement Python source for only '
+                f'{run_region_example_id}"}}}}\n'
+            )
         patch_rule = (
             "For patch_region, args.source must be the complete replacement Python source "
             "for only the requested source region. Do not use new_source or patch for "
             "patch_region replacement text."
         )
-        ledger_actions_text = "run_region, resume_from_region, or patch_region"
-    if recovery_functions:
+        ledger_actions_text = (
+            "patch_region"
+            if repair_pending
+            else "run_region, resume_from_region, or patch_region"
+        )
+    if repair_pending:
+        recovery_guidance = (
+            "append_recovery is unavailable while source repair is pending."
+        )
+        recovery_example_line = ""
+        recovery_rule = recovery_guidance
+    elif recovery_functions:
         allowed_actions.append("append_recovery")
     allowed_actions.append("finish")
     allowed_actions_text = ", ".join(allowed_actions)

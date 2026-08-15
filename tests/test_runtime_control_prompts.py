@@ -197,6 +197,46 @@ def test_group_mode_prompt_only_advertises_group_granularity_actions(compact_con
 
 
 @pytest.mark.parametrize("compact_context", [False, True])
+def test_group_mode_repair_pending_prompt_quarantines_execution_actions(
+    compact_context,
+):
+    prompt = build_capsule_prompt(
+        task="stack cubes",
+        regions=[CodeRegion("region_1", 1, 1, "x = 1")],
+        groups=[CodeRegionGroup("group_1", 1, 1, "x = 1", ["region_1"])],
+        history=[],
+        trace_summary={},
+        contract_violations=[
+            {
+                "code": "effectful_helper",
+                "message": "helper reaches a robot side effect",
+                "source_span": {"start_line": 1, "end_line": 1},
+                "region_ids": ["region_1"],
+                "group_ids": ["group_1"],
+                "side_effect_calls": ["move_to"],
+                "helper_name": "move_cube",
+            }
+        ],
+        recovery_observation_functions={"get_observation"},
+        repair_pending=True,
+        compact_context=compact_context,
+    )
+    text = prompt[1]["content"][0]["text"]
+    allowed_actions = next(
+        line for line in text.splitlines() if line.startswith("Allowed actions:")
+    )
+
+    assert "repair_pending=true" in text
+    assert "patch_group" in allowed_actions
+    assert "inspect_variables" in allowed_actions
+    assert "finish" in allowed_actions
+    assert "run_group" not in allowed_actions
+    assert "append_recovery" not in allowed_actions
+    assert '{"action": "run_group"' not in text
+    assert '{"action": "patch_group"' in text
+
+
+@pytest.mark.parametrize("compact_context", [False, True])
 def test_region_mode_prompt_only_advertises_region_granularity_actions(compact_context):
     prompt = build_capsule_prompt(
         task="stack cubes",

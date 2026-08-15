@@ -1943,6 +1943,7 @@ def _run_capsule_loop(
                     side_effect_ledger=_display_side_effect_ledger(lineage),
                     recovery_observation_functions=recovery_observation_functions,
                     strict_subset=require_strict_subset,
+                    repair_pending=_capsule_source_requires_repair(source_analysis),
                     compact_context=llm_step_compact_context,
                     history_max_entries=action_history_max_entries,
                     trace_max_events=action_trace_max_events,
@@ -2445,6 +2446,7 @@ def _run_capsule_loop(
             contract_violations=program_contract_violations,
             strict_subset_violations=strict_subset_violations,
         )
+        metric.update(_capsule_repair_state_evidence(source_analysis))
         metric["budget_exhausted"] = False
         step_metrics.append(metric)
 
