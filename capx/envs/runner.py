@@ -20,6 +20,7 @@ from typing import Any
 from tqdm import tqdm
 
 from capx.envs.configs.instantiate import instantiate
+from capx.envs.infrastructure import InfrastructureFailure
 from capx.envs.tasks.base import CodeExecutionEnvBase
 from capx.envs.trial import (
     _annotate_code_blocks,
@@ -373,6 +374,22 @@ def _run_single_trial_with_timeout(
                     else "cancelled"
                 ),
                 failure_message=str(exc),
+                partial_artifacts=partial_artifacts,
+                timeout_seconds=timeout_seconds,
+                started_monotonic=trial_started_monotonic,
+                llm_context=llm_context,
+            )
+        except TrialResultPersistenceError as persistence_error:
+            raise exc from persistence_error.cause
+    except InfrastructureFailure as exc:
+        try:
+            return _finalize_exception(
+                trial=trial,
+                config=config,
+                writer=writer,
+                outcome=RunOutcome.INFRASTRUCTURE_FAILED,
+                failure_kind=exc.kind,
+                failure_message=exc.message,
                 partial_artifacts=partial_artifacts,
                 timeout_seconds=timeout_seconds,
                 started_monotonic=trial_started_monotonic,

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from types import SimpleNamespace
 
 import pytest
 
 from capx.envs import runner
+from capx.envs.infrastructure import InfrastructureFailure
 from capx.llm.context import llm_call_stage
 from capx.llm.errors import LLMErrorKind, LLMQueryError
 from capx.llm import client as llm_client
@@ -41,6 +43,23 @@ def test_default_complete_trial_timeout_is_450_seconds(monkeypatch):
     monkeypatch.delenv("CAPX_TRIAL_TIMEOUT_SECONDS", raising=False)
 
     assert runner._trial_timeout_seconds() == 450
+
+
+def test_infrastructure_failure_preserves_stable_diagnostics():
+    module_spec = importlib.util.find_spec("capx.envs.infrastructure")
+    assert module_spec is not None
+
+    from capx.envs.infrastructure import InfrastructureFailure
+
+    failure = InfrastructureFailure(
+        "service_timeout",
+        "SAM3 timed out",
+        evidence={"service": "sam3"},
+    )
+
+    assert failure.kind == "service_timeout"
+    assert failure.message == "SAM3 timed out"
+    assert failure.evidence == {"service": "sam3"}
 
 
 def test_runner_writes_running_result_before_invoking_trial(tmp_path, monkeypatch):
@@ -87,6 +106,25 @@ def test_typed_llm_failure_is_persisted_without_retrying_whole_trial(tmp_path, m
     assert summary.failure_kind == "http_5xx"
     assert result["run_outcome"] == "llm_failed"
     assert result["failure_kind"] == "http_5xx"
+
+
+def test_typed_infrastructure_failure_is_persisted(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        runner,
+        "_run_single_trial",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            InfrastructureFailure("service_timeout", "SAM3 timed out")
+        ),
+    )
+
+    summary = runner._run_trial_with_retries(
+        object(), 1, _args(), _config(tmp_path), None
+    )
+
+    result = json.loads((tmp_path / "trial_1_result.json").read_text())
+    assert summary.run_outcome == "infrastructure_failed"
+    assert summary.failure_kind == "service_timeout"
+    assert result["run_outcome"] == "infrastructure_failed"
 
 
 def test_all_llm_failed_ensemble_is_classified_as_llm_failure(tmp_path, monkeypatch):

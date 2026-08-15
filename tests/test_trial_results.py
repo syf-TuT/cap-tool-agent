@@ -133,6 +133,20 @@ def test_writer_serializes_typed_llm_failure_kind_as_stable_value(tmp_path):
     assert _load(path)["failure_kind"] == "http_5xx"
 
 
+def test_writer_accepts_infrastructure_failed_outcome(tmp_path):
+    writer = TrialResultWriter(tmp_path)
+    path = writer.start(trial=21, started_at=STARTED_AT)
+
+    writer.finalize(
+        _finished_result(
+            run_outcome=RunOutcome.INFRASTRUCTURE_FAILED,
+            failure_kind="service_http_5xx",
+        )
+    )
+
+    assert _load(path)["run_outcome"] == "infrastructure_failed"
+
+
 def test_writer_marks_only_residual_running_result_parent_guard_killed(tmp_path):
     writer = TrialResultWriter(tmp_path)
     path = writer.start(trial=8, started_at=STARTED_AT)
