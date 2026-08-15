@@ -35,6 +35,10 @@ import numpy as np
 from PIL import Image
 
 from capx.envs.configs.instantiate import instantiate
+from capx.envs.infrastructure import (
+    InfrastructureFailure,
+    classify_runtime_infrastructure_failure,
+)
 from capx.envs.tasks.base import CodeExecutionEnvBase
 from capx.envs.trial_results import RunOutcome
 from capx.llm.client import (
@@ -94,6 +98,8 @@ if TYPE_CHECKING:
 
 
 MULTITURN_LIMIT = 10
+CAPSULE_INFRASTRUCTURE_MAX_ATTEMPTS = 3
+CAPSULE_INFRASTRUCTURE_RETRY_BACKOFF_SECONDS = (0.5, 1.0)
 
 # ---------------------------------------------------------------------------
 # Shared formatting helpers
@@ -1261,22 +1267,21 @@ def _recovery_action_state(
             & generation.inline_observation_group_keys
         )
     dependency_runnable = set(group_dependency_state.runnable_group_ids)
-    runnable_group_ids = tuple(
-        group.group_id
-        for group in groups
+    runnable_group_ids = []
+    for group in groups:
+        group_key = lineage.group_key_by_id.get(group.group_id)
         if (
             group.group_id in dependency_runnable
-            and lineage.group_key_by_id.get(group.group_id) in runnable_keys
-            and lineage.group_key_by_id.get(group.group_id)
-            not in lineage.executed_group_keys
-        )
-    )
+            and group_key in runnable_keys
+            and group_key not in lineage.executed_group_keys
+        ):
+            runnable_group_ids.append(group.group_id)
     return _RecoveryActionState(
         append_recovery_available=False,
         append_recovery_block_reason=(
             "no_new_physical_state_since_last_append"
         ),
-        runnable_recovery_group_ids=runnable_group_ids,
+        runnable_recovery_group_ids=tuple(runnable_group_ids),
     )
 
 
@@ -2221,14 +2226,29 @@ def _run_capsule_loop(
                     recovery_generations=recovery_generations,
                 )
                 recovery_execution_attempt = recovery_authorization is not None
-                event = _execute_runtime_action(
-                    action,
-                    executor,
-                    source,
-                    region_by_id,
-                    group_by_id,
-                    recovery_observation_functions=recovery_observation_functions,
-                )
+                if action.action == "run_group":
+                    event = _execute_runtime_action_with_infrastructure_retries(
+                        action,
+                        executor,
+                        source,
+                        region_by_id,
+                        group_by_id,
+                        recovery_observation_functions=(
+                            recovery_observation_functions
+                        ),
+                        side_effect_calls=side_effect_calls,
+                    )
+                else:
+                    event = _execute_runtime_action(
+                        action,
+                        executor,
+                        source,
+                        region_by_id,
+                        group_by_id,
+                        recovery_observation_functions=(
+                            recovery_observation_functions
+                        ),
+                    )
                 if (
                     action.action == "inspect_variables"
                     and event.status == "success"
@@ -3036,6 +3056,76 @@ def _execute_runtime_action(
         return executor.run_region(region)
 
     return RuntimeEvent(action=action.action, status="invalid", message="Unsupported runtime action")
+
+
+def _execute_runtime_action_with_infrastructure_retries(
+    action: RuntimeAction,
+    executor: CapsuleExecutor,
+    source: str,
+    region_by_id: dict[str, Any],
+    group_by_id: dict[str, Any] | None = None,
+    *,
+    recovery_observation_functions: set[str] | None = None,
+    side_effect_calls: set[str],
+) -> RuntimeEvent:
+    attempts: list[dict[str, Any]] = []
+    for attempt in range(1, CAPSULE_INFRASTRUCTURE_MAX_ATTEMPTS + 1):
+        event = _execute_runtime_action(
+            action,
+            executor,
+            source,
+            region_by_id,
+            group_by_id,
+            recovery_observation_functions=recovery_observation_functions,
+        )
+        failure = classify_runtime_infrastructure_failure(event)
+        if failure is None:
+            if attempts:
+                event.evidence.update(
+                    {
+                        "infrastructure_attempt_count": attempt,
+                        "infrastructure_retry_count": len(attempts),
+                        "infrastructure_failed_attempts": attempts,
+                    }
+                )
+            return event
+
+        side_effect_trace_present = _event_has_side_effect_trace(
+            event,
+            side_effect_calls,
+        )
+        attempts.append(
+            {
+                "attempt": attempt,
+                "failure_kind": failure.kind,
+                "side_effect_trace_present": side_effect_trace_present,
+                "runtime_event": event.to_dict(),
+            }
+        )
+        if side_effect_trace_present or attempt == CAPSULE_INFRASTRUCTURE_MAX_ATTEMPTS:
+            failure.evidence.update(
+                {
+                    "infrastructure_attempt_count": attempt,
+                    "infrastructure_retry_count": attempt - 1,
+                    "infrastructure_failed_attempts": attempts,
+                }
+            )
+            if side_effect_trace_present:
+                failure.evidence["retry_suppressed_reason"] = (
+                    "robot_side_effect_trace_present"
+                )
+            raise failure
+
+        backoff_index = min(
+            attempt - 1,
+            len(CAPSULE_INFRASTRUCTURE_RETRY_BACKOFF_SECONDS) - 1,
+        )
+        time.sleep(CAPSULE_INFRASTRUCTURE_RETRY_BACKOFF_SECONDS[backoff_index])
+
+    raise InfrastructureFailure(
+        "service_retry_exhausted",
+        "Runtime service retry loop exhausted unexpectedly.",
+    )
 
 
 def _no_rollback_guard_event(

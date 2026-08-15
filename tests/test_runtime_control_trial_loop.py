@@ -10,6 +10,7 @@ import capx.envs.trial as trial_module
 import numpy as np
 import pytest
 from PIL import Image
+from capx.envs.infrastructure import InfrastructureFailure
 from capx.envs.trial import (
     _analyze_capsule_source,
     _attach_capsule_visuals,
@@ -5256,6 +5257,172 @@ def test_side_effect_recorder_does_not_partially_seal_group_without_region_key()
 
     assert lineage.executed_region_keys == set()
     assert lineage.executed_group_keys == set()
+
+
+def test_run_group_retries_transient_infrastructure_failure_without_side_effect_trace(
+    tmp_path,
+    monkeypatch,
+):
+    calls = 0
+
+    def execute(*args, **kwargs):
+        nonlocal calls
+        action = args[0]
+        if action.action != "run_group":
+            return RuntimeEvent(action.action, "success")
+        calls += 1
+        if calls < 3:
+            return RuntimeEvent(
+                "run_group",
+                "failed",
+                message="connection refused",
+                evidence={
+                    "exception_type": "ConnectionError",
+                    "trace_events": [
+                        {"name": "get_pose", "status": "failed"}
+                    ],
+                },
+            )
+        return RuntimeEvent("run_group", "success", evidence={"trace_events": []})
+
+    monkeypatch.setattr(trial_module, "_execute_runtime_action", execute)
+    monkeypatch.setattr(trial_module.time, "sleep", lambda seconds: None)
+
+    trial_module._run_capsule_loop(
+        FakeIncompleteCapsuleEnv(),
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_max_regions_per_group": 1,
+        },
+        initial_code='pose = get_pose("cube")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+        ],
+    )
+    rows = _capsule_step_metrics(
+        tmp_path / "capsule_step_metrics_trial_00.jsonl"
+    )
+    trial_metrics = json.loads(
+        (tmp_path / "capsule_trial_metrics_trial_00.json").read_text()
+    )
+
+    assert calls == 3
+    assert rows[0]["event_status"] == "success"
+    assert trial_metrics["logical_decision_count"] == 2
+    assert trial_metrics["llm_decision_count"] == 0
+
+
+def test_run_group_does_not_retry_after_side_effect_api_trace(monkeypatch):
+    calls = 0
+
+    def execute(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return RuntimeEvent(
+            "run_group",
+            "failed",
+            message="connection refused",
+            evidence={
+                "exception_type": "ConnectionError",
+                "trace_events": [{"name": "move_to", "status": "failed"}],
+            },
+        )
+
+    monkeypatch.setattr(trial_module, "_execute_runtime_action", execute)
+    monkeypatch.setattr(trial_module.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(InfrastructureFailure) as exc_info:
+        trial_module._execute_runtime_action_with_infrastructure_retries(
+            RuntimeAction("run_group", {"group_id": "group_1"}),
+            object(),
+            'move_to("target")',
+            {},
+            {},
+            recovery_observation_functions={"get_observation"},
+            side_effect_calls={"move_to"},
+        )
+
+    assert calls == 1
+    assert exc_info.value.kind == "service_connection_refused"
+    assert exc_info.value.evidence["retry_suppressed_reason"] == (
+        "robot_side_effect_trace_present"
+    )
+
+
+def test_run_group_raises_typed_failure_after_three_safe_attempts(monkeypatch):
+    calls = 0
+
+    def execute(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return RuntimeEvent(
+            "run_group",
+            "failed",
+            message="read operation timed out",
+            evidence={"exception_type": "ReadTimeout", "trace_events": []},
+        )
+
+    monkeypatch.setattr(trial_module, "_execute_runtime_action", execute)
+    monkeypatch.setattr(trial_module.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(InfrastructureFailure) as exc_info:
+        trial_module._execute_runtime_action_with_infrastructure_retries(
+            RuntimeAction("run_group", {"group_id": "group_1"}),
+            object(),
+            "x = 1",
+            {},
+            {},
+            recovery_observation_functions={"get_observation"},
+            side_effect_calls={"move_to"},
+        )
+
+    assert calls == 3
+    assert exc_info.value.kind == "service_timeout"
+    assert exc_info.value.evidence["infrastructure_attempt_count"] == 3
+    assert exc_info.value.evidence["infrastructure_retry_count"] == 2
+
+
+def test_capsule_loop_propagates_infrastructure_failure_without_repair_history(
+    tmp_path,
+    monkeypatch,
+):
+    calls = 0
+
+    def execute(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return RuntimeEvent(
+            "run_group",
+            "failed",
+            message="connection refused",
+            evidence={"exception_type": "ConnectionError", "trace_events": []},
+        )
+
+    monkeypatch.setattr(trial_module, "_execute_runtime_action", execute)
+    monkeypatch.setattr(trial_module.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(InfrastructureFailure):
+        trial_module._run_capsule_loop(
+            FakeIncompleteCapsuleEnv(),
+            trial=0,
+            args=SimpleNamespace(model="test", use_oracle_code=False),
+            config={
+                "output_dir": str(tmp_path),
+                "max_capsule_steps": 1,
+                "capsule_max_regions_per_group": 1,
+            },
+            initial_code='pose = get_pose("cube")\n',
+            scripted_actions=[
+                {"action": "run_group", "args": {"group_id": "group_1"}}
+            ],
+        )
+
+    assert calls == 3
+    assert not (tmp_path / "capsule_step_metrics_trial_00.jsonl").exists()
 
 
 def test_recovery_trace_commit_is_atomic_when_lineage_recorder_raises(monkeypatch):

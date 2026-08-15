@@ -451,6 +451,7 @@ def test_capsule_prompt_blocks_repeat_append_and_exposes_runnable_recovery_group
     assert '"append_recovery_block_reason": "no_new_physical_state_since_last_append"' in text
     assert '"runnable_recovery_group_ids": [\n    "group_3"\n  ]' in text
     assert '{"action": "append_recovery", "args": {"source":' not in text
+    assert "use append_recovery with a fresh-state function" not in text
 
 
 def test_capsule_prompt_documents_task_specific_recovery_observation_functions():

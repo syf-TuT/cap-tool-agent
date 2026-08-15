@@ -151,6 +151,24 @@ def build_capsule_prompt(
         )
         recovery_example_line = ""
         recovery_rule = recovery_guidance
+    if repair_pending:
+        recovery_continuation_rule = (
+            "- Repair the current source before attempting additional robot-side-effect "
+            "motion.\n"
+        )
+    elif not append_recovery_available:
+        recovery_continuation_rule = (
+            "- If additional robot-side-effect motion is needed, run one of the listed "
+            "runnable recovery groups to record fresh physical trace evidence.\n"
+        )
+    elif recovery_functions:
+        recovery_continuation_rule = (
+            "- If additional robot-side-effect motion is needed after an executed "
+            "side-effect unit, use append_recovery with a fresh-state function and "
+            "continue from the current physical state.\n"
+        )
+    else:
+        recovery_continuation_rule = ""
     uses_semantic_groups = groups is not None
     normalized_side_effect_ledger = _normalize_side_effect_ledger(side_effect_ledger)
     group_availability = _normalize_group_availability(
@@ -291,6 +309,7 @@ def build_capsule_prompt(
         source_revision=source_revision,
         group_availability=group_availability,
         recovery_availability=recovery_availability,
+        recovery_continuation_rule=recovery_continuation_rule,
     )
     if compact_context and _prompt_text_over_budget(prompt_text, prompt_char_budget):
         prompt_text = _build_capsule_prompt_text(
@@ -330,6 +349,7 @@ def build_capsule_prompt(
             source_revision=source_revision,
             group_availability=group_availability,
             recovery_availability=recovery_availability,
+            recovery_continuation_rule=recovery_continuation_rule,
         )
     if (
         compact_context
@@ -374,6 +394,7 @@ def build_capsule_prompt(
             source_revision=source_revision,
             group_availability=group_availability,
             recovery_availability=recovery_availability,
+            recovery_continuation_rule=recovery_continuation_rule,
         )
     if (
         compact_context
@@ -414,6 +435,7 @@ def build_capsule_prompt(
             source_revision=source_revision,
             group_availability=group_availability,
             recovery_availability=recovery_availability,
+            recovery_continuation_rule=recovery_continuation_rule,
         )
     return _capsule_prompt_messages(prompt_text)
 
@@ -456,6 +478,7 @@ def _build_capsule_prompt_text(
     source_revision: int | None,
     group_availability: dict[str, Any] | None,
     recovery_availability: dict[str, Any] | None,
+    recovery_continuation_rule: str,
 ) -> str:
     if compact_context:
         region_units = [
@@ -621,9 +644,7 @@ def _build_capsule_prompt_text(
         f"- Do not choose {ledger_actions_text} for units "
         "marked execution_state=executed_side_effect or listed in the side-effect "
         "execution ledger; rollback is unavailable and those actions will be invalid.\n"
-        "- If additional robot-side-effect motion is needed after an executed side-effect "
-        "unit, use append_recovery with a fresh-state function and continue from the "
-        "current physical state.\n\n"
+        f"{recovery_continuation_rule}\n"
         f"Allowed actions: {allowed_actions_text}.\n\n"
         f"{execution_guidance}\n\n"
         "Respond with exactly one JSON object. Examples:\n"

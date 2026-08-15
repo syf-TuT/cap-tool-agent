@@ -9,10 +9,15 @@ import pytest
 
 from capx.envs import launch as launch_module
 from capx.envs import runner
-from capx.envs.infrastructure import InfrastructureFailure, ServiceReadinessError
+from capx.envs.infrastructure import (
+    InfrastructureFailure,
+    ServiceReadinessError,
+    classify_runtime_infrastructure_failure,
+)
+from capx.llm import client as llm_client
 from capx.llm.context import llm_call_stage
 from capx.llm.errors import LLMErrorKind, LLMQueryError
-from capx.llm import client as llm_client
+from capx.runtime_control.schema import RuntimeEvent
 from capx.utils.launch_utils import TrialSummary, _print_and_save_summary
 
 
@@ -62,6 +67,74 @@ def test_infrastructure_failure_preserves_stable_diagnostics():
     assert failure.kind == "service_timeout"
     assert failure.message == "SAM3 timed out"
     assert failure.evidence == {"service": "sam3"}
+
+
+@pytest.mark.parametrize(
+    ("event", "expected_kind"),
+    [
+        (
+            RuntimeEvent(
+                "run_group",
+                "failed",
+                message="[Errno 111] Connection refused",
+                evidence={"exception_type": "ConnectionError"},
+            ),
+            "service_connection_refused",
+        ),
+        (
+            RuntimeEvent(
+                "run_group",
+                "failed",
+                message="read operation timed out",
+                evidence={"exception_type": "ReadTimeout"},
+            ),
+            "service_timeout",
+        ),
+        (
+            RuntimeEvent(
+                "run_group",
+                "failed",
+                message="connect operation timed out",
+                evidence={"exception_type": "ConnectTimeout"},
+            ),
+            "service_timeout",
+        ),
+        *[
+            (
+                RuntimeEvent(
+                    "run_group",
+                    "failed",
+                    stderr=(
+                        "requests.exceptions.HTTPError: "
+                        f"{status_code} Server Error"
+                    ),
+                ),
+                "service_http_5xx",
+            )
+            for status_code in (500, 502, 503, 504)
+        ],
+    ],
+)
+def test_runtime_infrastructure_failure_classifier(event, expected_kind):
+    failure = classify_runtime_infrastructure_failure(event)
+
+    assert failure is not None
+    assert failure.kind == expected_kind
+    assert failure.evidence["runtime_event"]["status"] == "failed"
+
+
+@pytest.mark.parametrize("exception_type", ["NameError", "RuntimeError"])
+def test_runtime_infrastructure_failure_classifier_ignores_program_errors(
+    exception_type,
+):
+    event = RuntimeEvent(
+        "run_group",
+        "failed",
+        message="program execution failed",
+        evidence={"exception_type": exception_type},
+    )
+
+    assert classify_runtime_infrastructure_failure(event) is None
 
 
 def test_required_service_endpoints_include_libero_molmo():
