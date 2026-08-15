@@ -6112,6 +6112,10 @@ def test_recovery_stable_keys_never_leak_into_model_prompt(
     prompt_user_text = captured_prompts[0][1]["content"][0]["text"]
     assert '"append_recovery_available": false' in prompt_user_text
     assert (
+        '"pending_recovery_group_ids": [\n    "group_2",\n    "group_3"\n  ]'
+        in prompt_user_text
+    )
+    assert (
         '"runnable_recovery_group_ids": [\n    "group_2"\n  ]'
         in prompt_user_text
     )

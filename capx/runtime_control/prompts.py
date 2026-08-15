@@ -106,6 +106,7 @@ def build_capsule_prompt(
     blocked_group_dependencies: dict[str, list[str]] | None = None,
     append_recovery_available: bool = True,
     append_recovery_block_reason: str | None = None,
+    pending_recovery_group_ids: list[str] | None = None,
     runnable_recovery_group_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     recovery_functions = sorted(
@@ -121,11 +122,10 @@ def build_capsule_prompt(
         recovery_rule = recovery_guidance
     elif not append_recovery_available:
         recovery_guidance = (
-            "append_recovery is unavailable until a fresh physical trace is recorded "
-            "after the previous recovery append. Continue by running one of the "
-            "runnable recovery groups shown below. If none are runnable, patch the "
-            "existing recovery source, then execute it; a patch alone does not unlock "
-            "another append."
+            "append_recovery is unavailable while the latest recovery transaction "
+            "is pending; finish the existing recovery transaction by running one of "
+            "the runnable recovery groups shown below, or patch one of its pending "
+            "groups when repair is required."
         )
         recovery_example_line = ""
         recovery_rule = recovery_guidance
@@ -158,8 +158,9 @@ def build_capsule_prompt(
         )
     elif not append_recovery_available:
         recovery_continuation_rule = (
-            "- If additional robot-side-effect motion is needed, run one of the listed "
-            "runnable recovery groups to record fresh physical trace evidence.\n"
+            "- Finish the existing recovery transaction before appending another: "
+            "run a listed runnable recovery group, or patch a listed pending recovery "
+            "group when repair is required.\n"
         )
     elif recovery_functions:
         recovery_continuation_rule = (
@@ -178,6 +179,7 @@ def build_capsule_prompt(
     recovery_availability = _normalize_recovery_availability(
         append_recovery_available=append_recovery_available,
         append_recovery_block_reason=append_recovery_block_reason,
+        pending_recovery_group_ids=pending_recovery_group_ids,
         runnable_recovery_group_ids=runnable_recovery_group_ids,
     )
     run_group_example_id = _example_group_id(
@@ -1198,17 +1200,22 @@ def _normalize_recovery_availability(
     *,
     append_recovery_available: bool,
     append_recovery_block_reason: str | None,
+    pending_recovery_group_ids: list[str] | None,
     runnable_recovery_group_ids: list[str] | None,
 ) -> dict[str, Any] | None:
     if (
         append_recovery_available
         and append_recovery_block_reason is None
+        and pending_recovery_group_ids is None
         and runnable_recovery_group_ids is None
     ):
         return None
     return {
         "append_recovery_available": append_recovery_available,
         "append_recovery_block_reason": append_recovery_block_reason,
+        "pending_recovery_group_ids": _ordered_prompt_strings(
+            pending_recovery_group_ids
+        ),
         "runnable_recovery_group_ids": _ordered_prompt_strings(
             runnable_recovery_group_ids
         ),

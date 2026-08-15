@@ -2091,6 +2091,9 @@ def _run_capsule_loop(
                     append_recovery_block_reason=(
                         recovery_action_state.append_recovery_block_reason
                     ),
+                    pending_recovery_group_ids=list(
+                        recovery_action_state.pending_recovery_group_ids
+                    ),
                     runnable_recovery_group_ids=list(
                         recovery_action_state.runnable_recovery_group_ids
                     ),
