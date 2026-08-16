@@ -300,6 +300,25 @@ _soup = select(position)
 
 
 @pytest.mark.parametrize(
+    ("source", "sensitive_name"),
+    [
+        ("value = __name__\n", "__name__"),
+        ('__name__ = "changed"\n', "__name__"),
+        ("value = __annotations__\n", "__annotations__"),
+        ("__annotations__ = {}\n", "__annotations__"),
+    ],
+)
+def test_strict_subset_keeps_runtime_dunder_names_private(source, sensitive_name):
+    violations = _strict_analyze(source)
+
+    assert violations
+    assert any(
+        f"sensitive runtime name '{sensitive_name}' is not available" in violation.message
+        for violation in violations
+    )
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "value = pose._position\n",

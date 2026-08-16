@@ -103,7 +103,9 @@ _STRICT_CAPSULE_FORBIDDEN_CALLABLES = frozenset(
 _STRICT_CAPSULE_SENSITIVE_NAMES = frozenset(
     {
         "APIS",
+        "__annotations__",
         "__builtins__",
+        "__name__",
         "builtins",
         "ctypes",
         "env",
