@@ -518,6 +518,8 @@ def _prove_strict_helper_purity(
         helper = definitions[0]
         calls = _collect_strict_helper_calls(helper.body)
         for call in calls:
+            if _is_zero_argument_copy_call(call):
+                continue
             if not isinstance(call.func, ast.Name):
                 unsafe_reasons.setdefault(
                     helper_name,
@@ -771,6 +773,8 @@ class _StrictStaticCostEstimator:
         if node is None or isinstance(node, (ast.Constant, ast.Name)):
             return 0
         if isinstance(node, ast.Call):
+            if _is_zero_argument_copy_call(node):
+                return _add_static_cost(self.expression_cost(node.func.value), 1)
             argument_cost = self._call_argument_cost(node)
             if isinstance(node.func, ast.Name):
                 callable_name = node.func.id

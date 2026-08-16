@@ -2306,6 +2306,7 @@ def test_nonprivileged_repair_accepts_underscore_locals_and_copy(
     assert "Capsule-ready program contract violations" in initial_prompt
     assert "effectful_helper" in initial_prompt
     assert "private name" not in initial_prompt
+    assert "contains a non-direct call" not in initial_prompt
     assert (
         "calls must target a direct public API, safe builtin, or top-level helper name"
         not in initial_prompt

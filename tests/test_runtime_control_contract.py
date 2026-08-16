@@ -195,6 +195,16 @@ def test_strict_subset_allows_zero_argument_data_copy(expression):
     assert _strict_analyze(f"copied = {expression}\n") == []
 
 
+def test_strict_subset_allows_zero_argument_data_copy_in_pure_helper():
+    source = """\
+def clone(value):
+    return value.copy()
+copied = clone([1, 2, 3])
+"""
+
+    assert _strict_analyze(source) == []
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -801,6 +811,20 @@ def test_strict_subset_preflight_api_is_exported():
 
 def test_strict_subset_counts_for_iterable_construction_cost():
     source = "for item in list(range(10000)):\n    value = item\n"
+
+    violations = _strict_analyze(source)
+
+    assert any(
+        "static compute budget" in violation.message.lower()
+        for violation in violations
+    )
+
+
+def test_strict_subset_counts_zero_argument_copy_receiver_cost():
+    source = (
+        "first = list(range(6000)).copy()\n"
+        "second = list(range(6000)).copy()\n"
+    )
 
     violations = _strict_analyze(source)
 
