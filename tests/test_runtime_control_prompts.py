@@ -1246,7 +1246,7 @@ def test_capsule_prompt_states_strict_python_subset_constraints():
     assert "callable aliases" in text
     assert "attribute calls" in text
     assert "zero-argument .copy()" in text
-    assert "other attribute calls" in text
+    assert "All other attribute calls remain forbidden" in text
     assert "direct public API functions" in text
     assert "bounded for loops" in text
 
