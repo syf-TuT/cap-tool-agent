@@ -116,7 +116,7 @@ def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
     assert "dynamic or reflective calls" in prompt
     assert "callable aliases" in prompt
     assert "attribute calls" in prompt
-    assert "zero-argument .copy()" in prompt
+    assert "only zero-argument .copy() is allowed as an attribute call" in prompt
     assert "other attribute calls are forbidden" in prompt
     assert "direct calls to the public api functions" in prompt
     assert "safe builtins" in prompt
@@ -134,6 +134,8 @@ def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
     assert "wrist-camera capture is disabled" in docs
     assert "molmo remains an internal perception service used by `frankaliberoapi`" in docs
     assert "no imports, classes, lambdas, `try`, `while`, or async constructs" in docs
+    assert "only zero-argument `.copy()` is allowed as an attribute call" in docs
+    assert "all other attribute calls are unavailable" in docs
     assert "only statically bounded `for` loops" in docs
     assert "all loops" not in docs
     assert "prepared wsl project at `/home/capx/code/cap-x`" in docs

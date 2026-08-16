@@ -70,7 +70,8 @@ Because this configuration sets `privileged: false`, every generated Capsule pro
 must pass the strict Python-subset preflight. This enforcement is independent of
 `capsule_validate_program_contract`; setting that flag to `false` does not disable the
 strict subset. Use no imports, classes, lambdas, `try`, `while`, or async constructs.
-Dynamic or reflective calls, callable aliases, and attribute calls are unavailable. The
+Dynamic or reflective calls and callable aliases are unavailable. Only zero-argument
+`.copy()` is allowed as an attribute call; all other attribute calls are unavailable. The
 execution globals contain only restricted safe builtins and approved public API
 bindings. Programs may directly call those bindings, safe builtins, or proven-pure
 top-level helpers. They may use only statically bounded `for` loops, and total
