@@ -238,7 +238,6 @@ def test_strict_subset_rejects_callable_aliases_and_rebinding(source):
         "value = frame\n",
         "value = pose._position\n",
         "pose.position = target\n",
-        "_hidden = 1\n",
         "sys._getframe()\n",
     ],
 )
@@ -250,6 +249,30 @@ def test_strict_subset_rejects_private_and_sensitive_runtime_access(source):
         violation.code == "strict_subset_violation"
         for violation in violations
     )
+
+
+def test_strict_subset_allows_underscore_prefixed_local_names_and_parameters():
+    source = """\
+def select(_value):
+    return _value
+position, _ = detect_object("bowl")
+_soup = select(position)
+"""
+
+    assert _strict_analyze(source) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "value = pose._position\n",
+        "value = pose.__class__\n",
+        "def _helper(value):\n    return value\n_helper(1)\n",
+        "__builtins__ = {}\n",
+    ],
+)
+def test_strict_subset_keeps_private_capabilities_and_helpers_closed(source):
+    assert _strict_analyze(source)
 
 
 @pytest.mark.parametrize(

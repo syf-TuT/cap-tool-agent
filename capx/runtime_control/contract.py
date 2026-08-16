@@ -998,11 +998,13 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
     def add_helper_violation(self, helper: ast.FunctionDef, reason: str) -> None:
         self._emit(helper, reason, helper_name=helper.name)
 
-    def _identifier_violation(self, name: str) -> str | None:
-        if name.startswith("_"):
-            return f"private name '{name}' is not available"
+    def _identifier_violation(
+        self, name: str, *, allow_private_local: bool = False
+    ) -> str | None:
         if name in _STRICT_CAPSULE_SENSITIVE_NAMES:
             return f"sensitive runtime name '{name}' is not available"
+        if name.startswith("_") and not allow_private_local:
+            return f"private name '{name}' is not available"
         return None
 
     def generic_visit(self, node: ast.AST) -> None:
@@ -1049,7 +1051,7 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
             self._emit(node, "function defaults must be literal values")
 
         for argument in _function_arguments(node.args):
-            reason = self._identifier_violation(argument.arg)
+            reason = self._identifier_violation(argument.arg, allow_private_local=True)
             if reason is not None:
                 self._emit(argument, reason)
             elif argument.arg in self.protected_callable_names:
@@ -1075,7 +1077,7 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         self._emit(node, "syntax 'Lambda' is not allowed")
 
     def visit_Name(self, node: ast.Name) -> None:
-        reason = self._identifier_violation(node.id)
+        reason = self._identifier_violation(node.id, allow_private_local=True)
         if reason is not None:
             self._emit(node, reason)
             return
@@ -1150,7 +1152,7 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         if node.type is not None:
             self._visit_exception_type(node.type)
         if node.name is not None:
-            reason = self._identifier_violation(node.name)
+            reason = self._identifier_violation(node.name, allow_private_local=True)
             if reason is not None:
                 self._emit(node, reason)
             elif node.name in self.protected_callable_names:
