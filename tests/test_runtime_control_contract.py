@@ -184,6 +184,33 @@ def test_strict_subset_allows_direct_safe_exception_construction():
 
 
 @pytest.mark.parametrize(
+    "expression",
+    [
+        "position.copy()",
+        'observation["rgb"].copy()',
+        'detect_object("bowl")[0].copy()',
+    ],
+)
+def test_strict_subset_allows_zero_argument_data_copy(expression):
+    assert _strict_analyze(f"copied = {expression}\n") == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "value.copy(1)\n",
+        'value.copy(order="K")\n',
+        "value.tolist()\n",
+        "value._copy()\n",
+        "value._private.copy()\n",
+        "__builtins__.copy()\n",
+    ],
+)
+def test_strict_subset_rejects_non_whitelisted_attribute_calls(source):
+    assert _strict_analyze(source)
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "obj.measure()\n",

@@ -2258,6 +2258,64 @@ def test_nonprivileged_llm_step_reanalyzes_strict_source_after_patch(tmp_path):
     assert summary.sandbox_rc == 1
 
 
+def test_nonprivileged_repair_accepts_underscore_locals_and_copy(
+    tmp_path, monkeypatch
+):
+    env = FakeSuccessfulNonPrivilegedCapsuleEnv()
+    initial_source = (
+        "def execute_task():\n"
+        "    values = [1, 2, 3]\n"
+        "    _soup = values.copy()\n"
+        "    close_gripper()\n"
+        "execute_task()\n"
+    )
+    repaired_source = (
+        "values = [1, 2, 3]\n"
+        "_soup = values.copy()\n"
+        "close_gripper()\n"
+    )
+
+    _stub_capsule_model_actions(
+        monkeypatch,
+        [
+            {
+                "action": "patch_group",
+                "args": {"group_id": "group_1", "source": repaired_source},
+            },
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+        ],
+    )
+
+    trial_module._run_capsule_loop(
+        env,
+        trial=0,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 2,
+            "capsule_validate_program_contract": True,
+        },
+        initial_code=initial_source,
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_00.json").read_text())
+    metrics = _capsule_step_metrics(tmp_path / "capsule_step_metrics_trial_00.jsonl")
+    prompts = json.loads((tmp_path / "capsule_prompts_trial_00.json").read_text())
+    initial_prompt = str(prompts[0])
+
+    assert "Capsule-ready program contract violations" in initial_prompt
+    assert "effectful_helper" in initial_prompt
+    assert "private name" not in initial_prompt
+    assert (
+        "calls must target a direct public API, safe builtin, or top-level helper name"
+        not in initial_prompt
+    )
+    assert [entry["event"]["status"] for entry in trace] == ["success", "success"]
+    assert trace[0]["event"]["evidence"]["source_revision_after"] == 1
+    assert env.api.calls == ["close_gripper"]
+    assert all(row["strict_subset_valid"] is True for row in metrics)
+
+
 def test_program_contract_safety_failure_stays_sticky_after_task_success(tmp_path):
     env = FakeSuccessfulPrivilegedCapsuleEnv()
 

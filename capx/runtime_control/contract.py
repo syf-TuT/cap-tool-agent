@@ -132,6 +132,16 @@ _STRICT_CAPSULE_BOUNDED_ITERABLE_WRAPPERS = frozenset(
     {"dict", "enumerate", "list", "reversed", "set", "tuple"}
 )
 
+
+def _is_zero_argument_copy_call(node: ast.Call) -> bool:
+    return (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "copy"
+        and not node.args
+        and not node.keywords
+    )
+
+
 _STRICT_CAPSULE_ALLOWED_NODES = (
     ast.Module,
     ast.Expr,
@@ -1100,6 +1110,10 @@ class _StrictCapsuleSubsetVisitor(ast.NodeVisitor):
         self.visit(node.value)
 
     def visit_Call(self, node: ast.Call) -> None:
+        if _is_zero_argument_copy_call(node):
+            self.visit(node.func.value)
+            return
+
         if not isinstance(node.func, ast.Name):
             self._emit(
                 node,
