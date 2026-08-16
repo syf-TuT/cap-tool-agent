@@ -55,8 +55,9 @@ _STANDALONE_BASE64_PAYLOAD = re.compile(r"(?i)(?<![A-Za-z0-9_])base64,(?=\s*[A-Z
 _STRICT_CAPSULE_SOURCE_CONSTRAINTS = (
     "Strict Python subset for every generated or patched source:\n"
     "- Use no imports, classes, lambdas, try, while, async, dynamic or reflective "
-    "calls, callable aliases, or attribute calls. Call only direct public API "
-    "functions, safe builtins, and proven-pure helpers; use only bounded for loops."
+    "calls, callable aliases, or attribute calls other than zero-argument .copy(). "
+    "All other attribute calls remain forbidden. Call only direct public API functions, "
+    "safe builtins, and proven-pure helpers; use only bounded for loops."
 )
 
 

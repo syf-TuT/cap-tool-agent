@@ -24,7 +24,8 @@ env:
       Generate one complete executable Python program for the goal.
       The strict Python subset is mandatory for this non-privileged Capsule program.
       Use no imports, classes, lambdas, try, while, or async constructs.
-      Dynamic or reflective calls, callable aliases, and attribute calls are also forbidden.
+      Dynamic or reflective calls and callable aliases are also forbidden.
+      Only zero-argument .copy() is allowed as an attribute call; other attribute calls are forbidden.
       Use only direct calls to the public API functions and safe builtins.
       You may also directly call proven-pure top-level helper functions.
       Use only statically bounded for loops.

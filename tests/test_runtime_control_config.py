@@ -116,6 +116,8 @@ def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
     assert "dynamic or reflective calls" in prompt
     assert "callable aliases" in prompt
     assert "attribute calls" in prompt
+    assert "zero-argument .copy()" in prompt
+    assert "other attribute calls" in prompt
     assert "direct calls to the public api functions" in prompt
     assert "safe builtins" in prompt
     assert "proven-pure top-level helper functions" in prompt
