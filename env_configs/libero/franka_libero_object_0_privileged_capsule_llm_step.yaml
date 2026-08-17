@@ -21,20 +21,16 @@ env:
       Goal: {libero_environment_goal}
       Generate one complete executable Python program for the goal.
       Ground-truth object poses are available through the privileged public API functions.
-      Use no imports and do not access the internal env or APIS handles.
-      Use only direct calls to the public API functions and safe builtins.
-      Robot side effects must be top-level.
-      Use at most one robot side-effect API call per semantic group.
-      You may write Python code comments for reasoning.
-      Write only executable Python code and do not use code fences.
-      The public API functions below are already available in the restricted execution environment.
+      You may write Python code comments for reasoning but ONLY write the executable Python code and do not write it in code fences.
+      After each capsule step executes, you will receive runtime feedback and may patch or continue the program if needed.
+      The functions (APIs) below are already imported to the environment. If you want to use numpy, you need to import it explicitly.
 
 agent_mode: capsule
 max_capsule_steps: 24
 capsule_execution_granularity: semantic_group
 capsule_progress_mode: sparse_terminal
 capsule_require_task_success_for_finish: true
-capsule_validate_program_contract: true
+capsule_validate_program_contract: false
 capsule_action_visual_feedback: false
 capsule_prompt_state_level: full
 capsule_diagnostic_state_level: full

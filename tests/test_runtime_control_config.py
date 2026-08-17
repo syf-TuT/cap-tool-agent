@@ -153,7 +153,7 @@ def test_libero_object_capsule_llm_step_yaml_uses_approved_capabilities():
     assert "point-cloud" in docs
 
 
-def test_libero_object_privileged_capsule_yaml_uses_ground_truth_api():
+def test_libero_object_privileged_capsule_yaml_uses_ground_truth_api_and_regular_python():
     repo_root = Path(__file__).resolve().parents[1]
     config_path = (
         repo_root
@@ -184,7 +184,7 @@ def test_libero_object_privileged_capsule_yaml_uses_ground_truth_api():
     assert data["capsule_execution_granularity"] == "semantic_group"
     assert data["capsule_progress_mode"] == "sparse_terminal"
     assert data["capsule_require_task_success_for_finish"] is True
-    assert data["capsule_validate_program_contract"] is True
+    assert data["capsule_validate_program_contract"] is False
     assert data["capsule_action_visual_feedback"] is False
     assert data["capsule_prompt_state_level"] == "full"
     assert data["capsule_diagnostic_state_level"] == "full"
@@ -210,16 +210,15 @@ def test_libero_object_privileged_capsule_yaml_uses_ground_truth_api():
     prompt = cfg["prompt"].lower()
     assert "one complete executable python program" in prompt
     assert "ground-truth object poses" in prompt
-    assert "public api functions" in prompt
-    assert "no imports" in prompt
-    assert "do not access the internal env or apis handles" in prompt
-    assert "use only direct calls to the public api functions" in prompt
-    assert "safe builtins" in prompt
-    assert "robot side effects must be top-level" in prompt
-    assert "use at most one robot side-effect api call per semantic group" in prompt
+    assert "functions (apis) below are already imported" in prompt
+    assert "if you want to use numpy, you need to import it explicitly" in prompt
+    assert "no imports" not in prompt
+    assert "do not access the internal env or apis handles" not in prompt
+    assert "restricted execution environment" not in prompt
+    assert "safe builtins" not in prompt
     assert "you may write python code comments for reasoning" in prompt
-    assert "write only executable python code" in prompt
-    assert "do not use code fences" in prompt
+    assert "only write the executable python code" in prompt
+    assert "do not write it in code fences" in prompt
 
 
 def test_code_exec_env_config_defaults_molmo_service_to_unspecified():
