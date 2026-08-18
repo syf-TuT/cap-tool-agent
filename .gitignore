@@ -18,6 +18,8 @@ env/
 .codex_*.py
 .codex_start_services_*.sh
 .codex-downloads/
+.codex-model-cache/
+codecap-x.codex-model-cache*
 .codex-results/
 .codex-upload/
 /.codex_runs/
