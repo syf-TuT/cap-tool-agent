@@ -83,6 +83,9 @@ class FrankaControlSpillWipeApi(ApiBase):
         }
         return fns
 
+    def recovery_observation_functions(self) -> set[str]:
+        return {"get_object_pose"}
+
     def side_effect_functions(self) -> set[str]:
         return {"goto_pose"}
 
