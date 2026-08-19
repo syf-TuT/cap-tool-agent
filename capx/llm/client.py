@@ -130,6 +130,18 @@ def _reasoning_disabled() -> bool:
     return os.getenv("CAPX_DISABLE_REASONING") == "1"
 
 
+def _uses_qwen_thinking_flag(model: str) -> bool:
+    model_lower = model.lower()
+    return model_lower.startswith("qwen") or "/qwen" in model_lower
+
+
+def _disable_payload_reasoning(payload: dict[str, Any], *, model: str) -> None:
+    payload.pop("reasoning_effort", None)
+    payload["thinking"] = {"type": "disabled"}
+    if _uses_qwen_thinking_flag(model):
+        payload["enable_thinking"] = False
+
+
 _RETRYABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
 
 
@@ -480,8 +492,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> dict
 
     reasoning_disabled = _reasoning_disabled()
     if reasoning_disabled:
-        payload.pop("reasoning_effort", None)
-        payload["thinking"] = {"type": "disabled"}
+        _disable_payload_reasoning(payload, model=args.model)
 
     policy = LLMRetryPolicy.from_env()
     context = get_trial_llm_context()
@@ -998,8 +1009,7 @@ def _streaming_events(
 
     reasoning_disabled = _reasoning_disabled()
     if reasoning_disabled:
-        payload.pop("reasoning_effort", None)
-        payload["thinking"] = {"type": "disabled"}
+        _disable_payload_reasoning(payload, model=args.model)
 
     full_content = ""
     full_reasoning = ""

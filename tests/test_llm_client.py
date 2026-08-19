@@ -266,6 +266,39 @@ def test_empty_stream_falls_back_to_non_streaming_once(monkeypatch):
     assert [payload.get("stream", False) for payload in payloads] == [True, False]
 
 
+def test_qwen_non_streaming_reasoning_disabled_sets_enable_thinking(monkeypatch):
+    _non_streaming_policy(monkeypatch, attempts=1)
+    payloads = []
+
+    def fake_post(*args, data, **kwargs):
+        payloads.append(json.loads(data))
+        return _NonStreamingResponse()
+
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+
+    result = query_model(_args(model="qwen3-8b"), [{"role": "user", "content": "hi"}])
+
+    assert result == {"content": "ok", "reasoning": None}
+    assert payloads[0]["thinking"] == {"type": "disabled"}
+    assert payloads[0]["enable_thinking"] is False
+
+
+def test_non_qwen_reasoning_disabled_does_not_set_enable_thinking(monkeypatch):
+    _non_streaming_policy(monkeypatch, attempts=1)
+    payloads = []
+
+    def fake_post(*args, data, **kwargs):
+        payloads.append(json.loads(data))
+        return _NonStreamingResponse()
+
+    monkeypatch.setattr("capx.llm.client.requests.post", fake_post)
+
+    query_model(_args(model="deepseek-v4-flash"), [{"role": "user", "content": "hi"}])
+
+    assert payloads[0]["thinking"] == {"type": "disabled"}
+    assert "enable_thinking" not in payloads[0]
+
+
 @pytest.mark.parametrize(
     "interruption",
     [
