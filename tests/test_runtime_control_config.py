@@ -268,3 +268,23 @@ capsule_action_prompt_char_budget: 12000
     assert config["capsule_action_trace_max_events"] == 3
     assert config["capsule_action_source_preview_chars"] == 80
     assert config["capsule_action_prompt_char_budget"] == 12000
+
+
+def test_cube_stack_nonprivileged_matched_configs_share_task_contract():
+    multiturn = yaml.safe_load(
+        Path("env_configs/cube_stack/franka_robosuite_cube_stack_multiturn_vdm_matched.yaml").read_text()
+    )
+    capsule = yaml.safe_load(
+        Path("env_configs/cube_stack/franka_robosuite_cube_stack_capsule_vdm_matched.yaml").read_text()
+    )
+
+    multiturn_cfg = multiturn["env"]["cfg"]
+    capsule_cfg = capsule["env"]["cfg"]
+    assert multiturn_cfg["privileged"] is False
+    assert capsule_cfg["privileged"] is False
+    assert multiturn_cfg["apis"] == ["FrankaControlApiReducedSkillLibrary"]
+    assert capsule_cfg["apis"] == ["FrankaControlApiReducedSkillLibrary"]
+    assert multiturn_cfg["prompt"] == capsule_cfg["prompt"]
+    assert "multi_turn_prompt" in multiturn_cfg
+    assert "multi_turn_prompt" not in capsule_cfg
+    assert capsule["agent_mode"] == "capsule"
