@@ -837,6 +837,9 @@ def _run_capsule_auto_forward_loop(
     reward_drop_guard_threshold = float(
         config.get("capsule_reward_drop_guard_threshold", 0.25)
     )
+    require_task_success_for_finish = _coerce_config_bool(
+        config.get("capsule_require_task_success_for_finish", False)
+    )
     terminal_recovery_attempted = False
 
     group_index = 0
@@ -844,11 +847,7 @@ def _run_capsule_auto_forward_loop(
     while group_attempts < max_steps:
         if group_index >= len(groups):
             terminal_state = _capsule_state_snapshot(env)
-            terminal_reward = _state_reward(terminal_state)
-            terminal_succeeded = bool(terminal_state.get("task_completed")) or (
-                terminal_reward is not None and terminal_reward >= 1.0
-            )
-            if terminal_succeeded or terminal_recovery_attempted or not groups:
+            if _state_task_succeeded(terminal_state) or terminal_recovery_attempted or not groups:
                 break
 
             terminal_recovery_attempted = True
@@ -866,6 +865,7 @@ def _run_capsule_auto_forward_loop(
                 },
                 terminal_state=terminal_state,
                 recovery_observation_functions=recovery_observation_functions,
+                require_task_success_for_finish=require_task_success_for_finish,
             )
             prompts.append(recovery_prompt)
             try:
@@ -890,7 +890,15 @@ def _run_capsule_auto_forward_loop(
                     evidence={"exception_type": type(exc).__name__},
                 )
             else:
-                if recovery_action.action not in {"append_recovery", "finish"}:
+                recovery_event = _finish_requires_task_success_guard_event(
+                    recovery_action,
+                    terminal_state,
+                    require_task_success_for_finish,
+                )
+                if recovery_event is None and recovery_action.action not in {
+                    "append_recovery",
+                    "finish",
+                }:
                     recovery_event = RuntimeEvent(
                         action=recovery_action.action,
                         status="invalid",
@@ -900,7 +908,7 @@ def _run_capsule_auto_forward_loop(
                             "recovery."
                         ),
                     )
-                else:
+                if recovery_event is None:
                     recovery_event = _no_rollback_guard_event(
                         recovery_action,
                         executed_side_effect_regions,
@@ -1126,12 +1134,18 @@ def _run_capsule_auto_forward_loop(
                 recovery_source_unit = region_by_id.get(recovery_region_id) or group_by_id.get(
                     recovery_group_id
                 )
-                recovery_event = _validate_recovery_action(
+                recovery_event = _finish_requires_task_success_guard_event(
                     recovery_action,
-                    failed_unit=group,
-                    region_by_id=region_by_id,
-                    group_by_id=group_by_id,
+                    recovery_before_state,
+                    require_task_success_for_finish,
                 )
+                if recovery_event is None:
+                    recovery_event = _validate_recovery_action(
+                        recovery_action,
+                        failed_unit=group,
+                        region_by_id=region_by_id,
+                        group_by_id=group_by_id,
+                    )
                 if recovery_event is None:
                     recovery_event = _no_rollback_guard_event(
                         recovery_action,
@@ -1435,6 +1449,9 @@ def _run_capsule_llm_step_loop(
     action_prompt_char_budget = int(
         config.get("capsule_action_prompt_char_budget", 60000)
     )
+    require_task_success_for_finish = _coerce_config_bool(
+        config.get("capsule_require_task_success_for_finish", False)
+    )
 
     for step_id in range(1, max_steps + 1):
         action: RuntimeAction | None = None
@@ -1505,12 +1522,18 @@ def _run_capsule_llm_step_loop(
             region_id = str(action.args.get("region_id", ""))
             group_id = str(action.args.get("group_id", ""))
             source_unit_for_feedback = region_by_id.get(region_id) or group_by_id.get(group_id)
-            event = _no_rollback_guard_event(
+            event = _finish_requires_task_success_guard_event(
                 action,
-                executed_side_effect_regions,
-                executed_side_effect_groups,
-                recovery_observation_functions=recovery_observation_functions,
+                before_state,
+                require_task_success_for_finish,
             )
+            if event is None:
+                event = _no_rollback_guard_event(
+                    action,
+                    executed_side_effect_regions,
+                    executed_side_effect_groups,
+                    recovery_observation_functions=recovery_observation_functions,
+                )
             if event is None:
                 event = _reward_drop_guard_event(
                     action,
@@ -1545,7 +1568,8 @@ def _run_capsule_llm_step_loop(
                 if consumes_recovery_side_effect:
                     recovery_side_effect_budget -= 1
             if event.status in {"failed", "invalid"}:
-                failed = True
+                if not _is_recoverable_finish_guard_event(event):
+                    failed = True
                 if forced_recovery_action:
                     pending_recovery_actions.clear()
             if action.action == "run_region" and event.status != "invalid":
@@ -1674,7 +1698,13 @@ def _run_capsule_llm_step_loop(
             or (reward_after is not None and reward_after >= 1.0)
         ):
             break
-        if event.action == "finish" or (action.action == "finish" if action is not None else False):
+        if (
+            event.status == "success"
+            and (
+                event.action == "finish"
+                or (action.action == "finish" if action is not None else False)
+            )
+        ):
             finished = True
             break
 
@@ -2528,6 +2558,47 @@ def _capsule_step_metric(
         "state_after": after_state,
     }
     return metric, updated_best
+
+
+def _finish_requires_task_success_guard_event(
+    action: RuntimeAction,
+    state: dict[str, Any],
+    require_task_success_for_finish: bool,
+) -> RuntimeEvent | None:
+    if action.action != "finish" or not require_task_success_for_finish:
+        return None
+    if _state_task_succeeded(state):
+        return None
+
+    return RuntimeEvent(
+        action="finish",
+        status="invalid",
+        message=(
+            "finish rejected because capsule_require_task_success_for_finish is true "
+            "and the current state has not completed the task; continue execution or "
+            "use append_recovery from a fresh observation."
+        ),
+        evidence={
+            "guard": "capsule_require_task_success_for_finish",
+            "task_completed": state.get("task_completed"),
+            "reward": _state_reward(state),
+            "recoverable": True,
+        },
+    )
+
+
+def _is_recoverable_finish_guard_event(event: RuntimeEvent) -> bool:
+    return (
+        event.action == "finish"
+        and event.status == "invalid"
+        and event.evidence.get("guard") == "capsule_require_task_success_for_finish"
+        and bool(event.evidence.get("recoverable"))
+    )
+
+
+def _state_task_succeeded(state: dict[str, Any]) -> bool:
+    reward = _state_reward(state)
+    return bool(state.get("task_completed")) or (reward is not None and reward >= 1.0)
 
 
 def _state_reward(state: dict[str, Any]) -> float | None:

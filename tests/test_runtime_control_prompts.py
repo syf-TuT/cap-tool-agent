@@ -663,6 +663,40 @@ def test_terminal_recovery_prompt_only_allows_forward_append_or_finish():
     assert "resume_from_region" not in allowed_actions
 
 
+def test_terminal_recovery_prompt_omits_finish_when_success_required():
+    last_group = CodeRegionGroup(
+        group_id="group_1",
+        start_line=1,
+        end_line=1,
+        source='move_to("partial")',
+        region_ids=["region_1"],
+        primitive_calls=["move_to"],
+        defined_names=[],
+        used_names=["move_to"],
+        has_robot_side_effect=True,
+    )
+
+    prompt = build_capsule_terminal_recovery_prompt(
+        task="wipe the spill",
+        last_unit=last_group,
+        history_tail=[],
+        trace_summary={},
+        side_effect_ledger={},
+        terminal_state={"reward": 0.25, "task_completed": False},
+        recovery_observation_functions={"get_observation"},
+        require_task_success_for_finish=True,
+    )
+
+    text = prompt[1]["content"][0]["text"]
+    allowed_actions = next(
+        line for line in text.splitlines() if line.startswith("Allowed actions:")
+    )
+
+    assert "append_recovery" in allowed_actions
+    assert "finish" not in allowed_actions
+    assert "finish is unavailable until task_completed is true" in text
+
+
 def test_summarize_terminal_state_for_recovery_compacts_object_geometry():
     summary = summarize_terminal_state_for_recovery(
         {

@@ -185,6 +185,9 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "capsule_action_prompt_char_budget": configs_dict.get(
             "capsule_action_prompt_char_budget", 60000
         ),
+        "capsule_require_task_success_for_finish": configs_dict.get(
+            "capsule_require_task_success_for_finish", False
+        ),
         "capsule_execution_granularity": configs_dict.get(
             "capsule_execution_granularity", "semantic_group"
         ),

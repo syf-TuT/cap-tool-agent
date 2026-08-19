@@ -1968,6 +1968,84 @@ def test_append_recovery_rejects_api_without_fresh_state_capability():
     assert "does not declare" in event.message
 
 
+def test_capsule_llm_step_rejects_finish_before_required_task_success_and_continues(
+    tmp_path,
+):
+    env = FakeRewardDropCapsuleEnv()
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "capsule_control_mode": "llm_step",
+            "output_dir": str(tmp_path),
+            "max_capsule_steps": 6,
+            "capsule_max_regions_per_group": 1,
+            "capsule_require_task_success_for_finish": True,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='move_to("good")\n',
+        scripted_actions=[
+            {"action": "run_group", "args": {"group_id": "group_1"}},
+            {"action": "finish", "args": {}},
+            {
+                "action": "append_recovery",
+                "args": {"source": 'state = get_observation()\nmove_to("recover")'},
+            },
+            {"action": "finish", "args": {}},
+        ],
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 0
+    assert env.api.moves == ["good", "recover"]
+    assert trace[1]["event"]["action"] == "finish"
+    assert trace[1]["event"]["status"] == "invalid"
+    assert "capsule_require_task_success_for_finish" in trace[1]["event"]["message"]
+    assert trace[-1]["event"]["action"] == "finish"
+    assert trace[-1]["event"]["status"] == "success"
+
+
+def test_capsule_auto_forward_rejects_terminal_finish_when_success_required(
+    tmp_path,
+    monkeypatch,
+):
+    env = FakeRewardDropCapsuleEnv()
+
+    def fake_query(args, prompt):
+        return {"content": '{"action": "finish", "args": {}}', "reasoning": None}
+
+    monkeypatch.setattr("capx.envs.trial._query_model", fake_query)
+
+    summary = _run_capsule_trial(
+        env=env,
+        trial=1,
+        args=SimpleNamespace(model="test", use_oracle_code=False),
+        config={
+            "output_dir": str(tmp_path),
+            "use_runtime_control": True,
+            "capsule_control_mode": "auto_forward",
+            "max_capsule_steps": 4,
+            "capsule_max_regions_per_group": 1,
+            "capsule_require_task_success_for_finish": True,
+            "use_parallel_ensemble": False,
+            "use_multimodel": False,
+        },
+        initial_code='move_to("bad")\n',
+    )
+
+    trace = json.loads((tmp_path / "capsule_trace_trial_01.json").read_text())
+
+    assert summary.sandbox_rc == 1
+    assert env.api.moves == ["bad"]
+    assert trace[1]["event"]["action"] == "finish"
+    assert trace[1]["event"]["status"] == "invalid"
+    assert "capsule_require_task_success_for_finish" in trace[1]["event"]["message"]
+
+
 def test_capsule_trial_rejects_rerun_of_executed_side_effect_group(tmp_path):
     summary = _run_capsule_trial(
         env=FakeCapsuleEnv(),

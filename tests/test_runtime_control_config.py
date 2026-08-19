@@ -236,6 +236,7 @@ capsule_action_history_max_entries: 2
 capsule_action_trace_max_events: 3
 capsule_action_source_preview_chars: 80
 capsule_action_prompt_char_budget: 12000
+capsule_require_task_success_for_finish: true
 """
     )
     args = SimpleNamespace(
@@ -268,6 +269,7 @@ capsule_action_prompt_char_budget: 12000
     assert config["capsule_action_trace_max_events"] == 3
     assert config["capsule_action_source_preview_chars"] == 80
     assert config["capsule_action_prompt_char_budget"] == 12000
+    assert config["capsule_require_task_success_for_finish"] is True
 
 
 def test_cube_stack_nonprivileged_matched_configs_share_task_contract():

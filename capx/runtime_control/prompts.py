@@ -403,16 +403,19 @@ def build_capsule_terminal_recovery_prompt(
     side_effect_ledger: dict[str, Any],
     terminal_state: dict[str, Any],
     recovery_observation_functions: set[str] | None = None,
+    require_task_success_for_finish: bool = False,
 ) -> list[dict[str, Any]]:
     recovery_functions = sorted(
         {"get_observation"}
         if recovery_observation_functions is None
         else recovery_observation_functions
     )
-    allowed_actions = ["finish"]
+    terminal_succeeded = _terminal_state_succeeded(terminal_state)
+    finish_allowed = not require_task_success_for_finish or terminal_succeeded
+    allowed_actions = []
     append_recovery_example = None
     if recovery_functions:
-        allowed_actions.insert(0, "append_recovery")
+        allowed_actions.append("append_recovery")
         recovery_calls = ", ".join(f"{name}()" for name in recovery_functions)
         append_recovery_rule = (
             "Use append_recovery to add executable Python code that calls at least "
@@ -433,12 +436,21 @@ def build_capsule_terminal_recovery_prompt(
             "append_recovery is unavailable because the active API does not declare a "
             "fresh-state observation function."
         )
+    if finish_allowed:
+        allowed_actions.append("finish")
+        finish_rule = "Use finish only if no useful forward recovery remains."
+    else:
+        finish_rule = (
+            "finish is unavailable until task_completed is true or reward is at least 1.0."
+        )
 
     examples = []
     if append_recovery_example is not None:
         examples.append(append_recovery_example)
-    examples.append({"action": "finish", "args": {}})
+    if finish_allowed:
+        examples.append({"action": "finish", "args": {}})
     example_text = "\n".join(json.dumps(example) for example in examples)
+    allowed_actions_text = ", ".join(allowed_actions) if allowed_actions else "none"
     bounded_history = history_tail[-4:]
     bounded_trace_summary = _bound_trace_summary(trace_summary, max_events=5)
     terminal_state_summary = summarize_terminal_state_for_recovery(terminal_state)
@@ -474,11 +486,11 @@ def build_capsule_terminal_recovery_prompt(
         "Rollback is unavailable. Previously executed robot-side-effect code may have "
         "changed the current physical state, so recovery must append new code that "
         "starts from a fresh observation.\n\n"
-        f"Allowed actions: {', '.join(allowed_actions)}.\n\n"
+        f"Allowed actions: {allowed_actions_text}.\n\n"
         "Respond with exactly one JSON object. Examples:\n"
         f"{example_text}\n"
         f"{append_recovery_rule} "
-        "Use finish only if no useful forward recovery remains.\n\n"
+        f"{finish_rule}\n\n"
         f"{response_contract}"
     )
     return [
@@ -491,6 +503,16 @@ def build_capsule_terminal_recovery_prompt(
         },
         {"role": "user", "content": [{"type": "text", "text": prompt_text}]},
     ]
+
+
+def _terminal_state_succeeded(terminal_state: dict[str, Any]) -> bool:
+    try:
+        reward = float(terminal_state.get("reward"))
+    except (TypeError, ValueError):
+        reward = None
+    return bool(terminal_state.get("task_completed")) or (
+        reward is not None and reward >= 1.0
+    )
 
 
 def summarize_terminal_state_for_recovery(terminal_state: dict[str, Any]) -> dict[str, Any]:
