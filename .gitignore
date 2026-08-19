@@ -17,10 +17,12 @@ env/
 .capx_skills.json
 .codex_*.py
 .codex_start_services_*.sh
+.codex-model-cache/
 .codex-downloads/
 .codex-results/
 .codex-upload/
 /.codex_runs/
+/codecap-x.codex-model-cache*
 /.codex_sync_*.bundle
 .claude/
 .agents/
