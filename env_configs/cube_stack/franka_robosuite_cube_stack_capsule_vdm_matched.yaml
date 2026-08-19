@@ -1,0 +1,45 @@
+# Usage: uv run capx/envs/launch.py --config-path env_configs/cube_stack/franka_robosuite_cube_stack_capsule_vdm_matched.yaml
+
+env:
+  _target_: capx.envs.tasks.franka.franka_pick_place.FrankaPickPlaceCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level: franka_robosuite_cubes_low_level
+    privileged: false
+    apis:
+      - FrankaControlApiReducedSkillLibrary
+    prompt: |
+      You are controlling a Franka Emika robot with the API described below.
+      Goal: place the red cube on top of the green cube and then open the gripper.
+      Use only the provided non-privileged environment APIs.
+      Do not use privileged state APIs.
+      Write ONLY executable Python code. Do not use code fences. Import numpy explicitly if needed.
+
+agent_mode: capsule
+max_capsule_steps: 12
+checkpoint_policy: region
+rollback_policy: none
+capsule_feedback_level: source_region_repair_hint
+
+api_servers:
+  - _target_: capx.serving.launch_sam3_server.main
+    device: cuda
+    port: 8114
+    host: 127.0.0.1
+
+  - _target_: capx.serving.launch_contact_graspnet_server.main
+    port: 8115
+    host: 127.0.0.1
+
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+record_video: true
+use_img_differencing: true
+output_dir: ./outputs/franka_robosuite_cube_stack_capsule_vdm_matched
+
+trials: 100
+num_workers: 12
