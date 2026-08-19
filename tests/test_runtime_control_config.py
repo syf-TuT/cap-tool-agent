@@ -274,6 +274,7 @@ def test_cube_stack_nonprivileged_matched_configs_share_task_contract():
     multiturn = yaml.safe_load(
         Path("env_configs/cube_stack/franka_robosuite_cube_stack_multiturn_vdm_matched.yaml").read_text()
     )
+    assert "use_legacy_multi_turn_decision_prompt" not in multiturn
     capsule = yaml.safe_load(
         Path("env_configs/cube_stack/franka_robosuite_cube_stack_capsule_vdm_matched.yaml").read_text()
     )

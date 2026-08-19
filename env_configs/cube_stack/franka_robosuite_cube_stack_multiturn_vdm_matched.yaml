@@ -52,7 +52,6 @@ api_servers:
 record_video: true
 use_img_differencing: true
 output_dir: ./outputs/franka_robosuite_cube_stack_multiturn_vdm_matched
-use_legacy_multi_turn_decision_prompt: true
 
 trials: 100
 num_workers: 12

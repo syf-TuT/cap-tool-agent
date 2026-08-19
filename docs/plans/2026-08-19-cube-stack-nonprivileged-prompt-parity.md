@@ -4,7 +4,7 @@
 
 **Goal:** Add a matched non-privileged `cube_stack` multiturn/Capsule benchmark pair whose initial prompt and exposed API are identical.
 
-**Architecture:** Preserve existing VDM configurations as historical definitions. Add two sibling `*_matched.yaml` files with the same literal task prompt and `FrankaControlApiReducedSkillLibrary`; retain only execution-method fields in the configuration that needs them. A YAML-level pytest regression test prevents prompt/API drift.
+**Architecture:** Preserve existing VDM configurations as historical definitions. Add two sibling `*_matched.yaml` files with the same literal task prompt and `FrankaControlApiReducedSkillLibrary`; retain only execution-method fields in the configuration that needs them. A YAML-level pytest regression test prevents prompt/API drift. The matched multiturn YAML intentionally omits `use_legacy_multi_turn_decision_prompt`: the YAML field is not loaded into runtime CLI arguments, so omitting it uses the actual default/non-legacy decision path. This does not change loader behavior or legacy configurations.
 
 **Tech Stack:** YAML experiment configuration, PyYAML, pytest, WSL2 `uv` environment.
 
@@ -27,6 +27,7 @@ def test_cube_stack_nonprivileged_matched_configs_share_task_contract():
     multiturn = yaml.safe_load(
         Path("env_configs/cube_stack/franka_robosuite_cube_stack_multiturn_vdm_matched.yaml").read_text()
     )
+    assert "use_legacy_multi_turn_decision_prompt" not in multiturn
     capsule = yaml.safe_load(
         Path("env_configs/cube_stack/franka_robosuite_cube_stack_capsule_vdm_matched.yaml").read_text()
     )
@@ -94,9 +95,11 @@ env:
       Write ONLY executable Python code. Do not use code fences. Import numpy explicitly if needed.
 ```
 
-Retain the current `multi_turn_prompt` and
-`use_legacy_multi_turn_decision_prompt: true`. These are multiturn-only
-execution controls, not task information.
+Retain the current `multi_turn_prompt`. Intentionally omit
+`use_legacy_multi_turn_decision_prompt`: this top-level YAML field is not
+loaded into runtime CLI arguments, and its omission selects the actual
+default/non-legacy multiturn decision path. Do not change loader behavior or
+legacy configurations.
 
 **Step 3: Run the focused test**
 

@@ -32,6 +32,13 @@ instruction:
 - The Capsule configuration retains its `agent_mode`, checkpoint, rollback,
   and repair settings; the Capsule runtime supplies its own control prompts.
 
+The matched multiturn configuration intentionally omits
+`use_legacy_multi_turn_decision_prompt`. That top-level YAML field is not
+loaded into the runtime CLI arguments, so retaining it would be dead
+configuration rather than an execution control. Omitting it uses the actual
+default, non-legacy multiturn decision path. This matched-benchmark decision
+does not change loader behavior or any legacy configuration.
+
 Neither configuration uses `FrankaPickPlaceCodeEnv.PROMPT`, because that
 prompt instructs the agent to use privileged state calls such as
 `get_object_pose` and `sample_grasp_pose`, which are unavailable in this
@@ -48,8 +55,9 @@ Add a focused configuration test that loads both YAML files and asserts:
 1. `privileged` is false in both variants.
 2. Both expose exactly `FrankaControlApiReducedSkillLibrary`.
 3. Their initial `cfg.prompt` values are identical.
-4. The multiturn-only and Capsule-only control fields remain in their
-   respective configurations.
+4. The matched multiturn YAML omits the dead legacy decision field, while the
+   multiturn-only and Capsule-only control fields remain in their respective
+   configurations.
 
 Run this focused test before rerunning either benchmark.  Historical VDM
 results remain labelled as non-matched and are not used for the new comparison.
