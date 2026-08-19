@@ -22,7 +22,7 @@ from capx.envs.simulators.robosuite_base import RobosuiteBaseEnv
 class FrankaRobosuiteSpillWipeLowLevel(RobosuiteBaseEnv):
     """Robosuite Franka Wipe environment with FrankaPickPlaceLowLevel-compatible interface."""
 
-    _SUBSAMPLE_RATE = 10
+    _SUBSAMPLE_RATE = RobosuiteBaseEnv._SUBSAMPLE_RATE
     _ACTION_SLICE = -2  # Wipe env uses action[:-2] instead of action[:-1]
 
     def __init__(
@@ -147,7 +147,7 @@ class FrankaRobosuiteSpillWipeLowLevel(RobosuiteBaseEnv):
         return obs, reward, terminated, truncated, info
 
     def move_to_joints_blocking(
-        self, joints: np.ndarray, *, tolerance: float = 0.005, max_steps: int = 10
+        self, joints: np.ndarray, *, tolerance: float = 0.005, max_steps: int = 100
     ) -> None:
         """Move to target joint positions using Robosuite's controller.
 
