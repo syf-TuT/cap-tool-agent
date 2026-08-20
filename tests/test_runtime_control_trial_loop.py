@@ -398,6 +398,8 @@ def test_capsule_llm_step_mode_keeps_existing_action_loop(tmp_path):
 
     assert summary.sandbox_rc == 0
     assert env.api.moved is True
+    assert [entry["capsule_action"]["action"] for entry in trace] == ["run_group", "finish"]
+    assert [entry["capsule_action"]["step_id"] for entry in trace] == [1, 2]
     assert [entry["event"]["action"] for entry in trace] == ["run_group", "finish"]
 
 

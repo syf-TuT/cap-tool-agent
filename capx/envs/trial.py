@@ -1011,7 +1011,12 @@ def _run_capsule_llm_step_loop(
 
         after_state = _capsule_state_snapshot(env)
         trace_events = event.evidence.get("trace_events", [])
-        feedback_action = action if action is not None else RuntimeAction(action="invalid", args={})
+        feedback_action = (
+            action
+            if action is not None
+            else RuntimeAction(action="invalid", args={}, step_id=step_id)
+        )
+        capsule_action = feedback_action.to_dict()
         feedback = build_runtime_feedback(
             step_id=step_id,
             action=feedback_action,
@@ -1025,6 +1030,7 @@ def _run_capsule_llm_step_loop(
         history.append(
             {
                 "step_id": step_id,
+                "capsule_action": capsule_action,
                 "action": action.to_dict() if action is not None else {"action": "invalid"},
                 "event": event.to_dict(),
                 "feedback": feedback.to_dict(),
