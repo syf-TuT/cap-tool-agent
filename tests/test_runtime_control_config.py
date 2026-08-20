@@ -63,7 +63,7 @@ def test_load_config_reads_capsule_fields():
     assert config["agent_mode"] == "capsule"
     assert config["max_capsule_steps"] == 12
     assert config["max_regenerations"] is None
-    assert config["capsule_control_mode"] == "auto_forward"
+    assert config["capsule_control_mode"] == "llm_step"
     assert config["checkpoint_policy"] == "region"
     assert config["rollback_policy"] == "none"
     assert config["capsule_execution_granularity"] == "semantic_group"
@@ -194,7 +194,7 @@ env:
   _target_: tests.fake.Env
 trials: 1
 agent_mode: capsule
-capsule_control_mode: auto_forward
+capsule_control_mode: llm_step
 """
     )
     args = SimpleNamespace(
@@ -220,7 +220,7 @@ capsule_control_mode: auto_forward
 
     _, config, _ = _load_config(args)
 
-    assert config["capsule_control_mode"] == "auto_forward"
+    assert config["capsule_control_mode"] == "llm_step"
 
 
 def test_load_config_reads_compact_llm_step_prompt_fields(tmp_path):

@@ -16,14 +16,13 @@ state, and patched-source payloads. This makes token use scale with both program
 size and step count. In long trials or after source patches, repeated prompt
 payloads can dominate experiment cost.
 
-`auto_forward` avoids this normal-path cost by executing groups directly and
-querying the LLM only for recovery. That control policy is not acceptable for
-the `llm_step` ablation path, which must remain LLM-selected at every step.
+The runtime must keep strict stepwise control semantics: every normal execution
+step remains selected by the LLM rather than hidden behind deterministic source
+order execution.
 
 ## Requirements
 
 - Keep `llm_step` as a strict per-step LLM decision loop.
-- Do not change `auto_forward` behavior.
 - Keep full source and full runtime history available for execution, trace
   files, metrics, and post-run audit artifacts.
 - Remove redundant full-source and duplicated trace payloads from action
@@ -155,8 +154,6 @@ Focused tests should cover:
 - Prompt history omits `event.evidence.source` after patch or append recovery.
 - Failed or invalid units can expose focused full source in the next action
   prompt.
-- `auto_forward` does not call the action prompt builder on normal execution and
-  remains unchanged.
 
 ## Risks
 

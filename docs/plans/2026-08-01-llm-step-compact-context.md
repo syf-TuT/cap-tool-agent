@@ -247,7 +247,7 @@ Keep current behavior when `compact_context=False`.
 
 **Step 2: Add source preview helper**
 
-Add below `summarize_terminal_state_for_recovery` or near other private helpers:
+Add near the other private prompt helpers:
 
 ```python
 def _source_preview(source: str, *, max_chars: int) -> str:
@@ -762,5 +762,4 @@ git commit -m "Verify llm-step compact context"
 - Default `llm_step` action prompts use compact code and history views.
 - Full source remains available for execution, patches, saved code, trace files,
   and focused failed-unit repair context.
-- `auto_forward` behavior remains unchanged.
 - Focused prompt and trial-loop tests pass in WSL.
