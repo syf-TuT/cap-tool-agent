@@ -79,6 +79,31 @@ Only use the Windows checkout for source edits and documentation edits. If those
 edits need to be used by WSL experiments, copy or sync them into
 `/home/capx/code/cap-x` before running.
 
+## Experiment Script & Result Organization
+
+Keep future experiment work reproducible without committing bulky local outputs.
+Reusable launchers, analyzers, and report-generation scripts should live under
+`scripts/`, grouped by task family or experiment line, for example
+`scripts/capsule_rl/` or `scripts/two_arm_lift/`. Prefer descriptive names that
+include the task, method, and run scope, such as
+`run_cube_stack_capsule_rl_s01_20.py`. One-off Codex staging scripts may stay in
+ignored `.codex_*` or `.codex_remote_*` paths, but promote any script needed to
+reproduce a result into `scripts/` before sharing or committing.
+
+Store generated experiment outputs in ignored result directories, not beside
+source files. Use `outputs/<experiment-slug>/` for local simulator output,
+`artifacts/<experiment-slug>/` for derived videos, plots, tables, and packaged
+reports, and `remote_results/<experiment-slug>/` for downloaded server results.
+Choose slugs that include the task, method, important model/config, seed range,
+and date, for example `cube_stack_capsule_rl_packy_s01_20_20260823`.
+
+Commit only small, curated records: YAML configs required to rerun the
+experiment, reusable scripts, and concise summaries under `docs/` when useful.
+Do not commit model caches, raw videos, large logs, downloaded remote bundles,
+or intermediate Codex staging directories. When a result is important, write a
+short summary with the command, config path, seed range, output directory, and
+headline metrics instead of committing the raw run folder.
+
 ## Project Structure & Module Organization
 
 `capx/` contains the Python package. Environment launch and runner code lives in `capx/envs/`, robot and perception integrations in `capx/integrations/`, serving utilities in `capx/serving/`, web backend code in `capx/web/`, and helpers in `capx/utils/`. YAML experiment definitions are under `env_configs/`, grouped by task family. Tests live in `tests/`, with external-service or hardware-heavy checks in `tests/integrations/`. Documentation is in `docs/`, scripts in `scripts/`, RL reward code in `verl_agent_reward/`, and the React/Vite interface in `web-ui/`.

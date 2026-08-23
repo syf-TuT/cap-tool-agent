@@ -22,7 +22,11 @@ env/
 .codex-results/
 .codex-upload/
 /.codex_runs/
+/.codex_experiments/
+/.codex_remote_*/
+/.codex_stage/
 /codecap-x.codex-model-cache*
+/.codex-sync-*.bundle
 /.codex_sync_*.bundle
 .claude/
 .agents/
