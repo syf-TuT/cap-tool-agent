@@ -1,0 +1,101 @@
+# Capsule-Critique-GRPO MVP configuration contract.
+#
+# This file is safe to parse with --validate-only. It does not contain credentials, start a
+# service, initialize VeRL, or resolve the model/dataset placeholders. Replace every /path/to
+# placeholder before a server run.
+schema_version: 1
+trainer_factory: capx.rl.capsule.server_factory:create_trainer
+
+runtime:
+  # Used by the formal main_ppo checkpoint claim; choose a new immutable run ID per launch.
+  run_id: replace-with-unique-run-id
+  # This repository does not vendor the checkout; point to a separate clone at the pinned SHA.
+  verl_source_path: /path/to/pinned/verl
+  verl_pinned_sha: d5b4ca2712b3048a60745482a74425d687add0bb
+  # Fully composed pinned VeRL PPO config containing hardware/batch/rollout settings. The
+  # project factory overrides only the Capsule invariants and model/output paths.
+  verl_resolved_config_path: /path/to/resolved_verl_ppo.yaml
+  dataset_path: /path/to/capsule_rl_dataset.jsonl
+  program_model_path: /path/to/program_actor_checkpoint
+  output_dir: outputs/cube_stack_capsule_critique_grpo
+  requires:
+    egl: true
+    pyroki: true
+
+task:
+  environment: robosuite_cube_stack
+  config_path: env_configs/cube_stack/capsule_rl/franka_robosuite_cube_stack_privileged_clean_replay.yaml
+  api: franka_control_privileged
+  privilege: privileged
+  render: false
+  record_video: false
+
+# Program actor and frozen Controller are intentionally separate services. API key values stay
+# outside YAML; these fields name the environment variables read by the server factory.
+program_service:
+  endpoint: http://127.0.0.1:8101/v1
+  model: /path/to/program_actor_checkpoint
+  api_key_env: CAPX_PROGRAM_API_KEY
+
+controller_service:
+  endpoint: http://127.0.0.1:8102/v1
+  model: /path/to/frozen_controller_checkpoint
+  api_key_env: CAPX_CONTROLLER_API_KEY
+  frozen: true
+  request_timeout_s: 60.0
+  temperature: 0.7
+
+capsule:
+  group_size: 8
+  base_samples_before_repair: 7
+  p0_count: 2
+  repair_trajectories_per_p0: 2
+  max_controller_turns: 12
+  revision_input_max_tokens: 8192
+  revision_response_max_tokens: 2048
+  gamma: 0.1
+
+# Pinned VeRL-facing fields. The project trainer recomputes old log-probs after injecting the
+# guided member, while rollout_is_weights transports only the boolean guided-token mask.
+actor_rollout_ref:
+  model:
+    external_lib: capx.rl.capsule.verl_external
+  rollout:
+    n: 8
+    calculate_log_probs: false
+    mode: sync
+  actor:
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    # One eight-member mini-batch and one PPO epoch make Gate 6 exactly one global optimizer step.
+    ppo_epochs: 1
+    ppo_mini_batch_size: 8
+    ulysses_sequence_parallel_size: 1
+    policy_loss:
+      loss_mode: capsule_critique
+      capsule_gamma: 0.1
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: false
+  rollout_is: false
+  rollout_is_threshold: null
+  use_kl_in_reward: false
+
+# Typed clean-replay results supply binary token scores directly. Prime, ordinary online reward
+# managers, async reward execution, and reward-side KL are not part of this training path.
+reward_model:
+  enable: false
+  reward_manager: typed_replay
+  launch_reward_fn_async: false
+
+server_validation:
+  stop_on_gate_failure: true
+  gates:
+    - preflight
+    - seed
+    - oracle_replay
+    - collector
+    - guided
+    - trainer
+    - result_audit

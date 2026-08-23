@@ -50,6 +50,20 @@ class ApiBase(ABC):
         """Enable or disable web UI execution logging for this API instance."""
         self._webui_enabled = enabled
 
+    def reset_episode(
+        self,
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> bool:
+        """Clear episode-local API state and explicitly confirm completion.
+
+        Stateless APIs keep this no-op implementation. Stateful subclasses must only return
+        ``True`` after their episode-local state has been cleared.
+        """
+
+        del seed, options
+        return True
+
     def _log_step(
         self,
         tool_name: str,

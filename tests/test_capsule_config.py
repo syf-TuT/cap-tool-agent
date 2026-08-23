@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+import yaml
+
+from capx.rl.capsule.compat import CapsuleConfigError, validate_capsule_config
+
+
+CONFIG_PATH = (
+    Path(__file__).parents[1]
+    / "env_configs"
+    / "cube_stack"
+    / "capsule_rl"
+    / "franka_robosuite_cube_stack_capsule_critique_grpo.yaml"
+)
+CLEAN_REPLAY_CONFIG_PATH = CONFIG_PATH.with_name(
+    "franka_robosuite_cube_stack_privileged_clean_replay.yaml"
+)
+
+
+def valid_config() -> dict:
+    return {
+        "schema_version": 1,
+        "trainer_factory": "capx.rl.capsule.server_factory:create_trainer",
+        "runtime": {
+            "verl_source_path": "capx/third_party/verl",
+            "verl_pinned_sha": "d5b4ca2712b3048a60745482a74425d687add0bb",
+            "output_dir": "outputs/cube_stack_capsule_rl",
+            "dataset_path": "/path/to/capsule_dataset.parquet",
+            "program_model_path": "/path/to/program_model",
+            "verl_resolved_config_path": "/path/to/resolved_verl_ppo.yaml",
+            "requires": {"egl": True, "pyroki": True},
+        },
+        "task": {
+            "environment": "robosuite_cube_stack",
+            "config_path": (
+                "env_configs/cube_stack/capsule_rl/"
+                "franka_robosuite_cube_stack_privileged_clean_replay.yaml"
+            ),
+            "api": "franka_control_privileged",
+            "privilege": "privileged",
+            "render": False,
+            "record_video": False,
+        },
+        "program_service": {
+            "endpoint": "http://127.0.0.1:8101/v1",
+            "model": "program-model",
+            "api_key_env": "CAPX_PROGRAM_API_KEY",
+        },
+        "controller_service": {
+            "endpoint": "http://127.0.0.1:8102/v1",
+            "model": "controller-model",
+            "api_key_env": "CAPX_CONTROLLER_API_KEY",
+            "frozen": True,
+            "request_timeout_s": 60.0,
+            "temperature": 0.7,
+        },
+        "capsule": {
+            "group_size": 8,
+            "base_samples_before_repair": 7,
+            "p0_count": 2,
+            "repair_trajectories_per_p0": 2,
+            "max_controller_turns": 12,
+            "revision_input_max_tokens": 8192,
+            "revision_response_max_tokens": 2048,
+            "gamma": 0.1,
+        },
+        "actor_rollout_ref": {
+            "model": {"external_lib": "capx.rl.capsule.verl_external"},
+            "rollout": {"n": 8, "calculate_log_probs": False, "mode": "sync"},
+            "actor": {
+                "use_kl_loss": True,
+                "kl_loss_coef": 0.001,
+                "ppo_epochs": 1,
+                "ppo_mini_batch_size": 8,
+                "ulysses_sequence_parallel_size": 1,
+                "policy_loss": {"loss_mode": "capsule_critique", "capsule_gamma": 0.1},
+            },
+        },
+        "algorithm": {
+            "adv_estimator": "grpo",
+            "norm_adv_by_std_in_grpo": False,
+            "rollout_is": False,
+            "rollout_is_threshold": None,
+            "use_kl_in_reward": False,
+        },
+        "reward_model": {
+            "enable": False,
+            "reward_manager": "typed_replay",
+            "launch_reward_fn_async": False,
+        },
+        "server_validation": {
+            "gates": [
+                "preflight",
+                "seed",
+                "oracle_replay",
+                "collector",
+                "guided",
+                "trainer",
+                "result_audit",
+            ]
+        },
+    }
+
+
+def test_complete_capsule_config_is_accepted() -> None:
+    validate_capsule_config(valid_config())
+
+
+@pytest.mark.parametrize(
+    ("path", "bad_value", "message"),
+    [
+        (("schema_version",), True, "schema"),
+        (("capsule", "group_size"), True, "eight-member"),
+        (("actor_rollout_ref", "rollout", "n"), 7, "n=8"),
+        (("algorithm", "adv_estimator"), "gae", "grpo"),
+        (("algorithm", "norm_adv_by_std_in_grpo"), True, "std"),
+        (("algorithm", "rollout_is"), True, "rollout importance"),
+        (("actor_rollout_ref", "rollout", "calculate_log_probs"), True, "calculate_log_probs"),
+        (("actor_rollout_ref", "rollout", "mode"), "async", "sync"),
+        (("actor_rollout_ref", "actor", "use_kl_loss"), False, "use_kl_loss"),
+        (("actor_rollout_ref", "actor", "kl_loss_coef"), 0.0, "kl_loss_coef"),
+        (("actor_rollout_ref", "actor", "ppo_epochs"), 2, "ppo_epochs"),
+        (
+            ("actor_rollout_ref", "actor", "ulysses_sequence_parallel_size"),
+            2,
+            "sequence parallelism",
+        ),
+        (("actor_rollout_ref", "actor", "ppo_mini_batch_size"), 4, "ppo_mini_batch_size"),
+        (("algorithm", "use_kl_in_reward"), True, "use_kl_in_reward"),
+        (("reward_model", "reward_manager"), "prime", "Prime"),
+        (("reward_model", "launch_reward_fn_async"), True, "async"),
+        (("controller_service", "frozen"), False, "frozen"),
+        (("controller_service", "temperature"), 3.0, "temperature"),
+        (("controller_service", "request_timeout_s"), 0.0, "request_timeout_s"),
+        (("task", "render"), True, "render"),
+        (("capsule", "max_controller_turns"), 13, "12"),
+        (("capsule", "gamma"), 0.2, "0.1"),
+    ],
+)
+def test_unsafe_or_algorithm_changing_values_are_rejected(path, bad_value, message) -> None:
+    config = deepcopy(valid_config())
+    current = config
+    for key in path[:-1]:
+        current = current[key]
+    current[path[-1]] = bad_value
+
+    with pytest.raises(CapsuleConfigError, match=message):
+        validate_capsule_config(config)
+
+
+def test_program_and_controller_must_be_separate_and_use_env_var_names_only() -> None:
+    config = valid_config()
+    config["controller_service"]["endpoint"] = config["program_service"]["endpoint"]
+    config["controller_service"]["api_key_env"] = "literal-secret-value"
+
+    with pytest.raises(CapsuleConfigError) as caught:
+        validate_capsule_config(config)
+
+    assert "separate endpoints" in str(caught.value)
+    assert "api_key_env" in str(caught.value)
+
+
+def test_repository_template_contains_all_local_and_server_contract_fields() -> None:
+    config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+
+    validate_capsule_config(config)
+
+    assert config["task"]["render"] is False
+    assert config["task"]["record_video"] is False
+    assert config["controller_service"]["api_key_env"] == "CAPX_CONTROLLER_API_KEY"
+    assert "api_key" not in config["controller_service"]
+    assert config["server_validation"]["gates"][:3] == [
+        "preflight",
+        "seed",
+        "oracle_replay",
+    ]
+    assert config["task"]["config_path"] == str(
+        CLEAN_REPLAY_CONFIG_PATH.relative_to(Path(__file__).parents[1])
+    ).replace("\\", "/")
+
+
+def test_clean_replay_environment_template_disables_render_and_video() -> None:
+    config = yaml.safe_load(CLEAN_REPLAY_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    assert config["env"]["cfg"]["privileged"] is True
+    assert config["env"]["cfg"]["enable_render"] is False
+    assert config["env"]["cfg"]["viser_debug"] is False
+    assert config["record_video"] is False
+    assert config["num_workers"] == 1

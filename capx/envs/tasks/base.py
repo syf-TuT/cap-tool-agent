@@ -167,14 +167,18 @@ class CodeExecutionEnvBase(Env):
         stderr_buffer = io.StringIO()
         tee_err = Tee(sys.stderr, stderr_buffer)
         ok = True
+        error_type: str | None = None
+        error_message: str | None = None
         try:
             with (
                 contextlib.redirect_stdout(tee_out),
                 contextlib.redirect_stderr(tee_err),
             ):
                 exec(code, self._exec_globals, self._exec_globals)
-        except BaseException:  # defensive; propagate minimal info
+        except BaseException as error:  # defensive; propagate typed diagnostics
             ok = False
+            error_type = type(error).__name__
+            error_message = str(error)
             # Always print full traceback to the redirected stderr (tee -> console and buffer)
             traceback.print_exc(file=tee_err)
 
@@ -183,6 +187,8 @@ class CodeExecutionEnvBase(Env):
             "stdout": stdout_buffer.getvalue(),
             "stderr": stderr_buffer.getvalue(),
             "result": self._exec_globals.get("RESULT"),
+            "error_type": error_type,
+            "error_message": error_message,
         }
 
     def _init_exec_globals(self) -> None:
@@ -267,12 +273,25 @@ class CodeExecutionEnvBase(Env):
             tuple[ObsType, dict[str, Any]]: A tuple containing the observation and info.
         """
         self._step_count = 0
+        previous_namespace = self._exec_globals
+        api_reset_confirmations: list[bool] = []
+        for api in self._apis.values():
+            confirmation = api.reset_episode(seed=seed, options=options)
+            api_reset_confirmations.append(confirmation is True)
+        # Drop all user objects before resetting the physical episode.
+        self._init_exec_globals()
+        namespace_fresh = self._exec_globals is not previous_namespace
         obs, info = self.low_level_env.reset(seed=seed, options=options)
         obs.update(self._get_observation())
-        # Reinitialize globals for a fresh episode and prime INPUTS with the reset observation
-        self._init_exec_globals()
+        # Prime the new namespace with only the new episode observation.
         self._exec_globals["INPUTS"] = obs
         info.update({"task_prompt": self._task_prompt})
+        info["capsule_reset_evidence"] = {
+            "namespace_fresh": namespace_fresh,
+            "api_state_cleared": all(api_reset_confirmations),
+            "api_reset_count": len(self._apis),
+            "api_reset_confirmed_count": sum(api_reset_confirmations),
+        }
         return obs, info
 
     def step(self, action: str) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
@@ -312,6 +331,8 @@ class CodeExecutionEnvBase(Env):
             "stderr": exec_result["stderr"],
             "task_prompt": self._task_prompt,
             "task_completed": task_completed,
+            "error_type": exec_result.get("error_type"),
+            "error_message": exec_result.get("error_message"),
         }
         return obs, reward, bool(terminated), bool(truncated), info
 

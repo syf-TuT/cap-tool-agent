@@ -56,6 +56,17 @@ class FrankaControlPrivilegedApi(ApiBase):
         #     base_functions["breakpoint_code_block"] = self.breakpoint_code_block
         return base_functions
 
+    def reset_episode(
+        self,
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> bool:
+        """Discard IK warm-start state at every deterministic episode boundary."""
+
+        del seed, options
+        self.cfg = None
+        return self.cfg is None
+
     def side_effect_functions(self) -> set[str]:
         return {"goto_pose", "home_pose", "open_gripper", "close_gripper"}
 
