@@ -219,6 +219,19 @@ class _Reference:
         return {"ref_log_prob": torch.zeros_like(batch["response_mask"], dtype=torch.float32)}
 
 
+class _DataProtoLike:
+    def __init__(self, batch: dict[str, Any]) -> None:
+        self.batch = batch
+        self.meta_info: dict[str, Any] = {}
+
+
+class _LoRAEncoder(_Encoder):
+    def encode(
+        self, prompts: tuple[str, ...], responses: tuple[str, ...]
+    ) -> _DataProtoLike:
+        return _DataProtoLike(super().encode(prompts, responses))
+
+
 def _config() -> dict[str, Any]:
     return {"algorithm": {"rollout_is": False, "rollout_is_threshold": None}}
 
@@ -337,6 +350,62 @@ def test_reference_worker_is_required_when_actor_reference_kl_is_enabled() -> No
             actor_rollout_wg=_Actor(events),
             artifact_sink=MemoryArtifactSink(),
             config=config,
+        )
+
+
+def test_lora_reference_logprob_uses_same_actor_with_adapter_disabled_in_order() -> None:
+    events: list[str] = []
+
+    class _LoRAActor(_Actor):
+        def compute_log_prob(self, batch):
+            adapter_disabled = batch.meta_info.get("is_lora") is True
+            events.append("reference_logprob" if adapter_disabled else "old_logprob")
+            value = -2.0 if adapter_disabled else -1.0
+            return {
+                "old_log_probs": torch.full_like(
+                    batch.batch["response_mask"], value, dtype=torch.float32
+                )
+            }
+
+    actor = _LoRAActor(events)
+    trainer = CapsuleCritiqueRayTrainer(
+        assembler=_Assembler(events, _assembly([0.0] * 7 + [1.0])),
+        batch_encoder=_LoRAEncoder(),
+        actor_rollout_wg=actor,
+        ref_policy_wg=actor,
+        reference_policy_mode="actor_base_adapter_disabled",
+        artifact_sink=MemoryArtifactSink(),
+        config=_config(),
+        event_log=events,
+    )
+
+    result = trainer.run_step(_task())
+
+    assert events == [
+        "generate",
+        "score",
+        "repair",
+        "inject",
+        "old_logprob",
+        "reference_logprob",
+        "advantage",
+        "update",
+    ]
+    assert torch.all(result.batch.batch["old_log_probs"] == -1.0)
+    assert torch.all(result.batch.batch["ref_log_prob"] == -2.0)
+    assert "is_lora" not in result.batch.meta_info
+
+
+def test_lora_reference_mode_rejects_a_distinct_reference_worker() -> None:
+    with pytest.raises(ValueError, match="same actor"):
+        CapsuleCritiqueRayTrainer(
+            assembler=_Assembler([], _assembly([0.0] * 7 + [1.0])),
+            batch_encoder=_LoRAEncoder(),
+            actor_rollout_wg=_Actor([]),
+            ref_policy_wg=_Reference([]),
+            reference_policy_mode="actor_base_adapter_disabled",
+            artifact_sink=MemoryArtifactSink(),
+            config=_config(),
         )
 
 

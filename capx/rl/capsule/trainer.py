@@ -30,6 +30,8 @@ from .schema import ProgramReplayResultV1, ReplayOutcome, TaskInstanceV1
 _CONFIG_MISSING = object()
 GUIDED_TOKEN_MASK_FIELD = "guided_token_mask"
 VERL_MASK_SLOT = "rollout_is_weights"
+VERL_DISABLE_ADAPTER_META_FIELD = "is_lora"
+REFERENCE_POLICY_MODES = frozenset({"standalone", "actor_base_adapter_disabled"})
 
 
 class GroupAssembler(Protocol):
@@ -369,6 +371,7 @@ class CapsuleCritiqueRayTrainer:
         artifact_sink: ArtifactSink,
         config: Any,
         ref_policy_wg: Any | None = None,
+        reference_policy_mode: str = "standalone",
         event_log: list[str] | None = None,
     ) -> None:
         from .policy_loss import validate_capsule_training_config
@@ -381,10 +384,22 @@ class CapsuleCritiqueRayTrainer:
         )
         if reference_kl_enabled is True and ref_policy_wg is None:
             raise ValueError("ref_policy_wg is required when actor reference KL is enabled")
+        if reference_policy_mode not in REFERENCE_POLICY_MODES:
+            raise ValueError(
+                "reference_policy_mode must be standalone or actor_base_adapter_disabled"
+            )
+        if (
+            reference_policy_mode == "actor_base_adapter_disabled"
+            and ref_policy_wg is not actor_rollout_wg
+        ):
+            raise ValueError(
+                "actor_base_adapter_disabled reference mode requires the same actor worker"
+            )
         self.assembler = assembler
         self.batch_encoder = batch_encoder
         self.actor_rollout_wg = actor_rollout_wg
         self.ref_policy_wg = ref_policy_wg
+        self.reference_policy_mode = reference_policy_mode
         self.artifact_sink = artifact_sink
         self.config = config
         self.events = event_log if event_log is not None else []
@@ -828,6 +843,33 @@ class CapsuleCritiqueRayTrainer:
         self.events.append("advantage")
         return tuple(float(value) for value in sequence_advantages.detach().cpu().tolist())
 
+    def _compute_actor_base_reference_log_prob(self, batch: Any) -> Any:
+        """Ask the LoRA actor for frozen-base log-probs via VeRL's adapter-disable flag."""
+
+        meta_info = getattr(batch, "meta_info", None)
+        if not isinstance(meta_info, dict):
+            raise TypeError(
+                "actor_base_adapter_disabled reference requires mutable DataProto meta_info"
+            )
+        if VERL_DISABLE_ADAPTER_META_FIELD in meta_info:
+            raise ValueError(
+                f"batch meta_info already contains {VERL_DISABLE_ADAPTER_META_FIELD!r}"
+            )
+        meta_info[VERL_DISABLE_ADAPTER_META_FIELD] = True
+        try:
+            output = self.ref_policy_wg.compute_log_prob(batch)
+        finally:
+            meta_info.pop(VERL_DISABLE_ADAPTER_META_FIELD, None)
+        tensors = getattr(output, "batch", output)
+        if not hasattr(tensors, "__contains__") or "old_log_probs" not in tensors:
+            raise TypeError(
+                "LoRA actor reference output must contain VeRL old_log_probs"
+            )
+        if "ref_log_prob" in tensors:
+            raise ValueError("LoRA actor reference output unexpectedly contains ref_log_prob")
+        tensors["ref_log_prob"] = tensors.pop("old_log_probs")
+        return output
+
     def run_step(self, task: TaskInstanceV1) -> TrainingStepResult:
         assembly = self.assembler.assemble(task)
         validate_group_provenance(task, assembly)
@@ -837,7 +879,10 @@ class CapsuleCritiqueRayTrainer:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             batch = _merge_batch(batch, old_log_prob)
             if self.ref_policy_wg is not None:
-                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                if self.reference_policy_mode == "actor_base_adapter_disabled":
+                    ref_log_prob = self._compute_actor_base_reference_log_prob(batch)
+                else:
+                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                 batch = _merge_batch(batch, ref_log_prob)
 
         sequence_advantages = self._add_advantages(batch, assembly)

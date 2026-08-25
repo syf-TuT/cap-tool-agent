@@ -8,6 +8,7 @@ import pytest
 import torch
 import yaml
 
+import capx.rl.capsule.server_factory as server_factory
 from capx.rl.capsule.group import CandidateCollectionError
 from capx.rl.capsule.schema import source_sha256
 from capx.rl.capsule.server_factory import (
@@ -52,6 +53,134 @@ def _task_record() -> dict:
         "initial_state_sha256": source_sha256("seed-five-state"),
         "metadata": {"split": "train"},
     }
+
+
+def _verl_worker_config(
+    *,
+    lora_rank: int = 0,
+    lora_alpha: int | None = None,
+    target_modules: str | list[str] = "all-linear",
+    rollout_name: str = "vllm",
+    load_format: str = "safetensors",
+    tensor_parallel_size: int = 1,
+    data_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(
+            model=SimpleNamespace(
+                lora_rank=lora_rank,
+                lora_alpha=(32 if lora_rank > 0 else 0)
+                if lora_alpha is None
+                else lora_alpha,
+                target_modules=target_modules,
+            ),
+            actor=SimpleNamespace(strategy="fsdp"),
+            rollout=SimpleNamespace(
+                name=rollout_name,
+                load_format=load_format,
+                tensor_model_parallel_size=tensor_parallel_size,
+                data_parallel_size=data_parallel_size,
+                pipeline_model_parallel_size=pipeline_parallel_size,
+            ),
+        ),
+        trainer=SimpleNamespace(n_gpus_per_node=1, nnodes=1),
+    )
+
+
+class _InitProbe:
+    def __init__(self) -> None:
+        self.init_calls = 0
+
+    def init_model(self) -> None:
+        self.init_calls += 1
+
+
+def test_lora_worker_topology_reuses_one_actor_for_frozen_base_reference() -> None:
+    topology = server_factory._resolve_verl_worker_topology(
+        _verl_worker_config(lora_rank=16, lora_alpha=32)
+    )
+    actor = _InitProbe()
+
+    actor_wg, ref_wg = server_factory._initialize_verl_worker_groups(
+        {"actor_rollout": actor}, topology
+    )
+
+    assert topology.worker_roles == ("actor_rollout",)
+    assert topology.reference_policy_mode == "actor_base_adapter_disabled"
+    assert topology.lora_rank == 16
+    assert topology.lora_alpha == 32
+    assert topology.lora_target_modules == ("all-linear",)
+    assert actor_wg is actor
+    assert ref_wg is actor
+    assert actor.init_calls == 1
+
+
+def test_non_lora_worker_topology_keeps_distinct_reference_worker() -> None:
+    topology = server_factory._resolve_verl_worker_topology(_verl_worker_config())
+    actor = _InitProbe()
+    reference = _InitProbe()
+
+    actor_wg, ref_wg = server_factory._initialize_verl_worker_groups(
+        {"actor_rollout": actor, "ref": reference}, topology
+    )
+
+    assert topology.worker_roles == ("actor_rollout", "ref")
+    assert topology.reference_policy_mode == "standalone"
+    assert actor_wg is actor
+    assert ref_wg is reference
+    assert actor.init_calls == 1
+    assert reference.init_calls == 1
+
+
+def test_lora_reference_source_contract_requires_adapter_disable_path(tmp_path: Path) -> None:
+    worker_source = tmp_path / "verl" / "workers" / "fsdp_workers.py"
+    worker_source.parent.mkdir(parents=True)
+    worker_source.write_text(
+        "from contextlib import nullcontext\n"
+        "def compute_log_prob(self, data):\n"
+        "    is_lora = data.meta_info.pop('is_lora', False)\n"
+        "    adapter_ctx = (self.actor.actor_module.disable_adapter()\n"
+        "                   if is_lora else nullcontext())\n"
+        "    with adapter_ctx:\n"
+        "        return None\n",
+        encoding="utf-8",
+    )
+
+    server_factory._verify_lora_reference_source_contract(tmp_path)
+
+    worker_source.write_text(
+        "from contextlib import nullcontext\n"
+        "def compute_log_prob(self, data):\n"
+        "    is_lora = data.meta_info.pop('is_lora', False)\n"
+        "    adapter_ctx = self.actor.actor_module.disable_adapter()\n"
+        "    with adapter_ctx:\n"
+        "        return is_lora\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ServerFactoryError, match="disable_adapter"):
+        server_factory._verify_lora_reference_source_contract(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"lora_rank": True}, "lora_rank"),
+        ({"lora_rank": -1}, "lora_rank"),
+        ({"lora_rank": 16, "lora_alpha": 0}, "lora_alpha"),
+        ({"lora_rank": 16, "target_modules": []}, "target_modules"),
+        ({"lora_rank": 16, "rollout_name": "hf"}, "vLLM"),
+        ({"lora_rank": 16, "load_format": "auto"}, "safetensors"),
+        ({"lora_rank": 16, "tensor_parallel_size": 2}, "parallel"),
+        ({"lora_rank": 16, "data_parallel_size": 2}, "parallel"),
+        ({"lora_rank": 16, "pipeline_parallel_size": 2}, "parallel"),
+    ],
+)
+def test_lora_worker_topology_fails_fast_on_unsupported_config(
+    overrides: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ServerFactoryError, match=message):
+        server_factory._resolve_verl_worker_topology(_verl_worker_config(**overrides))
 
 
 def test_repository_config_names_concrete_project_factory() -> None:

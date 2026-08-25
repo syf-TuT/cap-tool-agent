@@ -8,6 +8,7 @@ repository-owned binding for the complete trainer dataflow.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -535,6 +536,10 @@ class VeRLWorkerSession:
     kl_loss_coef: float = 0.001
     data_parallel_world_size: int = 1
     sequence_parallel_size: int = 1
+    reference_policy_mode: str = "standalone"
+    lora_rank: int = 0
+    lora_alpha: int = 0
+    lora_target_modules: tuple[str, ...] = ()
     verl_source_path: Path | None = None
     verl_pinned_sha: str | None = None
     initial_verl_provenance: dict[str, Any] | None = None
@@ -785,6 +790,211 @@ def _capsule_data_parallel_world_size(verl_config: Any) -> int:
     return world_size
 
 
+@dataclass(frozen=True)
+class VeRLWorkerTopology:
+    """Resolved worker layout and the LoRA identity bound to that layout."""
+
+    worker_roles: tuple[str, ...]
+    reference_policy_mode: str
+    lora_rank: int
+    lora_alpha: int
+    lora_target_modules: tuple[str, ...]
+
+    @property
+    def shares_actor_reference(self) -> bool:
+        return self.lora_rank > 0
+
+
+def _config_value(node: Any, name: str, default: Any) -> Any:
+    if isinstance(node, Mapping):
+        return node.get(name, default)
+    getter = getattr(node, "get", None)
+    if callable(getter):
+        return getter(name, default)
+    return getattr(node, name, default)
+
+
+def _resolve_verl_worker_topology(verl_config: Any) -> VeRLWorkerTopology:
+    """Validate the supported VeRL layout before Ray is initialized."""
+
+    actor_rollout_ref = verl_config.actor_rollout_ref
+    model = actor_rollout_ref.model
+    actor = actor_rollout_ref.actor
+    rollout = actor_rollout_ref.rollout
+    strategy = str(_config_value(actor, "strategy", ""))
+    if strategy not in {"fsdp", "fsdp2"}:
+        raise ServerFactoryError("Cube Stack Capsule MVP supports only VeRL FSDP/FSDP2 workers")
+
+    lora_rank = _config_value(model, "lora_rank", 0)
+    if isinstance(lora_rank, bool) or not isinstance(lora_rank, int) or lora_rank < 0:
+        raise ServerFactoryError("VeRL actor_rollout_ref.model.lora_rank must be a non-negative integer")
+    if lora_rank == 0:
+        return VeRLWorkerTopology(
+            worker_roles=("actor_rollout", "ref"),
+            reference_policy_mode="standalone",
+            lora_rank=0,
+            lora_alpha=0,
+            lora_target_modules=(),
+        )
+
+    lora_alpha = _config_value(model, "lora_alpha", None)
+    if isinstance(lora_alpha, bool) or not isinstance(lora_alpha, int) or lora_alpha < 1:
+        raise ServerFactoryError(
+            "VeRL actor_rollout_ref.model.lora_alpha must be a positive integer when LoRA is enabled"
+        )
+    raw_targets = _config_value(model, "target_modules", None)
+    if isinstance(raw_targets, str):
+        target_modules = (raw_targets.strip(),) if raw_targets.strip() else ()
+    elif isinstance(raw_targets, Sequence):
+        target_modules = tuple(
+            str(target).strip()
+            for target in raw_targets
+            if isinstance(target, str) and target.strip()
+        )
+    else:
+        target_modules = ()
+    if not target_modules:
+        raise ServerFactoryError(
+            "VeRL actor_rollout_ref.model.target_modules must be non-empty when LoRA is enabled"
+        )
+    if target_modules != ("all-linear",):
+        raise ServerFactoryError("Capsule LoRA target_modules must resolve to all-linear")
+    if str(_config_value(rollout, "name", "")).lower() != "vllm":
+        raise ServerFactoryError("Capsule LoRA requires the vLLM rollout backend")
+    if str(_config_value(rollout, "load_format", "")).lower() != "safetensors":
+        raise ServerFactoryError("Capsule LoRA requires vLLM load_format=safetensors")
+
+    world_size = verl_config.trainer.n_gpus_per_node * verl_config.trainer.nnodes
+    if world_size == 1:
+        parallel_sizes = {
+            "tensor_model_parallel_size": _config_value(
+                rollout, "tensor_model_parallel_size", 1
+            ),
+            "data_parallel_size": _config_value(rollout, "data_parallel_size", 1),
+            "pipeline_model_parallel_size": _config_value(
+                rollout, "pipeline_model_parallel_size", 1
+            ),
+        }
+        invalid = {
+            name: value
+            for name, value in parallel_sizes.items()
+            if isinstance(value, bool) or not isinstance(value, int) or value != 1
+        }
+        if invalid:
+            raise ServerFactoryError(
+                "single-GPU Capsule LoRA requires tensor/data/pipeline parallel sizes of 1; "
+                f"got {invalid!r}"
+            )
+    return VeRLWorkerTopology(
+        worker_roles=("actor_rollout",),
+        reference_policy_mode="actor_base_adapter_disabled",
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_target_modules=target_modules,
+    )
+
+
+def _verify_lora_reference_source_contract(verl_path: Path) -> None:
+    """Prove the pinned FSDP actor maps ``is_lora`` to PEFT ``disable_adapter``."""
+
+    worker_path = verl_path / "verl" / "workers" / "fsdp_workers.py"
+    try:
+        worker_tree = ast.parse(
+            worker_path.read_text(encoding="utf-8"), filename=str(worker_path)
+        )
+    except (OSError, SyntaxError, UnicodeError) as error:
+        raise ServerFactoryError(
+            f"cannot inspect VeRL LoRA reference implementation at {worker_path}: {error}"
+        ) from error
+
+    def assigned_name(node: ast.Assign) -> str | None:
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            return None
+        return node.targets[0].id
+
+    def references_name(node: ast.AST, names: set[str]) -> bool:
+        return any(
+            isinstance(child, ast.Name) and child.id in names
+            for child in ast.walk(node)
+        )
+
+    def calls_disable_adapter(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "disable_adapter"
+            for child in ast.walk(node)
+        )
+
+    for node in ast.walk(worker_tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name != "compute_log_prob":
+            continue
+        marker_names: set[str] = set()
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Assign):
+                continue
+            name = assigned_name(child)
+            value = child.value
+            if (
+                name is not None
+                and isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "pop"
+                and value.args
+                and isinstance(value.args[0], ast.Constant)
+                and value.args[0].value == "is_lora"
+            ):
+                marker_names.add(name)
+        adapter_context_names: set[str] = set()
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Assign):
+                continue
+            name = assigned_name(child)
+            value = child.value
+            if (
+                name is not None
+                and isinstance(value, ast.IfExp)
+                and references_name(value.test, marker_names)
+                and calls_disable_adapter(value.body)
+                and not calls_disable_adapter(value.orelse)
+            ):
+                adapter_context_names.add(name)
+        enters_adapter_context = any(
+            isinstance(child, (ast.With, ast.AsyncWith))
+            and any(
+                references_name(item.context_expr, adapter_context_names)
+                for item in child.items
+            )
+            for child in ast.walk(node)
+        )
+        if marker_names and adapter_context_names and enters_adapter_context:
+            return
+    raise ServerFactoryError(
+        "pinned VeRL compute_log_prob must map is_lora to disable_adapter for the "
+        "frozen-base LoRA reference policy"
+    )
+
+
+def _initialize_verl_worker_groups(
+    groups: Mapping[str, Any], topology: VeRLWorkerTopology
+) -> tuple[Any, Any]:
+    """Initialize every physical worker exactly once and bind its logical roles."""
+
+    missing = set(topology.worker_roles).difference(groups)
+    if missing:
+        raise ServerFactoryError(f"VeRL worker spawn omitted roles: {sorted(missing)!r}")
+    actor_rollout_wg = groups["actor_rollout"]
+    if topology.shares_actor_reference:
+        actor_rollout_wg.init_model()
+        return actor_rollout_wg, actor_rollout_wg
+    ref_policy_wg = groups["ref"]
+    ref_policy_wg.init_model()
+    actor_rollout_wg.init_model()
+    return actor_rollout_wg, ref_policy_wg
+
+
 def _load_resolved_verl_config(config: Mapping[str, Any], project_root: Path) -> Any:
     runtime = _mapping(config.get("runtime"), "runtime")
     capsule = _mapping(config.get("capsule"), "capsule")
@@ -857,6 +1067,9 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
         verl_config, _dataset_row_count(config)
     )
     data_parallel_world_size = _capsule_data_parallel_world_size(verl_config)
+    topology = _resolve_verl_worker_topology(verl_config)
+    if topology.shares_actor_reference:
+        _verify_lora_reference_source_contract(verl_path)
     _bind_pinned_verl_import(verl_path)
 
     import ray
@@ -871,9 +1084,6 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
     from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
     _verify_imported_verl_path(verl_path)
-    strategy = str(verl_config.actor_rollout_ref.actor.strategy)
-    if strategy not in {"fsdp", "fsdp2"}:
-        raise ServerFactoryError("Cube Stack Capsule MVP supports only VeRL FSDP/FSDP2 workers")
     if ray.is_initialized():
         raise ServerFactoryError(
             "Capsule requires an isolated Ray runtime so actor/ref workers can be cleaned up"
@@ -962,7 +1172,9 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
 
         remote_worker = ray.remote(CapsuleActorRolloutRefWorker)
         global_pool = "capsule_global_pool"
-        mapping = {Role.ActorRollout: global_pool, Role.RefPolicy: global_pool}
+        mapping = {Role.ActorRollout: global_pool}
+        if not topology.shares_actor_reference:
+            mapping[Role.RefPolicy] = global_pool
         resource_manager = ResourcePoolManager(
             resource_pool_spec={
                 global_pool: [verl_config.trainer.n_gpus_per_node]
@@ -977,13 +1189,14 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
                 cls=remote_worker,
                 config=verl_config.actor_rollout_ref,
                 role="actor_rollout",
-            ),
-            "ref": RayClassWithInitArgs(
+            )
+        }
+        if not topology.shares_actor_reference:
+            class_dict["ref"] = RayClassWithInitArgs(
                 remote_worker,
                 config=verl_config.actor_rollout_ref,
                 role="ref",
-            ),
-        }
+            )
         worker_cls = create_colocated_worker_cls(class_dict=class_dict)
         worker_group = RayWorkerGroup(
             resource_pool=resource_pool,
@@ -991,10 +1204,9 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
             device_name=verl_config.trainer.device,
         )
         groups = worker_group.spawn(prefix_set=class_dict.keys())
-        ref_policy_wg = groups["ref"]
-        ref_policy_wg.init_model()
-        actor_rollout_wg = groups["actor_rollout"]
-        actor_rollout_wg.init_model()
+        actor_rollout_wg, ref_policy_wg = _initialize_verl_worker_groups(
+            groups, topology
+        )
         tokenizer = hf_tokenizer(
             verl_config.actor_rollout_ref.model.path,
             trust_remote_code=bool(verl_config.data.get("trust_remote_code", False)),
@@ -1018,6 +1230,10 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
             sequence_parallel_size=int(
                 verl_config.actor_rollout_ref.actor.ulysses_sequence_parallel_size
             ),
+            reference_policy_mode=topology.reference_policy_mode,
+            lora_rank=topology.lora_rank,
+            lora_alpha=topology.lora_alpha,
+            lora_target_modules=topology.lora_target_modules,
             verl_source_path=verl_path,
             verl_pinned_sha=expected_verl_sha,
         )
@@ -1165,6 +1381,9 @@ class CapsuleServerRuntime:
                 batch_encoder=batch_encoder,
                 actor_rollout_wg=workers.actor_rollout_wg,
                 ref_policy_wg=workers.ref_policy_wg,
+                reference_policy_mode=getattr(
+                    workers, "reference_policy_mode", "standalone"
+                ),
                 artifact_sink=AtomicJsonArtifactSink(output_dir / "groups"),
                 config=self.config,
             )
