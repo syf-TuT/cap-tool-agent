@@ -46,6 +46,7 @@ def valid_config() -> dict:
             "record_video": False,
         },
         "program_service": {
+            "mode": "actor_identity",
             "endpoint": "http://127.0.0.1:8101/v1",
             "model": "program-model",
             "api_key_env": "CAPX_PROGRAM_API_KEY",
@@ -146,6 +147,7 @@ def test_controller_output_limit_can_be_omitted_for_512_token_runtime_default() 
         (("controller_service", "request_timeout_s"), 0.0, "request_timeout_s"),
         (("controller_service", "max_output_tokens"), True, "max_output_tokens"),
         (("controller_service", "max_output_tokens"), 0, "max_output_tokens"),
+        (("program_service", "mode"), "generation", "actor_identity"),
         (("task", "render"), True, "render"),
         (("capsule", "max_controller_turns"), 13, "12"),
         (("capsule", "gamma"), 0.2, "0.1"),
@@ -182,6 +184,7 @@ def test_repository_template_contains_all_local_and_server_contract_fields() -> 
     assert config["task"]["render"] is False
     assert config["task"]["record_video"] is False
     assert config["controller_service"]["api_key_env"] == "CAPX_CONTROLLER_API_KEY"
+    assert config["program_service"]["mode"] == "actor_identity"
     assert config["controller_service"]["request_timeout_s"] == 300.0
     assert config["controller_service"]["max_output_tokens"] == 512
     assert "api_key" not in config["controller_service"]

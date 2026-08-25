@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-import json
 import builtins
 import hashlib
-from copy import deepcopy
+import json
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from capx.rl.capsule.group import RepairAttempt, deterministic_group_uid
 from capx.rl.capsule import main_ppo
+from capx.rl.capsule.actor_identity import actor_binding_sha256, build_actor_identity
+from capx.rl.capsule.group import RepairAttempt, deterministic_group_uid
 from capx.rl.capsule.repair import BaseUnitSpan, RepairDraft
 from capx.rl.capsule.schema import (
     LearningGroupV1,
@@ -69,7 +70,11 @@ CLEAN_REPLAY_CONFIG = (
 def _minimal_resolved_verl_config() -> dict[str, object]:
     return {
         "actor_rollout_ref": {
-            "model": {},
+            "model": {
+                "lora_rank": 16,
+                "lora_alpha": 32,
+                "target_modules": "all-linear",
+            },
             "rollout": {},
             "actor": {
                 "strategy": "fsdp",
@@ -97,6 +102,7 @@ def _server_config(tmp_path: Path) -> Path:
     verl.mkdir()
     model = project_root / "program-model"
     model.mkdir()
+    (model / "config.json").write_text('{"model_type":"qwen2"}\n', encoding="utf-8")
     dataset = project_root / "dataset.jsonl"
     dataset.write_text(
         json.dumps(
@@ -132,6 +138,7 @@ def _server_config(tmp_path: Path) -> Path:
     config["task"]["config_path"] = str(CLEAN_REPLAY_CONFIG)
     config["program_service"].update(
         {
+            "mode": "actor_identity",
             "endpoint": "http://127.0.0.1:8000/v1",
             "model": "program-actor",
             "api_key_env": "PROGRAM_API_KEY",
@@ -197,6 +204,18 @@ def test_server_config_requires_existing_resolved_verl_config(tmp_path: Path) ->
     config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
     with pytest.raises(common.ConfigValidationError, match="verl_resolved_config_path"):
+        common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+
+def test_server_config_rejects_plaintext_service_endpoint_off_loopback(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["program_service"]["endpoint"] = "http://example.com/v1"
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(common.ConfigValidationError, match="https.*loopback"):
         common.load_and_validate_server_config(config_path, check_runtime_paths=True)
 
 
@@ -308,6 +327,11 @@ def test_preflight_hashes_resolved_verl_config_without_overwriting(
         SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True)),
     )
     monkeypatch.setattr(server_preflight, "_endpoint_open", lambda _endpoint: True)
+    monkeypatch.setattr(
+        server_preflight,
+        "_fetch_actor_identity",
+        lambda _endpoint, _token: build_actor_identity(config),
+    )
 
     def fake_git_sha(path: Path) -> str:
         if path == Path(config["runtime"]["verl_source_path"]):
@@ -330,6 +354,13 @@ def test_preflight_hashes_resolved_verl_config_without_overwriting(
     assert payload["resolved_environment_sha256"] == payload["checks"][
         "resolved_environment_sha256"
     ]
+    assert payload["program_model_sha256"] == payload["checks"][
+        "program_model_sha256"
+    ]
+    assert payload["actor_binding_sha256"] == payload["checks"][
+        "actor_binding_sha256"
+    ]
+    assert payload["checks"]["program_actor_identity_verified"] is True
     dataset_path = Path(config["runtime"]["dataset_path"])
     assert payload["dataset_sha256"] == common.artifact_file_sha256(dataset_path)
     assert payload["checks"]["dataset_sha256"] == payload["dataset_sha256"]
@@ -355,6 +386,11 @@ def test_preflight_failure_is_published_separately_without_claiming_success(
         SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
     )
     monkeypatch.setattr(server_preflight, "_endpoint_open", lambda _endpoint: True)
+    monkeypatch.setattr(
+        server_preflight,
+        "_fetch_actor_identity",
+        lambda _endpoint, _token: build_actor_identity(config),
+    )
     monkeypatch.setattr(
         server_preflight,
         "_git_sha",
@@ -389,6 +425,40 @@ def test_preflight_failure_is_published_separately_without_claiming_success(
     assert failure_path.read_bytes() == original
 
 
+def test_preflight_rejects_program_actor_identity_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = _prepare_successful_preflight(config_path, monkeypatch)
+    monkeypatch.setattr(
+        server_preflight,
+        "_git_sha",
+        lambda path: (
+            str(config["runtime"]["verl_pinned_sha"])
+            if path.resolve() == Path(config["runtime"]["verl_source_path"]).resolve()
+            else "d" * 40
+        ),
+    )
+    drifted = build_actor_identity(config)
+    drifted["program_model_sha256"] = "b" * 64
+    monkeypatch.setattr(
+        server_preflight,
+        "_fetch_actor_identity",
+        lambda _endpoint, _token: drifted,
+    )
+    artifact = tmp_path / "gate01_identity_drift.json"
+
+    with pytest.raises(common.GateArtifactError, match="program_model_sha256"):
+        server_preflight.run_preflight(
+            config_path, artifact, run_id="capsule-smoke-identity-drift"
+        )
+
+    failure = json.loads(
+        common.gate_failure_artifact_path(artifact).read_text(encoding="utf-8")
+    )
+    assert failure["exception"]["stage"] == "runtime_checks"
+
+
 def test_preflight_typed_verification_precedes_success_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -405,6 +475,11 @@ def test_preflight_typed_verification_precedes_success_publication(
         SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True)),
     )
     monkeypatch.setattr(server_preflight, "_endpoint_open", lambda _endpoint: True)
+    monkeypatch.setattr(
+        server_preflight,
+        "_fetch_actor_identity",
+        lambda _endpoint, _token: build_actor_identity(config),
+    )
     monkeypatch.setattr(
         server_preflight,
         "_git_sha",
@@ -452,6 +527,11 @@ def _prepare_successful_preflight(
         SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True)),
     )
     monkeypatch.setattr(server_preflight, "_endpoint_open", lambda _endpoint: True)
+    monkeypatch.setattr(
+        server_preflight,
+        "_fetch_actor_identity",
+        lambda _endpoint, _token: build_actor_identity(config),
+    )
     return config
 
 
@@ -1204,6 +1284,7 @@ def _materialization_gate7_audit(
         config_path, check_runtime_paths=True
     )
     dependencies = common.runtime_dependency_hashes(config)
+    actor_identity = build_actor_identity(config)
     audit_path = config_path.parent / f"{config_path.stem}.gate07_audit.json"
     audit_path.write_text(
         json.dumps(
@@ -1215,6 +1296,8 @@ def _materialization_gate7_audit(
                     common.runtime_dataset_path(config)
                 ),
                 **dependencies,
+                "program_model_sha256": actor_identity["program_model_sha256"],
+                "actor_binding_sha256": actor_identity["actor_binding_sha256"],
                 "typed_task_identities": [
                     {
                         "task_id": "cube-stack",
@@ -1399,6 +1482,9 @@ def test_materialize_publishes_typed_dataset_and_updated_config(tmp_path: Path) 
         source_config["runtime"]["dataset_path"]
     )
     assert manifest["gate7_run_id"] == "capsule-smoke-001"
+    identity = build_actor_identity(source_config)
+    assert manifest["program_model_sha256"] == identity["program_model_sha256"]
+    assert manifest["actor_binding_sha256"] == identity["actor_binding_sha256"]
     assert manifest["gate7_audit_sha256"] == common.artifact_file_sha256(
         manifest["gate7_audit_path"]
     )
@@ -1651,6 +1737,30 @@ def test_materialize_resolver_failure_leaves_no_bundle(tmp_path: Path) -> None:
     assert not list(tmp_path.glob(".seed-resolved.*.tmp"))
 
 
+def test_materialize_rejects_actor_identity_changed_during_resolution(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    model_config = Path(config["runtime"]["program_model_path"]) / "config.json"
+    destination = tmp_path / "changed-actor-identity"
+
+    def mutate_model(_config):
+        model_config.write_text('{"model_type":"changed"}\n', encoding="utf-8")
+        return (_resolved_task(),)
+
+    with pytest.raises(common.ConfigValidationError, match="actor identity changed"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=destination,
+            validate_only=False,
+            task_resolver=mutate_model,
+        )
+
+    assert not destination.exists()
+
+
 def test_materialize_rejects_gate7_audit_dataset_mismatch_before_resolving(
     tmp_path: Path,
 ) -> None:
@@ -1668,6 +1778,37 @@ def test_materialize_rejects_gate7_audit_dataset_mismatch_before_resolving(
             config_path=config_path,
             gate7_audit_path=audit_path,
             output_dir=tmp_path / "mismatched-audit",
+            validate_only=False,
+            task_resolver=forbidden_resolver,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "message"),
+    [
+        ("program_model_sha256", "Program model SHA"),
+        ("actor_binding_sha256", "actor binding SHA"),
+    ],
+)
+def test_materialize_rejects_gate7_actor_identity_mismatch_before_resolving(
+    field_name: str,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    audit_path = _materialization_gate7_audit(config_path)
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit[field_name] = "0" * 64
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+
+    def forbidden_resolver(_config):
+        raise AssertionError("mismatched actor identity must fail before resolution")
+
+    with pytest.raises(common.ConfigValidationError, match=message):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=audit_path,
+            output_dir=tmp_path / f"mismatched-{field_name}",
             validate_only=False,
             task_resolver=forbidden_resolver,
         )
@@ -1871,7 +2012,29 @@ def test_documentation_records_all_gates_and_runtime_not_verified_boundary() -> 
         assert requirement in text
 
 
+def _synthetic_actor_identity() -> dict[str, object]:
+    identity: dict[str, object] = {
+        "schema_version": 1,
+        "service_role": "program_actor_identity",
+        "serves_generation": False,
+        "model": "Qwen/Qwen2.5-Coder-7B-Instruct",
+        "program_model_path": "/models/Qwen2.5-Coder-7B-Instruct",
+        "program_model_file_count": 2,
+        "program_model_sha256": "1" * 64,
+        "lora_rank": 16,
+        "lora_alpha": 32,
+        "lora_target_modules": ["all-linear"],
+        "verl_source_path": "/pinned/verl-source",
+        "verl_pinned_sha": "c" * 40,
+        "verl_resolved_config_path": "/resolved/verl.yaml",
+        "verl_resolved_config_sha256": "f" * 64,
+    }
+    identity["actor_binding_sha256"] = actor_binding_sha256(identity)
+    return identity
+
+
 def _gate_envelope(gate: str) -> dict[str, object]:
+    actor_identity = _synthetic_actor_identity()
     return {
         "schema_version": 1,
         "gate": gate,
@@ -1883,6 +2046,8 @@ def _gate_envelope(gate: str) -> dict[str, object]:
         "dataset_sha256": "9" * 64,
         "resolved_environment_sha256": "e" * 64,
         "verl_resolved_config_sha256": "f" * 64,
+        "program_model_sha256": actor_identity["program_model_sha256"],
+        "actor_binding_sha256": actor_identity["actor_binding_sha256"],
     }
 
 
@@ -1899,7 +2064,13 @@ def test_gate_envelope_requires_dataset_sha256() -> None:
 
 
 @pytest.mark.parametrize(
-    "field_name", ["resolved_environment_sha256", "verl_resolved_config_sha256"]
+    "field_name",
+    [
+        "resolved_environment_sha256",
+        "verl_resolved_config_sha256",
+        "program_model_sha256",
+        "actor_binding_sha256",
+    ],
 )
 def test_gate_envelope_requires_runtime_dependency_sha256(field_name: str) -> None:
     payload = {
@@ -2576,6 +2747,7 @@ def _complete_gate_payloads(checkpoint: Path) -> dict[str, dict[str, object]]:
     group = _verified_group()
     guided_provenance = _guided_provenance(group)
 
+    actor_identity = _synthetic_actor_identity()
     return {
         "preflight": {
             **_gate_envelope("preflight"),
@@ -2590,6 +2762,11 @@ def _complete_gate_payloads(checkpoint: Path) -> dict[str, dict[str, object]]:
                 "cuda_available": True,
                 "egl_configured": True,
                 "program_model_exists": True,
+                "program_model_file_count": actor_identity["program_model_file_count"],
+                "program_model_sha256": actor_identity["program_model_sha256"],
+                "actor_binding_sha256": actor_identity["actor_binding_sha256"],
+                "program_actor_identity": actor_identity,
+                "program_actor_identity_verified": True,
                 "program_api_key_present": True,
                 "controller_api_key_present": True,
                 "program_endpoint_ready": True,
@@ -2719,6 +2896,10 @@ def test_gate7_verifies_complete_typed_chain_and_emits_hash_manifest(tmp_path: P
     assert summary["dataset_sha256"] == "9" * 64
     assert summary["resolved_environment_sha256"] == "e" * 64
     assert summary["verl_resolved_config_sha256"] == "f" * 64
+    assert summary["program_model_sha256"] == "1" * 64
+    assert summary["actor_binding_sha256"] == _synthetic_actor_identity()[
+        "actor_binding_sha256"
+    ]
     assert summary["typed_task_identities"] == [
         {
             "task_id": "cube-stack-5",
@@ -2918,6 +3099,8 @@ def test_gate7_rejects_dataset_bytes_changed_between_gates(tmp_path: Path) -> No
     [
         ("resolved_environment_sha256", "resolved environment SHA"),
         ("verl_resolved_config_sha256", "resolved VeRL config SHA"),
+        ("program_model_sha256", "Program model SHA"),
+        ("actor_binding_sha256", "actor binding SHA"),
     ],
 )
 def test_gate7_rejects_runtime_dependency_changed_between_gates(

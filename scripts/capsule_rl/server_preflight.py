@@ -11,8 +11,15 @@ import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from capx.rl.capsule.actor_identity import (
+    ActorIdentityError,
+    build_actor_identity,
+    verify_actor_identity_payload,
+)
 from capx.rl.capsule.schema import TaskInstanceV1
 
 from .common import (
@@ -40,6 +47,70 @@ def _endpoint_open(endpoint: str, timeout_s: float = 2.0) -> bool:
             return True
     except OSError:
         return False
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
+def _fetch_actor_identity(
+    endpoint: str,
+    bearer_token: str,
+    *,
+    opener: Any | None = None,
+    timeout_s: float = 5.0,
+    max_response_bytes: int = 65_536,
+) -> dict[str, Any]:
+    """Fetch one bounded, authenticated identity document without following redirects."""
+
+    if not isinstance(bearer_token, str) or not bearer_token:
+        raise GateArtifactError("Program actor identity bearer token is missing")
+    identity_url = endpoint.rstrip("/") + "/capx/actor-identity"
+    request = Request(
+        identity_url,
+        method="GET",
+        headers={"Authorization": f"Bearer {bearer_token}", "Accept": "application/json"},
+    )
+    client = opener if opener is not None else build_opener(_RejectRedirects())
+    try:
+        with client.open(request, timeout=timeout_s) as response:
+            if getattr(response, "status", None) != 200:
+                raise GateArtifactError(
+                    f"Program actor identity returned HTTP {getattr(response, 'status', None)!r}"
+                )
+            if response.geturl() != identity_url:
+                raise GateArtifactError("Program actor identity redirect is forbidden")
+            raw_length = response.headers.get("Content-Length")
+            if raw_length is not None:
+                try:
+                    content_length = int(raw_length)
+                except (TypeError, ValueError) as error:
+                    raise GateArtifactError(
+                        "Program actor identity Content-Length is invalid"
+                    ) from error
+                if content_length < 0 or content_length > max_response_bytes:
+                    raise GateArtifactError("Program actor identity response is too large")
+            body = response.read(max_response_bytes + 1)
+    except GateArtifactError:
+        raise
+    except HTTPError as error:
+        if 300 <= error.code < 400:
+            raise GateArtifactError("Program actor identity redirect is forbidden") from error
+        raise GateArtifactError(
+            f"Program actor identity returned HTTP {error.code}"
+        ) from error
+    except (OSError, URLError) as error:
+        raise GateArtifactError(f"Program actor identity request failed: {error}") from error
+    if len(body) > max_response_bytes:
+        raise GateArtifactError("Program actor identity response is too large")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GateArtifactError("Program actor identity response must be UTF-8 JSON") from error
+    if not isinstance(payload, dict):
+        raise GateArtifactError("Program actor identity response must be a JSON object")
+    return payload
 
 
 def _git_sha(path: Path) -> str:
@@ -211,6 +282,15 @@ def _collect_preflight_payload(
     project_git_sha = _git_sha(project_root)
     failure_context["git_sha"] = project_git_sha
     verl_actual_sha = _git_sha(verl_path)
+    try:
+        local_actor_identity = build_actor_identity(config)
+        program_token = os.environ.get(str(program_service["api_key_env"]), "")
+        service_actor_identity = _fetch_actor_identity(
+            str(program_service["endpoint"]), program_token
+        )
+        verify_actor_identity_payload(service_actor_identity, local_actor_identity)
+    except ActorIdentityError as error:
+        raise GateArtifactError(f"Program actor identity verification failed: {error}") from error
     checks = {
         "git_sha": project_git_sha,
         "verl_source_path": str(verl_path.resolve()),
@@ -224,6 +304,11 @@ def _collect_preflight_payload(
         "cuda_available": bool(torch.cuda.is_available()),
         "egl_configured": os.environ.get("MUJOCO_GL", "").lower() == "egl",
         "program_model_exists": program_model_path.exists(),
+        "program_model_file_count": local_actor_identity["program_model_file_count"],
+        "program_model_sha256": local_actor_identity["program_model_sha256"],
+        "actor_binding_sha256": local_actor_identity["actor_binding_sha256"],
+        "program_actor_identity": service_actor_identity,
+        "program_actor_identity_verified": True,
         "dataset_path": str(dataset_path),
         "dataset_sha256": dataset_sha256,
         "dataset_task_count": len(dataset_task_identities),
@@ -233,7 +318,7 @@ def _collect_preflight_payload(
         ],
         "program_api_key_present": bool(os.environ.get(program_service["api_key_env"])),
         "controller_api_key_present": bool(os.environ.get(controller_service["api_key_env"])),
-        "program_endpoint_ready": _endpoint_open(program_service["endpoint"]),
+        "program_endpoint_ready": True,
         "controller_endpoint_ready": _endpoint_open(controller_service["endpoint"]),
         "pyroki_endpoint_ready": _endpoint_open(pyroki_endpoint),
         "resolved_environment_sha256": dependency_hashes[
@@ -256,6 +341,8 @@ def _collect_preflight_payload(
         "config_sha256": config_sha256,
         "git_sha": project_git_sha,
         "dataset_sha256": dataset_sha256,
+        "program_model_sha256": local_actor_identity["program_model_sha256"],
+        "actor_binding_sha256": local_actor_identity["actor_binding_sha256"],
         **dependency_hashes,
         "failed_checks": [],
         "checks": checks,
@@ -338,6 +425,22 @@ def run_preflight(config_path: Path, artifact_path: Path, *, run_id: str) -> dic
                     else "resolved VeRL config"
                 )
                 raise GateArtifactError(f"{label} bytes changed during preflight")
+        stage = "post_actor_identity"
+        try:
+            post_local_identity = build_actor_identity(config)
+            post_service_identity = _fetch_actor_identity(
+                str(config["program_service"]["endpoint"]),
+                os.environ.get(str(config["program_service"]["api_key_env"]), ""),
+            )
+            verify_actor_identity_payload(
+                post_local_identity,
+                payload["checks"]["program_actor_identity"],
+            )
+            verify_actor_identity_payload(post_service_identity, post_local_identity)
+        except ActorIdentityError as error:
+            raise GateArtifactError(
+                f"Program actor identity changed during preflight: {error}"
+            ) from error
         stage = "artifact_publish"
         if failure_file.exists() or failure_file.is_symlink():
             raise FileExistsError(

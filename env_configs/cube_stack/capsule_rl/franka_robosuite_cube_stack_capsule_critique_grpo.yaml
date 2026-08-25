@@ -33,6 +33,8 @@ task:
 # Program actor and frozen Controller are intentionally separate services. API key values stay
 # outside YAML; these fields name the environment variables read by the server factory.
 program_service:
+  # Authenticated identity only; VeRL remains the sole Program generation path.
+  mode: actor_identity
   endpoint: http://127.0.0.1:8101/v1
   model: /path/to/program_actor_checkpoint
   api_key_env: CAPX_PROGRAM_API_KEY

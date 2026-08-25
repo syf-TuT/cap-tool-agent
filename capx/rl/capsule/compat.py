@@ -393,6 +393,11 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
             True,
             "only the Program actor is updated; Controller is frozen",
         ),
+        (
+            "program_service.mode",
+            "actor_identity",
+            "Program HTTP service exposes actor identity only; VeRL owns generation",
+        ),
         ("capsule.group_size", 8, "Capsule-Critique uses one eight-member group"),
         ("capsule.base_samples_before_repair", 7, "repair triggers only after seven failures"),
         ("capsule.p0_count", 2, "repair ranks exactly two P0 programs"),

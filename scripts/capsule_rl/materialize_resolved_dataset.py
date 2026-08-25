@@ -17,6 +17,7 @@ from typing import Any
 
 import yaml
 
+from capx.rl.capsule.actor_identity import ActorIdentityError, build_actor_identity
 from capx.rl.capsule.provenance import project_path
 from capx.rl.capsule.schema import TaskInstanceV1
 
@@ -54,6 +55,8 @@ class _Gate7Audit:
     dataset_sha256: str
     resolved_environment_sha256: str
     verl_resolved_config_sha256: str
+    program_model_sha256: str
+    actor_binding_sha256: str
     typed_task_identities: tuple[dict[str, object], ...]
 
 
@@ -68,6 +71,13 @@ def _required_sha256(payload: Mapping[str, Any], field_name: str) -> str:
     if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
         raise ConfigValidationError(f"Gate7 audit {field_name} must be lowercase SHA-256")
     return value
+
+
+def _build_actor_identity(config: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        return build_actor_identity(config)
+    except ActorIdentityError as error:
+        raise ConfigValidationError(f"cannot bind Program actor identity: {error}") from error
 
 
 def _load_gate7_audit(path: str | Path) -> _Gate7Audit:
@@ -142,6 +152,8 @@ def _load_gate7_audit(path: str | Path) -> _Gate7Audit:
         verl_resolved_config_sha256=_required_sha256(
             payload, "verl_resolved_config_sha256"
         ),
+        program_model_sha256=_required_sha256(payload, "program_model_sha256"),
+        actor_binding_sha256=_required_sha256(payload, "actor_binding_sha256"),
         typed_task_identities=tuple(normalized_identities),
     )
 
@@ -152,6 +164,7 @@ def _validate_gate7_bindings(
     source_config_sha256: str,
     source_dataset_sha256: str,
     dependency_hashes: Mapping[str, str],
+    actor_identity: Mapping[str, Any],
 ) -> None:
     if audit.config_sha256 != source_config_sha256:
         raise ConfigValidationError("Gate7 audit config SHA does not match the source config")
@@ -168,6 +181,14 @@ def _validate_gate7_bindings(
     ]:
         raise ConfigValidationError(
             "Gate7 audit resolved VeRL config SHA does not match the source config"
+        )
+    if audit.program_model_sha256 != actor_identity["program_model_sha256"]:
+        raise ConfigValidationError(
+            "Gate7 audit Program model SHA does not match the source model bytes"
+        )
+    if audit.actor_binding_sha256 != actor_identity["actor_binding_sha256"]:
+        raise ConfigValidationError(
+            "Gate7 audit actor binding SHA does not match the source actor identity"
         )
 
 
@@ -456,6 +477,8 @@ def _publish_bundle(
             "verl_resolved_config_sha256": dependency_hashes[
                 "verl_resolved_config_sha256"
             ],
+            "program_model_sha256": gate7_audit.program_model_sha256,
+            "actor_binding_sha256": gate7_audit.actor_binding_sha256,
         }
         _write_synced_text(
             staging / manifest_name,
@@ -518,12 +541,14 @@ def materialize(
     source_dataset_path = runtime_dataset_path(config)
     source_dataset_sha256 = artifact_file_sha256(source_dataset_path)
     dependency_hashes = runtime_dependency_hashes(config)
+    actor_identity = _build_actor_identity(config)
     gate7_audit = _load_gate7_audit(gate7_audit_path)
     _validate_gate7_bindings(
         gate7_audit,
         source_config_sha256=source_config_sha256,
         source_dataset_sha256=source_dataset_sha256,
         dependency_hashes=dependency_hashes,
+        actor_identity=actor_identity,
     )
     if destination.exists():
         raise FileExistsError(f"materialization output already exists: {destination}")
@@ -573,6 +598,8 @@ def materialize(
         raise ConfigValidationError("source dataset changed during task resolution")
     if runtime_dependency_hashes(config) != dependency_hashes:
         raise ConfigValidationError("runtime dependencies changed during task resolution")
+    if _build_actor_identity(config) != actor_identity:
+        raise ConfigValidationError("Program actor identity changed during task resolution")
     if artifact_file_sha256(gate7_audit.source_path) != gate7_audit.sha256:
         raise ConfigValidationError("Gate7 audit changed during task resolution")
     resolved_identities = {

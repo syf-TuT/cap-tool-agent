@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from capx.rl.capsule.actor_identity import build_actor_identity
 from capx.rl.capsule.checkpoint import AtomicCheckpointClaim
 from capx.rl.capsule.group import RepairAttempt, deterministic_group_uid
 from capx.rl.capsule.repair import BaseUnitSpan, RepairDraft
@@ -93,12 +94,34 @@ def _runtime_config(tmp_path: Path) -> dict[str, object]:
         environment_config_path.write_text("task: CubeStack\n", encoding="utf-8")
     resolved_verl_config_path = tmp_path / "resolved_verl.yaml"
     if not resolved_verl_config_path.exists():
-        resolved_verl_config_path.write_text("trainer: {}\n", encoding="utf-8")
+        resolved_verl_config_path.write_text(
+            "actor_rollout_ref:\n"
+            "  model:\n"
+            "    lora_rank: 16\n"
+            "    lora_alpha: 32\n"
+            "    target_modules: all-linear\n"
+            "trainer: {}\n",
+            encoding="utf-8",
+        )
+    model_path = tmp_path / "program-model"
+    model_path.mkdir(exist_ok=True)
+    model_config = model_path / "config.json"
+    if not model_config.exists():
+        model_config.write_text('{"model_type":"qwen2"}\n', encoding="utf-8")
+    verl_source_path = tmp_path / "verl-source"
+    verl_source_path.mkdir(exist_ok=True)
     return {
         "runtime": {
             "project_root": str(tmp_path),
             "dataset_path": str(dataset_path),
+            "program_model_path": str(model_path),
+            "verl_source_path": str(verl_source_path),
+            "verl_pinned_sha": "a" * 40,
             "verl_resolved_config_path": str(resolved_verl_config_path),
+        },
+        "program_service": {
+            "mode": "actor_identity",
+            "model": str(model_path),
         },
         "task": {
             "environment": "robosuite_cube_stack",
@@ -591,6 +614,7 @@ def test_gate6_verifier_failure_aborts_published_checkpoint_transaction(
     config = _runtime_config(tmp_path)
     dataset_sha256 = artifact_file_sha256(config["runtime"]["dataset_path"])
     dependency_hashes = server_adapter.runtime_dependency_hashes(config)
+    actor_identity = build_actor_identity(config)
     args = _args(tmp_path)
     args.guided_artifact.write_text(
         json.dumps(
@@ -598,8 +622,10 @@ def test_gate6_verifier_failure_aborts_published_checkpoint_transaction(
                 "run_id": "run-01",
                 "config_sha256": artifact_file_sha256(config_path),
                 "git_sha": "c" * 40,
-                "dataset_sha256": dataset_sha256,
-                **dependency_hashes,
+                    "dataset_sha256": dataset_sha256,
+                    **dependency_hashes,
+                    "program_model_sha256": actor_identity["program_model_sha256"],
+                    "actor_binding_sha256": actor_identity["actor_binding_sha256"],
             }
         ),
         encoding="utf-8",
@@ -1391,6 +1417,8 @@ def _guided_payload(run_id: str) -> dict[str, object]:
         "dataset_sha256": "9" * 64,
         "resolved_environment_sha256": "e" * 64,
         "verl_resolved_config_sha256": "f" * 64,
+        "program_model_sha256": "1" * 64,
+        "actor_binding_sha256": "2" * 64,
         "task_instance": task.to_dict(),
         "original_prompt": prompt,
         "training_input_contains_critique": False,

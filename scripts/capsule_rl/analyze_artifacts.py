@@ -300,6 +300,8 @@ def audit_gate_directory(directory: str | Path) -> dict[str, Any]:
     dependency_labels = {
         "resolved_environment_sha256": "resolved environment SHA",
         "verl_resolved_config_sha256": "resolved VeRL config SHA",
+        "program_model_sha256": "Program model SHA",
+        "actor_binding_sha256": "actor binding SHA",
     }
     runtime_dependency_sha256s = {
         field_name: artifacts[0][2][field_name]

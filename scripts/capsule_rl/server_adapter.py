@@ -20,6 +20,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 
+from capx.rl.capsule.actor_identity import (
+    ActorIdentityError,
+    build_actor_identity,
+    verify_actor_identity_payload,
+)
 from capx.rl.capsule.schema import (
     ProgramReplayResultV1,
     ReplayOutcome,
@@ -424,6 +429,7 @@ def execute_gate(
     git_sha: str | None = None
     dataset_sha256: str | None = None
     dependency_hashes: dict[str, str] | None = None
+    actor_identity: dict[str, Any] | None = None
     transaction: GateTransaction | None = None
     published_artifact: _PublishedArtifactIdentity | None = None
     stage = "config_hash"
@@ -440,6 +446,11 @@ def execute_gate(
         dataset_sha256 = artifact_file_sha256(dataset_path)
         stage = "runtime_dependency_hash"
         dependency_hashes = runtime_dependency_hashes(config)
+        stage = "actor_identity_hash"
+        try:
+            actor_identity = build_actor_identity(config)
+        except ActorIdentityError as error:
+            raise ServerAdapterError(f"cannot bind Program actor identity: {error}") from error
         request_values = vars(args).copy()
         request_values.update(command=command, run_id=run_id)
         request_args = argparse.Namespace(**request_values)
@@ -462,6 +473,8 @@ def execute_gate(
                 dataset_sha256,
                 dependency_hashes["resolved_environment_sha256"],
                 dependency_hashes["verl_resolved_config_sha256"],
+                actor_identity["program_model_sha256"],
+                actor_identity["actor_binding_sha256"],
             )
             actual_identity = tuple(
                 dependency.get(field)
@@ -472,12 +485,15 @@ def execute_gate(
                     "dataset_sha256",
                     "resolved_environment_sha256",
                     "verl_resolved_config_sha256",
+                    "program_model_sha256",
+                    "actor_binding_sha256",
                 )
             )
             if actual_identity != expected_identity:
                 raise ServerAdapterError(
                     "guided artifact run_id/config_sha256/git_sha/dataset_sha256/"
-                    "resolved_environment_sha256/verl_resolved_config_sha256 does not "
+                    "resolved_environment_sha256/verl_resolved_config_sha256/"
+                    "program_model_sha256/actor_binding_sha256 does not "
                     "match the trainer gate"
                 )
         if runtime_factory is not None:
@@ -509,6 +525,14 @@ def execute_gate(
                 raise ServerAdapterError(
                     f"{label} bytes changed while the gate was executing"
                 )
+        stage = "post_actor_identity"
+        try:
+            post_actor_identity = build_actor_identity(config)
+            verify_actor_identity_payload(post_actor_identity, actor_identity)
+        except ActorIdentityError as error:
+            raise ServerAdapterError(
+                f"Program actor identity changed while the gate was executing: {error}"
+            ) from error
         stage = "evidence_validation"
         if not isinstance(evidence, Mapping):
             raise ServerAdapterError("gate runtime must return a mapping")
@@ -523,6 +547,8 @@ def execute_gate(
             "dataset_sha256",
             "resolved_environment_sha256",
             "verl_resolved_config_sha256",
+            "program_model_sha256",
+            "actor_binding_sha256",
         }.intersection(evidence)
         if forbidden:
             raise ServerAdapterError(
@@ -539,6 +565,8 @@ def execute_gate(
             "git_sha": git_sha,
             "dataset_sha256": dataset_sha256,
             **dependency_hashes,
+            "program_model_sha256": actor_identity["program_model_sha256"],
+            "actor_binding_sha256": actor_identity["actor_binding_sha256"],
             **dict(evidence),
         }
         stage = "artifact_verification"

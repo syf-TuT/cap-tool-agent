@@ -1,24 +1,25 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 from pathlib import Path
 
 import pytest
 import yaml
 
 from capx.rl.capsule import main_ppo
+from capx.rl.capsule.actor_identity import build_actor_identity
+from capx.rl.capsule.compat import (
+    PINNED_VERL_SHA,
+    VeRLCompatibilityError,
+    VeRLCompatibilityReport,
+)
 from capx.rl.capsule.provenance import (
     file_sha256,
     project_path,
     runtime_dependency_hashes,
 )
 from capx.rl.capsule.schema import TaskInstanceV1
-from capx.rl.capsule.compat import (
-    PINNED_VERL_SHA,
-    VeRLCompatibilityError,
-    VeRLCompatibilityReport,
-)
 from test_capsule_config import valid_config
 
 
@@ -36,6 +37,7 @@ def write_config(tmp_path: Path, config: dict) -> Path:
                 "runtime.verl_resolved_config_path",
             )
             dependencies = runtime_dependency_hashes(config)
+            actor_identity = build_actor_identity(config)
             records = [
                 TaskInstanceV1.from_json(line)
                 for line in dataset_path.read_text(encoding="utf-8").splitlines()
@@ -62,6 +64,8 @@ def write_config(tmp_path: Path, config: dict) -> Path:
                     "config_sha256": file_sha256(path),
                     "dataset_sha256": file_sha256(dataset_path),
                     **dependencies,
+                    "program_model_sha256": actor_identity["program_model_sha256"],
+                    "actor_binding_sha256": actor_identity["actor_binding_sha256"],
                     "typed_task_identities": typed_identities,
                 },
                 sort_keys=True,
@@ -101,6 +105,8 @@ def write_config(tmp_path: Path, config: dict) -> Path:
                     "verl_resolved_config_sha256": dependencies[
                         "verl_resolved_config_sha256"
                     ],
+                    "program_model_sha256": actor_identity["program_model_sha256"],
+                    "actor_binding_sha256": actor_identity["actor_binding_sha256"],
                 },
                 sort_keys=True,
             ),
@@ -134,8 +140,21 @@ def valid_local_config(tmp_path: Path) -> dict:
         encoding="utf-8",
     )
     program_model.mkdir(parents=True)
+    (program_model / "config.json").write_text(
+        '{"model_type":"qwen2"}\n', encoding="utf-8"
+    )
+    verl_source = project_root / "verl-source"
+    verl_source.mkdir()
     resolved_verl_config.parent.mkdir(parents=True)
-    resolved_verl_config.write_text("trainer: {}\n", encoding="utf-8")
+    resolved_verl_config.write_text(
+        "actor_rollout_ref:\n"
+        "  model:\n"
+        "    lora_rank: 16\n"
+        "    lora_alpha: 32\n"
+        "    target_modules: all-linear\n"
+        "trainer: {}\n",
+        encoding="utf-8",
+    )
     environment_config.write_text("task: CubeStack\n", encoding="utf-8")
     gate7_audit.parent.mkdir(parents=True)
     output_parent.mkdir(parents=True)
@@ -144,6 +163,7 @@ def valid_local_config(tmp_path: Path) -> dict:
             "project_root": str(project_root),
             "dataset_path": "data/tasks.jsonl",
             "program_model_path": "models/program",
+            "verl_source_path": "verl-source",
             "verl_resolved_config_path": "configs/verl.yaml",
             "bundle_manifest_path": "bundle/bundle_manifest.json",
             "gate7_audit_path": "bundle/gate07_audit.json",
@@ -261,6 +281,27 @@ def test_validate_only_rejects_tampered_bundle_provenance(
 
     assert main_ppo.main(["--config", str(path), "--validate-only"]) == 2
     assert message in capsys.readouterr().err
+
+
+def test_validate_only_rejects_program_model_changed_after_gate7(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = valid_local_config(tmp_path)
+    path = write_config(tmp_path, config)
+    model_path = project_path(
+        config,
+        config["runtime"]["program_model_path"],
+        "runtime.program_model_path",
+    )
+    (model_path / "config.json").write_text(
+        '{"model_type":"changed"}\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(main_ppo, "_project_git_sha", lambda _config: "a" * 40)
+
+    assert main_ppo.main(["--config", str(path), "--validate-only"]) == 2
+    assert "Program actor" in capsys.readouterr().err
 
 
 def test_validate_only_requires_bundle_manifest(

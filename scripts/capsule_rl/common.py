@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -22,6 +23,10 @@ from urllib.parse import urlparse
 
 import yaml
 
+from capx.rl.capsule.actor_identity import (
+    ActorIdentityError,
+    verify_actor_identity_payload,
+)
 from capx.rl.capsule.compat import CapsuleConfigError, validate_capsule_config
 from capx.rl.capsule.provenance import runtime_dependency_hashes
 from capx.rl.capsule.repair import RepairInvariantError
@@ -255,6 +260,16 @@ def _validate_endpoint(value: object, field_name: str) -> None:
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ConfigValidationError(f"{field_name} must be an http(s) URL")
+    if parsed.scheme == "http":
+        hostname = parsed.hostname.lower()
+        try:
+            loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            loopback = hostname == "localhost"
+        if not loopback:
+            raise ConfigValidationError(
+                f"{field_name} must use https unless it targets a loopback address"
+            )
 
 
 def _validate_resolved_verl_config(path: Path) -> None:
@@ -413,6 +428,8 @@ def load_and_validate_server_config_bytes(
         key_env = _required(service, "api_key_env", str)
         if _ENV_NAME_RE.fullmatch(key_env) is None:
             raise ConfigValidationError(f"{name}.api_key_env is not a valid environment name")
+    if program_service.get("mode") != "actor_identity":
+        raise ConfigValidationError("program_service.mode must be actor_identity")
     if controller_service.get("frozen") is not True:
         raise ConfigValidationError("controller_service.frozen must be true")
 
@@ -932,6 +949,8 @@ def verify_gate_envelope(payload: Mapping[str, Any], expected_gate: str) -> None
     for field_name in (
         "resolved_environment_sha256",
         "verl_resolved_config_sha256",
+        "program_model_sha256",
+        "actor_binding_sha256",
     ):
         dependency_sha256 = payload.get(field_name)
         if (
@@ -1055,6 +1074,7 @@ def verify_preflight_gate_artifact(payload: Mapping[str, Any]) -> None:
         "program_api_key_present",
         "controller_api_key_present",
         "program_endpoint_ready",
+        "program_actor_identity_verified",
         "controller_endpoint_ready",
         "pyroki_endpoint_ready",
     )
@@ -1087,6 +1107,36 @@ def verify_preflight_gate_artifact(payload: Mapping[str, Any]) -> None:
     if resolved_verl_sha != payload.get("verl_resolved_config_sha256"):
         raise GateArtifactError(
             "preflight resolved VeRL config SHA must match the common gate envelope"
+        )
+    for field_name in ("program_model_sha256", "actor_binding_sha256"):
+        value = payload.get(field_name)
+        if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+            raise GateArtifactError(f"preflight {field_name} must be lowercase SHA-256")
+        if checks.get(field_name) != value:
+            raise GateArtifactError(
+                f"preflight {field_name} must match the common gate identity"
+            )
+    model_file_count = checks.get("program_model_file_count")
+    if (
+        isinstance(model_file_count, bool)
+        or not isinstance(model_file_count, int)
+        or model_file_count < 1
+    ):
+        raise GateArtifactError("preflight program model file count must be positive")
+    service_identity = checks.get("program_actor_identity")
+    if not isinstance(service_identity, Mapping):
+        raise GateArtifactError("preflight must record the Program actor identity response")
+    try:
+        verify_actor_identity_payload(service_identity, service_identity)
+    except ActorIdentityError as error:
+        raise GateArtifactError(f"preflight Program actor identity is invalid: {error}") from error
+    if (
+        service_identity.get("program_model_sha256") != payload["program_model_sha256"]
+        or service_identity.get("actor_binding_sha256") != payload["actor_binding_sha256"]
+        or service_identity.get("program_model_file_count") != model_file_count
+    ):
+        raise GateArtifactError(
+            "preflight Program actor identity does not match its top-level binding"
         )
     dataset_path = checks.get("dataset_path")
     if not isinstance(dataset_path, str) or not Path(dataset_path).is_absolute():

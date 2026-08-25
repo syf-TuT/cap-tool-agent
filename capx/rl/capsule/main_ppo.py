@@ -21,6 +21,7 @@ from typing import Any
 
 import yaml
 
+from .actor_identity import ActorIdentityError, build_actor_identity
 from .compat import (
     CapsuleConfigError,
     VeRLCompatibilityError,
@@ -364,6 +365,15 @@ def verify_bundle_provenance(
         )
     if dependency_hashes["verl_resolved_config_sha256"] != resolved_verl_sha256:
         raise TrainerFactoryError("bundle resolved VeRL config dependency hash is inconsistent")
+    try:
+        actor_identity = build_actor_identity(config)
+    except ActorIdentityError as error:
+        raise TrainerFactoryError(f"cannot bind Program actor identity: {error}") from error
+    for field_name in ("program_model_sha256", "actor_binding_sha256"):
+        if actor_identity[field_name] != _manifest_sha256(manifest, field_name):
+            raise TrainerFactoryError(
+                f"bundle {field_name} does not match the current Program actor"
+            )
 
     audit_path = _manifest_path(
         manifest_path, manifest.get("gate7_audit_path"), "gate7_audit_path"
@@ -398,6 +408,8 @@ def verify_bundle_provenance(
         ("dataset_sha256", "source_dataset_sha256"),
         ("resolved_environment_sha256", "resolved_environment_sha256"),
         ("verl_resolved_config_sha256", "verl_resolved_config_sha256"),
+        ("program_model_sha256", "program_model_sha256"),
+        ("actor_binding_sha256", "actor_binding_sha256"),
     ):
         expected = _manifest_sha256(manifest, manifest_field)
         if audit.get(audit_field) != expected:
@@ -458,6 +470,8 @@ def verify_bundle_provenance(
             "resolved_environment_sha256"
         ],
         "verl_resolved_config_sha256": resolved_verl_sha256,
+        "program_model_sha256": actor_identity["program_model_sha256"],
+        "actor_binding_sha256": actor_identity["actor_binding_sha256"],
     }
 
 
