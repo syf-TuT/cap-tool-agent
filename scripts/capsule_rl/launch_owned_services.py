@@ -47,6 +47,12 @@ GATE_ORDER = (
     "gate07_audit",
 )
 GPU_OOM_GATES = frozenset(GATE_ORDER[1:6])
+_GPU_OOM_LOG_MARKERS = (
+    b"out of memory",
+    b"cuda oom",
+    b"cuda error: out of memory",
+    b"no available memory for the cache blocks",
+)
 VERL_V061_SHA = "d62da4950573d7a4b7ef2362337952e7ab59e78d"
 CONTROLLER_GGUF_SHA256 = (
     "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c"
@@ -84,6 +90,13 @@ class GateCommandError(RuntimeError):
         self.returncode = returncode
         self.oom = oom
         self.guided_retry = guided_retry
+
+
+def _gate_log_indicates_gpu_oom(log_tail: bytes) -> bool:
+    """Recognize allocator and vLLM KV-cache capacity failures."""
+
+    normalized = log_tail.lower()
+    return any(marker in normalized for marker in _GPU_OOM_LOG_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -1569,7 +1582,6 @@ class LinuxRuntime:
             )
         if result.returncode:
             tail = log_path.read_bytes()[-256 * 1024 :].lower()
-            markers = (b"out of memory", b"cuda oom", b"cuda error: out of memory")
             guided_retry = (
                 gate_name == "gate05_guided"
                 and b"no pt/p_hat double-success group after" in tail
@@ -1579,7 +1591,7 @@ class LinuxRuntime:
                 result.returncode,
                 oom=(
                     gate_name in GPU_OOM_GATES
-                    and any(marker in tail for marker in markers)
+                    and _gate_log_indicates_gpu_oom(tail)
                 ),
                 guided_retry=guided_retry,
             )

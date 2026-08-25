@@ -36,6 +36,7 @@ from scripts.capsule_rl.launch_owned_services import (
     load_single_a800_resolved_profile,
     materialize_retry_profile,
     _gate_artifacts,
+    _gate_log_indicates_gpu_oom,
     _llama_build_number,
     _render_gate_commands,
     _render_services,
@@ -57,6 +58,16 @@ WORKFLOW_PATH = (
     / "capsule_rl"
     / "franka_robosuite_cube_stack_capsule_single_a800_owned_services.yaml"
 )
+
+
+def test_vllm_zero_cache_blocks_is_classified_as_gpu_oom() -> None:
+    log_tail = (
+        b"ValueError: No available memory for the cache blocks. "
+        b"Try increasing `gpu_memory_utilization` when initializing the engine."
+    )
+
+    assert _gate_log_indicates_gpu_oom(log_tail)
+
 
 CAPSULE_PATH = (
     Path(__file__).parents[1]
