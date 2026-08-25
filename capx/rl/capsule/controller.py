@@ -34,7 +34,8 @@ class FrozenControllerConfig:
     api_key_env: str
     frozen: bool = True
     max_turns: int = 12
-    request_timeout_s: float = 60.0
+    request_timeout_s: float = 300.0
+    max_output_tokens: int = 512
     temperature: float = 0.7
 
     def __post_init__(self) -> None:
@@ -58,6 +59,12 @@ class FrozenControllerConfig:
             or self.request_timeout_s <= 0
         ):
             raise ValueError("request_timeout_s must be a positive finite number")
+        if isinstance(self.max_output_tokens, bool) or not isinstance(
+            self.max_output_tokens, int
+        ):
+            raise TypeError("max_output_tokens must be an integer")
+        if self.max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be a positive integer")
         if (
             isinstance(self.temperature, bool)
             or not isinstance(self.temperature, (int, float))
@@ -107,6 +114,7 @@ class OpenAICompatibleControllerTransport:
             model=self.config.model,
             messages=list(messages),
             temperature=float(self.config.temperature),
+            max_tokens=self.config.max_output_tokens,
             response_format={"type": "json_object"},
         )
         choices = getattr(response, "choices", None)

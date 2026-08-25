@@ -1353,6 +1353,7 @@ class CapsuleServerRuntime:
                 frozen=True,
                 max_turns=int(capsule["max_controller_turns"]),
                 request_timeout_s=float(controller_service["request_timeout_s"]),
+                max_output_tokens=int(controller_service.get("max_output_tokens", 512)),
                 temperature=float(controller_service["temperature"]),
             )
             repair_collector = ControllerRepairCollector(

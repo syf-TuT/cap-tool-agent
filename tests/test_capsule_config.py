@@ -55,7 +55,8 @@ def valid_config() -> dict:
             "model": "controller-model",
             "api_key_env": "CAPX_CONTROLLER_API_KEY",
             "frozen": True,
-            "request_timeout_s": 60.0,
+            "request_timeout_s": 300.0,
+            "max_output_tokens": 512,
             "temperature": 0.7,
         },
         "capsule": {
@@ -110,6 +111,13 @@ def test_complete_capsule_config_is_accepted() -> None:
     validate_capsule_config(valid_config())
 
 
+def test_controller_output_limit_can_be_omitted_for_512_token_runtime_default() -> None:
+    config = valid_config()
+    del config["controller_service"]["max_output_tokens"]
+
+    validate_capsule_config(config)
+
+
 @pytest.mark.parametrize(
     ("path", "bad_value", "message"),
     [
@@ -136,6 +144,8 @@ def test_complete_capsule_config_is_accepted() -> None:
         (("controller_service", "frozen"), False, "frozen"),
         (("controller_service", "temperature"), 3.0, "temperature"),
         (("controller_service", "request_timeout_s"), 0.0, "request_timeout_s"),
+        (("controller_service", "max_output_tokens"), True, "max_output_tokens"),
+        (("controller_service", "max_output_tokens"), 0, "max_output_tokens"),
         (("task", "render"), True, "render"),
         (("capsule", "max_controller_turns"), 13, "12"),
         (("capsule", "gamma"), 0.2, "0.1"),
@@ -172,6 +182,8 @@ def test_repository_template_contains_all_local_and_server_contract_fields() -> 
     assert config["task"]["render"] is False
     assert config["task"]["record_video"] is False
     assert config["controller_service"]["api_key_env"] == "CAPX_CONTROLLER_API_KEY"
+    assert config["controller_service"]["request_timeout_s"] == 300.0
+    assert config["controller_service"]["max_output_tokens"] == 512
     assert "api_key" not in config["controller_service"]
     assert config["server_validation"]["gates"][:3] == [
         "preflight",

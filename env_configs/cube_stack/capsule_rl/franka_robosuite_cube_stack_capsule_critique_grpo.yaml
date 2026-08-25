@@ -42,7 +42,8 @@ controller_service:
   model: /path/to/frozen_controller_checkpoint
   api_key_env: CAPX_CONTROLLER_API_KEY
   frozen: true
-  request_timeout_s: 60.0
+  request_timeout_s: 300.0
+  max_output_tokens: 512
   temperature: 0.7
 
 capsule:

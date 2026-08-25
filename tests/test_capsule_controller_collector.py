@@ -185,6 +185,8 @@ def test_frozen_controller_config_is_strict() -> None:
         api_key_env="CAPX_CONTROLLER_API_KEY",
     )
     assert config.frozen is True
+    assert config.request_timeout_s == 300.0
+    assert config.max_output_tokens == 512
 
     with pytest.raises(ValueError, match="frozen"):
         FrozenControllerConfig(
@@ -200,6 +202,14 @@ def test_frozen_controller_config_is_strict() -> None:
             api_key_env="CAPX_CONTROLLER_API_KEY",
             max_turns=13,
         )
+    for invalid in (True, 0, -1):
+        with pytest.raises((TypeError, ValueError), match="max_output_tokens"):
+            FrozenControllerConfig(
+                endpoint="http://controller.invalid/v1",
+                model="controller-model",
+                api_key_env="CAPX_CONTROLLER_API_KEY",
+                max_output_tokens=invalid,
+            )
 
 
 def test_openai_transport_is_lazy_and_uses_dedicated_credentials(monkeypatch) -> None:
@@ -237,7 +247,7 @@ def test_openai_transport_is_lazy_and_uses_dedicated_credentials(monkeypatch) ->
         {
             "api_key": "controller-secret",
             "base_url": "http://controller.invalid/v1",
-            "timeout": 60.0,
+            "timeout": 300.0,
         }
     ]
     assert calls == [
@@ -245,6 +255,7 @@ def test_openai_transport_is_lazy_and_uses_dedicated_credentials(monkeypatch) ->
             "model": "controller-model",
             "messages": [{"role": "user", "content": "repair"}],
             "temperature": 0.7,
+            "max_tokens": 512,
             "response_format": {"type": "json_object"},
         }
     ]

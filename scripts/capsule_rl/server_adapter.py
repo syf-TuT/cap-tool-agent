@@ -747,6 +747,7 @@ class ConcreteGateRuntime:
                 frozen=True,
                 max_turns=int(capsule["max_controller_turns"]),
                 request_timeout_s=float(controller["request_timeout_s"]),
+                max_output_tokens=int(controller.get("max_output_tokens", 512)),
                 temperature=float(controller["temperature"]),
             )
             repair_collector = ControllerRepairCollector(
@@ -1258,6 +1259,9 @@ class ConcreteGateRuntime:
                     batch_encoder=encoder,
                     actor_rollout_wg=workers.actor_rollout_wg,
                     ref_policy_wg=workers.ref_policy_wg,
+                    reference_policy_mode=getattr(
+                        workers, "reference_policy_mode", "standalone"
+                    ),
                     artifact_sink=sink,
                     config=self.config,
                 )
