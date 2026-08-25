@@ -16,7 +16,8 @@ from typing import Any
 
 ATTESTATION_ARTIFACT_TYPE = "llama_cpp_b10516_runtime_attestation"
 ATTESTATION_SCHEMA_VERSION = 1
-_BUILD_PATTERN = re.compile(r"(?im)^\s*(?:version|build)\s*:\s*(\d+)\b")
+_BUILD_FIELD_PATTERN = re.compile(r"(?im)\bbuild\s*:?\s*(\d+)\b")
+_LEGACY_VERSION_BUILD_PATTERN = re.compile(r"(?im)^\s*version\s*:\s*(\d{3,})\b")
 _DYNAMIC_LOADER_ENV_NAMES = frozenset(
     {"LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT"}
 )
@@ -27,8 +28,11 @@ class LlamaRuntimeAttestationError(ValueError):
 
 
 def llama_build_number(version_text: str) -> int | None:
-    match = _BUILD_PATTERN.search(version_text)
-    return int(match.group(1)) if match is not None else None
+    for pattern in (_BUILD_FIELD_PATTERN, _LEGACY_VERSION_BUILD_PATTERN):
+        match = pattern.search(version_text)
+        if match is not None:
+            return int(match.group(1))
+    return None
 
 
 def sanitize_dynamic_loader_environment(

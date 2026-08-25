@@ -437,8 +437,16 @@ def test_capsule_policy_loss_survives_recursive_hydra_actor_conversion(
 def test_llama_build_number_parses_only_bounded_numeric_release() -> None:
     assert _llama_build_number("version: 10516 (abcdef)\nbuilt with cc") == 10516
     assert _llama_build_number("build: 10516, commit: abcdef") == 10516
+    assert (
+        _llama_build_number(
+            "version: 0.1.2-dev (build 10516, commit b95502ba9)\n"
+            "built with cc (Ubuntu 11.4.0) 11.4.0 for x86_64-linux-gnu"
+        )
+        == 10516
+    )
     assert _llama_build_number("version: 10515 (abcdef)") == 10515
     assert _llama_build_number("version: 105160 (abcdef)") == 105160
+    assert _llama_build_number("version: 0.1.2-dev") is None
     assert _llama_build_number("version: b10516") is None
 
 
