@@ -77,6 +77,7 @@ def _mock_git(
 def test_compatibility_check_is_read_only_and_matches_pinned_surface(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("CAPX_GIT_ENV_SENTINEL", "preserved")
     _write_pinned_surface(tmp_path)
     calls = _mock_git(monkeypatch)
 
@@ -89,6 +90,9 @@ def test_compatibility_check_is_read_only_and_matches_pinned_surface(
     assert command == ["git", "-C", str(tmp_path.resolve()), "rev-parse", "HEAD"]
     assert kwargs.get("shell", False) is False
     assert kwargs["capture_output"] is True
+    for _command, call_kwargs in calls:
+        assert call_kwargs["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+        assert call_kwargs["env"]["CAPX_GIT_ENV_SENTINEL"] == "preserved"
 
 
 def test_compatibility_rejects_tracked_changes_in_pinned_checkout(

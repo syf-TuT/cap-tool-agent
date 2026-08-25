@@ -28,6 +28,14 @@ from capx.rl.capsule.actor_identity import (
     verify_actor_identity_payload,
 )
 from capx.rl.capsule.compat import CapsuleConfigError, validate_capsule_config
+from capx.rl.capsule.lora_contract import (
+    QWEN25_ALL_LINEAR_PROJECTIONS,
+    QWEN25_ALL_LINEAR_TENSOR_COUNT,
+    QWEN25_CODER_7B_LAYER_COUNT,
+    QWEN25_PROJECTION_DIMENSIONS,
+    qwen_lora_tensor_identity,
+    validate_qwen_all_linear_coverage,
+)
 from capx.rl.capsule.provenance import runtime_dependency_hashes
 from capx.rl.capsule.repair import RepairInvariantError
 from capx.rl.capsule.schema import (
@@ -37,15 +45,126 @@ from capx.rl.capsule.schema import (
     ReplayOutcome,
     TaskInstanceV1,
 )
+from capx.rl.capsule.stable_io import (
+    StablePathError,
+    pin_absolute_path,
+    read_stable_regular_file,
+)
 from capx.rl.capsule.telemetry import summarize_replay_results
 
 SCHEMA_VERSION = 1
 CANONICAL_EXECUTION_MODE = "repository_server_adapter_v1"
+ADAPTER_RELOAD_PROMPT = "Return exactly one Python assignment that sets x to 1."
+_ADAPTER_RELOAD_PROMPT_SHA256 = hashlib.sha256(
+    ADAPTER_RELOAD_PROMPT.encode("utf-8")
+).hexdigest()
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHELL_OPERATORS = frozenset({"|", "||", "&&", ";", ">", ">>", "<", "<<", "&"})
 GATE_ORDER = ("preflight", "seed", "oracle_replay", "collector", "guided", "trainer")
+FINAL_RUNTIME_AUDIT_GATE_ORDER = (*GATE_ORDER, "adapter_reload")
+_FINAL_RUNTIME_AUDIT_GATE_FILES = {
+    "preflight": "gate01_preflight.json",
+    "seed": "gate02_seed.json",
+    "oracle_replay": "gate03_oracle.json",
+    "collector": "gate04_collector.json",
+    "guided": "gate05_guided_group.json",
+    "trainer": "gate06_trainer.json",
+    "adapter_reload": "adapter_reload_smoke.json",
+}
+_FINAL_RUNTIME_AUDIT_FIELDS = frozenset(
+    {
+        "artifact_files",
+        "learning_groups",
+        "base_members",
+        "base_successes",
+        "guided_members",
+        "guided_successes",
+        "repair_attempts",
+        "pt_successes",
+        "p_hat_successes",
+        "retry_count",
+        "infra_failures",
+        "optimizer_steps",
+        "schema_version",
+        "artifact_type",
+        "runtime_verified",
+        "run_id",
+        "config_sha256",
+        "git_sha",
+        "dataset_sha256",
+        "resolved_environment_sha256",
+        "verl_resolved_config_sha256",
+        "program_model_sha256",
+        "actor_binding_sha256",
+        "typed_task_identities",
+        "gate_statuses",
+        "gate_chain",
+        "gradient_norm",
+        "trainer_metrics",
+        "adapter_reload_artifact_sha256",
+        "adapter_reload_max_abs_logit_diff",
+        "adapter_model_sha256",
+        "adapter_config_sha256",
+        "gate07_candidate_sha256",
+        "launcher_continuous_memory_sha256",
+        "launcher_controller_attestation_sha256",
+        "launcher_owned_cleanup_sha256",
+        "launcher_initial_audit_sha256",
+        "launcher_post_controller_memory_sha256",
+        "continuous_memory_required_mib",
+        "minimum_mem_available_mib",
+        "continuous_memory_sample_count",
+        "continuous_memory_maximum_sample_gap_ms",
+        "controller_archive_sha256",
+        "controller_binary_sha256",
+        "controller_gguf_sha256",
+        "controller_runtime_tree_sha256",
+        "owned_service_cleanup_completed",
+        "owned_service_cleanup_count",
+        "oom_profile",
+        "resolved_profile_sha256",
+        "initial_hardware",
+        "mem_available_after_controller_mib",
+    }
+)
+_FINAL_RUNTIME_AUDIT_SHA256_FIELDS = frozenset(
+    {
+        "config_sha256",
+        "dataset_sha256",
+        "resolved_environment_sha256",
+        "verl_resolved_config_sha256",
+        "program_model_sha256",
+        "actor_binding_sha256",
+        "adapter_reload_artifact_sha256",
+        "adapter_model_sha256",
+        "adapter_config_sha256",
+        "gate07_candidate_sha256",
+        "launcher_continuous_memory_sha256",
+        "launcher_controller_attestation_sha256",
+        "launcher_owned_cleanup_sha256",
+        "launcher_initial_audit_sha256",
+        "launcher_post_controller_memory_sha256",
+        "controller_binary_sha256",
+        "controller_runtime_tree_sha256",
+        "resolved_profile_sha256",
+    }
+)
+_LLAMA_CPP_B10516_ARCHIVE_SHA256 = (
+    "f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35"
+)
+_QWEN25_CODER_7B_Q4_K_M_GGUF_SHA256 = (
+    "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c"
+)
+_SINGLE_A800_OOM_PROFILES = frozenset(
+    {
+        "base_dynamic_fp32",
+        "vllm_util_026",
+        "fixed_microbatch_1",
+        "fsdp_base_bf16",
+    }
+)
 
 
 class ConfigValidationError(ValueError):
@@ -62,6 +181,268 @@ class GateExecutionError(RuntimeError):
 
 class GateArtifactError(ValueError):
     """A gate artifact does not prove the required invariant."""
+
+
+def _is_final_audit_sha256(value: object) -> bool:
+    return isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
+
+
+def _is_final_audit_non_negative_int(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
+
+
+def _is_final_audit_finite_number(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
+
+
+def validate_final_runtime_audit(payload: Mapping[str, Any]) -> None:
+    """Validate the complete immutable Gate 7 runtime-audit consumer contract.
+
+    A bare ``runtime_verified: true`` flag is deliberately insufficient.  Consumers accept
+    only the exact schema emitted after all seven gate artifacts, Controller provenance,
+    continuous host-memory monitoring, and owned-service cleanup have been bound together.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise GateArtifactError("final Gate 7 runtime audit must be a mapping")
+    if set(payload) != _FINAL_RUNTIME_AUDIT_FIELDS:
+        missing = sorted(_FINAL_RUNTIME_AUDIT_FIELDS - set(payload))
+        unexpected = sorted(set(payload) - _FINAL_RUNTIME_AUDIT_FIELDS)
+        raise GateArtifactError(
+            "final Gate 7 runtime audit schema is incomplete or unexpected: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != SCHEMA_VERSION
+        or payload.get("artifact_type") != "capsule_rl_gate07_runtime_audit"
+        or payload.get("runtime_verified") is not True
+    ):
+        raise GateArtifactError(
+            "final Gate 7 runtime audit must use schema 1, the runtime-audit artifact type, "
+            "and runtime_verified=true"
+        )
+    run_id = payload.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise GateArtifactError("final Gate 7 runtime audit run_id must be non-empty")
+    git_sha = payload.get("git_sha")
+    if not isinstance(git_sha, str) or _GIT_SHA_RE.fullmatch(git_sha) is None:
+        raise GateArtifactError("final Gate 7 runtime audit git_sha must be a full Git SHA")
+    for field_name in _FINAL_RUNTIME_AUDIT_SHA256_FIELDS:
+        if not _is_final_audit_sha256(payload.get(field_name)):
+            raise GateArtifactError(
+                f"final Gate 7 runtime audit {field_name} must be lowercase SHA-256"
+            )
+    if payload.get("controller_archive_sha256") != _LLAMA_CPP_B10516_ARCHIVE_SHA256:
+        raise GateArtifactError(
+            "final Gate 7 runtime audit must bind the fixed llama.cpp b10516 archive"
+        )
+    if payload.get("controller_gguf_sha256") != _QWEN25_CODER_7B_Q4_K_M_GGUF_SHA256:
+        raise GateArtifactError(
+            "final Gate 7 runtime audit must bind the fixed Qwen Q4_K_M Controller GGUF"
+        )
+
+    counter_fields = (
+        "artifact_files",
+        "learning_groups",
+        "base_members",
+        "base_successes",
+        "guided_members",
+        "guided_successes",
+        "repair_attempts",
+        "pt_successes",
+        "p_hat_successes",
+        "retry_count",
+        "infra_failures",
+        "optimizer_steps",
+    )
+    for field_name in counter_fields:
+        if not _is_final_audit_non_negative_int(payload.get(field_name)):
+            raise GateArtifactError(
+                f"final Gate 7 runtime audit {field_name} must be a non-negative integer"
+            )
+    if (
+        payload.get("artifact_files", 0) < len(FINAL_RUNTIME_AUDIT_GATE_ORDER)
+        or payload.get("learning_groups") != 1
+        or payload.get("base_members") != 7
+        or payload.get("base_successes") != 0
+        or payload.get("guided_members") != 1
+        or payload.get("guided_successes") != 1
+        or payload.get("infra_failures") != 0
+        or payload.get("optimizer_steps") != 1
+    ):
+        raise GateArtifactError(
+            "final Gate 7 runtime audit does not prove the fixed 7+1 one-step contract"
+        )
+
+    identities = payload.get("typed_task_identities")
+    if not isinstance(identities, list) or len(identities) != 1:
+        raise GateArtifactError(
+            "final Gate 7 runtime audit must bind exactly one typed seed-5 task"
+        )
+    identity = identities[0]
+    if not isinstance(identity, Mapping) or set(identity) != {
+        "task_id",
+        "environment_seed",
+        "initial_state_sha256",
+    }:
+        raise GateArtifactError("final Gate 7 typed task identity schema is invalid")
+    if (
+        not isinstance(identity.get("task_id"), str)
+        or not identity.get("task_id")
+        or identity.get("environment_seed") != 5
+        or isinstance(identity.get("environment_seed"), bool)
+        or not _is_final_audit_sha256(identity.get("initial_state_sha256"))
+    ):
+        raise GateArtifactError("final Gate 7 typed task identity is not the seed-5 task")
+
+    expected_statuses = {gate: "passed" for gate in FINAL_RUNTIME_AUDIT_GATE_ORDER}
+    if payload.get("gate_statuses") != expected_statuses:
+        raise GateArtifactError("final Gate 7 runtime audit gate_statuses must all be passed")
+    chain = payload.get("gate_chain")
+    if not isinstance(chain, list) or len(chain) != len(FINAL_RUNTIME_AUDIT_GATE_ORDER):
+        raise GateArtifactError(
+            "final Gate 7 runtime audit must contain the fixed seven-item chain"
+        )
+    previous_sha256: str | None = None
+    chain_parent: Path | None = None
+    for index, (expected_gate, entry) in enumerate(
+        zip(FINAL_RUNTIME_AUDIT_GATE_ORDER, chain, strict=True)
+    ):
+        if not isinstance(entry, Mapping) or set(entry) != {
+            "gate",
+            "path",
+            "sha256",
+            "previous_sha256",
+        }:
+            raise GateArtifactError(f"final Gate 7 gate_chain[{index}] schema is invalid")
+        path_value = entry.get("path")
+        path = Path(path_value) if isinstance(path_value, str) else None
+        if (
+            entry.get("gate") != expected_gate
+            or path is None
+            or not path.is_absolute()
+            or path.name != _FINAL_RUNTIME_AUDIT_GATE_FILES[expected_gate]
+            or not _is_final_audit_sha256(entry.get("sha256"))
+        ):
+            raise GateArtifactError(
+                f"final Gate 7 gate_chain[{index}] does not bind {expected_gate}"
+            )
+        if chain_parent is None:
+            chain_parent = path.parent
+        elif path.parent != chain_parent:
+            raise GateArtifactError("final Gate 7 gate_chain paths must share one run directory")
+        if entry.get("previous_sha256") != previous_sha256:
+            raise GateArtifactError(
+                f"final Gate 7 gate_chain[{index}] previous_sha256 link is invalid"
+            )
+        previous_sha256 = str(entry["sha256"])
+    if payload.get("adapter_reload_artifact_sha256") != previous_sha256:
+        raise GateArtifactError(
+            "final Gate 7 adapter reload SHA does not match the last gate-chain link"
+        )
+
+    gradient_norm = payload.get("gradient_norm")
+    reload_difference = payload.get("adapter_reload_max_abs_logit_diff")
+    if not _is_final_audit_finite_number(gradient_norm) or float(gradient_norm) <= 0:
+        raise GateArtifactError("final Gate 7 gradient_norm must be finite and non-zero")
+    if (
+        not _is_final_audit_finite_number(reload_difference)
+        or float(reload_difference) <= 1e-8
+    ):
+        raise GateArtifactError("final Gate 7 adapter reload must change finite logits")
+    trainer_metrics = payload.get("trainer_metrics")
+    if not isinstance(trainer_metrics, Mapping) or not trainer_metrics:
+        raise GateArtifactError("final Gate 7 trainer_metrics must be non-empty")
+    for name, value in trainer_metrics.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or not _is_final_audit_finite_number(value)
+        ):
+            raise GateArtifactError("final Gate 7 trainer_metrics must be finite numerics")
+
+    memory_integer_fields = (
+        "continuous_memory_required_mib",
+        "minimum_mem_available_mib",
+        "continuous_memory_sample_count",
+        "continuous_memory_maximum_sample_gap_ms",
+        "owned_service_cleanup_count",
+        "mem_available_after_controller_mib",
+    )
+    for field_name in memory_integer_fields:
+        if not _is_final_audit_non_negative_int(payload.get(field_name)):
+            raise GateArtifactError(
+                f"final Gate 7 runtime audit {field_name} must be a non-negative integer"
+            )
+    if (
+        payload.get("continuous_memory_required_mib") != 12288
+        or payload.get("minimum_mem_available_mib", 0) < 12288
+        or payload.get("continuous_memory_sample_count", 0) < 2
+        or payload.get("continuous_memory_maximum_sample_gap_ms", 5001) > 5000
+        or payload.get("mem_available_after_controller_mib", 0) < 92160
+    ):
+        raise GateArtifactError("final Gate 7 runtime audit violates host-memory thresholds")
+    if (
+        payload.get("owned_service_cleanup_completed") is not True
+        or payload.get("owned_service_cleanup_count") != 3
+    ):
+        raise GateArtifactError(
+            "final Gate 7 runtime audit must prove cleanup of all three owned services"
+        )
+    if payload.get("oom_profile") not in _SINGLE_A800_OOM_PROFILES:
+        raise GateArtifactError("final Gate 7 runtime audit OOM profile is invalid")
+    if payload.get("resolved_profile_sha256") != payload.get(
+        "verl_resolved_config_sha256"
+    ):
+        raise GateArtifactError(
+            "final Gate 7 resolved profile SHA must match the resolved VeRL config SHA"
+        )
+
+    hardware = payload.get("initial_hardware")
+    hardware_fields = {
+        "gpu_name",
+        "gpu_count",
+        "gpu_total_vram_mib",
+        "gpu_free_vram_mib",
+        "host_memory_mib",
+        "shm_available_mib",
+        "disk_free_mib",
+        "repo_is_dirty",
+    }
+    if not isinstance(hardware, Mapping) or set(hardware) != hardware_fields:
+        raise GateArtifactError("final Gate 7 initial_hardware schema is invalid")
+    gpu_name = hardware.get("gpu_name")
+    normalized_gpu_name = (
+        gpu_name.upper().replace("-", "").replace(" ", "")
+        if isinstance(gpu_name, str)
+        else ""
+    )
+    if "A800" not in normalized_gpu_name or "80GB" not in normalized_gpu_name:
+        raise GateArtifactError("final Gate 7 runtime audit requires an A800 80GB")
+    hardware_thresholds = {
+        "gpu_total_vram_mib": 81920,
+        "gpu_free_vram_mib": 77824,
+        "host_memory_mib": 122880,
+        "shm_available_mib": 12288,
+        "disk_free_mib": 81920,
+    }
+    if hardware.get("gpu_count") != 1 or isinstance(hardware.get("gpu_count"), bool):
+        raise GateArtifactError("final Gate 7 runtime audit requires exactly one GPU")
+    for field_name, minimum in hardware_thresholds.items():
+        if (
+            not _is_final_audit_non_negative_int(hardware.get(field_name))
+            or hardware.get(field_name, 0) < minimum
+        ):
+            raise GateArtifactError(
+                f"final Gate 7 initial_hardware {field_name} is below threshold"
+            )
+    if not isinstance(hardware.get("repo_is_dirty"), bool):
+        raise GateArtifactError("final Gate 7 initial_hardware repo_is_dirty must be boolean")
 
 
 def repository_root() -> Path:
@@ -171,6 +552,192 @@ def artifact_tree_sha256(path: str | Path) -> str:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
     return digest.hexdigest()
+
+
+def _safetensors_tensor_metadata(payload: bytes) -> dict[str, Mapping[str, Any]]:
+    if len(payload) < 9:
+        raise GateArtifactError("adapter_model.safetensors has no valid header")
+    header_size = int.from_bytes(payload[:8], "little")
+    if header_size <= 0 or header_size > len(payload) - 8:
+        raise GateArtifactError("adapter_model.safetensors header length is invalid")
+    try:
+        header = json.loads(payload[8 : 8 + header_size])
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GateArtifactError(
+            f"adapter_model.safetensors header is invalid JSON: {error}"
+        ) from error
+    if not isinstance(header, Mapping):
+        raise GateArtifactError("adapter_model.safetensors header must be a mapping")
+    data_size = len(payload) - 8 - header_size
+    tensors: dict[str, Mapping[str, Any]] = {}
+    intervals: list[tuple[int, int]] = []
+    dtype_bytes = {
+        "BOOL": 1,
+        "I8": 1,
+        "U8": 1,
+        "F8_E4M3": 1,
+        "F8_E5M2": 1,
+        "I16": 2,
+        "U16": 2,
+        "F16": 2,
+        "BF16": 2,
+        "I32": 4,
+        "U32": 4,
+        "F32": 4,
+        "I64": 8,
+        "U64": 8,
+        "F64": 8,
+    }
+    for name, tensor in header.items():
+        if name == "__metadata__":
+            continue
+        if not isinstance(name, str) or not name or not isinstance(tensor, Mapping):
+            raise GateArtifactError("adapter_model.safetensors tensor metadata is invalid")
+        offsets = tensor.get("data_offsets")
+        shape = tensor.get("shape")
+        dtype = tensor.get("dtype")
+        if (
+            not isinstance(offsets, list)
+            or len(offsets) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in offsets)
+            or offsets[0] < 0
+            or offsets[0] > offsets[1]
+            or offsets[1] > data_size
+            or not isinstance(shape, list)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in shape
+            )
+            or not isinstance(dtype, str)
+            or dtype not in dtype_bytes
+        ):
+            raise GateArtifactError("adapter_model.safetensors tensor metadata is invalid")
+        element_count = math.prod(shape)
+        if offsets[1] - offsets[0] != element_count * dtype_bytes[dtype]:
+            raise GateArtifactError(
+                "adapter_model.safetensors tensor byte length disagrees with shape/dtype"
+            )
+        intervals.append((offsets[0], offsets[1]))
+        tensors[name] = tensor
+    if not tensors:
+        raise GateArtifactError("adapter_model.safetensors contains no adapter tensors")
+    intervals.sort()
+    if intervals[0][0] != 0 or intervals[-1][1] != data_size or any(
+        previous[1] != current[0]
+        for previous, current in zip(intervals, intervals[1:], strict=False)
+    ):
+        raise GateArtifactError(
+            "adapter_model.safetensors tensor offsets do not cover the data section exactly"
+        )
+    return tensors
+
+
+def direct_lora_adapter_evidence(checkpoint: str | Path) -> dict[str, Any]:
+    """Validate VeRL v0.6.1's direct PEFT checkpoint layout and hash its bytes."""
+
+    checkpoint_path = Path(os.path.abspath(Path(checkpoint).expanduser()))
+    adapter_path = checkpoint_path / "lora_adapter"
+    adapter_model_path = adapter_path / "adapter_model.safetensors"
+    adapter_config_path = adapter_path / "adapter_config.json"
+    try:
+        with pin_absolute_path(
+            checkpoint_path, label="trainer checkpoint", directory=True
+        ) as pinned_checkpoint, pin_absolute_path(
+            adapter_path, label="trainer lora_adapter", directory=True
+        ) as pinned_adapter:
+            model_snapshot = read_stable_regular_file(
+                adapter_model_path, label="adapter_model.safetensors"
+            )
+            config_snapshot = read_stable_regular_file(
+                adapter_config_path, label="adapter_config.json"
+            )
+            pinned_checkpoint.validate()
+            pinned_adapter.validate()
+    except StablePathError as error:
+        raise GateArtifactError(str(error)) from error
+    model_bytes = model_snapshot.raw_bytes
+    config_bytes = config_snapshot.raw_bytes
+    tensor_metadata = _safetensors_tensor_metadata(model_bytes)
+    try:
+        config = json.loads(config_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GateArtifactError(f"adapter_config.json is invalid UTF-8 JSON: {error}") from error
+    if not isinstance(config, Mapping):
+        raise GateArtifactError("adapter_config.json root must be a mapping")
+    if config.get("r") != 16 or isinstance(config.get("r"), bool):
+        raise GateArtifactError("adapter_config.json must prove LoRA rank=16")
+    if config.get("lora_alpha") != 32 or isinstance(config.get("lora_alpha"), bool):
+        raise GateArtifactError("adapter_config.json must prove LoRA alpha=32")
+    peft_type = config.get("peft_type")
+    if not isinstance(peft_type, str) or peft_type.upper() != "LORA":
+        raise GateArtifactError("adapter_config.json must identify PEFT type LORA")
+    if config.get("bias") != "none":
+        raise GateArtifactError("adapter_config.json must prove LoRA bias=none")
+    if config.get("task_type") != "CAUSAL_LM":
+        raise GateArtifactError("adapter_config.json must prove task_type=CAUSAL_LM")
+    targets = config.get("target_modules")
+    if (
+        isinstance(targets, list)
+        and targets
+        and all(isinstance(value, str) and value.strip() for value in targets)
+    ):
+        if len(targets) != len(set(targets)):
+            raise GateArtifactError(
+                "adapter_config.json target_modules must not contain duplicates"
+            )
+        normalized_targets = sorted(targets)
+    else:
+        raise GateArtifactError(
+            "adapter_config.json target_modules must expand the seven Qwen all-linear projections"
+        )
+    expected_targets = list(QWEN25_ALL_LINEAR_PROJECTIONS)
+    if normalized_targets != expected_targets:
+        raise GateArtifactError(
+            "adapter_config.json must list exactly the seven Qwen all-linear projection suffixes"
+        )
+    try:
+        coverage = validate_qwen_all_linear_coverage(tensor_metadata)
+    except ValueError as error:
+        raise GateArtifactError(
+            f"adapter Qwen all-linear tensor coverage is invalid: {error}"
+        ) from error
+    for name, metadata in tensor_metadata.items():
+        _layer, projection, side = qwen_lora_tensor_identity(name)
+        shape = metadata["shape"]
+        dtype = metadata["dtype"]
+        if dtype not in {"F16", "BF16", "F32"} or len(shape) != 2:
+            raise GateArtifactError(
+                "adapter LoRA tensors must be rank-2 floating-point matrices"
+            )
+        input_dimension, output_dimension = QWEN25_PROJECTION_DIMENSIONS[projection]
+        expected_shape = (
+            [16, input_dimension] if side == "A" else [output_dimension, 16]
+        )
+        if shape != expected_shape:
+            raise GateArtifactError(
+                "adapter LoRA A/B tensor shapes must match Qwen2.5-Coder-7B dimensions "
+                f"for {projection}: expected {expected_shape}, got {shape}"
+            )
+    if coverage.tensor_count != QWEN25_ALL_LINEAR_TENSOR_COUNT:
+        raise GateArtifactError("adapter tensor count disagrees with Qwen all-linear coverage")
+    return {
+        "adapter_path": str(adapter_path),
+        "adapter_model_path": str(model_snapshot.path),
+        "adapter_config_path": str(config_snapshot.path),
+        "adapter_model_sha256": model_snapshot.sha256,
+        "adapter_config_sha256": config_snapshot.sha256,
+        "adapter_tensor_count": coverage.tensor_count,
+        "adapter_lora_layer_count": coverage.layer_count,
+        "adapter_lora_projection_suffixes": list(coverage.projection_suffixes),
+        "adapter_config": {
+            "peft_type": "LORA",
+            "r": 16,
+            "lora_alpha": 32,
+            "bias": "none",
+            "task_type": "CAUSAL_LM",
+            "target_modules": normalized_targets,
+        },
+    }
 
 
 def atomic_write_text(path: str | Path, text: str) -> Path:
@@ -1736,6 +2303,116 @@ def _validate_verl_provenance(value: object, world_size: int) -> dict[str, Any]:
     return dict(value)
 
 
+def _validate_lora_runtime_evidence(value: object, world_size: int) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise GateArtifactError("trainer gate must record LoRA runtime evidence")
+    if (
+        value.get("lora_rank") != 16
+        or isinstance(value.get("lora_rank"), bool)
+        or value.get("lora_alpha") != 32
+        or isinstance(value.get("lora_alpha"), bool)
+        or value.get("lora_target_modules") != ["all-linear"]
+    ):
+        raise GateArtifactError("trainer LoRA runtime must be rank=16, alpha=32, all-linear")
+    worker_count = value.get("worker_count")
+    ranks = value.get("worker_ranks")
+    if (
+        isinstance(worker_count, bool)
+        or worker_count != world_size
+        or ranks != list(range(world_size))
+    ):
+        raise GateArtifactError("trainer LoRA runtime must cover every actor rank")
+    total = value.get("total_parameter_count")
+    trainable = value.get("trainable_parameter_count")
+    non_lora = value.get("non_lora_trainable_parameter_count")
+    if (
+        isinstance(total, bool)
+        or not isinstance(total, int)
+        or total <= 0
+        or isinstance(trainable, bool)
+        or not isinstance(trainable, int)
+        or trainable <= 0
+        or trainable > total
+        or non_lora != 0
+        or isinstance(non_lora, bool)
+        or value.get("only_lora_trainable") is not True
+    ):
+        raise GateArtifactError("trainer gate must prove that only LoRA parameters are trainable")
+    if (
+        value.get("lora_layer_count") != QWEN25_CODER_7B_LAYER_COUNT
+        or value.get("lora_projection_suffixes")
+        != list(QWEN25_ALL_LINEAR_PROJECTIONS)
+        or value.get("lora_tensor_count_per_worker")
+        != QWEN25_ALL_LINEAR_TENSOR_COUNT
+    ):
+        raise GateArtifactError(
+            "trainer LoRA runtime must prove complete Qwen all-linear A/B coverage"
+        )
+    cuda_peak = value.get("cuda_peak_reserved_bytes")
+    worker_host_min = value.get("host_mem_available_min_bytes")
+    if (
+        isinstance(cuda_peak, bool)
+        or not isinstance(cuda_peak, int)
+        or cuda_peak < 0
+        or cuda_peak > 70 * 1024**3
+    ):
+        raise GateArtifactError("trainer LoRA CUDA peak reserved memory must not exceed 70 GiB")
+    if (
+        isinstance(worker_host_min, bool)
+        or not isinstance(worker_host_min, int)
+        or worker_host_min <= 0
+    ):
+        raise GateArtifactError("trainer LoRA worker MemAvailable evidence is invalid")
+    names_sha256s = value.get("trainable_parameter_name_sha256s")
+    workers = value.get("workers")
+    if (
+        not isinstance(names_sha256s, list)
+        or len(names_sha256s) != world_size
+        or any(
+            not isinstance(item, str) or _SHA256_RE.fullmatch(item) is None
+            for item in names_sha256s
+        )
+        or not isinstance(workers, list)
+        or len(workers) != world_size
+    ):
+        raise GateArtifactError("trainer LoRA evidence must bind every rank's trainable names")
+    normalized_workers: list[dict[str, Any]] = []
+    for expected_rank, (record, expected_names_sha) in enumerate(
+        zip(workers, names_sha256s, strict=True)
+    ):
+        if not isinstance(record, Mapping):
+            raise GateArtifactError("trainer LoRA worker evidence must be mappings")
+        if (
+            record.get("rank") != expected_rank
+            or record.get("only_lora_trainable") is not True
+            or record.get("non_lora_trainable_parameter_count") != 0
+            or record.get("trainable_parameter_names_sha256") != expected_names_sha
+            or record.get("trainable_tensor_count") != QWEN25_ALL_LINEAR_TENSOR_COUNT
+            or record.get("lora_layer_count") != QWEN25_CODER_7B_LAYER_COUNT
+            or record.get("lora_projection_suffixes")
+            != list(QWEN25_ALL_LINEAR_PROJECTIONS)
+        ):
+            raise GateArtifactError("trainer LoRA worker found non-LoRA trainable parameters")
+        for name in (
+            "total_parameter_count",
+            "trainable_parameter_count",
+            "trainable_tensor_count",
+            "cuda_peak_reserved_bytes",
+            "host_mem_available_bytes",
+        ):
+            count = record.get(name)
+            if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                raise GateArtifactError("trainer LoRA worker counts must be positive integers")
+        if record["cuda_peak_reserved_bytes"] > 70 * 1024**3:
+            raise GateArtifactError("trainer LoRA worker CUDA peak exceeds 70 GiB")
+        normalized_workers.append(dict(record))
+    if sum(record["total_parameter_count"] for record in normalized_workers) != total:
+        raise GateArtifactError("trainer LoRA total parameter count disagrees across evidence")
+    if sum(record["trainable_parameter_count"] for record in normalized_workers) != trainable:
+        raise GateArtifactError("trainer LoRA trainable parameter count disagrees across evidence")
+    return dict(value)
+
+
 def verify_trainer_gate_artifact(payload: Mapping[str, Any]) -> None:
     verify_gate_envelope(payload, "trainer")
     group = _typed_group(payload.get("learning_group"))
@@ -1751,6 +2428,10 @@ def verify_trainer_gate_artifact(payload: Mapping[str, Any]) -> None:
         raise GateArtifactError("trainer gate must use capsule_gamma=0.1")
     if payload.get("reference_kl_enabled") is not True:
         raise GateArtifactError("trainer gate must keep reference KL enabled")
+    if payload.get("reference_policy_mode") != "actor_base_adapter_disabled":
+        raise GateArtifactError(
+            "trainer gate requires reference_policy_mode=actor_base_adapter_disabled"
+        )
     reference_kl_coef = payload.get("reference_kl_coef")
     if (
         isinstance(reference_kl_coef, bool)
@@ -1788,6 +2469,69 @@ def verify_trainer_gate_artifact(payload: Mapping[str, Any]) -> None:
     )
     if provenance_after != provenance_before:
         raise GateArtifactError("VeRL provenance changed during the trainer gate")
+    lora_before = _validate_lora_runtime_evidence(
+        payload.get("lora_runtime_before"), data_parallel_world_size
+    )
+    lora_after = _validate_lora_runtime_evidence(
+        payload.get("lora_runtime_after"), data_parallel_world_size
+    )
+    stable_lora_fields = (
+        "lora_rank",
+        "lora_alpha",
+        "lora_target_modules",
+        "worker_count",
+        "worker_ranks",
+        "trainable_parameter_name_sha256s",
+        "total_parameter_count",
+        "trainable_parameter_count",
+        "non_lora_trainable_parameter_count",
+        "only_lora_trainable",
+        "lora_layer_count",
+        "lora_projection_suffixes",
+        "lora_tensor_count_per_worker",
+    )
+    if any(lora_after.get(field) != lora_before.get(field) for field in stable_lora_fields):
+        raise GateArtifactError("trainer LoRA trainability evidence changed during Gate 6")
+    cuda_peak_reserved = payload.get("cuda_peak_reserved_bytes")
+    expected_cuda_peak = max(
+        lora_before["cuda_peak_reserved_bytes"], lora_after["cuda_peak_reserved_bytes"]
+    )
+    if (
+        isinstance(cuda_peak_reserved, bool)
+        or not isinstance(cuda_peak_reserved, int)
+        or cuda_peak_reserved != expected_cuda_peak
+        or cuda_peak_reserved > 70 * 1024**3
+    ):
+        raise GateArtifactError("trainer CUDA peak reserved memory must not exceed 70 GiB")
+    host_memory = payload.get("host_memory")
+    if not isinstance(host_memory, Mapping):
+        raise GateArtifactError("trainer gate must record host memory monitoring evidence")
+    sample_count = host_memory.get("sample_count")
+    minimum_host_available = host_memory.get("minimum_mem_available_bytes")
+    poll_interval_s = host_memory.get("poll_interval_s")
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count < 5
+        or isinstance(minimum_host_available, bool)
+        or not isinstance(minimum_host_available, int)
+        or minimum_host_available < 12 * 1024**3
+        or isinstance(poll_interval_s, bool)
+        or not isinstance(poll_interval_s, (int, float))
+        or float(poll_interval_s) != 0.25
+        or host_memory.get("monitor_scope")
+        != "before_worker_start_through_after_ray_shutdown"
+    ):
+        raise GateArtifactError(
+            "trainer host monitor must sample the lifecycle and stay above 12 GiB"
+        )
+    ray_release = payload.get("ray_release")
+    if not isinstance(ray_release, Mapping) or ray_release != {
+        "worker_close_calls": 1,
+        "ray_shutdown_calls": 1,
+        "ray_shutdown_complete": True,
+    }:
+        raise GateArtifactError("trainer must close workers and shut Ray down exactly once")
     optimizer_steps = payload.get("optimizer_steps")
     if isinstance(optimizer_steps, bool) or optimizer_steps != 1:
         raise GateArtifactError("trainer gate must perform exactly one optimizer step")
@@ -1829,6 +2573,49 @@ def verify_trainer_gate_artifact(payload: Mapping[str, Any]) -> None:
         raise GateArtifactError("trainer gate must record a positive guided token count")
     if payload.get("guided_mask_response_only") is not True:
         raise GateArtifactError("trainer guided token mask must be limited to response tokens")
+    guided_shape = payload.get("guided_token_mask_shape")
+    reference_shape = payload.get("reference_log_prob_shape")
+    if (
+        not isinstance(guided_shape, list)
+        or len(guided_shape) != 2
+        or guided_shape[0] != 8
+        or isinstance(guided_shape[1], bool)
+        or not isinstance(guided_shape[1], int)
+        or guided_shape[1] < 1
+        or reference_shape != guided_shape
+    ):
+        raise GateArtifactError(
+            "trainer guided mask and reference log-prob shapes must agree for all 8 responses"
+        )
+    expected_guided_rows = [
+        index
+        for index, member in enumerate(group.members)
+        if member.member_type == "critique_guided_revision"
+    ]
+    if (
+        payload.get("guided_row_indices") != expected_guided_rows
+        or payload.get("rollout_mask_matches_guided") is not True
+        or payload.get("old_log_probs_finite") is not True
+        or payload.get("reference_log_probs_finite") is not True
+        or payload.get("training_call_trace")
+        != ["old_logprob", "reference_logprob", "update"]
+    ):
+        raise GateArtifactError(
+            "trainer must derive guided-mask/reference-KL evidence from the exact update batch"
+        )
+    response_token_counts = payload.get("reference_log_prob_response_token_counts")
+    if (
+        not isinstance(response_token_counts, list)
+        or len(response_token_counts) != 8
+        or any(
+            isinstance(count, bool) or not isinstance(count, int) or count < 1
+            for count in response_token_counts
+        )
+        or any(count > guided_shape[1] for count in response_token_counts)
+    ):
+        raise GateArtifactError(
+            "trainer reference log-prob response mask must cover each of the 8 responses"
+        )
     if payload.get("rollout_is") is not False:
         raise GateArtifactError("trainer gate must keep standard rollout importance sampling off")
     if payload.get("norm_adv_by_std_in_grpo") is not False:
@@ -1891,6 +2678,131 @@ def verify_trainer_gate_artifact(payload: Mapping[str, Any]) -> None:
     }
     if any(manifest.get(key) != value for key, value in expected_manifest_fields.items()):
         raise GateArtifactError("checkpoint manifest does not match trainer gate evidence")
+    adapter_evidence = direct_lora_adapter_evidence(checkpoint_path)
+    if any(payload.get(key) != value for key, value in adapter_evidence.items()):
+        raise GateArtifactError("trainer direct LoRA adapter evidence does not match checkpoint")
+
+
+def verify_adapter_reload_artifact(payload: Mapping[str, Any]) -> None:
+    """Validate the post-Ray, fresh-FP32 PEFT adapter reload smoke artifact."""
+
+    if (
+        payload.get("schema_version") != SCHEMA_VERSION
+        or payload.get("gate") != "adapter_reload"
+        or payload.get("passed") is not True
+        or payload.get("execution_mode") != CANONICAL_EXECUTION_MODE
+    ):
+        raise GateArtifactError("adapter reload artifact envelope is invalid")
+    gate6_value = payload.get("gate06_artifact")
+    gate6_path = Path(gate6_value) if isinstance(gate6_value, str) else None
+    if gate6_path is None or not gate6_path.is_absolute():
+        raise GateArtifactError("adapter reload must record an absolute Gate 6 artifact path")
+    try:
+        gate6_snapshot = read_stable_regular_file(
+            gate6_path, label="Gate 6 trainer artifact"
+        )
+        gate6_payload = json.loads(gate6_snapshot.raw_bytes)
+    except (StablePathError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GateArtifactError(f"cannot read bound Gate 6 trainer artifact: {error}") from error
+    if not isinstance(gate6_payload, Mapping):
+        raise GateArtifactError("bound Gate 6 trainer artifact must be a JSON mapping")
+    verify_trainer_gate_artifact(gate6_payload)
+    if payload.get("gate06_artifact_sha256") != gate6_snapshot.sha256:
+        raise GateArtifactError("adapter reload Gate 6 artifact SHA-256 does not match")
+    identity_fields = (
+        "run_id",
+        "config_sha256",
+        "git_sha",
+        "dataset_sha256",
+        "resolved_environment_sha256",
+        "verl_resolved_config_sha256",
+        "program_model_sha256",
+        "actor_binding_sha256",
+    )
+    if any(payload.get(field) != gate6_payload.get(field) for field in identity_fields):
+        raise GateArtifactError("adapter reload identity does not match Gate 6")
+    if payload.get("ray_release") != gate6_payload.get("ray_release") or payload.get(
+        "ray_release"
+    ) != {
+        "worker_close_calls": 1,
+        "ray_shutdown_calls": 1,
+        "ray_shutdown_complete": True,
+    }:
+        raise GateArtifactError("adapter reload requires proof that Ray was released exactly once")
+    for field in ("adapter_path", "adapter_model_sha256", "adapter_config_sha256"):
+        if payload.get(field) != gate6_payload.get(field):
+            raise GateArtifactError(f"adapter reload {field} does not match Gate 6")
+    base_model_path = payload.get("base_model_path")
+    if (
+        not isinstance(base_model_path, str)
+        or not base_model_path
+        or not Path(base_model_path).is_absolute()
+        or payload.get("base_model_dtype") != "float32"
+        or payload.get("device") != "cuda:0"
+    ):
+        raise GateArtifactError("adapter reload must use an absolute FP32 base on cuda:0")
+    prompt_sha256 = payload.get("prompt_sha256")
+    input_token_count = payload.get("input_token_count")
+    if (
+        not isinstance(prompt_sha256, str)
+        or prompt_sha256 != _ADAPTER_RELOAD_PROMPT_SHA256
+        or isinstance(input_token_count, bool)
+        or not isinstance(input_token_count, int)
+        or input_token_count < 1
+    ):
+        raise GateArtifactError("adapter reload fixed prompt evidence is invalid")
+    if (
+        payload.get("adapter_disabled_logits_finite") is not True
+        or payload.get("adapter_enabled_logits_finite") is not True
+    ):
+        raise GateArtifactError("adapter reload logits must both be finite")
+    max_difference = payload.get("max_abs_logit_diff")
+    if (
+        isinstance(max_difference, bool)
+        or not isinstance(max_difference, (int, float))
+        or not math.isfinite(float(max_difference))
+        or max_difference <= 1e-8
+    ):
+        raise GateArtifactError("adapter reload must change logits by more than 1e-8")
+    cuda_peak = payload.get("cuda_peak_reserved_bytes")
+    if (
+        isinstance(cuda_peak, bool)
+        or not isinstance(cuda_peak, int)
+        or cuda_peak <= 0
+        or cuda_peak > 70 * 1024**3
+    ):
+        raise GateArtifactError("adapter reload CUDA peak reserved memory must stay below 70 GiB")
+    host_before = payload.get("host_mem_available_before_bytes")
+    host_after = payload.get("host_mem_available_after_bytes")
+    host_minimum = payload.get("host_mem_available_min_bytes")
+    reload_host_memory = payload.get("host_memory")
+    if (
+        any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (host_before, host_after, host_minimum)
+        )
+        or host_minimum > min(host_before, host_after)
+        or host_minimum < 12 * 1024**3
+    ):
+        raise GateArtifactError("adapter reload host MemAvailable must stay above 12 GiB")
+    reload_sample_count = (
+        reload_host_memory.get("sample_count")
+        if isinstance(reload_host_memory, Mapping)
+        else None
+    )
+    if (
+        not isinstance(reload_host_memory, Mapping)
+        or isinstance(reload_sample_count, bool)
+        or not isinstance(reload_sample_count, int)
+        or reload_sample_count < 6
+        or reload_host_memory.get("minimum_mem_available_bytes") != host_minimum
+        or reload_host_memory.get("poll_interval_s") != 0.25
+        or reload_host_memory.get("monitor_scope")
+        != "adapter_reload_model_load_through_cuda_release"
+    ):
+        raise GateArtifactError(
+            "adapter reload must poll host MemAvailable across model load and CUDA release"
+        )
 
 
 def external_gate_main(
@@ -1957,10 +2869,12 @@ def external_gate_main(
 
 
 __all__ = [
+    "ADAPTER_RELOAD_PROMPT",
     "CANONICAL_EXECUTION_MODE",
     "CommandValidationError",
     "ConfigValidationError",
     "ExternalGatePlan",
+    "FINAL_RUNTIME_AUDIT_GATE_ORDER",
     "GATE_ORDER",
     "GateArtifactError",
     "GateExecutionError",
@@ -1970,6 +2884,7 @@ __all__ = [
     "artifact_tree_sha256",
     "atomic_write_json",
     "atomic_write_text",
+    "direct_lora_adapter_evidence",
     "external_gate_main",
     "exception_evidence",
     "gate_failure_artifact_path",
@@ -1982,7 +2897,9 @@ __all__ = [
     "runtime_dependency_hashes",
     "run_external_gate",
     "validation_requested",
+    "validate_final_runtime_audit",
     "verify_gate_envelope",
+    "verify_adapter_reload_artifact",
     "verify_collector_gate_artifact",
     "verify_guided_gate_artifact",
     "verify_oracle_gate_artifact",

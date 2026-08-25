@@ -27,7 +27,7 @@ def valid_config() -> dict:
         "trainer_factory": "capx.rl.capsule.server_factory:create_trainer",
         "runtime": {
             "verl_source_path": "capx/third_party/verl",
-            "verl_pinned_sha": "d5b4ca2712b3048a60745482a74425d687add0bb",
+            "verl_pinned_sha": "d62da4950573d7a4b7ef2362337952e7ab59e78d",
             "output_dir": "outputs/cube_stack_capsule_rl",
             "dataset_path": "/path/to/capsule_dataset.parquet",
             "program_model_path": "/path/to/program_model",
@@ -174,6 +174,17 @@ def test_program_and_controller_must_be_separate_and_use_env_var_names_only() ->
 
     assert "separate endpoints" in str(caught.value)
     assert "api_key_env" in str(caught.value)
+
+
+@pytest.mark.parametrize("service_name", ["program_service", "controller_service"])
+def test_formal_config_rejects_plaintext_http_for_non_loopback_service(
+    service_name: str,
+) -> None:
+    config = valid_config()
+    config[service_name]["endpoint"] = "http://example.com/v1"
+
+    with pytest.raises(CapsuleConfigError, match="https.*loopback"):
+        validate_capsule_config(config)
 
 
 def test_repository_template_contains_all_local_and_server_contract_fields() -> None:

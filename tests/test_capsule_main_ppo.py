@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,7 @@ from capx.rl.capsule.provenance import (
     runtime_dependency_hashes,
 )
 from capx.rl.capsule.schema import TaskInstanceV1
+from test_capsule_final_audit_contract import valid_final_runtime_audit
 from test_capsule_config import valid_config
 
 
@@ -58,16 +61,20 @@ def write_config(tmp_path: Path, config: dict) -> Path:
         )
         audit_path.write_text(
             json.dumps(
-                {
-                    "runtime_verified": True,
-                    "run_id": "capsule-smoke-001",
-                    "config_sha256": file_sha256(path),
-                    "dataset_sha256": file_sha256(dataset_path),
-                    **dependencies,
-                    "program_model_sha256": actor_identity["program_model_sha256"],
-                    "actor_binding_sha256": actor_identity["actor_binding_sha256"],
-                    "typed_task_identities": typed_identities,
-                },
+                valid_final_runtime_audit(
+                    run_directory=audit_path.parent,
+                    config_sha256=file_sha256(path),
+                    dataset_sha256=file_sha256(dataset_path),
+                    resolved_environment_sha256=dependencies[
+                        "resolved_environment_sha256"
+                    ],
+                    verl_resolved_config_sha256=dependencies[
+                        "verl_resolved_config_sha256"
+                    ],
+                    program_model_sha256=actor_identity["program_model_sha256"],
+                    actor_binding_sha256=actor_identity["actor_binding_sha256"],
+                    typed_task_identities=typed_identities,
+                ),
                 sort_keys=True,
             ),
             encoding="utf-8",
@@ -172,6 +179,283 @@ def valid_local_config(tmp_path: Path) -> dict:
     )
     config["task"]["config_path"] = "configs/environment.yaml"
     return config
+
+
+def test_config_snapshot_rejects_replacement_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_config(tmp_path, valid_local_config(tmp_path))
+    replacement = tmp_path / "replacement.yaml"
+    replacement.write_bytes(path.read_bytes())
+    target_identity = (path.stat().st_dev, path.stat().st_ino)
+    original_read = os.read
+    replaced = False
+
+    def racing_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        chunk = original_read(descriptor, size)
+        opened = os.fstat(descriptor)
+        if chunk and not replaced and (opened.st_dev, opened.st_ino) == target_identity:
+            replaced = True
+            os.replace(replacement, path)
+        return chunk
+
+    monkeypatch.setattr(os, "read", racing_read)
+
+    with pytest.raises(main_ppo.ConfigLoadError, match="changed|replaced"):
+        main_ppo.load_and_validate_config(path)
+
+    assert replaced is True
+
+
+def test_public_config_and_bundle_helpers_keep_their_two_argument_api(
+    tmp_path: Path,
+) -> None:
+    path = write_config(tmp_path, valid_local_config(tmp_path))
+
+    config, loaded_path = main_ppo.load_and_validate_config(path)
+    provenance = main_ppo.verify_bundle_provenance(config, loaded_path)
+
+    assert loaded_path == path.resolve()
+    assert provenance["config_sha256"] == file_sha256(path)
+
+
+def test_bundle_manifest_digest_comes_from_the_parsed_a_to_b_to_a_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = valid_local_config(tmp_path)
+    path = write_config(tmp_path, config)
+    manifest_path = project_path(
+        config,
+        config["runtime"]["bundle_manifest_path"],
+        "runtime.bundle_manifest_path",
+    )
+    trusted = manifest_path.read_bytes()
+    replacement = trusted + b"\n"
+    trusted_sha256 = file_sha256(manifest_path)
+    original_load = main_ppo._load_json_mapping
+    original_checked_hash = main_ppo._checked_file_sha256
+    original_snapshot = main_ppo.read_stable_regular_file
+
+    def load_then_swap(candidate: Path, label: str):
+        payload = original_load(candidate, label)
+        if label == "bundle manifest":
+            candidate.write_bytes(replacement)
+        return payload
+
+    def hash_then_restore(candidate: Path, label: str) -> str:
+        if label == "bundle manifest":
+            digest = file_sha256(candidate)
+            candidate.write_bytes(trusted)
+            return digest
+        return original_checked_hash(candidate, label)
+
+    def snapshot_during_a_to_b_to_a(candidate: str | Path, *, label: str):
+        snapshot = original_snapshot(candidate, label=label)
+        if label == "bundle manifest":
+            manifest_path.write_bytes(replacement)
+            manifest_path.write_bytes(trusted)
+        return snapshot
+
+    monkeypatch.setattr(main_ppo, "_load_json_mapping", load_then_swap)
+    monkeypatch.setattr(main_ppo, "_checked_file_sha256", hash_then_restore)
+    monkeypatch.setattr(
+        main_ppo, "read_stable_regular_file", snapshot_during_a_to_b_to_a
+    )
+
+    provenance = main_ppo.verify_bundle_provenance(config, path)
+
+    assert manifest_path.read_bytes() == trusted
+    assert provenance["manifest_sha256"] == trusted_sha256
+
+
+def test_bundle_dataset_is_parsed_from_the_hashed_a_to_b_to_a_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = valid_local_config(tmp_path)
+    path = write_config(tmp_path, config)
+    dataset_path = project_path(
+        config, config["runtime"]["dataset_path"], "runtime.dataset_path"
+    )
+    trusted = dataset_path.read_bytes()
+    replacement_task = TaskInstanceV1.from_json(trusted.decode("utf-8").strip())
+    replacement_payload = replacement_task.to_dict()
+    replacement_payload["prompt"] = "attacker prompt"
+    replacement = (TaskInstanceV1.from_dict(replacement_payload).to_json() + "\n").encode()
+    source_dataset_path = tmp_path / "source-dataset.jsonl"
+    source_dataset_path.write_bytes(trusted)
+    manifest_path = project_path(
+        config,
+        config["runtime"]["bundle_manifest_path"],
+        "runtime.bundle_manifest_path",
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_dataset_path"] = str(source_dataset_path)
+    manifest["source_dataset_sha256"] = file_sha256(source_dataset_path)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    original_checked_hash = main_ppo._checked_file_sha256
+    original_snapshot = main_ppo.read_stable_regular_file
+    original_from_json = TaskInstanceV1.from_json
+    parsed_prompts: list[str] = []
+
+    def hash_then_swap(candidate: Path, label: str) -> str:
+        digest = original_checked_hash(candidate, label)
+        if label == "output dataset":
+            dataset_path.write_bytes(replacement)
+        return digest
+
+    def snapshot_then_swap(candidate: str | Path, *, label: str):
+        snapshot = original_snapshot(candidate, label=label)
+        if label == "output dataset":
+            dataset_path.write_bytes(replacement)
+        return snapshot
+
+    def capture_then_restore(cls, payload: str) -> TaskInstanceV1:
+        del cls
+        parsed_prompts.append(str(json.loads(payload)["prompt"]))
+        dataset_path.write_bytes(trusted)
+        return original_from_json(payload)
+
+    monkeypatch.setattr(main_ppo, "_checked_file_sha256", hash_then_swap)
+    monkeypatch.setattr(main_ppo, "read_stable_regular_file", snapshot_then_swap)
+    monkeypatch.setattr(TaskInstanceV1, "from_json", classmethod(capture_then_restore))
+
+    main_ppo.verify_bundle_provenance(config, path)
+
+    assert dataset_path.read_bytes() == trusted
+    assert parsed_prompts == ["stack"]
+
+
+def test_gate7_is_parsed_from_the_hashed_a_to_b_to_a_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = valid_local_config(tmp_path)
+    path = write_config(tmp_path, config)
+    audit_path = project_path(
+        config, config["runtime"]["gate7_audit_path"], "runtime.gate7_audit_path"
+    )
+    trusted = audit_path.read_bytes()
+    replacement_payload = json.loads(trusted)
+    replacement_payload["runtime_verified"] = False
+    replacement = json.dumps(replacement_payload, sort_keys=True).encode()
+    original_checked_hash = main_ppo._checked_file_sha256
+    original_load = main_ppo._load_json_mapping
+    original_snapshot = main_ppo.read_stable_regular_file
+
+    def hash_then_swap(candidate: Path, label: str) -> str:
+        digest = original_checked_hash(candidate, label)
+        if label == "Gate7 audit":
+            audit_path.write_bytes(replacement)
+        return digest
+
+    def load_then_restore(candidate: Path, label: str):
+        payload = original_load(candidate, label)
+        if label == "Gate7 audit":
+            audit_path.write_bytes(trusted)
+        return payload
+
+    def snapshot_during_a_to_b_to_a(candidate: str | Path, *, label: str):
+        snapshot = original_snapshot(candidate, label=label)
+        if label == "Gate7 audit":
+            audit_path.write_bytes(replacement)
+            audit_path.write_bytes(trusted)
+        return snapshot
+
+    monkeypatch.setattr(main_ppo, "_checked_file_sha256", hash_then_swap)
+    monkeypatch.setattr(main_ppo, "_load_json_mapping", load_then_restore)
+    monkeypatch.setattr(
+        main_ppo, "read_stable_regular_file", snapshot_during_a_to_b_to_a
+    )
+
+    provenance = main_ppo.verify_bundle_provenance(config, path)
+
+    assert audit_path.read_bytes() == trusted
+    assert provenance["gate7_run_id"] == "capsule-smoke-001"
+
+
+def test_bundle_rejects_forged_minimal_gate7_runtime_verified_flag(tmp_path: Path) -> None:
+    config = valid_local_config(tmp_path)
+    config_path = write_config(tmp_path, config)
+    audit_path = project_path(
+        config, config["runtime"]["gate7_audit_path"], "runtime.gate7_audit_path"
+    )
+    manifest_path = project_path(
+        config,
+        config["runtime"]["bundle_manifest_path"],
+        "runtime.bundle_manifest_path",
+    )
+    audit_path.write_text(
+        json.dumps(
+            {
+                "runtime_verified": True,
+                "run_id": "capsule-smoke-001",
+                "typed_task_identities": [
+                    {
+                        "task_id": "cube-stack",
+                        "environment_seed": 5,
+                        "initial_state_sha256": "a" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["gate7_audit_sha256"] = file_sha256(audit_path)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(main_ppo.TrainerFactoryError, match="schema is incomplete"):
+        main_ppo.verify_bundle_provenance(config, config_path)
+
+
+def test_main_never_trains_config_a_while_verifying_config_b(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_a = valid_local_config(tmp_path)
+    config_a["trainer_factory"] = "tests.fake_capsule:create_trainer"
+    path = write_config(tmp_path, config_a)
+    bytes_a = path.read_bytes()
+
+    config_b = deepcopy(config_a)
+    config_b["controller_service"]["model"] = "different-frozen-controller"
+    write_config(tmp_path, config_b)
+    bytes_b = path.read_bytes()
+    path.write_bytes(bytes_a)
+
+    swapped = False
+
+    original_validate_inputs = main_ppo.validate_local_execution_inputs
+
+    def swap_after_config_load(received_config: dict) -> dict[str, Path]:
+        nonlocal swapped
+        result = original_validate_inputs(received_config)
+        if not swapped:
+            swapped = True
+            path.write_bytes(bytes_b)
+        return result
+
+    monkeypatch.setattr(main_ppo, "validate_local_execution_inputs", swap_after_config_load)
+    monkeypatch.setattr(
+        main_ppo,
+        "check_verl_compatibility",
+        lambda source_path, expected_sha: compatible_report(source_path),
+    )
+    monkeypatch.setattr(main_ppo, "_project_git_sha", lambda _config: "a" * 40)
+    monkeypatch.setattr(main_ppo, "bind_pinned_verl_import", lambda _path: None)
+    monkeypatch.setattr(main_ppo, "register_capsule_critique_policy_loss", lambda: True)
+    factory_called = False
+
+    def forbidden_loader(_dotted_path: str):
+        nonlocal factory_called
+        factory_called = True
+        return lambda _config: object()
+
+    assert main_ppo.main(["--config", str(path)], factory_loader=forbidden_loader) == 2
+    assert swapped is True
+    assert factory_called is False
+    assert "config SHA" in capsys.readouterr().err
 
 
 def compatible_report(source_path: str | Path) -> VeRLCompatibilityReport:
@@ -549,6 +833,33 @@ def test_validate_only_fails_closed_on_project_checkout_provenance_error(
     assert "untracked files" in capsys.readouterr().err
 
 
+def test_project_git_provenance_disables_optional_locks_and_preserves_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = valid_local_config(tmp_path)
+    root = Path(config["runtime"]["project_root"])
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    monkeypatch.setenv("CAPX_GIT_ENV_SENTINEL", "preserved")
+
+    def fake_run(command: list[str], **kwargs: object):
+        calls.append((command, kwargs))
+        if command[-2:] == ["rev-parse", "HEAD"]:
+            stdout = "a" * 40 + "\n"
+        elif command[-2:] == ["rev-parse", "--show-toplevel"]:
+            stdout = str(root) + "\n"
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(main_ppo.subprocess, "run", fake_run)
+
+    assert main_ppo._project_git_sha(config) == "a" * 40
+    assert len(calls) == 3
+    for _command, kwargs in calls:
+        assert kwargs["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+        assert kwargs["env"]["CAPX_GIT_ENV_SENTINEL"] == "preserved"
+
+
 def test_non_validate_mode_requires_explicit_project_trainer_factory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -646,6 +957,50 @@ def test_non_validate_mode_rejects_bundle_drift_during_fit(
         factory_loader=lambda _path: lambda _config: MutatingTrainer(),
     ) == 2
     assert "dataset SHA" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("guarded_tree", ["program_model_path", "verl_source_path"])
+def test_non_validate_mode_rejects_a_to_b_to_a_runtime_tree_mutation(
+    guarded_tree: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = valid_local_config(tmp_path)
+    config["trainer_factory"] = "tests.fake_capsule:create_trainer"
+    path = write_config(tmp_path, config)
+    guarded_root = project_path(
+        config, config["runtime"][guarded_tree], f"runtime.{guarded_tree}"
+    )
+    existing_model_file = guarded_root / "config.json"
+    original_model_bytes = (
+        existing_model_file.read_bytes() if existing_model_file.exists() else None
+    )
+    transient_verl_file = guarded_root / "transient_attacker.py"
+    monkeypatch.setattr(
+        main_ppo,
+        "check_verl_compatibility",
+        lambda source_path, expected_sha: compatible_report(source_path),
+    )
+    monkeypatch.setattr(main_ppo, "_project_git_sha", lambda _config: "a" * 40)
+    monkeypatch.setattr(main_ppo, "bind_pinned_verl_import", lambda _path: None)
+    monkeypatch.setattr(main_ppo, "register_capsule_critique_policy_loss", lambda: True)
+
+    class MutatingTrainer:
+        def fit(self):
+            if guarded_tree == "program_model_path":
+                existing_model_file.write_bytes(b'{"model_type":"attacker"}\n')
+                existing_model_file.write_bytes(original_model_bytes or b"")
+            else:
+                transient_verl_file.write_text("attacker = True\n", encoding="utf-8")
+                transient_verl_file.unlink()
+            return {"fit": True}
+
+    assert main_ppo.main(
+        ["--config", str(path)],
+        factory_loader=lambda _path: lambda _config: MutatingTrainer(),
+    ) == 2
+    assert "changed during training" in capsys.readouterr().err
 
 
 def test_loss_registration_failure_is_fail_closed_before_factory_load(

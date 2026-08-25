@@ -16,6 +16,7 @@ from capx.rl.capsule.server_factory import (
     ServerFactoryError,
     VeRLGroupEncoder,
     VeRLProgramGenerator,
+    VeRLWorkerSession,
     YamlEnvironmentFactory,
     create_trainer,
     load_task_instances,
@@ -53,6 +54,239 @@ def _task_record() -> dict:
         "initial_state_sha256": source_sha256("seed-five-state"),
         "metadata": {"split": "train"},
     }
+
+
+def _worker_session(actor: object, ray: object) -> VeRLWorkerSession:
+    return VeRLWorkerSession(
+        actor_rollout_wg=actor,
+        ref_policy_wg=actor,
+        tokenizer=object(),
+        data_proto_factory=lambda **_kwargs: object(),
+        ray_module=ray,
+        owns_ray=True,
+        data_parallel_world_size=1,
+        reference_policy_mode="actor_base_adapter_disabled",
+        lora_rank=16,
+        lora_alpha=32,
+        lora_target_modules=("all-linear",),
+    )
+
+
+def test_lora_runtime_evidence_requires_only_lora_parameters_and_records_memory() -> None:
+    class _Actor:
+        def get_capsule_lora_runtime_evidence(self):
+            return {
+                "rank": 0,
+                "total_parameter_count": 7_000_000_000,
+                "trainable_parameter_count": 40_000_000,
+                "trainable_tensor_count": 392,
+                "lora_layer_count": 28,
+                "lora_projection_suffixes": [
+                    "down_proj",
+                    "gate_proj",
+                    "k_proj",
+                    "o_proj",
+                    "q_proj",
+                    "up_proj",
+                    "v_proj",
+                ],
+                "non_lora_trainable_parameter_count": 0,
+                "only_lora_trainable": True,
+                "trainable_parameter_names_sha256": "a" * 64,
+                "cuda_peak_reserved_bytes": 60 * 1024**3,
+                "host_mem_available_bytes": 90 * 1024**3,
+            }
+
+    evidence = _worker_session(_Actor(), SimpleNamespace()).lora_runtime_evidence()
+
+    assert evidence["lora_rank"] == 16
+    assert evidence["lora_alpha"] == 32
+    assert evidence["lora_target_modules"] == ["all-linear"]
+    assert evidence["only_lora_trainable"] is True
+    assert evidence["trainable_parameter_count"] == 40_000_000
+    assert evidence["non_lora_trainable_parameter_count"] == 0
+    assert evidence["cuda_peak_reserved_bytes"] == 60 * 1024**3
+    assert evidence["host_mem_available_min_bytes"] == 90 * 1024**3
+
+
+def test_lora_runtime_evidence_rejects_any_non_lora_trainable_parameter() -> None:
+    class _Actor:
+        def get_capsule_lora_runtime_evidence(self):
+            return {
+                "rank": 0,
+                "total_parameter_count": 10,
+                "trainable_parameter_count": 2,
+                "trainable_tensor_count": 2,
+                "non_lora_trainable_parameter_count": 1,
+                "only_lora_trainable": False,
+                "trainable_parameter_names_sha256": "b" * 64,
+                "cuda_peak_reserved_bytes": 1,
+                "host_mem_available_bytes": 1,
+            }
+
+    with pytest.raises(ServerFactoryError, match="non-LoRA trainable"):
+        _worker_session(_Actor(), SimpleNamespace()).lora_runtime_evidence()
+
+
+def test_actor_lora_probe_hashes_names_and_rejects_trainable_base_weights() -> None:
+    class _Parameter:
+        def __init__(self, count: int, requires_grad: bool) -> None:
+            self.count = count
+            self.requires_grad = requires_grad
+
+        def numel(self) -> int:
+            return self.count
+
+    class _Model:
+        def named_parameters(self):
+            parameters = [("base_model.layers.0.weight", _Parameter(100, False))]
+            for layer in range(28):
+                for projection in (
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ):
+                    for side in ("A", "B"):
+                        parameters.append(
+                            (
+                                f"base_model.model.layers.{layer}.{projection}."
+                                f"lora_{side}.default.weight",
+                                _Parameter(8, True),
+                            )
+                        )
+            return iter(parameters)
+
+    record = server_factory._actor_lora_runtime_record(
+        _Model(),
+        rank=0,
+        cuda_peak_reserved_loader=lambda: 123,
+        host_mem_available_loader=lambda: 456,
+    )
+
+    assert record["total_parameter_count"] == 100 + 28 * 7 * 2 * 8
+    assert record["trainable_parameter_count"] == 28 * 7 * 2 * 8
+    assert record["trainable_tensor_count"] == 28 * 7 * 2
+    assert record["lora_layer_count"] == 28
+    assert record["lora_projection_suffixes"] == [
+        "down_proj",
+        "gate_proj",
+        "k_proj",
+        "o_proj",
+        "q_proj",
+        "up_proj",
+        "v_proj",
+    ]
+    assert record["only_lora_trainable"] is True
+    assert len(record["trainable_parameter_names_sha256"]) == 64
+
+    class _BadModel:
+        def named_parameters(self):
+            return iter((("base_model.layers.0.weight", _Parameter(100, True)),))
+
+    with pytest.raises(RuntimeError, match="non-LoRA trainable"):
+        server_factory._actor_lora_runtime_record(
+            _BadModel(),
+            rank=0,
+            cuda_peak_reserved_loader=lambda: 123,
+            host_mem_available_loader=lambda: 456,
+        )
+
+
+def test_actor_lora_probe_rejects_incomplete_qwen_all_linear_coverage() -> None:
+    class _Parameter:
+        requires_grad = True
+
+        @staticmethod
+        def numel() -> int:
+            return 16
+
+    class _IncompleteModel:
+        def named_parameters(self):
+            return iter(
+                (
+                    (
+                        "base_model.model.layers.0.q_proj.lora_A.default.weight",
+                        _Parameter(),
+                    ),
+                    (
+                        "base_model.model.layers.0.q_proj.lora_B.default.weight",
+                        _Parameter(),
+                    ),
+                )
+            )
+
+    with pytest.raises(RuntimeError, match="all-linear coverage"):
+        server_factory._actor_lora_runtime_record(
+            _IncompleteModel(),
+            rank=0,
+            cuda_peak_reserved_loader=lambda: 123,
+            host_mem_available_loader=lambda: 456,
+        )
+
+
+def test_worker_session_shuts_ray_down_exactly_once_and_proves_release() -> None:
+    class _Actor:
+        pass
+
+    class _Ray:
+        def __init__(self) -> None:
+            self.initialized = True
+            self.shutdown_calls = 0
+
+        def shutdown(self) -> None:
+            self.shutdown_calls += 1
+            self.initialized = False
+
+        def is_initialized(self) -> bool:
+            return self.initialized
+
+    ray = _Ray()
+    session = _worker_session(_Actor(), ray)
+    session.verl_provenance = lambda: {"captured": True}  # type: ignore[method-assign]
+
+    session.close()
+    session.close()
+
+    assert ray.shutdown_calls == 1
+    assert session.ray_release_evidence() == {
+        "worker_close_calls": 1,
+        "ray_shutdown_calls": 1,
+        "ray_shutdown_complete": True,
+    }
+
+
+def test_worker_session_close_failure_is_visible_and_retries_ray_shutdown() -> None:
+    class _Ray:
+        def __init__(self) -> None:
+            self.initialized = True
+            self.shutdown_calls = 0
+
+        def shutdown(self) -> None:
+            self.shutdown_calls += 1
+            if self.shutdown_calls == 1:
+                raise RuntimeError("transient shutdown failure")
+            self.initialized = False
+
+        def is_initialized(self) -> bool:
+            return self.initialized
+
+    ray = _Ray()
+    session = _worker_session(object(), ray)
+    session.verl_provenance = lambda: {"captured": True}  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="transient shutdown failure"):
+        session.close()
+    with pytest.raises(RuntimeError, match="transient shutdown failure"):
+        session.close()
+
+    assert ray.shutdown_calls == 2
+    assert ray.initialized is False
+    with pytest.raises(ServerFactoryError, match="release is incomplete"):
+        session.ray_release_evidence()
 
 
 def _verl_worker_config(

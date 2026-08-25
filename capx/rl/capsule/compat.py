@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import ast
 import importlib
+import ipaddress
 import math
+import os
 import re
 import subprocess
 import sys
@@ -21,7 +23,8 @@ from urllib.parse import urlparse
 
 from .config_validation import validate_capsule_training_config
 
-PINNED_VERL_SHA = "d5b4ca2712b3048a60745482a74425d687add0bb"
+# Official VeRL v0.6.1 tag.
+PINNED_VERL_SHA = "d62da4950573d7a4b7ef2362337952e7ab59e78d"
 CAPSULE_EXTERNAL_LIB = "capx.rl.capsule.verl_external"
 CAPSULE_LOSS_MODE = "capsule_critique"
 VERL_ROLLOUT_IS_SLOT = "rollout_is_weights"
@@ -182,6 +185,7 @@ def _read_required_surface(source_path: Path) -> tuple[Path, Path, Path, tuple[P
 
 
 def _git_head(source_path: Path) -> str:
+    git_environment = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     command = ["git", "-C", str(source_path), "rev-parse", "HEAD"]
     try:
         completed = subprocess.run(
@@ -190,6 +194,7 @@ def _git_head(source_path: Path) -> str:
             text=True,
             check=False,
             timeout=10,
+            env=git_environment,
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise VeRLCompatibilityError("git_error", f"cannot read VeRL git SHA: {error}") from error
@@ -208,6 +213,7 @@ def _git_head(source_path: Path) -> str:
             text=True,
             check=False,
             timeout=10,
+            env=git_environment,
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise VeRLCompatibilityError(
@@ -232,6 +238,7 @@ def _git_head(source_path: Path) -> str:
             text=True,
             check=False,
             timeout=10,
+            env=git_environment,
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise VeRLCompatibilityError(
@@ -492,6 +499,21 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
             parsed = urlparse(value)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 errors.append(f"{path} must be an absolute HTTP(S) URL")
+            elif parsed.scheme == "http":
+                try:
+                    hostname = parsed.hostname
+                except ValueError:
+                    hostname = None
+                loopback = False
+                if hostname:
+                    try:
+                        loopback = ipaddress.ip_address(hostname).is_loopback
+                    except ValueError:
+                        loopback = hostname.lower() == "localhost"
+                if not loopback:
+                    errors.append(
+                        f"{path} must use https unless it targets a loopback address"
+                    )
     for path in ("program_service.api_key_env", "controller_service.api_key_env"):
         value = _get(config, path)
         if isinstance(value, str) and not _ENV_NAME.fullmatch(value):

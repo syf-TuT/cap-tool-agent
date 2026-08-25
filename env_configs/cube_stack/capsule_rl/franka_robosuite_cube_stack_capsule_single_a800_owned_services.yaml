@@ -1,0 +1,271 @@
+runtime:
+  repo_root: /root/autodl-tmp/cap-x
+  python_executable: /root/autodl-tmp/cap-x/.venv/bin/python
+  verl_source_path: /root/autodl-tmp/cap-x/.codex-downloads/verl-v0.6.1
+  verl_pinned_sha: d62da4950573d7a4b7ef2362337952e7ab59e78d
+  max_controller_seed_run_ids: 3
+
+hardware:
+  gpu_model: A800
+  gpu_count: 1
+  gpu_total_vram_required_mib: 81920
+  gpu_free_vram_required_mib: 77824
+  max_other_process_vram_mib: 512
+  host_memory_required_mib: 122880
+  mem_available_after_controller_required_mib: 92160
+  mem_available_during_run_required_mib: 12288
+  shm_required_mib: 12288
+  disk_free_required_mib: 81920
+
+paths:
+  output_root: /root/autodl-tmp/cap-x/outputs/capsule_single_a800
+  artifact_root: /root/autodl-tmp/cap-x/artifacts/capsule_single_a800
+  checkpoint_root: /root/autodl-tmp/cap-x/outputs/capsule_single_a800_checkpoints
+  forbid_overwrite: true
+
+services:
+  controller:
+    version_tag: b10516
+    archive_path: /root/autodl-tmp/cap-x/.codex-downloads/llama-b10516-bin-ubuntu-x64.tar.gz
+    archive_sha256: f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35
+    binary_path: /root/autodl-tmp/cap-x/.codex-downloads/llama-b10516/llama-server
+    gguf_path: /root/autodl-tmp/cap-x/.codex-downloads/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf
+    model_sha256: 509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c
+    model_alias: qwen2.5-coder-7b-controller-q4_k_m
+    argv_template:
+      - "{controller_binary}"
+      - --model
+      - "{controller_gguf}"
+      - --alias
+      - "{controller_alias}"
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8102"
+      - --n-gpu-layers
+      - "0"
+      - --parallel
+      - "1"
+      - --ctx-size
+      - "16384"
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      LLAMA_API_KEY: "{env:CAPX_CONTROLLER_API_KEY}"
+    readiness:
+      url: http://127.0.0.1:8102/v1/models
+      bearer_token_env: CAPX_CONTROLLER_API_KEY
+      timeout_s: 300
+  program:
+    argv_template:
+      - "{python}"
+      - -m
+      - capx.rl.capsule.actor_identity
+      - --config
+      - "{capsule_config}"
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8101"
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      CAPX_PROGRAM_API_KEY: "{env:CAPX_PROGRAM_API_KEY}"
+    readiness:
+      url: http://127.0.0.1:8101/v1/capx/actor-identity
+      bearer_token_env: CAPX_PROGRAM_API_KEY
+      timeout_s: 120
+  pyroki:
+    argv_template:
+      - "{python}"
+      - -m
+      - capx.serving.launch_pyroki_server
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      JAX_PLATFORMS: cpu
+    readiness:
+      url: http://127.0.0.1:8116/docs
+      timeout_s: 600
+
+gates:
+  - gate01_preflight
+  - gate02_seed
+  - gate03_oracle_replay
+  - gate04_collector
+  - gate05_guided
+  - gate06_trainer
+  - adapter_reload_smoke
+  - gate07_audit
+
+gate_commands:
+  gate01_preflight:
+    argv_template:
+      - "{python}"
+      - -m
+      - scripts.capsule_rl.server_preflight
+      - --config
+      - "{capsule_config}"
+      - --artifact
+      - "{gate01_preflight}"
+      - --run-id
+      - "{run_id}"
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+      MUJOCO_GL: egl
+      CAPX_PROGRAM_API_KEY: "{env:CAPX_PROGRAM_API_KEY}"
+      CAPX_CONTROLLER_API_KEY: "{env:CAPX_CONTROLLER_API_KEY}"
+  gate02_seed:
+    argv_template:
+      - "{python}"
+      - -m
+      - scripts.capsule_rl.server_adapter
+      - --config
+      - "{capsule_config}"
+      - --artifact
+      - "{gate02_seed}"
+      - --run-id
+      - "{run_id}"
+      - seed
+      - --seeds
+      - 5,6,5
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+      MUJOCO_GL: egl
+  gate03_oracle_replay:
+    argv_template:
+      - "{python}"
+      - -m
+      - scripts.capsule_rl.server_adapter
+      - --config
+      - "{capsule_config}"
+      - --artifact
+      - "{gate03_oracle_replay}"
+      - --run-id
+      - "{run_id}"
+      - oracle
+      - --seed
+      - "5"
+      - --replays
+      - "2"
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+      MUJOCO_GL: egl
+  gate04_collector:
+    argv_template:
+      - "{python}"
+      - -m
+      - scripts.capsule_rl.server_adapter
+      - --config
+      - "{capsule_config}"
+      - --artifact
+      - "{gate04_collector}"
+      - --run-id
+      - "{run_id}"
+      - collector
+      - --p0-count
+      - "2"
+      - --trajectories
+      - "2"
+      - --max-turns
+      - "12"
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+      MUJOCO_GL: egl
+      CAPX_CONTROLLER_API_KEY: "{env:CAPX_CONTROLLER_API_KEY}"
+  gate05_guided:
+    argv_template:
+      - "{python}"
+      - -m
+      - scripts.capsule_rl.server_adapter
+      - --config
+      - "{capsule_config}"
+      - --artifact
+      - "{gate05_guided}"
+      - --run-id
+      - "{run_id}"
+      - guided
+      - --group-size
+      - "8"
+      - --base-count
+      - "7"
+      - --guided-count
+      - "1"
+      - --max-group-attempts
+      - "20"
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+      MUJOCO_GL: egl
+      CAPX_CONTROLLER_API_KEY: "{env:CAPX_CONTROLLER_API_KEY}"
+  gate06_trainer:
+    argv_template:
+      - "{python}"
+      - -m
+      - scripts.capsule_rl.server_adapter
+      - --config
+      - "{capsule_config}"
+      - --artifact
+      - "{gate06_trainer}"
+      - --run-id
+      - "{run_id}"
+      - trainer
+      - --optimizer-steps
+      - "1"
+      - --group-rewards
+      - 0,0,0,0,0,0,0,1
+      - --guided-artifact
+      - "{gate05_guided}"
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+      MUJOCO_GL: egl
+  adapter_reload_smoke:
+    argv_template:
+      - "{python}"
+      - -m
+      - scripts.capsule_rl.adapter_reload_smoke
+      - --config
+      - "{capsule_config}"
+      - --gate6-artifact
+      - "{gate06_trainer}"
+      - --artifact
+      - "{adapter_reload_smoke}"
+      - --run-id
+      - "{run_id}"
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+      MUJOCO_GL: egl
+  gate07_audit:
+    argv_template:
+      - "{python}"
+      - -m
+      - scripts.capsule_rl.analyze_artifacts
+      - --input-dir
+      - "{input_dir}"
+      - --output-json
+      - "{gate07_audit_candidate_json}"
+      - --output-report
+      - "{gate07_audit_candidate_report}"
+    env: {}
+  gate07_finalize:
+    argv_template:
+      - "{python}"
+      - -m
+      - scripts.capsule_rl.analyze_artifacts
+      - --input-dir
+      - "{input_dir}"
+      - --output-json
+      - "{gate07_audit_json}"
+      - --output-report
+      - "{gate07_audit_report}"
+      - --candidate-artifact
+      - "{gate07_audit_candidate_json}"
+      - --continuous-memory-artifact
+      - "{launcher_continuous_memory}"
+      - --controller-attestation-artifact
+      - "{launcher_controller_attestation}"
+      - --owned-cleanup-artifact
+      - "{launcher_owned_cleanup}"
+    env: {}
+
+oom_ladder:
+  - base_dynamic_fp32
+  - vllm_util_026
+  - fixed_microbatch_1
+  - fsdp_base_bf16

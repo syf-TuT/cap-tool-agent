@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from capx.rl.capsule.actor_identity import build_actor_identity
 from capx.rl.capsule.checkpoint import AtomicCheckpointClaim
@@ -21,6 +23,65 @@ from capx.rl.capsule.schema import (
 )
 from scripts.capsule_rl import server_adapter
 from scripts.capsule_rl.common import artifact_file_sha256
+
+
+def _write_test_lora_adapter(checkpoint: Path) -> None:
+    adapter = checkpoint / "lora_adapter"
+    adapter.mkdir(parents=True, exist_ok=True)
+    projections = {
+        "q_proj": "self_attn",
+        "k_proj": "self_attn",
+        "v_proj": "self_attn",
+        "o_proj": "self_attn",
+        "gate_proj": "mlp",
+        "up_proj": "mlp",
+        "down_proj": "mlp",
+    }
+    dimensions = {
+        "q_proj": (3584, 3584),
+        "k_proj": (3584, 512),
+        "v_proj": (3584, 512),
+        "o_proj": (3584, 3584),
+        "gate_proj": (3584, 18944),
+        "up_proj": (3584, 18944),
+        "down_proj": (18944, 3584),
+    }
+    tensor_header: dict[str, object] = {}
+    offset = 0
+    for layer in range(28):
+        for projection, block in projections.items():
+            input_dimension, output_dimension = dimensions[projection]
+            for side, shape in (
+                ("A", [16, input_dimension]),
+                ("B", [output_dimension, 16]),
+            ):
+                byte_length = shape[0] * shape[1] * 2
+                tensor_header[
+                    f"base_model.model.model.layers.{layer}.{block}.{projection}."
+                    f"lora_{side}.default.weight"
+                ] = {
+                    "dtype": "F16",
+                    "shape": shape,
+                    "data_offsets": [offset, offset + byte_length],
+                }
+                offset += byte_length
+    header = json.dumps(tensor_header, separators=(",", ":")).encode("utf-8")
+    with (adapter / "adapter_model.safetensors").open("wb") as stream:
+        stream.write(len(header).to_bytes(8, "little") + header)
+        stream.truncate(8 + len(header) + offset)
+    (adapter / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "peft_type": "LORA",
+                "r": 16,
+                "lora_alpha": 32,
+                "bias": "none",
+                "task_type": "CAUSAL_LM",
+                "target_modules": list(projections),
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 class _FakeRuntime:
@@ -66,6 +127,45 @@ class _FakeRuntime:
         return self.evidence
 
 
+def test_derived_gate6_evidence_rejects_nonfinite_reference_or_wrong_trace() -> None:
+    response_mask = torch.tensor([[True, True, False]] * 8)
+    guided_rows = torch.tensor([False] * 7 + [True])
+    guided_mask = response_mask & guided_rows.unsqueeze(-1)
+    tensors = {
+        "response_mask": response_mask,
+        "guided_token_mask": guided_mask,
+        "rollout_is_weights": guided_mask.clone(),
+        "old_log_probs": torch.zeros((8, 3)),
+        "ref_log_prob": torch.zeros((8, 3)),
+    }
+    group = SimpleNamespace(
+        members=[
+            SimpleNamespace(
+                member_type=("base" if row < 7 else "critique_guided_revision")
+            )
+            for row in range(8)
+        ]
+    )
+    result = SimpleNamespace(
+        batch=SimpleNamespace(batch=tensors),
+        execution_trace=("old_logprob", "reference_logprob", "update"),
+    )
+
+    evidence = server_adapter._derive_training_tensor_evidence(result, group)
+    assert evidence["guided_row_indices"] == [7]
+    assert evidence["reference_log_prob_shape"] == [8, 3]
+    assert evidence["reference_log_prob_response_token_counts"] == [2] * 8
+
+    tensors["ref_log_prob"][0, 0] = torch.nan
+    with pytest.raises(server_adapter.ServerAdapterError, match="non-finite"):
+        server_adapter._derive_training_tensor_evidence(result, group)
+
+    tensors["ref_log_prob"][0, 0] = 0
+    result.execution_trace = ("reference_logprob", "old_logprob", "update")
+    with pytest.raises(server_adapter.ServerAdapterError, match="exactly"):
+        server_adapter._derive_training_tensor_evidence(result, group)
+
+
 def _args(tmp_path: Path) -> argparse.Namespace:
     return argparse.Namespace(
         run_id="run-01",
@@ -83,6 +183,50 @@ def _args(tmp_path: Path) -> argparse.Namespace:
         group_rewards=(0, 0, 0, 0, 0, 0, 0, 1),
         guided_artifact=tmp_path / "guided.json",
     )
+
+
+def test_git_provenance_disables_optional_locks_and_preserves_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    monkeypatch.setenv("CAPX_GIT_ENV_SENTINEL", "preserved")
+
+    def fake_run(command: list[str], **kwargs: object):
+        calls.append((command, kwargs))
+        if command[-2:] == ["rev-parse", "HEAD"]:
+            stdout = "a" * 40 + "\n"
+        elif command[-2:] == ["rev-parse", "--show-toplevel"]:
+            stdout = str(tmp_path.resolve()) + "\n"
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(server_adapter.subprocess, "run", fake_run)
+
+    assert server_adapter._git_sha(tmp_path) == "a" * 40
+    assert len(calls) == 3
+    for _command, kwargs in calls:
+        assert kwargs["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+        assert kwargs["env"]["CAPX_GIT_ENV_SENTINEL"] == "preserved"
+
+
+def test_host_memory_monitor_records_the_minimum_across_lifecycle_samples() -> None:
+    values = iter((100, 80, 90))
+    monitor = server_adapter._HostMemoryMonitor(
+        loader=lambda: next(values),
+        poll_interval_s=60.0,
+    )
+
+    with monitor:
+        monitor.sample()
+        monitor.sample()
+
+    assert monitor.evidence() == {
+        "sample_count": 3,
+        "minimum_mem_available_bytes": 80,
+        "poll_interval_s": 60.0,
+        "monitor_scope": "before_worker_start_through_after_ray_shutdown",
+    }
 
 
 def _runtime_config(tmp_path: Path) -> dict[str, object]:
@@ -533,6 +677,114 @@ def test_execute_gate_rejects_runtime_dependency_change_before_publishing(
         )
     )
     assert failure["exception"]["stage"] == "post_runtime_dependencies"
+
+
+@pytest.mark.parametrize(
+    "guarded_input",
+    [
+        "config",
+        "dataset",
+        "environment",
+        "resolved_verl",
+        "program_model",
+        "verl_source",
+    ],
+)
+def test_execute_gate_rejects_a_to_b_to_a_runtime_input_mutation(
+    guarded_input: str,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("schema_version: 1\n", encoding="utf-8")
+    config = _runtime_config(tmp_path)
+    paths = {
+        "config": config_path,
+        "dataset": Path(config["runtime"]["dataset_path"]),
+        "environment": Path(config["task"]["config_path"]),
+        "resolved_verl": Path(config["runtime"]["verl_resolved_config_path"]),
+        "program_model": Path(config["runtime"]["program_model_path"]) / "config.json",
+        "verl_source": Path(config["runtime"]["verl_source_path"]) / "attacker.py",
+    }
+    guarded_path = paths[guarded_input]
+    trusted = guarded_path.read_bytes() if guarded_path.exists() else None
+    artifact = tmp_path / f"{guarded_input}.seed.json"
+
+    class _RestoringRuntime(_FakeRuntime):
+        def seed(self, seeds, *, run_id):
+            guarded_path.write_bytes(b"attacker bytes\n")
+            if trusted is None:
+                guarded_path.unlink()
+            else:
+                guarded_path.write_bytes(trusted)
+            return {
+                "seeds": [5, 6, 5],
+                "initial_state_sha256": ["a" * 64, "b" * 64, "a" * 64],
+            }
+
+    with pytest.raises(server_adapter.ServerAdapterError, match="changed during runtime gate"):
+        server_adapter.execute_gate(
+            config_path=config_path,
+            artifact_path=artifact,
+            command="seed",
+            run_id="run-01",
+            runtime=_RestoringRuntime(),
+            args=_args(tmp_path),
+            config_loader=lambda _raw, *, check_runtime_paths: config,
+            git_sha_loader=lambda _root: "c" * 40,
+        )
+
+    failure = json.loads(
+        artifact.with_name(f"{artifact.name}.failure.json").read_text(encoding="utf-8")
+    )
+    assert failure["exception"]["stage"] == "runtime_mutation_guard"
+
+
+def test_execute_trainer_gate_guards_guided_dependency_against_a_to_b_to_a(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("schema_version: 1\n", encoding="utf-8")
+    config = _runtime_config(tmp_path)
+    args = _args(tmp_path)
+    dependencies = server_adapter.runtime_dependency_hashes(config)
+    actor_identity = build_actor_identity(config)
+    guided_payload = {
+        "run_id": "run-01",
+        "config_sha256": artifact_file_sha256(config_path),
+        "git_sha": "c" * 40,
+        "dataset_sha256": artifact_file_sha256(config["runtime"]["dataset_path"]),
+        **dependencies,
+        "program_model_sha256": actor_identity["program_model_sha256"],
+        "actor_binding_sha256": actor_identity["actor_binding_sha256"],
+    }
+    args.guided_artifact.write_text(json.dumps(guided_payload), encoding="utf-8")
+    trusted = args.guided_artifact.read_bytes()
+    artifact = tmp_path / "gate06_trainer.json"
+    monkeypatch.setattr(server_adapter, "_validate_gate_request", lambda **_kwargs: {})
+    monkeypatch.setitem(server_adapter._VERIFIERS, "trainer", lambda _payload: None)
+
+    class _RestoringTrainerRuntime(_FakeRuntime):
+        def trainer(self, optimizer_steps, group_rewards, guided_artifact, *, run_id):
+            args.guided_artifact.write_bytes(trusted + b"\n")
+            args.guided_artifact.write_bytes(trusted)
+            return {}
+
+    with pytest.raises(server_adapter.ServerAdapterError, match="changed during runtime gate"):
+        server_adapter.execute_gate(
+            config_path=config_path,
+            artifact_path=artifact,
+            command="trainer",
+            run_id="run-01",
+            runtime=_RestoringTrainerRuntime(),
+            args=args,
+            config_loader=lambda _raw, *, check_runtime_paths: config,
+            git_sha_loader=lambda _root: "c" * 40,
+        )
+
+    failure = json.loads(
+        artifact.with_name(f"{artifact.name}.failure.json").read_text(encoding="utf-8")
+    )
+    assert failure["exception"]["stage"] == "runtime_mutation_guard"
 
 
 def test_execute_gate_rolls_back_transaction_when_post_checks_fail(tmp_path: Path) -> None:
@@ -1466,6 +1718,8 @@ def test_concrete_trainer_rebuilds_full_repair_audit_and_hashes_input_artifact(
     observed: dict[str, object] = {}
 
     class _Workers:
+        reference_policy_mode = "actor_base_adapter_disabled"
+
         actor_rollout_wg = object()
         ref_policy_wg = object()
         tokenizer = object()
@@ -1498,6 +1752,58 @@ def test_concrete_trainer_rebuilds_full_repair_audit_and_hashes_input_artifact(
             observed["checkpoint_step"] = step
             path.mkdir(parents=True)
             (path / "state.bin").write_bytes(b"checkpoint")
+            _write_test_lora_adapter(path)
+
+        def lora_runtime_evidence(self) -> dict[str, object]:
+            observed["lora_probe_calls"] = int(observed.get("lora_probe_calls", 0)) + 1
+            return {
+                "lora_rank": 16,
+                "lora_alpha": 32,
+                "lora_target_modules": ["all-linear"],
+                "worker_count": 1,
+                "worker_ranks": [0],
+                "trainable_parameter_name_sha256s": ["a" * 64],
+                "total_parameter_count": 7_000_000_000,
+                "trainable_parameter_count": 40_000_000,
+                "non_lora_trainable_parameter_count": 0,
+                "only_lora_trainable": True,
+                "lora_layer_count": 28,
+                "lora_projection_suffixes": [
+                    "down_proj",
+                    "gate_proj",
+                    "k_proj",
+                    "o_proj",
+                    "q_proj",
+                    "up_proj",
+                    "v_proj",
+                ],
+                "lora_tensor_count_per_worker": 392,
+                "cuda_peak_reserved_bytes": 60 * 1024**3,
+                "host_mem_available_min_bytes": 90 * 1024**3,
+                "workers": [
+                    {
+                        "rank": 0,
+                        "total_parameter_count": 7_000_000_000,
+                        "trainable_parameter_count": 40_000_000,
+                        "trainable_tensor_count": 392,
+                        "lora_layer_count": 28,
+                        "lora_projection_suffixes": [
+                            "down_proj",
+                            "gate_proj",
+                            "k_proj",
+                            "o_proj",
+                            "q_proj",
+                            "up_proj",
+                            "v_proj",
+                        ],
+                        "non_lora_trainable_parameter_count": 0,
+                        "only_lora_trainable": True,
+                        "trainable_parameter_names_sha256": "a" * 64,
+                        "cuda_peak_reserved_bytes": 60 * 1024**3,
+                        "host_mem_available_bytes": 90 * 1024**3,
+                    }
+                ],
+            }
 
         def verl_provenance(self) -> dict[str, object]:
             observed["verl_provenance_calls"] = int(
@@ -1506,7 +1812,15 @@ def test_concrete_trainer_rebuilds_full_repair_audit_and_hashes_input_artifact(
             return dict(self._verl_provenance)
 
         def close(self) -> None:
-            observed["workers_closed"] = True
+            observed["workers_closed"] = int(observed.get("workers_closed", 0)) + 1
+
+        def ray_release_evidence(self) -> dict[str, object]:
+            assert observed["workers_closed"] == 1
+            return {
+                "worker_close_calls": 1,
+                "ray_shutdown_calls": 1,
+                "ray_shutdown_complete": True,
+            }
 
     class _Encoder:
         def __init__(self, **_kwargs: object) -> None:
@@ -1524,9 +1838,27 @@ def test_concrete_trainer_rebuilds_full_repair_audit_and_hashes_input_artifact(
                 attempt.selected for attempt in assembly.repair_attempts
             )
             self.actor_updates_completed = 1
+            response_mask = torch.tensor([[True, True, False]] * 8)
+            guided_rows = torch.tensor(
+                [
+                    member.member_type == "critique_guided_revision"
+                    for member in assembly.group.members
+                ]
+            )
+            guided_mask = response_mask & guided_rows.unsqueeze(-1)
             return SimpleNamespace(
                 actor_output={"metrics": {"actor/grad_norm": 2.0}},
-                artifact=SimpleNamespace(guided_token_mask=((0,), (1,))),
+                artifact=SimpleNamespace(guided_token_mask=guided_mask.tolist()),
+                batch=SimpleNamespace(
+                    batch={
+                        "response_mask": response_mask,
+                        "guided_token_mask": guided_mask,
+                        "rollout_is_weights": guided_mask.clone(),
+                        "old_log_probs": torch.zeros((8, 3)),
+                        "ref_log_prob": torch.full((8, 3), -1.0),
+                    }
+                ),
+                execution_trace=("old_logprob", "reference_logprob", "update"),
                 skipped_actor_update=False,
             )
 
@@ -1535,6 +1867,31 @@ def test_concrete_trainer_rebuilds_full_repair_audit_and_hashes_input_artifact(
     monkeypatch.setattr(server_factory, "VeRLGroupEncoder", _Encoder)
     monkeypatch.setattr(trainer_module, "CapsuleCritiqueRayTrainer", _Trainer)
     monkeypatch.setattr(trainer_module, "MemoryArtifactSink", lambda: object())
+
+    class _Monitor:
+        def __init__(self, **_kwargs: object) -> None:
+            observed["monitor_created"] = True
+
+        def __enter__(self):
+            observed["monitor_started"] = True
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            observed["monitor_stopped"] = True
+
+        def sample(self) -> None:
+            observed["monitor_samples"] = int(observed.get("monitor_samples", 0)) + 1
+
+        def evidence(self) -> dict[str, object]:
+            assert observed["workers_closed"] == 1
+            return {
+                "sample_count": 8,
+                "minimum_mem_available_bytes": 80 * 1024**3,
+                "poll_interval_s": 0.25,
+                "monitor_scope": "before_worker_start_through_after_ray_shutdown",
+            }
+
+    monkeypatch.setattr(server_adapter, "_HostMemoryMonitor", _Monitor)
     output_dir = tmp_path / "outputs"
     runtime = server_adapter.ConcreteGateRuntime(
         {
@@ -1581,12 +1938,28 @@ def test_concrete_trainer_rebuilds_full_repair_audit_and_hashes_input_artifact(
     assert evidence["optimizer_step_before"] == 0
     assert evidence["optimizer_step_after"] == 1
     assert observed["checkpoint_step"] == 1
-    assert evidence["checkpoint_file_count"] == 1
+    assert evidence["checkpoint_file_count"] == 3
     assert len(evidence["checkpoint_sha256"]) == 64
     assert evidence["verl_provenance_before"] == evidence["verl_provenance_after"]
     assert evidence["verl_provenance_after"]["actual_sha"] == "e" * 40
     assert observed["verl_provenance_calls"] == 2
-    assert observed["workers_closed"] is True
+    assert observed["workers_closed"] == 1
+    assert observed["lora_probe_calls"] == 2
+    assert observed["monitor_started"] is True
+    assert observed["monitor_stopped"] is True
+    assert evidence["lora_runtime_before"]["only_lora_trainable"] is True
+    assert evidence["reference_policy_mode"] == "actor_base_adapter_disabled"
+    assert evidence["lora_runtime_after"]["trainable_parameter_count"] == 40_000_000
+    assert evidence["ray_release"] == {
+        "worker_close_calls": 1,
+        "ray_shutdown_calls": 1,
+        "ray_shutdown_complete": True,
+    }
+    assert evidence["host_memory"]["minimum_mem_available_bytes"] == 80 * 1024**3
+    assert evidence["cuda_peak_reserved_bytes"] == 60 * 1024**3
+    assert Path(evidence["adapter_model_path"]).name == "adapter_model.safetensors"
+    assert Path(evidence["adapter_config_path"]).name == "adapter_config.json"
+    assert evidence["adapter_config"]["r"] == 16
     evidence.commit()
 
 

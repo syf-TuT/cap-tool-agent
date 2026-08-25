@@ -3,8 +3,8 @@
 本文档描述 Cube Stack privileged MVP 的服务器验证入口。当前仓库中的本地测试只覆盖
 schema、repair lineage、fake clean replay、7+1 组装、loss/trainer mock 和脚本 dry-run；它们
 不创建 Robosuite/MuJoCo 环境，不启动 PyRoKi、Controller、Program 模型或 optimizer。
-因此，在服务器 gate 1--6 全部通过以前，状态只能写成“本地代码实现完成”，不能写成
-“Capsule-RL runtime verified”。
+因此，在服务器 gate 1--6、独立 adapter reload smoke 和 Gate 7 全部通过以前，状态只能
+写成“本地代码实现完成”，不能写成“Capsule-RL runtime verified”。
 
 ## 服务器前置条件
 
@@ -25,7 +25,8 @@ env_configs/cube_stack/capsule_rl/franka_robosuite_cube_stack_capsule_critique_g
   `runtime.output_dir`；resolved VeRL YAML 必须已存在；
 - `trainer_factory` 必须指向项目自有 factory；模板使用
   `capx.rl.capsule.server_factory:create_trainer`；
-- Program actor 的 endpoint、model 与 `api_key_env`；
+- Program actor-identity 的 endpoint、model 与 `api_key_env`；该服务只返回经认证的模型、
+  LoRA、VeRL 与 resolved-config 身份，不加载模型或生成 token；
 - 正式 `main_ppo` 每次启动使用新的 `runtime.run_id`；同名 checkpoint claim 不会覆盖；
 - 独立且冻结的 Controller endpoint、model 与 `CONTROLLER_API_KEY`（或配置指定的变量名）；
 - PyRoKi 服务地址，默认 `http://127.0.0.1:8116`；
@@ -33,13 +34,14 @@ env_configs/cube_stack/capsule_rl/franka_robosuite_cube_stack_capsule_critique_g
 - privileged Cube Stack 环境、`FrankaControlPrivilegedApi`、EGL 与模型权重均可访问；
 - `render: false`、`record_video: false`、Controller `frozen: true`。
 
-Program actor 与 Controller 必须是两个独立服务。训练只更新 Program；Controller 的模型和
-凭据不得指向正在更新的 actor。
+Program actor-identity 与 Controller 必须是两个独立的本地服务。实际 Program rollout 始终来自
+VeRL 的 trainable actor；identity 服务不参与生成。Controller 是冻结的本机 CPU
+`llama.cpp` 服务，不接外部模型 API，其模型和凭据不得指向正在更新的 actor。
 
 Program 的 base/revision 采样由 pinned VeRL checkout 中同一个 trainable actor/rollout worker
 完成，随后也由该 worker 计算 old log-prob 并更新；不能把一个未同步的外部 Program endpoint
-当作训练 rollout 来源。`program_service` 的 endpoint/model/credential 用于服务器 preflight 和
-部署身份检查，必须与本次 Program actor 部署一致。Capsule runtime 要求启动前 Ray 尚未初始化，
+当作训练 rollout 来源。`program_service` 的 endpoint/model/credential 仅用于服务器 preflight
+和部署身份检查，必须与本次 Program actor 部署一致。Capsule runtime 要求启动前 Ray 尚未初始化，
 由本次 session 独占创建并在成功或失败后关闭，以免遗留 actor/ref worker。
 
 推荐目录约定：
@@ -49,6 +51,112 @@ outputs/<experiment-slug>/       # simulator/trainer 原始输出（忽略提交
 artifacts/<experiment-slug>/     # gate JSON、审计表和报告（忽略大文件）
 remote_results/<experiment-slug>/# 从服务器下载的结果
 ```
+
+## Single-A800 owned services
+
+单卡 A800 训练/验证现在有一个独立的 owned-service workflow，不复用通用
+`capx/serving/launch_servers.py`。相关仓内文件：
+
+- resolved VeRL profile：
+  `env_configs/cube_stack/capsule_rl/franka_robosuite_cube_stack_capsule_single_a800_verl.yaml`
+- owned-service workflow：
+  `env_configs/cube_stack/capsule_rl/franka_robosuite_cube_stack_capsule_single_a800_owned_services.yaml`
+- launcher：
+  `scripts/capsule_rl/launch_owned_services.py`
+
+该 profile 固定到官方 VeRL `v0.6.1`、完整 SHA
+`d62da4950573d7a4b7ef2362337952e7ab59e78d`。配置使用该版本的真实字段：FSDP1、
+FP32 FSDP base、LoRA `rank=16`/`alpha=32`/`all-linear`、gradient checkpointing、
+remove padding、`param_offload=true`、optimizer/activation offload 关闭、`model.use_shm=false`；
+actor/rollout/ref 动态 token cap 均为 10240。vLLM 固定 BF16、TP/DP/PP=`1/1/1`、
+utilization 0.30、sleep cache release、eager、chunked prefill、`max_num_seqs=1` 与
+`load_format=safetensors`。LoRA reference 模式为
+`actor_base_adapter_disabled`，不会创建第二份 reference worker。
+profile 是按 v0.6.1 `_generated_ppo_trainer.yaml` 展开的可直接加载配置，并保留 worker
+直接访问的 legacy micro-batch 字段、`data`、`ray_kwargs`、`trainer.device` 及各结构化配置的
+`_target_`。`capx.rl.capsule.verl_config.CapsulePolicyLossConfig` 只扩展官方
+`PolicyLossConfig` 的 `capsule_gamma` 字段，避免 Hydra 结构化转换拒绝 Capsule 的固定 gamma。
+
+启动前 launcher 只读校验：恰好一张 A800 80GB（兼容 PCIe 与 SXM4 的 NVIDIA 名称）、
+free VRAM 至少 77824 MiB、任一既有 GPU process 不得超过 512 MiB、RAM 至少
+122880 MiB、`/dev/shm` 至少 12288 MiB、实验磁盘至少 81920 MiB。Controller ready 后
+`MemAvailable` 必须仍有 92160 MiB；每个 gate 后不得低于 12288 MiB。Git HEAD/dirty 状态、
+系统、CUDA 与 driver 会进入审计快照；dirty 状态本身不会被 launcher 当成硬件失败，Gate 1
+仍会执行仓库自己的不可变 provenance 校验。
+Controller 通过 92160 MiB 点检后，launcher 还会以 1 秒间隔启动独立采样线程，覆盖后续
+Program/PyRoKi readiness、Gate 1--7 和 adapter reload；任一样本低于 12288 MiB 都会令
+attempt 失败。
+
+Controller 不调用 OpenAI、OpenRouter 或其他外部模型；它使用本机 CPU 上的官方 llama.cpp
+`b10516` Ubuntu x64 archive（SHA-256
+`f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35`）和官方
+Qwen2.5-Coder-7B-Instruct Q4_K_M GGUF（SHA-256
+`509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c`）。launcher
+先复核两个固定 hash，再安全解析归档，拒绝逃逸路径、特殊节点、重复 server 和不安全链接；归档内
+每个普通文件与安全符号链接都必须与实际解压树逐字节一致。`llama-server --version` 的有边界
+数值字段必须为 build `10516`，启动后 `/proc/<pid>/exe` 也必须与归档 server 的 SHA-256 一致。
+官方归档保留顶层 `llama-b10516/`：归档文件放在 `.codex-downloads/`，解压后 binary 路径为
+`.codex-downloads/llama-b10516/llama-server`，不能把归档再放进该解压目录。
+完整证明独占写入 `launcher_controller_attestation.json`，并在最终 Gate 7 再次从落盘字节重算。
+Controller 随后以固定 alias 启动
+`--n-gpu-layers 0 --parallel 1 --ctx-size 16384`。`CAPX_CONTROLLER_API_KEY` 只在子进程
+内部映射为 `LLAMA_API_KEY`，不会写进 argv、渲染结果或日志。Program actor-identity、
+Controller 和 PyRoKi 均清空 `CUDA_VISIBLE_DEVICES`；Gate 子进程才显式使用
+`CUDA_VISIBLE_DEVICES=0` 与 `MUJOCO_GL=egl`。
+
+OOM fallback 是累计而不是互相独立的 profile，每一级都物化新的 resolved VeRL YAML、
+profile SHA 和 run ID，并保留失败目录：
+
+```text
+base_dynamic_fp32
+vllm_util_026          # 仅将 vLLM utilization 0.30 -> 0.26
+fixed_microbatch_1     # 保留 0.26，actor/rollout/ref 改固定 microbatch 1
+fsdp_base_bf16         # 保留前两项，再将 actor/ref FSDP model_dtype 改为 BF16
+```
+
+任何 fallback 都不会缩短 10240 token cap，也不会改变 7+1 group、KL 或 GRPO 语义。
+每个 attempt 的 `resolved/verl.yaml` 字节 SHA 同时绑定 run ID、initial audit、Gate chain 和最终
+audit；其 `capsule_runtime.oom_profile` 必须与 launcher retry 名一致，不能只修改审计字段冒充
+另一个 fallback。
+只有 GPU Gate 2--6 日志中识别出的 CUDA OOM 才能推进该 ladder；Gate 1、adapter reload、
+Gate 7 的 OOM 与所有非 OOM 失败立即停止。每个 OOM profile 固定最多使用三个新的 Controller
+随机性 run ID；第三次仍无法得到 seed-5 guided success 时立即停止。只有识别出的 GPU OOM
+才能进入下一个 profile，并为它生成另一组三个新 run ID，不能跨 profile 复用，也不能降低
+Gate 5 标准。Gate 6 子进程退出（并完成 Ray shutdown）后，
+launcher 才执行独立的 `scripts.capsule_rl.adapter_reload_smoke`，随后执行 Gate 7。
+
+dry-run 示例：
+
+```bash
+python -m scripts.capsule_rl.launch_owned_services \
+  --workflow-config env_configs/cube_stack/capsule_rl/franka_robosuite_cube_stack_capsule_single_a800_owned_services.yaml \
+  --profile-config env_configs/cube_stack/capsule_rl/franka_robosuite_cube_stack_capsule_single_a800_verl.yaml \
+  --capsule-config /root/autodl-tmp/cap-x/artifacts/cube_stack_capsule_rl_prepare/capsule_rl.resolved.yaml \
+  --dry-run
+```
+
+dry-run 会做只读硬件、controller/model provenance 校验并渲染 base attempt，但不会创建目录、
+reserve run ID、启动服务或写 artifact。执行模式以 `Popen` PID 加
+`/proc/<pid>/stat` starttime 识别本轮服务；cleanup 只终止 starttime 仍匹配的进程组。已有
+output、artifact 或 checkpoint 路径一律拒绝覆盖，失败时保留已生成的 Gate 证据和
+`launcher_failure.json`。每个实际 attempt 在任何服务启动前独占写入
+`launcher_initial_audit.json`；每次 spawn 立即写入仅含 PID、starttime、argv hash、env key
+名称及 credential-key 标记的 `launcher_owned_process_*.json`，不落盘环境变量值。Controller
+启动后和每个 Gate 后的 RAM 阈值检查也分别写入不可覆盖的 `launcher_memory_*.json`，因此
+readiness、Gate 或 cleanup 失败仍保留足够的归属与资源证据。
+连续采样的完整时间偏移、样本数、最大采样间隔和最低 `MemAvailable` 独占写入
+`launcher_continuous_memory.json`；最大采样间隔超过 5 秒也视为证据不完整并令 attempt 失败。
+Gate 7 在监控范围内先发布 `gate07_audit.candidate.json`/`.md`，其中明确记录
+`runtime_verified: false` 以及等待 launcher 内存和 owned-service cleanup 最终化。launcher 停止
+监控并成功清理本轮服务后，独占写入 `launcher_owned_cleanup.json`，再运行独立 finalizer；
+finalizer 重新验证 gate chain、candidate、连续内存、Controller 运行树、cleanup 证据和不存在
+`launcher_failure.json`，同时绑定启动前 A800/RAM/shm/disk 审计和 Controller ready 后的
+90 GiB `MemAvailable` 点检，然后独占发布正式 `gate07_audit.json`/`.md` 并把
+`runtime_verified` 改为 `true`。监控违规、采样缺口、Controller 漂移或 cleanup 失败都不会留下
+正式 true 报告。finalizer 从重算到发布后复验始终监视 Gate、checkpoint 和 launcher 证据；
+任何期间修改都会回滚本轮刚发布的 JSON/Markdown。正式审计使用精确 schema，后续
+materializer 和 `main_ppo` 不接受只有 `runtime_verified: true` 的缩减或伪造 JSON。
+受控失败路径同样在清理 owned service 前发布内存证据。
 
 ## 安全验证模式
 
@@ -84,7 +192,9 @@ Gate 1--6 的 JSON 顶层必须共享 `schema_version: 1`、规范 gate 名、`p
 run/config/dataset/commit identity，以及同一个 `resolved_environment_sha256` 和
 `verl_resolved_config_sha256`；随后把每个文件 SHA-256 与前一个 SHA-256 写入 hash
 manifest。任何 gate 的 success 旁若同时存在 `.failure.json`，或 artifact 来自非 canonical
-execution mode，Gate 7 都会拒绝 `runtime_verified`。
+execution mode，Gate 7 都会拒绝 `runtime_verified`。单 A800 LoRA workflow 还要求
+`adapter_reload_smoke.json`：它必须在 Gate 6 已完成 Ray shutdown 后，由 fresh FP32 base
+直接加载落盘 adapter，并证明 adapter 开/关 logits 都有限且最大差异大于 `1e-8`。
 
 Gate 7 审计并物化正式 bundle 后，再验证项目 trainer 配置：
 
@@ -116,20 +226,24 @@ dataset/config bundle。先安全预览：
 
 ```bash
 python -m scripts.capsule_rl.materialize_resolved_dataset \
-  --config artifacts/cube_stack_capsule_rl_prepare/capsule_rl.resolved.yaml \
-  --gate7-audit artifacts/$RUN_ID/audit_summary.json \
+  --config artifacts/$RUN_ID/resolved/capsule.yaml \
+  --gate7-audit artifacts/$RUN_ID/gate07_audit.json \
   --output-dir artifacts/cube_stack_capsule_rl_seed_resolved \
   --validate-only
 ```
 
-移除验证参数后，该 server-only 命令才会按 task seed 创建真实环境并 reset，调用
+这里的 `$RUN_ID` 必须是 launcher 最终成功 attempt 打印的 run ID；`--config` 必须使用同一
+attempt 的 `resolved/capsule.yaml`，因为 Gate 1--7 绑定的是该文件的字节 SHA。不得回退使用
+launcher 的上游 prepare 配置。移除验证参数后，该 server-only 命令才会按 task seed 创建真实环境并 reset，调用
 `resolve_task_instances`，输出完整 `TaskInstanceV1` JSONL、更新了 `runtime.dataset_path` 的 YAML、
 Gate 7 audit 副本和 `bundle_manifest.json`。manifest 绑定 source config/dataset SHA、Gate 7
 audit SHA/run_id/typed task identities、resolved environment、resolved VeRL YAML，以及 output
 dataset/config SHA；新 YAML 同时写入 `runtime.bundle_manifest_path` 与
 `runtime.gate7_audit_path`。输出目录必须不存在；bundle 以独占目录发布，`BaseException` 也只会
 清理仍由本进程持有身份的 staging/部分输出，绝不覆盖或删除并发替换的目录。正式训练使用新
-YAML。Smoke Gate 1--6 仍应全程
+YAML。materializer 会直接重新运行 Gate 7 producer verifier，并要求重算结果与正式审计逐字段
+完全一致；其 mutation guard 覆盖所有 Gate、candidate、内存、Controller、cleanup 和最终审计，
+直到 bundle 复制后再次校验完毕。Smoke Gate 1--6 仍应全程
 使用同一原始配置以保持 artifact `config_sha256` 一致；物化 bundle 服务于随后单独启动的正式
 训练，不得在同一 gate audit 中途切换配置。
 
@@ -310,30 +424,49 @@ actor worker 会从 AdamW optimizer state 读取各 rank 的 before/after step�
 
 ### 7. Result audit
 
-Gate 1--6 结束后汇总 base/repair/PT/P_hat、retry、infra failure、guided shaping 与 optimizer
-证据：
+Gate 1--6 与独立 adapter reload smoke 结束后，汇总 base/repair/PT/P_hat、retry、
+infra failure、guided shaping、optimizer 与 reload 证据：
 
 ```bash
 python -m scripts.capsule_rl.analyze_artifacts \
   --input-dir artifacts/$RUN_ID \
-  --output-json artifacts/$RUN_ID/audit_summary.json \
-  --output-report artifacts/$RUN_ID/audit_report.md \
+  --output-json artifacts/$RUN_ID/gate07_audit.candidate.json \
+  --output-report artifacts/$RUN_ID/gate07_audit.candidate.md \
   --validate-only
 ```
 
 缺失 gate、identity 不一致、同 gate success/failure 并存、noncanonical 来源或 typed evidence
-无效都会令命令非零退出，且不会生成成功报告。
+无效都会令命令非零退出，且不会生成 candidate。移除 `--validate-only` 后生成的 candidate 即使
+所有 gate 都通过也保持 `runtime_verified: false`，不能单独作为运行验证结论。
 Gate 7 还会重算 Gate 5 文件 SHA-256、checkpoint tree SHA-256 与 manifest，拒绝只在 JSON 中
 声明但未由落盘字节支持的依赖或 checkpoint。
 六个 gate 的 `dataset_sha256` 必须完全一致；Oracle、Collector 与 Guided 的 typed
 `(task_id, environment_seed, initial_state_sha256)` 也必须形成同一个 seed-5 task identity。
 六个 gate 的 resolved environment 与 resolved VeRL YAML SHA-256 也必须逐项一致；Gate 7
 把 seed-5 typed identity、两项 dependency hash、run/config/Git/dataset identity 一并写入
-`audit_summary.json`，供正式 bundle materializer 绑定。
-只有 gate 1--6 全部通过时，报告才写入 `runtime_verified: true`、六项状态和 artifact hash
-chain，才能把状态升级为“Capsule-RL runtime verified”；正式多-seed 训练、成功率比较和
-消融不属于这些 smoke gate。JSON 与 Markdown 报告先分别写入 staging，再作为一对发布；第二个
-文件发布失败时会回滚本次已发布的第一个文件，避免留下半套审计结果。
+`gate07_audit.json`，供正式 bundle materializer 绑定。
+owned-service launcher 在 candidate 发布后停止连续内存监控并清理本轮服务；只有这两步都成功，
+它才调用 finalizer：
+
+```bash
+python -m scripts.capsule_rl.analyze_artifacts \
+  --input-dir artifacts/$RUN_ID \
+  --output-json artifacts/$RUN_ID/gate07_audit.json \
+  --output-report artifacts/$RUN_ID/gate07_audit.md \
+  --candidate-artifact artifacts/$RUN_ID/gate07_audit.candidate.json \
+  --continuous-memory-artifact artifacts/$RUN_ID/launcher_continuous_memory.json \
+  --controller-attestation-artifact artifacts/$RUN_ID/launcher_controller_attestation.json \
+  --owned-cleanup-artifact artifacts/$RUN_ID/launcher_owned_cleanup.json
+```
+
+finalizer 重新计算全部持久化证据，校验 candidate、连续内存、Controller attestation 与 cleanup
+artifact 的 SHA/聚合值，并拒绝任何 `launcher_failure.json`。只有 gate 1--6、adapter reload、
+连续内存、Controller 运行树与 cleanup 全部通过时，
+正式报告才写入 `runtime_verified: true`、六项 gate 状态、reload 状态、内存证据及 artifact hash
+chain，才能把状态升级为“Capsule-RL runtime verified”；正式多-seed 训练、成功率比较和消融
+不属于这些 smoke gate。JSON 与 Markdown 报告先分别写入 staging，再作为一对发布；第二个文件
+发布失败时会回滚本次已发布的第一个文件，避免留下半套审计结果。不得在 launcher 尚未停止监控
+和清理 owned services 前手工调用 finalizer。
 
 ## 失败恢复
 

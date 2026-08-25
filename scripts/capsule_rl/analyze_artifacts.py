@@ -5,12 +5,24 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import stat
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
+
+import yaml
+
+from capx.rl.capsule.stable_io import (
+    MutationWatch,
+    PathMutationGuard,
+    StablePathError,
+    read_stable_regular_file,
+    sys_platform_linux,
+)
 
 from .common import (
     CANONICAL_EXECUTION_MODE,
@@ -18,12 +30,17 @@ from .common import (
     add_validation_arguments,
     gate_failure_artifact_path,
     validation_requested,
+    verify_adapter_reload_artifact,
     verify_collector_gate_artifact,
     verify_guided_gate_artifact,
     verify_oracle_gate_artifact,
     verify_preflight_gate_artifact,
     verify_seed_gate_artifact,
     verify_trainer_gate_artifact,
+)
+from .llama_attestation import (
+    LlamaRuntimeAttestationError,
+    attest_llama_cpp_runtime,
 )
 
 REQUIRED_GATE_FILES = {
@@ -33,7 +50,34 @@ REQUIRED_GATE_FILES = {
     "collector": "gate04_collector.json",
     "guided": "gate05_guided_group.json",
     "trainer": "gate06_trainer.json",
+    "adapter_reload": "adapter_reload_smoke.json",
 }
+RUNTIME_VERIFICATION_PENDING = (
+    "launcher_continuous_memory",
+    "owned_service_cleanup",
+    "controller_runtime_attestation",
+)
+_AUDIT_META_FILENAMES = {
+    "gate07_audit.candidate.json",
+    "gate07_audit.json",
+    "launcher_continuous_memory.json",
+    "launcher_controller_attestation.json",
+    "launcher_owned_cleanup.json",
+    "launcher_initial_audit.json",
+    "launcher_memory_00_post-controller.json",
+}
+_OOM_PROFILES = {
+    "base_dynamic_fp32",
+    "vllm_util_026",
+    "fixed_microbatch_1",
+    "fsdp_base_bf16",
+}
+_LLAMA_ARCHIVE_SHA256 = (
+    "f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35"
+)
+_CONTROLLER_GGUF_SHA256 = (
+    "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c"
+)
 GATE_VERIFIERS = {
     "preflight": verify_preflight_gate_artifact,
     "seed": verify_seed_gate_artifact,
@@ -41,6 +85,7 @@ GATE_VERIFIERS = {
     "collector": verify_collector_gate_artifact,
     "guided": verify_guided_gate_artifact,
     "trainer": verify_trainer_gate_artifact,
+    "adapter_reload": verify_adapter_reload_artifact,
 }
 
 
@@ -79,10 +124,76 @@ def _load_gate_artifact_snapshot(
     try:
         payload = json.loads(raw_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise GateArtifactError(f"gate {gate} artifact is not valid UTF-8 JSON: {error}") from error
+        raise GateArtifactError(
+            f"gate {gate} artifact is not valid UTF-8 JSON: {error}"
+        ) from error
     if not isinstance(payload, Mapping):
         raise GateArtifactError(f"gate {gate} artifact root must be a JSON mapping")
     return payload, hashlib.sha256(raw_bytes).hexdigest()
+
+
+def _gate7_mutation_context(
+    root: Path, *, finalizing: bool
+) -> PathMutationGuard | Any:
+    if not sys_platform_linux():
+        if finalizing:
+            raise GateArtifactError(
+                "final runtime verification requires Linux inotify mutation guards"
+            )
+        return nullcontext()
+    gate_paths = [root / filename for filename in REQUIRED_GATE_FILES.values()]
+    trainer_payload, trainer_sha256 = _load_gate_artifact_snapshot(
+        root / REQUIRED_GATE_FILES["trainer"], "trainer_guard_setup"
+    )
+    checkpoint_value = trainer_payload.get("checkpoint")
+    checkpoint = (
+        Path(checkpoint_value).expanduser()
+        if isinstance(checkpoint_value, str) and checkpoint_value
+        else None
+    )
+    if checkpoint is None or not checkpoint.is_absolute():
+        raise GateArtifactError("trainer checkpoint path is invalid during guard setup")
+    watched_paths = list(gate_paths)
+    if finalizing:
+        watched_paths.extend(
+            root / filename
+            for filename in (
+                "gate07_audit.candidate.json",
+                "launcher_continuous_memory.json",
+                "launcher_controller_attestation.json",
+                "launcher_owned_cleanup.json",
+                "launcher_initial_audit.json",
+                "launcher_memory_00_post-controller.json",
+            )
+        )
+        watched_paths.append(root / "resolved" / "verl.yaml")
+    watches = [
+        MutationWatch(path=path, label=f"Gate 7 evidence {path.name}")
+        for path in watched_paths
+    ]
+    watches.append(
+        MutationWatch(
+            path=checkpoint,
+            label="Gate 6 checkpoint tree",
+            recursive=True,
+        )
+    )
+    try:
+        guard = PathMutationGuard.open(watches)
+        try:
+            _current, current_sha256 = _load_gate_artifact_snapshot(
+                root / REQUIRED_GATE_FILES["trainer"], "trainer_guard_recheck"
+            )
+            if current_sha256 != trainer_sha256:
+                raise GateArtifactError(
+                    "trainer artifact changed while Gate 7 mutation guards were installed"
+                )
+        except BaseException:
+            guard.close()
+            raise
+        return guard
+    except StablePathError as error:
+        raise GateArtifactError(f"cannot guard Gate 7 evidence: {error}") from error
 
 
 def _record_cleanup_error(primary: BaseException, cleanup: BaseException) -> None:
@@ -206,6 +317,8 @@ def analyze_directory(directory: str | Path) -> dict[str, Any]:
     }
     seen_learning_groups: set[tuple[str, str]] = set()
     for path in sorted(root.rglob("*.json")):
+        if path.name in _AUDIT_META_FILENAMES:
+            continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -253,7 +366,7 @@ def analyze_directory(directory: str | Path) -> dict[str, Any]:
 
 
 def audit_gate_directory(directory: str | Path) -> dict[str, Any]:
-    """Verify the complete Gate 1--6 evidence chain and return an auditable manifest."""
+    """Verify Gate 1--6 plus the independent adapter reload evidence chain."""
 
     root = Path(directory).expanduser().resolve()
     if not root.is_dir():
@@ -396,11 +509,12 @@ def audit_gate_directory(directory: str | Path) -> dict[str, Any]:
 
     summary = analyze_directory(root)
     for gate, path, _payload, snapshot_sha256 in artifacts:
-        _current_payload, current_sha256 = _load_gate_artifact_snapshot(path, gate)
+        current_payload, current_sha256 = _load_gate_artifact_snapshot(path, gate)
         if current_sha256 != snapshot_sha256:
             raise GateArtifactError(
                 f"gate {gate} artifact changed during Gate 7 audit: {path}"
             )
+        GATE_VERIFIERS[gate](current_payload)
 
     chain: list[dict[str, Any]] = []
     previous_sha256: str | None = None
@@ -415,10 +529,14 @@ def audit_gate_directory(directory: str | Path) -> dict[str, Any]:
         )
         previous_sha256 = sha256
 
-    trainer_payload = artifacts[-1][2]
+    trainer_payload = payload_by_gate["trainer"]
+    reload_payload = payload_by_gate["adapter_reload"]
     summary.update(
         {
-            "runtime_verified": True,
+            "schema_version": 1,
+            "artifact_type": "capsule_rl_gate07_candidate_audit",
+            "runtime_verified": False,
+            "runtime_verification_pending": list(RUNTIME_VERIFICATION_PENDING),
             "run_id": identity[0],
             "config_sha256": identity[1],
             "git_sha": identity[2],
@@ -435,6 +553,557 @@ def audit_gate_directory(directory: str | Path) -> dict[str, Any]:
             "gate_chain": chain,
             "gradient_norm": trainer_payload["gradient_norm"],
             "trainer_metrics": dict(trainer_payload["metrics"]),
+            "adapter_reload_artifact_sha256": next(
+                sha256
+                for gate, _path, _payload, sha256 in artifacts
+                if gate == "adapter_reload"
+            ),
+            "adapter_reload_max_abs_logit_diff": reload_payload[
+                "max_abs_logit_diff"
+            ],
+            "adapter_model_sha256": reload_payload["adapter_model_sha256"],
+            "adapter_config_sha256": reload_payload["adapter_config_sha256"],
+        }
+    )
+    return summary
+
+
+def _verify_continuous_memory_artifact(
+    path: Path,
+) -> tuple[Mapping[str, Any], str]:
+    payload, sha256 = _load_gate_artifact_snapshot(path, "launcher_continuous_memory")
+    expected_fields = {
+        "schema_version",
+        "artifact_type",
+        "interval_s",
+        "required_mib",
+        "sample_count",
+        "minimum_available_mib",
+        "maximum_sample_gap_ms",
+        "maximum_allowed_gap_ms",
+        "passed",
+        "probe_error",
+        "samples",
+    }
+    if set(payload) != expected_fields:
+        raise GateArtifactError("continuous memory artifact schema is incomplete or unexpected")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("artifact_type") != "single_a800_continuous_memory"
+        or payload.get("required_mib") != 12288
+        or payload.get("passed") is not True
+        or payload.get("probe_error") is not None
+    ):
+        raise GateArtifactError("continuous memory artifact did not pass the 12 GiB contract")
+    interval_s = payload.get("interval_s")
+    if (
+        isinstance(interval_s, bool)
+        or not isinstance(interval_s, (int, float))
+        or not math.isfinite(float(interval_s))
+        or interval_s <= 0
+    ):
+        raise GateArtifactError("continuous memory interval must be positive and finite")
+    samples = payload.get("samples")
+    if not isinstance(samples, list) or len(samples) < 2:
+        raise GateArtifactError("continuous memory artifact requires at least two samples")
+    normalized: list[tuple[int, int]] = []
+    for sample in samples:
+        if not isinstance(sample, Mapping):
+            raise GateArtifactError("continuous memory sample must be a mapping")
+        elapsed_ms = sample.get("elapsed_ms")
+        available_mib = sample.get("available_mib")
+        if (
+            isinstance(elapsed_ms, bool)
+            or not isinstance(elapsed_ms, int)
+            or elapsed_ms < 0
+            or isinstance(available_mib, bool)
+            or not isinstance(available_mib, int)
+            or available_mib < 12288
+        ):
+            raise GateArtifactError("continuous memory sample violates the 12 GiB contract")
+        normalized.append((elapsed_ms, available_mib))
+    if any(later[0] < earlier[0] for earlier, later in zip(normalized, normalized[1:])):
+        raise GateArtifactError("continuous memory sample times must be monotonic")
+    minimum = min(available for _elapsed, available in normalized)
+    maximum_gap = max(
+        (
+            later[0] - earlier[0]
+            for earlier, later in zip(normalized, normalized[1:])
+        ),
+        default=0,
+    )
+    maximum_allowed_gap = int(max(5.0, float(interval_s) * 5) * 1000)
+    if (
+        payload.get("sample_count") != len(normalized)
+        or payload.get("minimum_available_mib") != minimum
+        or payload.get("maximum_sample_gap_ms") != maximum_gap
+        or payload.get("maximum_allowed_gap_ms") != maximum_allowed_gap
+        or maximum_gap > maximum_allowed_gap
+    ):
+        raise GateArtifactError("continuous memory aggregate evidence is inconsistent")
+    return payload, sha256
+
+
+def _is_lower_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _verify_controller_attestation_artifact(
+    path: Path,
+) -> tuple[Mapping[str, Any], str]:
+    payload, sha256 = _load_gate_artifact_snapshot(
+        path, "launcher_controller_attestation"
+    )
+    expected_fields = {
+        "schema_version",
+        "artifact_type",
+        "version_tag",
+        "archive_path",
+        "archive_sha256",
+        "binary_path",
+        "binary_archive_member",
+        "binary_sha256",
+        "gguf_path",
+        "gguf_sha256",
+        "build_number",
+        "runtime_tree_sha256",
+        "regular_file_count",
+        "symlink_count",
+    }
+    if set(payload) != expected_fields:
+        raise GateArtifactError(
+            "Controller runtime attestation schema is incomplete or unexpected"
+        )
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("artifact_type")
+        != "llama_cpp_b10516_runtime_attestation"
+        or payload.get("version_tag") != "b10516"
+        or payload.get("build_number") != 10516
+        or payload.get("archive_sha256") != _LLAMA_ARCHIVE_SHA256
+        or payload.get("gguf_sha256") != _CONTROLLER_GGUF_SHA256
+    ):
+        raise GateArtifactError(
+            "Controller runtime attestation does not bind the fixed b10516/Q4_K_M inputs"
+        )
+    for field_name in ("archive_path", "binary_path", "gguf_path"):
+        value = payload.get(field_name)
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise GateArtifactError(
+                f"Controller runtime attestation {field_name} must be absolute"
+            )
+    member = payload.get("binary_archive_member")
+    if not isinstance(member, str) or not member or Path(member).name != "llama-server":
+        raise GateArtifactError(
+            "Controller runtime attestation must identify the archive llama-server"
+        )
+    for field_name in ("binary_sha256", "runtime_tree_sha256"):
+        if not _is_lower_sha256(payload.get(field_name)):
+            raise GateArtifactError(
+                f"Controller runtime attestation {field_name} must be SHA-256"
+            )
+    regular_count = payload.get("regular_file_count")
+    symlink_count = payload.get("symlink_count")
+    if (
+        isinstance(regular_count, bool)
+        or not isinstance(regular_count, int)
+        or regular_count < 1
+        or isinstance(symlink_count, bool)
+        or not isinstance(symlink_count, int)
+        or symlink_count < 0
+    ):
+        raise GateArtifactError(
+            "Controller runtime attestation member counts are invalid"
+        )
+    try:
+        recomputed = attest_llama_cpp_runtime(
+            archive_path=payload["archive_path"],
+            expected_archive_sha256=_LLAMA_ARCHIVE_SHA256,
+            binary_path=payload["binary_path"],
+            gguf_path=payload["gguf_path"],
+            expected_gguf_sha256=_CONTROLLER_GGUF_SHA256,
+            expected_build_number=10516,
+            version_tag="b10516",
+        )
+    except LlamaRuntimeAttestationError as error:
+        raise GateArtifactError(
+            f"Controller runtime changed before final Gate 7 publication: {error}"
+        ) from error
+    if recomputed != dict(payload):
+        raise GateArtifactError(
+            "Controller runtime attestation changed before final Gate 7 publication"
+        )
+    return payload, sha256
+
+
+def _verify_owned_cleanup_artifact(
+    path: Path, *, expected_run_id: str
+) -> tuple[Mapping[str, Any], str]:
+    payload, sha256 = _load_gate_artifact_snapshot(path, "launcher_owned_cleanup")
+    if set(payload) != {
+        "schema_version",
+        "artifact_type",
+        "run_id",
+        "cleanup_completed",
+        "services",
+    }:
+        raise GateArtifactError("owned-service cleanup schema is incomplete or unexpected")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("artifact_type") != "single_a800_owned_service_cleanup"
+        or payload.get("run_id") != expected_run_id
+        or payload.get("cleanup_completed") is not True
+    ):
+        raise GateArtifactError("owned-service cleanup did not complete for this run")
+    services = payload.get("services")
+    if not isinstance(services, list) or len(services) != 3:
+        raise GateArtifactError("owned-service cleanup must bind exactly three services")
+    expected_names = {"controller", "program", "pyroki"}
+    seen_names: set[str] = set()
+    seen_processes: set[tuple[int, int]] = set()
+    for service in services:
+        if not isinstance(service, Mapping) or set(service) != {
+            "name",
+            "pid",
+            "starttime_ticks",
+            "termination_confirmed",
+        }:
+            raise GateArtifactError("owned-service cleanup entry schema is invalid")
+        name = service.get("name")
+        pid = service.get("pid")
+        starttime_ticks = service.get("starttime_ticks")
+        if (
+            name not in expected_names
+            or name in seen_names
+            or isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid < 1
+            or isinstance(starttime_ticks, bool)
+            or not isinstance(starttime_ticks, int)
+            or starttime_ticks < 1
+            or service.get("termination_confirmed") is not True
+            or (pid, starttime_ticks) in seen_processes
+        ):
+            raise GateArtifactError("owned-service cleanup entry is invalid or duplicated")
+        proc_stat = Path(f"/proc/{pid}/stat")
+        if Path("/proc").is_dir():
+            try:
+                stat_text = proc_stat.read_text(encoding="ascii")
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise GateArtifactError(
+                    f"cannot verify cleaned owned process {pid}: {error}"
+                ) from error
+            else:
+                closing = stat_text.rfind(")")
+                if closing < 0:
+                    raise GateArtifactError(
+                        f"cannot parse cleaned owned process identity for PID {pid}"
+                    )
+                try:
+                    current_starttime = int(stat_text[closing + 2 :].split()[19])
+                except (IndexError, ValueError):
+                    raise GateArtifactError(
+                        f"cannot parse cleaned owned process identity for PID {pid}"
+                    ) from None
+                if current_starttime == starttime_ticks:
+                    raise GateArtifactError(
+                        f"owned service {name} is still running at final Gate 7"
+                    )
+        seen_names.add(name)
+        seen_processes.add((pid, starttime_ticks))
+    if seen_names != expected_names:
+        raise GateArtifactError("owned-service cleanup is missing a required service")
+    return payload, sha256
+
+
+def _non_negative_int(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
+
+
+def _verify_initial_audit_artifact(
+    path: Path, *, expected_run_id: str, expected_git_sha: str
+) -> tuple[Mapping[str, Any], str]:
+    payload, sha256 = _load_gate_artifact_snapshot(path, "launcher_initial_audit")
+    if set(payload) != {
+        "schema_version",
+        "artifact_type",
+        "run_id",
+        "retry_name",
+        "profile_sha256",
+        "snapshot",
+    }:
+        raise GateArtifactError("initial hardware audit schema is incomplete or unexpected")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("artifact_type") != "single_a800_initial_audit"
+        or payload.get("run_id") != expected_run_id
+        or payload.get("retry_name") not in _OOM_PROFILES
+        or not _is_lower_sha256(payload.get("profile_sha256"))
+    ):
+        raise GateArtifactError("initial hardware audit identity is invalid")
+    snapshot = payload.get("snapshot")
+    expected_snapshot_fields = {
+        "gpu_name",
+        "gpu_count",
+        "gpu_total_vram_mib",
+        "gpu_free_vram_mib",
+        "other_gpu_processes_mib",
+        "host_memory_mib",
+        "mem_available_before_controller_mib",
+        "mem_available_after_controller_mib",
+        "mem_available_during_run_mib",
+        "shm_available_mib",
+        "disk_free_mib",
+        "cuda_version",
+        "nvidia_driver",
+        "repo_head",
+        "repo_is_dirty",
+        "system_version",
+    }
+    if not isinstance(snapshot, Mapping) or set(snapshot) != expected_snapshot_fields:
+        raise GateArtifactError("initial hardware audit snapshot schema is invalid")
+    gpu_name = snapshot.get("gpu_name")
+    normalized_gpu_name = (
+        gpu_name.upper().replace("-", "").replace(" ", "")
+        if isinstance(gpu_name, str)
+        else ""
+    )
+    threshold_fields = {
+        "gpu_count": 1,
+        "gpu_total_vram_mib": 81920,
+        "gpu_free_vram_mib": 77824,
+        "host_memory_mib": 122880,
+        "shm_available_mib": 12288,
+        "disk_free_mib": 81920,
+    }
+    for field_name, minimum in threshold_fields.items():
+        value = snapshot.get(field_name)
+        if not _non_negative_int(value):
+            raise GateArtifactError(f"initial hardware audit {field_name} is invalid")
+        if field_name == "gpu_count":
+            if value != minimum:
+                raise GateArtifactError("initial hardware audit requires exactly one GPU")
+        elif value < minimum:
+            raise GateArtifactError(
+                f"initial hardware audit {field_name} is below the fixed threshold"
+            )
+    if "A800" not in normalized_gpu_name or "80GB" not in normalized_gpu_name:
+        raise GateArtifactError("initial hardware audit GPU must be an A800 80GB")
+    other_processes = snapshot.get("other_gpu_processes_mib")
+    if (
+        not isinstance(other_processes, list)
+        or any(
+            not _non_negative_int(value) or value > 512
+            for value in other_processes
+        )
+    ):
+        raise GateArtifactError("initial hardware audit has an oversized GPU process")
+    for field_name in (
+        "mem_available_before_controller_mib",
+        "mem_available_after_controller_mib",
+        "mem_available_during_run_mib",
+    ):
+        if not _non_negative_int(snapshot.get(field_name)):
+            raise GateArtifactError(f"initial hardware audit {field_name} is invalid")
+    for field_name in ("cuda_version", "nvidia_driver", "system_version"):
+        value = snapshot.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise GateArtifactError(f"initial hardware audit {field_name} is empty")
+    if snapshot.get("repo_head") != expected_git_sha:
+        raise GateArtifactError("initial hardware audit Git SHA does not match Gate 1")
+    if not isinstance(snapshot.get("repo_is_dirty"), bool):
+        raise GateArtifactError("initial hardware audit repo_is_dirty must be boolean")
+    return payload, sha256
+
+
+def _verify_post_controller_memory_artifact(
+    path: Path,
+) -> tuple[Mapping[str, Any], str]:
+    payload, sha256 = _load_gate_artifact_snapshot(
+        path, "launcher_memory_00_post-controller"
+    )
+    if set(payload) != {
+        "schema_version",
+        "artifact_type",
+        "stage",
+        "available_mib",
+        "required_mib",
+        "passed",
+    }:
+        raise GateArtifactError("post-Controller memory artifact schema is invalid")
+    available = payload.get("available_mib")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("artifact_type") != "single_a800_memory_check"
+        or payload.get("stage") != "post-controller"
+        or payload.get("required_mib") != 92160
+        or payload.get("passed") is not True
+        or not _non_negative_int(available)
+        or available < 92160
+    ):
+        raise GateArtifactError("post-Controller MemAvailable did not satisfy 90 GiB")
+    return payload, sha256
+
+
+def _verify_resolved_verl_profile(
+    path: Path,
+    *,
+    initial_profile_sha256: object,
+    candidate_profile_sha256: object,
+    retry_name: object,
+) -> str:
+    try:
+        snapshot = read_stable_regular_file(path, label="resolved VeRL profile")
+    except StablePathError as error:
+        raise GateArtifactError(f"cannot read resolved VeRL profile: {error}") from error
+    if snapshot.sha256 != initial_profile_sha256:
+        raise GateArtifactError(
+            "resolved VeRL profile SHA does not match the initial launcher audit"
+        )
+    if snapshot.sha256 != candidate_profile_sha256:
+        raise GateArtifactError(
+            "resolved VeRL profile SHA does not match the Gate 7 candidate"
+        )
+    try:
+        payload = yaml.safe_load(snapshot.raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
+        raise GateArtifactError(f"resolved VeRL profile is invalid YAML: {error}") from error
+    capsule_runtime = payload.get("capsule_runtime") if isinstance(payload, Mapping) else None
+    oom_profile = (
+        capsule_runtime.get("oom_profile")
+        if isinstance(capsule_runtime, Mapping)
+        else None
+    )
+    if oom_profile != retry_name:
+        raise GateArtifactError(
+            "resolved VeRL capsule_runtime.oom_profile does not match initial audit retry_name"
+        )
+    return snapshot.sha256
+
+
+def finalize_runtime_audit(
+    directory: str | Path,
+    *,
+    candidate_artifact: str | Path,
+    continuous_memory_artifact: str | Path,
+    controller_attestation_artifact: str | Path,
+    owned_cleanup_artifact: str | Path,
+) -> dict[str, Any]:
+    """Bind the monitored Gate 7 candidate and successful owned-service cleanup proof."""
+
+    root = Path(directory).expanduser().resolve()
+    candidate_path = Path(candidate_artifact).expanduser().resolve()
+    memory_path = Path(continuous_memory_artifact).expanduser().resolve()
+    controller_path = Path(controller_attestation_artifact).expanduser().resolve()
+    cleanup_path = Path(owned_cleanup_artifact).expanduser().resolve()
+    initial_audit_path = root / "launcher_initial_audit.json"
+    post_controller_memory_path = root / "launcher_memory_00_post-controller.json"
+    if candidate_path != root / "gate07_audit.candidate.json":
+        raise GateArtifactError("Gate 7 candidate must use the owned launcher path")
+    if memory_path != root / "launcher_continuous_memory.json":
+        raise GateArtifactError("continuous memory evidence must use the owned launcher path")
+    if controller_path != root / "launcher_controller_attestation.json":
+        raise GateArtifactError(
+            "Controller runtime attestation must use the owned launcher path"
+        )
+    if cleanup_path != root / "launcher_owned_cleanup.json":
+        raise GateArtifactError("owned-service cleanup must use the owned launcher path")
+    launcher_failure = root / "launcher_failure.json"
+    if launcher_failure.exists() or launcher_failure.is_symlink():
+        raise GateArtifactError("launcher failure evidence forbids runtime verification")
+
+    candidate, candidate_sha256 = _load_gate_artifact_snapshot(
+        candidate_path, "gate07_candidate"
+    )
+    if (
+        candidate.get("runtime_verified") is not False
+        or candidate.get("runtime_verification_pending")
+        != list(RUNTIME_VERIFICATION_PENDING)
+    ):
+        raise GateArtifactError("Gate 7 candidate is not pending launcher finalization")
+    memory, memory_sha256 = _verify_continuous_memory_artifact(memory_path)
+    controller, controller_sha256 = _verify_controller_attestation_artifact(
+        controller_path
+    )
+    cleanup, cleanup_sha256 = _verify_owned_cleanup_artifact(
+        cleanup_path, expected_run_id=str(candidate.get("run_id"))
+    )
+    initial_audit, initial_audit_sha256 = _verify_initial_audit_artifact(
+        initial_audit_path,
+        expected_run_id=str(candidate.get("run_id")),
+        expected_git_sha=str(candidate.get("git_sha")),
+    )
+    post_controller_memory, post_controller_memory_sha256 = (
+        _verify_post_controller_memory_artifact(post_controller_memory_path)
+    )
+    resolved_profile_sha256 = _verify_resolved_verl_profile(
+        root / "resolved" / "verl.yaml",
+        initial_profile_sha256=initial_audit.get("profile_sha256"),
+        candidate_profile_sha256=candidate.get("verl_resolved_config_sha256"),
+        retry_name=initial_audit.get("retry_name"),
+    )
+    summary = audit_gate_directory(root)
+    if resolved_profile_sha256 != summary.get("verl_resolved_config_sha256"):
+        raise GateArtifactError(
+            "resolved VeRL profile SHA does not match the recomputed gate summary"
+        )
+    expected_candidate = dict(summary)
+    actual_candidate = dict(candidate)
+    expected_candidate.pop("artifact_files", None)
+    actual_candidate.pop("artifact_files", None)
+    if actual_candidate != expected_candidate:
+        raise GateArtifactError("Gate 7 candidate does not match the final gate chain")
+
+    summary.pop("runtime_verification_pending", None)
+    summary.update(
+        {
+            "artifact_type": "capsule_rl_gate07_runtime_audit",
+            "runtime_verified": True,
+            "gate07_candidate_sha256": candidate_sha256,
+            "launcher_continuous_memory_sha256": memory_sha256,
+            "launcher_controller_attestation_sha256": controller_sha256,
+            "launcher_owned_cleanup_sha256": cleanup_sha256,
+            "launcher_initial_audit_sha256": initial_audit_sha256,
+            "launcher_post_controller_memory_sha256": (
+                post_controller_memory_sha256
+            ),
+            "continuous_memory_required_mib": memory["required_mib"],
+            "minimum_mem_available_mib": memory["minimum_available_mib"],
+            "continuous_memory_sample_count": memory["sample_count"],
+            "continuous_memory_maximum_sample_gap_ms": memory[
+                "maximum_sample_gap_ms"
+            ],
+            "controller_archive_sha256": controller["archive_sha256"],
+            "controller_binary_sha256": controller["binary_sha256"],
+            "controller_gguf_sha256": controller["gguf_sha256"],
+            "controller_runtime_tree_sha256": controller["runtime_tree_sha256"],
+            "owned_service_cleanup_completed": cleanup["cleanup_completed"],
+            "owned_service_cleanup_count": len(cleanup["services"]),
+            "oom_profile": initial_audit["retry_name"],
+            "resolved_profile_sha256": resolved_profile_sha256,
+            "initial_hardware": {
+                "gpu_name": initial_audit["snapshot"]["gpu_name"],
+                "gpu_count": initial_audit["snapshot"]["gpu_count"],
+                "gpu_total_vram_mib": initial_audit["snapshot"][
+                    "gpu_total_vram_mib"
+                ],
+                "gpu_free_vram_mib": initial_audit["snapshot"][
+                    "gpu_free_vram_mib"
+                ],
+                "host_memory_mib": initial_audit["snapshot"]["host_memory_mib"],
+                "shm_available_mib": initial_audit["snapshot"]["shm_available_mib"],
+                "disk_free_mib": initial_audit["snapshot"]["disk_free_mib"],
+                "repo_is_dirty": initial_audit["snapshot"]["repo_is_dirty"],
+            },
+            "mem_available_after_controller_mib": post_controller_memory[
+                "available_mib"
+            ],
         }
     )
     return summary
@@ -447,7 +1116,7 @@ def _markdown(summary: Mapping[str, Any]) -> str:
         [
             "",
             "This report audits persisted evidence only; it does not claim simulator or training ",
-            "runtime verification unless gates 1 through 6 all passed.",
+            "runtime verification unless gates 1 through 6 and the adapter reload all passed.",
             "",
         ]
     )
@@ -458,6 +1127,8 @@ def _publish_audit_outputs(
     output_json: Path,
     output_report: Path,
     summary: Mapping[str, Any],
+    *,
+    post_publish_verify: Callable[[], None] | None = None,
 ) -> None:
     """Publish the JSON and Markdown pair together, rolling back a partial pair."""
 
@@ -501,6 +1172,8 @@ def _publish_audit_outputs(
         published.append(
             (report_path, report_staging, staged_payloads[1][1].encode("utf-8"))
         )
+        if post_publish_verify is not None:
+            post_publish_verify()
     except BaseException as error:
         primary_error = error
         for path, staging, expected in reversed(published):
@@ -523,6 +1196,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--output-report", type=Path, required=True)
+    parser.add_argument("--candidate-artifact", type=Path)
+    parser.add_argument("--continuous-memory-artifact", type=Path)
+    parser.add_argument("--controller-attestation-artifact", type=Path)
+    parser.add_argument("--owned-cleanup-artifact", type=Path)
     add_validation_arguments(parser)
     return parser
 
@@ -535,18 +1212,74 @@ def main(argv: list[str] | None = None) -> int:
     for output in (args.output_json, args.output_report):
         if output.exists():
             raise FileExistsError(f"artifact already exists: {output.resolve()}")
-    summary = audit_gate_directory(args.input_dir)
-    plan = {
-        "mode": "VALIDATION ONLY" if validate_only else "ANALYZE",
-        "input": str(args.input_dir.resolve()),
-        "json": str(args.output_json.resolve()),
-        "report": str(args.output_report.resolve()),
-        "verified_run_id": summary["run_id"],
-    }
-    print(json.dumps(plan, ensure_ascii=False, indent=2))
-    if validate_only:
-        return 0
-    _publish_audit_outputs(args.output_json, args.output_report, summary)
+    finalization_values = (
+        args.candidate_artifact,
+        args.continuous_memory_artifact,
+        args.controller_attestation_artifact,
+        args.owned_cleanup_artifact,
+    )
+    provided = sum(value is not None for value in finalization_values)
+    if provided not in {0, len(finalization_values)}:
+        raise ValueError(
+            "all Gate 7 finalization artifacts must be provided together"
+        )
+    finalizing = provided == len(finalization_values)
+    root = args.input_dir.expanduser().resolve()
+
+    def compute_summary() -> dict[str, Any]:
+        if not finalizing:
+            return audit_gate_directory(root)
+        return finalize_runtime_audit(
+            root,
+            candidate_artifact=args.candidate_artifact,
+            continuous_memory_artifact=args.continuous_memory_artifact,
+            controller_attestation_artifact=args.controller_attestation_artifact,
+            owned_cleanup_artifact=args.owned_cleanup_artifact,
+        )
+
+    with _gate7_mutation_context(root, finalizing=finalizing) as mutation_guard:
+        summary = compute_summary()
+        plan = {
+            "mode": "VALIDATION ONLY" if validate_only else "ANALYZE",
+            "input": str(root),
+            "json": str(args.output_json.resolve()),
+            "report": str(args.output_report.resolve()),
+            "verified_run_id": summary["run_id"],
+        }
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+        if validate_only:
+            if isinstance(mutation_guard, PathMutationGuard):
+                mutation_guard.assert_unchanged(
+                    context="during Gate 7 validation"
+                )
+            return 0
+
+        def verify_after_publish() -> None:
+            if isinstance(mutation_guard, PathMutationGuard):
+                mutation_guard.assert_unchanged(
+                    context="during Gate 7 publication"
+                )
+            if finalizing:
+                recomputed = compute_summary()
+                expected = dict(summary)
+                actual = dict(recomputed)
+                expected.pop("artifact_files", None)
+                actual.pop("artifact_files", None)
+                if actual != expected:
+                    raise GateArtifactError(
+                        "Gate 7 evidence changed during final publication"
+                    )
+            if isinstance(mutation_guard, PathMutationGuard):
+                mutation_guard.assert_unchanged(
+                    context="during Gate 7 post-publication verification"
+                )
+
+        _publish_audit_outputs(
+            args.output_json,
+            args.output_report,
+            summary,
+            post_publish_verify=verify_after_publish,
+        )
     return 0
 
 

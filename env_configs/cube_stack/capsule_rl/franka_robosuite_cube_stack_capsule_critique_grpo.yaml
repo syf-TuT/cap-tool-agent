@@ -11,7 +11,8 @@ runtime:
   run_id: replace-with-unique-run-id
   # This repository does not vendor the checkout; point to a separate clone at the pinned SHA.
   verl_source_path: /path/to/pinned/verl
-  verl_pinned_sha: d5b4ca2712b3048a60745482a74425d687add0bb
+  # Official VeRL v0.6.1 tag.
+  verl_pinned_sha: d62da4950573d7a4b7ef2362337952e7ab59e78d
   # Fully composed pinned VeRL PPO config containing hardware/batch/rollout settings. The
   # project factory overrides only the Capsule invariants and model/output paths.
   verl_resolved_config_path: /path/to/resolved_verl_ppo.yaml

@@ -15,6 +15,8 @@ import math
 import os
 import re
 import subprocess
+import sys
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +32,12 @@ from capx.rl.capsule.schema import (
     ReplayOutcome,
     TaskInstanceV1,
 )
+from capx.rl.capsule.stable_io import (
+    MutationWatch,
+    PathMutationGuard,
+    StablePathError,
+    read_stable_regular_file,
+)
 from capx.rl.capsule.telemetry import summarize_replay_results
 
 from .common import (
@@ -37,6 +45,7 @@ from .common import (
     GateArtifactError,
     artifact_file_sha256,
     atomic_write_json,
+    direct_lora_adapter_evidence,
     gate_failure_artifact_path,
     load_and_validate_server_config,
     load_and_validate_server_config_bytes,
@@ -54,6 +63,197 @@ from .common import (
 
 class ServerAdapterError(RuntimeError):
     """A server gate cannot produce trustworthy evidence."""
+
+
+def _derive_training_tensor_evidence(result: Any, group: Any) -> dict[str, Any]:
+    """Derive Gate 6 mask/KL evidence from the exact batch consumed by ``update_actor``."""
+
+    import torch
+
+    expected_trace = ("old_logprob", "reference_logprob", "update")
+    trace = getattr(result, "execution_trace", None)
+    normalized_trace = tuple(trace) if isinstance(trace, (list, tuple)) else ()
+    if normalized_trace != expected_trace:
+        raise ServerAdapterError(
+            "trainer execution trace must be exactly "
+            "old_logprob -> reference_logprob -> update"
+        )
+    tensors = getattr(result.batch, "batch", result.batch)
+    required = (
+        "response_mask",
+        "guided_token_mask",
+        "rollout_is_weights",
+        "old_log_probs",
+        "ref_log_prob",
+    )
+    if any(name not in tensors for name in required):
+        raise ServerAdapterError(
+            "trainer update batch omitted response/guided/old/reference log-prob evidence"
+        )
+    response_mask, guided_mask, rollout_mask, old_log_probs, ref_log_prob = (
+        tensors[name] for name in required
+    )
+    if any(
+        not isinstance(value, torch.Tensor)
+        for value in (response_mask, guided_mask, rollout_mask, old_log_probs, ref_log_prob)
+    ):
+        raise ServerAdapterError("trainer Gate 6 evidence fields must be torch tensors")
+    expected_shape = response_mask.shape
+    if (
+        response_mask.ndim != 2
+        or expected_shape[0] != 8
+        or any(
+            value.shape != expected_shape
+            for value in (guided_mask, rollout_mask, old_log_probs, ref_log_prob)
+        )
+        or response_mask.dtype != torch.bool
+        or guided_mask.dtype != torch.bool
+        or rollout_mask.dtype != torch.bool
+        or not old_log_probs.is_floating_point()
+        or not ref_log_prob.is_floating_point()
+        or torch.any(response_mask.sum(dim=-1) == 0).item()
+    ):
+        raise ServerAdapterError(
+            "trainer mask and old/reference log-prob tensors must share shape (8, response_length)"
+        )
+    guided_rows = torch.tensor(
+        [member.member_type == "critique_guided_revision" for member in group.members],
+        dtype=torch.bool,
+        device=response_mask.device,
+    )
+    expected_guided_mask = response_mask & guided_rows.unsqueeze(-1)
+    if (
+        int(guided_rows.sum().item()) != 1
+        or not torch.equal(guided_mask, expected_guided_mask)
+        or not torch.equal(rollout_mask, guided_mask)
+    ):
+        raise ServerAdapterError(
+            "trainer guided/rollout mask does not derive from the single guided response row"
+        )
+    if not torch.all(torch.isfinite(old_log_probs)).item():
+        raise ServerAdapterError("trainer old_log_probs contains non-finite values")
+    if not torch.all(torch.isfinite(ref_log_prob)).item():
+        raise ServerAdapterError("trainer ref_log_prob contains non-finite values")
+    guided_token_count = int(guided_mask.sum().item())
+    if guided_token_count < 1:
+        raise ServerAdapterError("trainer guided response contains no guided tokens")
+    return {
+        "guided_token_mask_present": True,
+        "guided_token_count": guided_token_count,
+        "guided_token_mask_shape": list(expected_shape),
+        "guided_row_indices": torch.nonzero(guided_rows, as_tuple=False)
+        .flatten()
+        .detach()
+        .cpu()
+        .tolist(),
+        "guided_mask_response_only": True,
+        "rollout_mask_matches_guided": True,
+        "old_log_probs_finite": True,
+        "reference_log_probs_finite": True,
+        "reference_log_prob_shape": list(ref_log_prob.shape),
+        "reference_log_prob_response_token_counts": response_mask.sum(dim=-1)
+        .detach()
+        .cpu()
+        .tolist(),
+        "training_call_trace": list(expected_trace),
+        "reference_kl_enabled": True,
+    }
+
+
+def _read_host_mem_available_bytes(path: Path = Path("/proc/meminfo")) -> int:
+    try:
+        for line in path.read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                fields = line.split()
+                if len(fields) == 3 and fields[2] == "kB":
+                    value = int(fields[1]) * 1024
+                    if value > 0:
+                        return value
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ServerAdapterError(f"cannot read host MemAvailable: {error}") from error
+    raise ServerAdapterError("/proc/meminfo omitted a positive MemAvailable value")
+
+
+class _HostMemoryMonitor:
+    """Poll MemAvailable from before worker startup until after Ray shutdown."""
+
+    def __init__(
+        self,
+        *,
+        loader: Callable[[], int] = _read_host_mem_available_bytes,
+        poll_interval_s: float = 0.25,
+        monitor_scope: str = "before_worker_start_through_after_ray_shutdown",
+    ) -> None:
+        if poll_interval_s <= 0:
+            raise ValueError("host memory poll interval must be positive")
+        if not monitor_scope:
+            raise ValueError("host memory monitor scope must be non-empty")
+        self.loader = loader
+        self.poll_interval_s = poll_interval_s
+        self.monitor_scope = monitor_scope
+        self._minimum: int | None = None
+        self._sample_count = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._error: BaseException | None = None
+
+    def sample(self) -> int:
+        value = self.loader()
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ServerAdapterError("host MemAvailable loader returned an invalid value")
+        with self._lock:
+            self._minimum = value if self._minimum is None else min(self._minimum, value)
+            self._sample_count += 1
+        return value
+
+    def _poll(self) -> None:
+        while not self._stop.wait(self.poll_interval_s):
+            try:
+                self.sample()
+            except BaseException as error:
+                self._error = error
+                self._stop.set()
+                return
+
+    def __enter__(self) -> _HostMemoryMonitor:
+        self.sample()
+        self._thread = threading.Thread(
+            target=self._poll,
+            name="capsule-host-memory-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        del exc_type, traceback
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                error = ServerAdapterError("host memory monitor did not stop")
+                if isinstance(exc, BaseException):
+                    _record_cleanup_error(exc, error)
+                else:
+                    raise error
+        if self._error is not None:
+            if isinstance(exc, BaseException):
+                _record_cleanup_error(exc, self._error)
+            else:
+                raise self._error
+        return False
+
+    def evidence(self) -> dict[str, Any]:
+        with self._lock:
+            if self._minimum is None or self._sample_count < 1:
+                raise ServerAdapterError("host memory monitor recorded no samples")
+            return {
+                "sample_count": self._sample_count,
+                "minimum_mem_available_bytes": self._minimum,
+                "poll_interval_s": self.poll_interval_s,
+                "monitor_scope": self.monitor_scope,
+            }
 
 
 class GateRuntime(Protocol):
@@ -237,6 +437,7 @@ def _project_path(config: Mapping[str, Any], value: object, field_name: str) -> 
 
 
 def _git_sha(project_root: Path) -> str:
+    git_environment = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     try:
         completed = subprocess.run(
             ["git", "-C", str(project_root), "rev-parse", "HEAD"],
@@ -244,6 +445,7 @@ def _git_sha(project_root: Path) -> str:
             capture_output=True,
             text=True,
             timeout=10,
+            env=git_environment,
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise ServerAdapterError(f"cannot read project Git SHA: {error}") from error
@@ -257,6 +459,7 @@ def _git_sha(project_root: Path) -> str:
             capture_output=True,
             text=True,
             timeout=10,
+            env=git_environment,
         )
         if Path(top_level.stdout.strip()).resolve() != project_root.resolve():
             raise ServerAdapterError(
@@ -275,6 +478,7 @@ def _git_sha(project_root: Path) -> str:
             capture_output=True,
             text=True,
             timeout=10,
+            env=git_environment,
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise ServerAdapterError(f"cannot inspect project Git worktree: {error}") from error
@@ -284,6 +488,68 @@ def _git_sha(project_root: Path) -> str:
             "before executing a runtime gate"
         )
     return value
+
+
+def _runtime_mutation_watches(
+    config: Mapping[str, Any],
+    *,
+    config_file: Path,
+    command: str,
+    args: argparse.Namespace,
+) -> tuple[MutationWatch, ...]:
+    """Resolve every immutable input consumed by a concrete runtime gate."""
+
+    runtime = config.get("runtime")
+    task = config.get("task")
+    if not isinstance(runtime, Mapping):
+        raise ServerAdapterError("runtime must be a mapping")
+    if not isinstance(task, Mapping):
+        raise ServerAdapterError("task must be a mapping")
+    watches = [
+        MutationWatch(config_file, "server config"),
+        MutationWatch(runtime_dataset_path(config), "runtime dataset"),
+        MutationWatch(
+            _project_path(config, task.get("config_path"), "task.config_path"),
+            "resolved environment config",
+        ),
+        MutationWatch(
+            _project_path(
+                config,
+                runtime.get("verl_resolved_config_path"),
+                "runtime.verl_resolved_config_path",
+            ),
+            "resolved VeRL config",
+        ),
+        MutationWatch(
+            _project_path(
+                config,
+                runtime.get("program_model_path"),
+                "runtime.program_model_path",
+            ),
+            "Program model tree",
+            recursive=True,
+        ),
+        MutationWatch(
+            _project_path(
+                config,
+                runtime.get("verl_source_path"),
+                "runtime.verl_source_path",
+            ),
+            "VeRL source tree",
+            recursive=True,
+        ),
+    ]
+    if command == "trainer":
+        guided_artifact = args.guided_artifact.expanduser().resolve()
+        watches.append(MutationWatch(guided_artifact, "guided Gate 5 artifact"))
+    return tuple(watches)
+
+
+def _assert_runtime_inputs_unchanged(guard: PathMutationGuard) -> None:
+    try:
+        guard.assert_unchanged(context="during runtime gate")
+    except StablePathError as error:
+        raise ServerAdapterError(str(error)) from error
 
 
 def _gate_name(command: str) -> str:
@@ -432,15 +698,36 @@ def execute_gate(
     actor_identity: dict[str, Any] | None = None
     transaction: GateTransaction | None = None
     published_artifact: _PublishedArtifactIdentity | None = None
+    mutation_guard: PathMutationGuard | None = None
+    previous_dont_write_bytecode = sys.dont_write_bytecode
     stage = "config_hash"
     try:
-        config_bytes = config_file.read_bytes()
-        config_sha256 = hashlib.sha256(config_bytes).hexdigest()
+        try:
+            config_snapshot = read_stable_regular_file(
+                config_file, label="server config"
+            )
+        except StablePathError as error:
+            raise ServerAdapterError(str(error)) from error
+        config_bytes = config_snapshot.raw_bytes
+        config_sha256 = config_snapshot.sha256
         stage = "config_load"
         resolved_config_loader = load_and_validate_server_config_bytes
         if config_loader is not None:
             resolved_config_loader = config_loader
         config = resolved_config_loader(config_bytes, check_runtime_paths=True)
+        stage = "runtime_mutation_guard"
+        sys.dont_write_bytecode = True
+        try:
+            mutation_guard = PathMutationGuard.open(
+                _runtime_mutation_watches(
+                    config,
+                    config_file=config_file,
+                    command=command,
+                    args=args,
+                )
+            )
+        except StablePathError as error:
+            raise ServerAdapterError(str(error)) from error
         stage = "dataset_hash"
         dataset_path = runtime_dataset_path(config)
         dataset_sha256 = artifact_file_sha256(dataset_path)
@@ -574,6 +861,8 @@ def execute_gate(
         stage = "post_config"
         if artifact_file_sha256(config_file) != config_sha256:
             raise ServerAdapterError("server config bytes changed while the gate was executing")
+        stage = "runtime_mutation_guard"
+        _assert_runtime_inputs_unchanged(mutation_guard)
         stage = "artifact_publish"
         atomic_write_json(artifact_file, payload)
         if transaction is not None:
@@ -629,6 +918,10 @@ def execute_gate(
             except BaseException:
                 pass
         raise
+    finally:
+        if mutation_guard is not None:
+            mutation_guard.close()
+        sys.dont_write_bytecode = previous_dont_write_bytecode
     return payload
 
 
@@ -1262,123 +1555,162 @@ class ConcreteGateRuntime:
         )
         checkpoint_claim.__enter__()
         try:
-            workers = start_verl_workers(self.config)
-            primary_error: BaseException | None = None
+            memory_monitor = _HostMemoryMonitor()
+            memory_monitor.__enter__()
+            monitor_primary_error: BaseException | None = None
             try:
-                verl_provenance_before = workers.verl_provenance()
-                capsule = self.config["capsule"]
-                program = self.config["program_service"]
-                system_prompt = str(
-                    program.get(
-                        "system_prompt",
-                        "Generate only one complete independently executable Python robot program.",
+                workers = start_verl_workers(self.config)
+                primary_error: BaseException | None = None
+                try:
+                    memory_monitor.sample()
+                    verl_provenance_before = workers.verl_provenance()
+                    lora_runtime_before = workers.lora_runtime_evidence()
+                    reference_policy_mode = getattr(
+                        workers, "reference_policy_mode", None
                     )
-                )
-                encoder = VeRLGroupEncoder(
-                    tokenizer=workers.tokenizer,
-                    data_proto_factory=workers.data_proto_factory,
-                    prompt_token_limit=int(capsule["revision_input_max_tokens"]),
-                    response_token_limit=int(capsule["revision_response_max_tokens"]),
-                    system_prompt=system_prompt,
-                )
-                sink = MemoryArtifactSink()
-                trainer = CapsuleCritiqueRayTrainer(
-                    assembler=_StaticAssembler(),
-                    batch_encoder=encoder,
-                    actor_rollout_wg=workers.actor_rollout_wg,
-                    ref_policy_wg=workers.ref_policy_wg,
-                    reference_policy_mode=getattr(
-                        workers, "reference_policy_mode", "standalone"
-                    ),
-                    artifact_sink=sink,
-                    config=self.config,
-                )
-                optimizer_step_before = workers.optimizer_step()
-                result = trainer.run_step(task)
-                actor_update_rpcs = getattr(trainer, "actor_updates_completed", None)
-                if actor_update_rpcs != 1 or isinstance(actor_update_rpcs, bool):
-                    raise ServerAdapterError(
-                        "trainer did not complete exactly one actor update RPC"
+                    if reference_policy_mode != "actor_base_adapter_disabled":
+                        raise ServerAdapterError(
+                            "LoRA Gate 6 requires reference_policy_mode="
+                            "actor_base_adapter_disabled"
+                        )
+                    capsule = self.config["capsule"]
+                    program = self.config["program_service"]
+                    system_prompt = str(
+                        program.get(
+                            "system_prompt",
+                            "Generate only one complete independently executable Python robot "
+                            "program.",
+                        )
                     )
-                optimizer_step_after = workers.optimizer_step()
-                optimizer_step_delta = optimizer_step_after - optimizer_step_before
-                if optimizer_step_delta != 1:
-                    raise ServerAdapterError(
-                        "actor optimizer step did not advance exactly once; "
-                        f"before={optimizer_step_before}, after={optimizer_step_after}"
+                    encoder = VeRLGroupEncoder(
+                        tokenizer=workers.tokenizer,
+                        data_proto_factory=workers.data_proto_factory,
+                        prompt_token_limit=int(capsule["revision_input_max_tokens"]),
+                        response_token_limit=int(capsule["revision_response_max_tokens"]),
+                        system_prompt=system_prompt,
                     )
-                metrics = self._actor_metrics(result.actor_output)
-                grad_values = [
-                    value
-                    for key, value in metrics.items()
-                    if "grad" in key.lower() and "norm" in key.lower()
-                ]
-                if not grad_values or not any(value > 0 for value in grad_values):
-                    raise ServerAdapterError(
-                        "actor metrics contain no positive finite gradient norm"
+                    sink = MemoryArtifactSink()
+                    trainer = CapsuleCritiqueRayTrainer(
+                        assembler=_StaticAssembler(),
+                        batch_encoder=encoder,
+                        actor_rollout_wg=workers.actor_rollout_wg,
+                        ref_policy_wg=workers.ref_policy_wg,
+                        reference_policy_mode=reference_policy_mode,
+                        artifact_sink=sink,
+                        config=self.config,
                     )
-                gradient_norm = max(grad_values)
-                rollout_mode = getattr(workers, "rollout_mode", None)
-                ppo_epochs = getattr(workers, "ppo_epochs", None)
-                ppo_mini_batch_size = getattr(workers, "ppo_mini_batch_size", None)
-                reference_kl_coef = getattr(workers, "kl_loss_coef", None)
-                data_parallel_world_size = getattr(
-                    workers, "data_parallel_world_size", None
-                )
-                sequence_parallel_size = getattr(
-                    workers, "sequence_parallel_size", None
-                )
-                if (
-                    rollout_mode != "sync"
-                    or isinstance(ppo_epochs, bool)
-                    or ppo_epochs != 1
-                    or isinstance(ppo_mini_batch_size, bool)
-                    or ppo_mini_batch_size != 8
-                ):
-                    raise ServerAdapterError(
-                        "trainer worker must use sync rollout, ppo_epochs=1, and "
-                        "ppo_mini_batch_size=8"
+                    optimizer_step_before = workers.optimizer_step()
+                    result = trainer.run_step(task)
+                    training_tensor_evidence = _derive_training_tensor_evidence(
+                        result, group
                     )
-                if (
-                    isinstance(reference_kl_coef, bool)
-                    or not isinstance(reference_kl_coef, (int, float))
-                    or not math.isfinite(float(reference_kl_coef))
-                    or reference_kl_coef <= 0
-                ):
-                    raise ServerAdapterError(
-                        "trainer worker reference KL coefficient must be positive"
+                    memory_monitor.sample()
+                    actor_update_rpcs = getattr(trainer, "actor_updates_completed", None)
+                    if actor_update_rpcs != 1 or isinstance(actor_update_rpcs, bool):
+                        raise ServerAdapterError(
+                            "trainer did not complete exactly one actor update RPC"
+                        )
+                    optimizer_step_after = workers.optimizer_step()
+                    optimizer_step_delta = optimizer_step_after - optimizer_step_before
+                    if optimizer_step_delta != 1:
+                        raise ServerAdapterError(
+                            "actor optimizer step did not advance exactly once; "
+                            f"before={optimizer_step_before}, after={optimizer_step_after}"
+                        )
+                    metrics = self._actor_metrics(result.actor_output)
+                    grad_values = [
+                        value
+                        for key, value in metrics.items()
+                        if "grad" in key.lower() and "norm" in key.lower()
+                    ]
+                    if not grad_values or not any(value > 0 for value in grad_values):
+                        raise ServerAdapterError(
+                            "actor metrics contain no positive finite gradient norm"
+                        )
+                    gradient_norm = max(grad_values)
+                    rollout_mode = getattr(workers, "rollout_mode", None)
+                    ppo_epochs = getattr(workers, "ppo_epochs", None)
+                    ppo_mini_batch_size = getattr(workers, "ppo_mini_batch_size", None)
+                    reference_kl_coef = getattr(workers, "kl_loss_coef", None)
+                    data_parallel_world_size = getattr(
+                        workers, "data_parallel_world_size", None
                     )
-                if (
-                    isinstance(data_parallel_world_size, bool)
-                    or not isinstance(data_parallel_world_size, int)
-                    or data_parallel_world_size < 1
-                    or 8 % data_parallel_world_size != 0
-                ):
-                    raise ServerAdapterError(
-                        "trainer FSDP data-parallel world size must be a positive divisor of 8"
+                    sequence_parallel_size = getattr(
+                        workers, "sequence_parallel_size", None
                     )
-                if sequence_parallel_size != 1 or isinstance(
-                    sequence_parallel_size, bool
-                ):
-                    raise ServerAdapterError(
-                        "trainer must disable Ulysses sequence parallelism"
+                    if (
+                        rollout_mode != "sync"
+                        or isinstance(ppo_epochs, bool)
+                        or ppo_epochs != 1
+                        or isinstance(ppo_mini_batch_size, bool)
+                        or ppo_mini_batch_size != 8
+                    ):
+                        raise ServerAdapterError(
+                            "trainer worker must use sync rollout, ppo_epochs=1, and "
+                            "ppo_mini_batch_size=8"
+                        )
+                    if (
+                        isinstance(reference_kl_coef, bool)
+                        or not isinstance(reference_kl_coef, (int, float))
+                        or not math.isfinite(float(reference_kl_coef))
+                        or reference_kl_coef <= 0
+                    ):
+                        raise ServerAdapterError(
+                            "trainer worker reference KL coefficient must be positive"
+                        )
+                    if (
+                        isinstance(data_parallel_world_size, bool)
+                        or not isinstance(data_parallel_world_size, int)
+                        or data_parallel_world_size < 1
+                        or 8 % data_parallel_world_size != 0
+                    ):
+                        raise ServerAdapterError(
+                            "trainer FSDP data-parallel world size must be a positive divisor "
+                            "of 8"
+                        )
+                    if sequence_parallel_size != 1 or isinstance(
+                        sequence_parallel_size, bool
+                    ):
+                        raise ServerAdapterError(
+                            "trainer must disable Ulysses sequence parallelism"
+                        )
+                    checkpoint_evidence = checkpoint_claim.publish(
+                        lambda staging: workers.save_checkpoint(
+                            staging, optimizer_step_after
+                        ),
+                        optimizer_step_before=optimizer_step_before,
+                        optimizer_step_after=optimizer_step_after,
                     )
-                checkpoint_evidence = checkpoint_claim.publish(
-                    lambda staging: workers.save_checkpoint(
-                        staging, optimizer_step_after
-                    ),
-                    optimizer_step_before=optimizer_step_before,
-                    optimizer_step_after=optimizer_step_after,
-                )
-                verl_provenance_after = workers.verl_provenance()
-                if verl_provenance_after != verl_provenance_before:
-                    raise ServerAdapterError(
-                        "VeRL driver/worker provenance changed during the trainer gate"
+                    memory_monitor.sample()
+                    lora_runtime_after = workers.lora_runtime_evidence()
+                    stable_lora_fields = (
+                        "lora_rank",
+                        "lora_alpha",
+                        "lora_target_modules",
+                        "worker_count",
+                        "worker_ranks",
+                        "trainable_parameter_name_sha256s",
+                        "total_parameter_count",
+                        "trainable_parameter_count",
+                        "non_lora_trainable_parameter_count",
+                        "only_lora_trainable",
+                        "lora_layer_count",
+                        "lora_projection_suffixes",
+                        "lora_tensor_count_per_worker",
                     )
-                guided_mask = result.artifact.guided_token_mask
-                guided_token_count = sum(sum(row) for row in guided_mask)
-                return GateTransaction(
-                    evidence={
+                    if any(
+                        lora_runtime_after.get(field) != lora_runtime_before.get(field)
+                        for field in stable_lora_fields
+                    ):
+                        raise ServerAdapterError(
+                            "actor LoRA trainability evidence changed during Gate 6"
+                        )
+                    verl_provenance_after = workers.verl_provenance()
+                    if verl_provenance_after != verl_provenance_before:
+                        raise ServerAdapterError(
+                            "VeRL driver/worker provenance changed during the trainer gate"
+                        )
+                    gate_evidence: dict[str, Any] = {
                         "learning_group": group.to_dict(),
                         "actor_update_rpcs": actor_update_rpcs,
                         "optimizer_steps": optimizer_step_delta,
@@ -1386,15 +1718,13 @@ class ConcreteGateRuntime:
                         "optimizer_step_after": optimizer_step_after,
                         "gradient_norm": gradient_norm,
                         "group_rewards": list(group_rewards),
-                        "guided_token_mask_present": True,
-                        "guided_token_count": guided_token_count,
-                        "guided_mask_response_only": True,
+                        **training_tensor_evidence,
                         "rollout_is": False,
                         "norm_adv_by_std_in_grpo": False,
                         "loss_mode": "capsule_critique",
                         "capsule_gamma": 0.1,
-                        "reference_kl_enabled": True,
                         "reference_kl_coef": float(reference_kl_coef),
+                        "reference_policy_mode": reference_policy_mode,
                         "rollout_mode": rollout_mode,
                         "ppo_epochs": ppo_epochs,
                         "ppo_mini_batch_size": ppo_mini_batch_size,
@@ -1409,15 +1739,45 @@ class ConcreteGateRuntime:
                         "guided_artifact_sha256": artifact_file_sha256(guided_artifact),
                         "verl_provenance_before": verl_provenance_before,
                         "verl_provenance_after": verl_provenance_after,
-                    },
-                    commit_callback=checkpoint_claim.commit,
-                    rollback_callback=checkpoint_claim.abort,
-                )
+                        "lora_runtime_before": lora_runtime_before,
+                        "lora_runtime_after": lora_runtime_after,
+                        "cuda_peak_reserved_bytes": max(
+                            int(lora_runtime_before["cuda_peak_reserved_bytes"]),
+                            int(lora_runtime_after["cuda_peak_reserved_bytes"]),
+                        ),
+                    }
+                except BaseException as error:
+                    primary_error = error
+                    raise
+                finally:
+                    _run_cleanup_preserving_primary(workers.close, primary_error)
+                ray_release = workers.ray_release_evidence()
+                memory_monitor.sample()
             except BaseException as error:
-                primary_error = error
+                monitor_primary_error = error
                 raise
             finally:
-                _run_cleanup_preserving_primary(workers.close, primary_error)
+                memory_monitor.__exit__(
+                    type(monitor_primary_error) if monitor_primary_error is not None else None,
+                    monitor_primary_error,
+                    monitor_primary_error.__traceback__
+                    if monitor_primary_error is not None
+                    else None,
+                )
+            host_memory = memory_monitor.evidence()
+            if host_memory["minimum_mem_available_bytes"] < 12 * 1024**3:
+                raise ServerAdapterError(
+                    "host MemAvailable fell below the 12 GiB Gate 6 runtime limit"
+                )
+            adapter_evidence = direct_lora_adapter_evidence(checkpoint_evidence.path)
+            gate_evidence.update(adapter_evidence)
+            gate_evidence["ray_release"] = ray_release
+            gate_evidence["host_memory"] = host_memory
+            return GateTransaction(
+                evidence=gate_evidence,
+                commit_callback=checkpoint_claim.commit,
+                rollback_callback=checkpoint_claim.abort,
+            )
         except BaseException as error:
             _run_cleanup_preserving_primary(checkpoint_claim.abort, error)
             raise

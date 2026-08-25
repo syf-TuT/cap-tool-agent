@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import sys
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+from capx.rl.capsule import actor_identity
 from capx.rl.capsule.actor_identity import (
     ActorIdentityError,
     actor_binding_sha256,
@@ -137,6 +140,127 @@ def test_actor_identity_rejects_symlinked_parent_of_configured_model(
 
     with pytest.raises(ActorIdentityError, match="symlink"):
         build_actor_identity(config)
+
+
+def test_actor_identity_parent_replacement_cannot_redirect_model_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted_parent = tmp_path / "trusted-parent"
+    trusted_parent.mkdir()
+    config = _identity_config(tmp_path)
+    model_name = "Qwen2.5-Coder-7B-Instruct"
+    original_model = tmp_path / model_name
+    original_model.rename(trusted_parent / model_name)
+    config["runtime"]["program_model_path"] = str(trusted_parent / model_name)
+
+    attacker_parent = tmp_path / "attacker-parent"
+    attacker_parent.mkdir()
+    attacker_model = attacker_parent / model_name
+    attacker_model.mkdir()
+    (attacker_model / "config.json").write_text(
+        '{"model_type":"attacker"}\n', encoding="utf-8"
+    )
+    (attacker_model / "model.safetensors").write_bytes(b"attacker-model-bytes")
+    displaced_parent = tmp_path / "displaced-trusted-parent"
+
+    original_tree_identity = actor_identity._model_tree_identity
+    swapped = False
+
+    def swap_parent_before_hash(*args: object, **kwargs: object) -> tuple[int, str]:
+        nonlocal swapped
+        if not swapped:
+            trusted_parent.rename(displaced_parent)
+            attacker_parent.rename(trusted_parent)
+            swapped = True
+        return original_tree_identity(*args, **kwargs)
+
+    monkeypatch.setattr(actor_identity, "_model_tree_identity", swap_parent_before_hash)
+
+    with pytest.raises(ActorIdentityError, match="changed|replaced"):
+        build_actor_identity(config)
+
+    assert swapped is True
+
+
+def test_actor_identity_finally_revalidates_an_early_model_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _identity_config(tmp_path)
+    early_file = Path(config["runtime"]["program_model_path"]) / "config.json"
+    trusted = early_file.read_bytes()
+    original_scan = actor_identity._snapshot_regular_tree
+    raced = False
+
+    def mutate_after_final_metadata_scan(*args: object, **kwargs: object):
+        nonlocal raced
+        nodes = original_scan(*args, **kwargs)
+        if kwargs.get("digest") is None and not raced:
+            raced = True
+            early_file.write_bytes(b'{"model_type":"attacker"}\n')
+            early_file.write_bytes(trusted)
+        return nodes
+
+    monkeypatch.setattr(
+        actor_identity, "_snapshot_regular_tree", mutate_after_final_metadata_scan
+    )
+
+    with pytest.raises(ActorIdentityError, match="changed after it was scanned"):
+        build_actor_identity(config)
+
+    assert raced is True
+    assert early_file.read_bytes() == trusted
+
+
+def test_actor_identity_cli_builds_from_one_stable_config_a_to_b_to_a_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _identity_config(tmp_path)
+    config_path = tmp_path / "actor-identity.yaml"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    trusted = config_path.read_bytes()
+    replacement_config = deepcopy(config)
+    replacement_config["program_service"]["model"] = "attacker-model"
+    replacement = yaml.safe_dump(replacement_config, sort_keys=False).encode()
+    original_snapshot = actor_identity.read_stable_regular_file
+    original_read_text = Path.read_text
+    observed_models: list[str] = []
+
+    def snapshot_during_a_to_b_to_a(candidate: str | Path, *, label: str):
+        snapshot = original_snapshot(candidate, label=label)
+        if label == "actor identity config":
+            config_path.write_bytes(replacement)
+            config_path.write_bytes(trusted)
+        return snapshot
+
+    def read_attacker_then_restore(self: Path, *args: object, **kwargs: object) -> str:
+        if self.resolve() != config_path.resolve():
+            return original_read_text(self, *args, **kwargs)
+        config_path.write_bytes(replacement)
+        payload = original_read_text(self, *args, **kwargs)
+        config_path.write_bytes(trusted)
+        return payload
+
+    def capture_identity(received_config):
+        observed_models.append(str(received_config["program_service"]["model"]))
+        return build_actor_identity(config)
+
+    monkeypatch.setattr(
+        actor_identity, "read_stable_regular_file", snapshot_during_a_to_b_to_a
+    )
+    monkeypatch.setattr(Path, "read_text", read_attacker_then_restore)
+    monkeypatch.setattr(actor_identity, "build_actor_identity", capture_identity)
+    monkeypatch.setattr(actor_identity, "create_actor_identity_app", lambda *_a, **_k: object())
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        SimpleNamespace(run=lambda *_args, **_kwargs: None),
+    )
+    monkeypatch.setenv("CAPX_PROGRAM_API_KEY", "identity-secret")
+
+    actor_identity.main(["--config", str(config_path)])
+
+    assert config_path.read_bytes() == trusted
+    assert observed_models == ["Qwen/Qwen2.5-Coder-7B-Instruct"]
 
 
 def test_actor_identity_service_requires_bearer_and_has_no_generation_route(

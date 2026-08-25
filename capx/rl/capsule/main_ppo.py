@@ -9,6 +9,7 @@ project-owned factory must be named explicitly in the configuration.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
@@ -16,10 +17,14 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from scripts.capsule_rl.common import GateArtifactError, validate_final_runtime_audit
 
 from .actor_identity import ActorIdentityError, build_actor_identity
 from .compat import (
@@ -29,8 +34,15 @@ from .compat import (
     check_verl_compatibility,
     validate_capsule_config,
 )
-from .provenance import file_sha256, runtime_dependency_hashes
+from .provenance import file_sha256, project_path
 from .schema import TaskInstanceV1
+from .stable_io import (
+    MutationWatch,
+    PathMutationGuard,
+    StableFileSnapshot,
+    StablePathError,
+    read_stable_regular_file,
+)
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -66,21 +78,29 @@ def _expand_config(value: Any) -> Any:
     return value
 
 
-def load_and_validate_config(path: str | Path) -> tuple[dict[str, Any], Path]:
-    """Load one YAML file, expand environment syntax, and validate local invariants."""
+def _load_and_validate_config_snapshot(
+    path: str | Path,
+) -> tuple[dict[str, Any], StableFileSnapshot]:
+    """Parse and validate one immutable YAML byte snapshot for internal callers."""
 
-    config_path = Path(path).expanduser().resolve()
-    if not config_path.is_file():
-        raise ConfigLoadError(f"config file does not exist: {config_path}")
+    config_path = Path(os.path.abspath(Path(path).expanduser()))
     try:
-        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        snapshot = read_stable_regular_file(config_path, label="Capsule config")
+        raw = yaml.safe_load(snapshot.raw_bytes.decode("utf-8"))
+    except (StablePathError, UnicodeError, yaml.YAMLError) as error:
         raise ConfigLoadError(f"cannot parse config {config_path}: {error}") from error
     if not isinstance(raw, Mapping):
         raise ConfigLoadError("config root must be a YAML mapping")
     config = _expand_config(raw)
     validate_capsule_config(config)
-    return config, config_path
+    return config, snapshot
+
+
+def load_and_validate_config(path: str | Path) -> tuple[dict[str, Any], Path]:
+    """Load and validate a config while preserving the original two-value helper API."""
+
+    config, snapshot = _load_and_validate_config_snapshot(path)
+    return config, snapshot.path
 
 
 def load_dotted_object(dotted_path: str) -> Any:
@@ -185,13 +205,34 @@ def validate_local_execution_inputs(config: Mapping[str, Any]) -> dict[str, Path
     }
 
 
-def _load_json_mapping(path: Path, label: str) -> Mapping[str, Any]:
+def _stable_file_snapshot(path: str | Path, label: str) -> StableFileSnapshot:
     try:
-        payload = json.loads(path.read_bytes())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return read_stable_regular_file(path, label=label)
+    except StablePathError as error:
+        raise TrainerFactoryError(str(error)) from error
+
+
+def _json_mapping_from_bytes(payload_bytes: bytes, label: str) -> Mapping[str, Any]:
+    try:
+        payload = json.loads(payload_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise TrainerFactoryError(f"{label} is not valid UTF-8 JSON: {error}") from error
     if not isinstance(payload, Mapping):
         raise TrainerFactoryError(f"{label} root must be a JSON mapping")
+    return payload
+
+
+def _load_json_snapshot(
+    path: str | Path, label: str
+) -> tuple[Mapping[str, Any], StableFileSnapshot]:
+    snapshot = _stable_file_snapshot(path, label)
+    return _json_mapping_from_bytes(snapshot.raw_bytes, label), snapshot
+
+
+def _load_json_mapping(path: Path, label: str) -> Mapping[str, Any]:
+    """Compatibility wrapper that parses one stable path snapshot."""
+
+    payload, _snapshot = _load_json_snapshot(path, label)
     return payload
 
 
@@ -212,10 +253,70 @@ def _manifest_sha256(manifest: Mapping[str, Any], field_name: str) -> str:
 
 
 def _checked_file_sha256(path: Path, label: str) -> str:
-    try:
-        return file_sha256(path)
-    except OSError as error:
-        raise TrainerFactoryError(f"cannot hash {label}: {error}") from error
+    """Compatibility wrapper that hashes one stable regular-file snapshot."""
+
+    return _stable_file_snapshot(path, label).sha256
+
+
+@dataclass(frozen=True)
+class _RuntimeDependencySnapshot:
+    hashes: Mapping[str, str]
+    resolved_verl_config: StableFileSnapshot
+    environment_config: StableFileSnapshot | None
+
+
+def _snapshot_runtime_dependencies(
+    config: Mapping[str, Any],
+    *,
+    resolved_verl_config: StableFileSnapshot | None = None,
+) -> _RuntimeDependencySnapshot:
+    task = config.get("task")
+    runtime = config.get("runtime")
+    if not isinstance(task, Mapping):
+        raise TrainerFactoryError("task must be a mapping")
+    if not isinstance(runtime, Mapping):
+        raise TrainerFactoryError("runtime must be a mapping")
+    environment_value = task.get("config_path")
+    environment_snapshot: StableFileSnapshot | None = None
+    if isinstance(environment_value, str) and environment_value:
+        try:
+            environment_path = project_path(config, environment_value, "task.config_path")
+        except ValueError as error:
+            raise TrainerFactoryError(f"cannot resolve runtime dependencies: {error}") from error
+        environment_snapshot = _stable_file_snapshot(
+            environment_path, "resolved environment config"
+        )
+    environment_sha256 = (
+        environment_snapshot.sha256 if environment_snapshot is not None else None
+    )
+    serialized_environment = json.dumps(
+        {
+            "task": dict(task),
+            "environment_config_sha256": environment_sha256,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    resolved_path = _runtime_path(config, "verl_resolved_config_path")
+    if resolved_verl_config is None:
+        resolved_verl_config = _stable_file_snapshot(
+            resolved_path, "resolved VeRL config dependency"
+        )
+    elif resolved_verl_config.path != resolved_path:
+        raise TrainerFactoryError(
+            "resolved VeRL config snapshot path does not match runtime config"
+        )
+    return _RuntimeDependencySnapshot(
+        hashes={
+            "resolved_environment_sha256": hashlib.sha256(
+                serialized_environment.encode("utf-8")
+            ).hexdigest(),
+            "verl_resolved_config_sha256": resolved_verl_config.sha256,
+        },
+        resolved_verl_config=resolved_verl_config,
+        environment_config=environment_snapshot,
+    )
 
 
 def _typed_task_identities(value: object, field_name: str) -> list[dict[str, object]]:
@@ -260,16 +361,17 @@ def _typed_task_identities(value: object, field_name: str) -> list[dict[str, obj
     return normalized
 
 
-def verify_bundle_provenance(
-    config: Mapping[str, Any], config_path: str | Path
+def _verify_bundle_provenance_snapshot(
+    config: Mapping[str, Any], config_snapshot: StableFileSnapshot
 ) -> dict[str, Any]:
-    """Re-hash the formal training bundle without importing VeRL, Torch, or a trainer."""
+    """Verify the formal training bundle without importing VeRL, Torch, or a trainer."""
 
-    resolved_config_path = Path(config_path).expanduser().resolve()
+    config_sha256 = config_snapshot.sha256
+    resolved_config_path = config_snapshot.path
     manifest_path = _validate_existing_runtime_path(
         config, "bundle_manifest_path", directory=False
     )
-    manifest = _load_json_mapping(manifest_path, "bundle manifest")
+    manifest, manifest_snapshot = _load_json_snapshot(manifest_path, "bundle manifest")
     if type(manifest.get("schema_version")) is not int or manifest.get(
         "schema_version"
     ) != 1:
@@ -283,8 +385,10 @@ def verify_bundle_provenance(
     if output_config_path != resolved_config_path:
         raise TrainerFactoryError("bundle manifest output config path does not match --config")
     output_config_sha256 = _manifest_sha256(manifest, "output_config_sha256")
-    if _checked_file_sha256(resolved_config_path, "output config") != output_config_sha256:
-        raise TrainerFactoryError("bundle output config SHA does not match --config bytes")
+    if config_sha256 != output_config_sha256:
+        raise TrainerFactoryError(
+            "bundle output config SHA does not match the loaded --config byte snapshot"
+        )
     if _manifest_path(manifest_path, manifest.get("config_path"), "config_path") != (
         output_config_path
     ) or _manifest_sha256(manifest, "config_sha256") != output_config_sha256:
@@ -301,7 +405,8 @@ def verify_bundle_provenance(
             "bundle manifest output dataset path does not match runtime.dataset_path"
         )
     output_dataset_sha256 = _manifest_sha256(manifest, "output_dataset_sha256")
-    if _checked_file_sha256(dataset_path, "output dataset") != output_dataset_sha256:
+    dataset_snapshot = _stable_file_snapshot(dataset_path, "output dataset")
+    if dataset_snapshot.sha256 != output_dataset_sha256:
         raise TrainerFactoryError("bundle output dataset SHA does not match dataset bytes")
     if _manifest_path(manifest_path, manifest.get("dataset_path"), "dataset_path") != (
         manifest_dataset_path
@@ -314,11 +419,12 @@ def verify_bundle_provenance(
         manifest_path, manifest.get("source_config_path"), "source_config_path"
     )
     source_config_sha256 = _manifest_sha256(manifest, "source_config_sha256")
-    if not source_config_path.is_file() or _checked_file_sha256(
-        source_config_path, "source config"
-    ) != (
-        source_config_sha256
-    ):
+    source_config_snapshot = (
+        config_snapshot
+        if source_config_path == config_snapshot.path
+        else _stable_file_snapshot(source_config_path, "source config")
+    )
+    if source_config_snapshot.sha256 != source_config_sha256:
         raise TrainerFactoryError(
             "bundle source config SHA does not match source config bytes"
         )
@@ -326,11 +432,12 @@ def verify_bundle_provenance(
         manifest_path, manifest.get("source_dataset_path"), "source_dataset_path"
     )
     source_dataset_sha256 = _manifest_sha256(manifest, "source_dataset_sha256")
-    if not source_dataset_path.is_file() or _checked_file_sha256(
-        source_dataset_path, "source dataset"
-    ) != (
-        source_dataset_sha256
-    ):
+    source_dataset_snapshot = (
+        dataset_snapshot
+        if source_dataset_path == dataset_snapshot.path
+        else _stable_file_snapshot(source_dataset_path, "source dataset")
+    )
+    if source_dataset_snapshot.sha256 != source_dataset_sha256:
         raise TrainerFactoryError(
             "bundle source dataset SHA does not match source dataset bytes"
         )
@@ -348,15 +455,20 @@ def verify_bundle_provenance(
     resolved_verl_sha256 = _manifest_sha256(
         manifest, "verl_resolved_config_sha256"
     )
-    if _checked_file_sha256(
+    resolved_verl_snapshot = _stable_file_snapshot(
         resolved_verl_path, "resolved VeRL config"
-    ) != resolved_verl_sha256:
+    )
+    if resolved_verl_snapshot.sha256 != resolved_verl_sha256:
         raise TrainerFactoryError("bundle resolved VeRL config SHA does not match YAML bytes")
 
     try:
-        dependency_hashes = runtime_dependency_hashes(config)
-    except (OSError, ValueError) as error:
+        dependency_snapshot = _snapshot_runtime_dependencies(
+            config,
+            resolved_verl_config=resolved_verl_snapshot,
+        )
+    except TrainerFactoryError as error:
         raise TrainerFactoryError(f"cannot hash runtime dependencies: {error}") from error
+    dependency_hashes = dependency_snapshot.hashes
     if dependency_hashes["resolved_environment_sha256"] != _manifest_sha256(
         manifest, "resolved_environment_sha256"
     ):
@@ -366,7 +478,10 @@ def verify_bundle_provenance(
     if dependency_hashes["verl_resolved_config_sha256"] != resolved_verl_sha256:
         raise TrainerFactoryError("bundle resolved VeRL config dependency hash is inconsistent")
     try:
-        actor_identity = build_actor_identity(config)
+        actor_identity = build_actor_identity(
+            config,
+            resolved_config_snapshot=resolved_verl_snapshot,
+        )
     except ActorIdentityError as error:
         raise TrainerFactoryError(f"cannot bind Program actor identity: {error}") from error
     for field_name in ("program_model_sha256", "actor_binding_sha256"):
@@ -382,14 +497,14 @@ def verify_bundle_provenance(
         raise TrainerFactoryError(
             "bundle manifest Gate7 audit path does not match runtime.gate7_audit_path"
         )
-    if not audit_path.is_file():
-        raise TrainerFactoryError(f"bundle Gate7 audit does not exist: {audit_path}")
     audit_sha256 = _manifest_sha256(manifest, "gate7_audit_sha256")
-    if _checked_file_sha256(audit_path, "Gate7 audit") != audit_sha256:
+    audit, audit_snapshot = _load_json_snapshot(audit_path, "Gate7 audit")
+    if audit_snapshot.sha256 != audit_sha256:
         raise TrainerFactoryError("bundle Gate7 audit SHA does not match audit bytes")
-    audit = _load_json_mapping(audit_path, "Gate7 audit")
-    if audit.get("runtime_verified") is not True:
-        raise TrainerFactoryError("Gate7 audit must record runtime_verified=true")
+    try:
+        validate_final_runtime_audit(audit)
+    except GateArtifactError as error:
+        raise TrainerFactoryError(f"Gate7 final runtime audit is invalid: {error}") from error
     gate7_run_id = manifest.get("gate7_run_id")
     if not isinstance(gate7_run_id, str) or not gate7_run_id:
         raise TrainerFactoryError("bundle manifest gate7_run_id must be non-empty")
@@ -418,9 +533,10 @@ def verify_bundle_provenance(
             )
 
     try:
+        dataset_text = dataset_snapshot.raw_bytes.decode("utf-8")
         tasks = [
             TaskInstanceV1.from_json(line)
-            for line in dataset_path.read_text(encoding="utf-8").splitlines()
+            for line in dataset_text.splitlines()
             if line.strip()
         ]
     except (OSError, UnicodeError, KeyError, TypeError, ValueError) as error:
@@ -461,11 +577,11 @@ def verify_bundle_provenance(
         )
     return {
         "manifest_path": str(manifest_path),
-        "manifest_sha256": _checked_file_sha256(manifest_path, "bundle manifest"),
+        "manifest_sha256": manifest_snapshot.sha256,
         "gate7_run_id": gate7_run_id,
         "gate7_audit_sha256": audit_sha256,
         "dataset_sha256": output_dataset_sha256,
-        "config_sha256": output_config_sha256,
+        "config_sha256": config_sha256,
         "resolved_environment_sha256": dependency_hashes[
             "resolved_environment_sha256"
         ],
@@ -473,6 +589,15 @@ def verify_bundle_provenance(
         "program_model_sha256": actor_identity["program_model_sha256"],
         "actor_binding_sha256": actor_identity["actor_binding_sha256"],
     }
+
+
+def verify_bundle_provenance(
+    config: Mapping[str, Any], config_path: str | Path
+) -> dict[str, Any]:
+    """Verify a formal bundle while preserving the original two-argument helper API."""
+
+    config_snapshot = _stable_file_snapshot(config_path, "Capsule config")
+    return _verify_bundle_provenance_snapshot(config, config_snapshot)
 
 
 def _project_git_sha(config: Mapping[str, Any]) -> str:
@@ -500,6 +625,7 @@ def _project_git_sha(config: Mapping[str, Any]) -> str:
             "--untracked-files=all",
         ],
     }
+    git_environment = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     results: dict[str, str] = {}
     for name, command in commands.items():
         try:
@@ -509,6 +635,7 @@ def _project_git_sha(config: Mapping[str, Any]) -> str:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                env=git_environment,
             )
         except (OSError, subprocess.SubprocessError) as error:
             raise TrainerFactoryError(
@@ -588,6 +715,63 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _runtime_input_watches(
+    config: Mapping[str, Any], config_path: Path
+) -> tuple[MutationWatch, ...]:
+    watches = [
+        MutationWatch(config_path, "formal training config"),
+        MutationWatch(_runtime_path(config, "dataset_path"), "training dataset"),
+        MutationWatch(_runtime_path(config, "bundle_manifest_path"), "bundle manifest"),
+        MutationWatch(_runtime_path(config, "gate7_audit_path"), "Gate7 audit"),
+        MutationWatch(
+            _runtime_path(config, "verl_resolved_config_path"),
+            "resolved VeRL config",
+        ),
+        MutationWatch(
+            _runtime_path(config, "program_model_path"),
+            "program model tree",
+            recursive=True,
+        ),
+        MutationWatch(
+            _runtime_path(config, "verl_source_path"),
+            "pinned VeRL source tree",
+            recursive=True,
+        ),
+    ]
+    task = config.get("task")
+    if isinstance(task, Mapping):
+        environment_value = task.get("config_path")
+        if isinstance(environment_value, str) and environment_value:
+            try:
+                environment_path = project_path(
+                    config, environment_value, "task.config_path"
+                )
+            except ValueError as error:
+                raise TrainerFactoryError(
+                    f"cannot resolve task environment config: {error}"
+                ) from error
+            watches.append(MutationWatch(environment_path, "task environment config"))
+    return tuple(watches)
+
+
+@contextmanager
+def _guard_runtime_inputs(config: Mapping[str, Any], config_path: Path):
+    try:
+        guard = PathMutationGuard.open(_runtime_input_watches(config, config_path))
+    except StablePathError as error:
+        raise TrainerFactoryError(f"cannot guard runtime inputs: {error}") from error
+    previous_dont_write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        yield guard
+        guard.assert_unchanged(context="during training")
+    except StablePathError as error:
+        raise TrainerFactoryError(str(error)) from error
+    finally:
+        sys.dont_write_bytecode = previous_dont_write_bytecode
+        guard.close()
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -595,12 +779,17 @@ def main(
 ) -> int:
     args = _parser().parse_args(argv)
     try:
-        config, config_path = load_and_validate_config(args.config)
+        config, config_snapshot = _load_and_validate_config_snapshot(args.config)
+        config_path = config_snapshot.path
+        config_sha256 = config_snapshot.sha256
         runtime = config["runtime"]
         verl_source_path = _runtime_path(config, "verl_source_path")
         if args.validate_only or args.dry_run:
             runtime_paths = validate_local_execution_inputs(config)
-            bundle_provenance = verify_bundle_provenance(config, config_path)
+            bundle_provenance = _verify_bundle_provenance_snapshot(
+                config,
+                config_snapshot,
+            )
             project_git_sha = _project_git_sha(config)
             compatibility = check_verl_compatibility(
                 verl_source_path, runtime["verl_pinned_sha"]
@@ -626,18 +815,37 @@ def main(
             return 0
 
         validate_local_execution_inputs(config)
-        bundle_provenance_before = verify_bundle_provenance(config, config_path)
-        check_verl_compatibility(verl_source_path, runtime["verl_pinned_sha"])
-        project_git_sha_before = _project_git_sha(config)
-        result = run_training(config, factory_loader=factory_loader)
-        bundle_provenance_after = verify_bundle_provenance(config, config_path)
-        if bundle_provenance_after != bundle_provenance_before:
-            raise TrainerFactoryError(
-                "formal training bundle provenance changed while training was executing"
+        with _guard_runtime_inputs(config, config_path) as mutation_guard:
+            bundle_provenance_before = _verify_bundle_provenance_snapshot(
+                config,
+                config_snapshot,
             )
-        project_git_sha_after = _project_git_sha(config)
-        if project_git_sha_after != project_git_sha_before:
-            raise TrainerFactoryError("project Git SHA changed while training was executing")
+            check_verl_compatibility(verl_source_path, runtime["verl_pinned_sha"])
+            project_git_sha_before = _project_git_sha(config)
+            mutation_guard.assert_unchanged(context="during training preflight")
+            result = run_training(config, factory_loader=factory_loader)
+            config_after, config_snapshot_after = _load_and_validate_config_snapshot(
+                config_path
+            )
+            if (
+                config_snapshot_after.path != config_path
+                or config_snapshot_after.sha256 != config_sha256
+                or config_after != config
+            ):
+                raise TrainerFactoryError(
+                    "formal training config changed while training was executing"
+                )
+            bundle_provenance_after = _verify_bundle_provenance_snapshot(
+                config_after,
+                config_snapshot_after,
+            )
+            if bundle_provenance_after != bundle_provenance_before:
+                raise TrainerFactoryError(
+                    "formal training bundle provenance changed while training was executing"
+                )
+            project_git_sha_after = _project_git_sha(config)
+            if project_git_sha_after != project_git_sha_before:
+                raise TrainerFactoryError("project Git SHA changed while training was executing")
         print(
             json.dumps(
                 {

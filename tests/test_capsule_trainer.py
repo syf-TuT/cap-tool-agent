@@ -393,6 +393,11 @@ def test_lora_reference_logprob_uses_same_actor_with_adapter_disabled_in_order()
     ]
     assert torch.all(result.batch.batch["old_log_probs"] == -1.0)
     assert torch.all(result.batch.batch["ref_log_prob"] == -2.0)
+    assert result.execution_trace == (
+        "old_logprob",
+        "reference_logprob",
+        "update",
+    )
     assert "is_lora" not in result.batch.meta_info
 
 

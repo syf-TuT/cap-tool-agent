@@ -160,6 +160,7 @@ def test_ray_runtime_env_propagates_pinned_verl_without_mutating_input(tmp_path:
     assert runtime_env["env_vars"]["PYTHONPATH"] == "/existing"
     assert resolved["env_vars"]["CAPX_PINNED_VERL_SOURCE_PATH"] == str(pinned.resolve())
     assert resolved["env_vars"]["CAPX_PINNED_VERL_SHA"] == pinned_sha
+    assert resolved["env_vars"]["PYTHONDONTWRITEBYTECODE"] == "1"
     assert resolved["env_vars"]["PYTHONPATH"].split(os.pathsep) == [
         str(pinned.resolve()),
         "/existing",

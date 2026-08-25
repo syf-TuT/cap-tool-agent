@@ -78,6 +78,7 @@ class TrainingStepResult:
     batch: Any
     actor_output: Any | None
     events: tuple[str, ...]
+    execution_trace: tuple[str, ...]
     skipped_actor_update: bool
 
 
@@ -871,6 +872,7 @@ class CapsuleCritiqueRayTrainer:
         return output
 
     def run_step(self, task: TaskInstanceV1) -> TrainingStepResult:
+        execution_trace: list[str] = []
         assembly = self.assembler.assemble(task)
         validate_group_provenance(task, assembly)
         batch = self._inject_group(task, assembly)
@@ -878,12 +880,14 @@ class CapsuleCritiqueRayTrainer:
         if not assembly.group.skip_actor_update:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             batch = _merge_batch(batch, old_log_prob)
+            execution_trace.append("old_logprob")
             if self.ref_policy_wg is not None:
                 if self.reference_policy_mode == "actor_base_adapter_disabled":
                     ref_log_prob = self._compute_actor_base_reference_log_prob(batch)
                 else:
                     ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                 batch = _merge_batch(batch, ref_log_prob)
+                execution_trace.append("reference_logprob")
 
         sequence_advantages = self._add_advantages(batch, assembly)
         tensors = _tensor_batch(batch)
@@ -899,12 +903,14 @@ class CapsuleCritiqueRayTrainer:
         if not assembly.group.skip_actor_update:
             actor_output = self.actor_rollout_wg.update_actor(batch)
             self._actor_updates_completed += 1
+            execution_trace.append("update")
         self.artifact_sink.write(artifact)
         return TrainingStepResult(
             artifact=artifact,
             batch=batch,
             actor_output=actor_output,
             events=tuple(self.events),
+            execution_trace=tuple(execution_trace),
             skipped_actor_update=assembly.group.skip_actor_update,
         )
 

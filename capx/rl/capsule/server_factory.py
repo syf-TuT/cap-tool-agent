@@ -49,6 +49,12 @@ from .group import (
     ProgramCandidate,
     deterministic_group_uid,
 )
+from .lora_contract import (
+    QWEN25_ALL_LINEAR_PROJECTIONS,
+    QWEN25_ALL_LINEAR_TENSOR_COUNT,
+    QWEN25_CODER_7B_LAYER_COUNT,
+    validate_qwen_all_linear_coverage,
+)
 from .schema import TaskInstanceV1
 from .trainer import (
     AtomicJsonArtifactSink,
@@ -70,6 +76,86 @@ class RuntimeSession(Protocol):
 
 class DataProtoFactory(Protocol):
     def __call__(self, tensors: dict[str, torch.Tensor]) -> Any: ...
+
+
+def _host_mem_available_bytes(path: Path = Path("/proc/meminfo")) -> int:
+    try:
+        for line in path.read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                fields = line.split()
+                if len(fields) == 3 and fields[2] == "kB":
+                    value = int(fields[1]) * 1024
+                    if value > 0:
+                        return value
+    except (OSError, UnicodeError, ValueError) as error:
+        raise RuntimeError(f"cannot read host MemAvailable evidence: {error}") from error
+    raise RuntimeError("/proc/meminfo omitted a positive MemAvailable value")
+
+
+def _actor_lora_runtime_record(
+    model: Any,
+    *,
+    rank: int,
+    cuda_peak_reserved_loader: Callable[[], int],
+    host_mem_available_loader: Callable[[], int],
+) -> dict[str, Any]:
+    """Collect one rank's trainability and memory evidence without retaining tensors."""
+
+    named_parameters = getattr(model, "named_parameters", None)
+    if not callable(named_parameters):
+        raise RuntimeError("actor worker has no named model parameters")
+    total = 0
+    trainable = 0
+    trainable_names: list[str] = []
+    non_lora_trainable: list[str] = []
+    for name, parameter in named_parameters():
+        if not isinstance(name, str) or not name:
+            raise RuntimeError("actor model returned an invalid parameter name")
+        count = int(parameter.numel())
+        if count < 0:
+            raise RuntimeError(f"actor parameter has a negative size: {name}")
+        total += count
+        if not bool(parameter.requires_grad):
+            continue
+        trainable += count
+        trainable_names.append(name)
+        lowered = name.lower()
+        if ".lora_a." not in lowered and ".lora_b." not in lowered:
+            non_lora_trainable.append(name)
+    if non_lora_trainable:
+        preview = ", ".join(non_lora_trainable[:3])
+        raise RuntimeError(f"actor contains non-LoRA trainable parameters: {preview}")
+    if total <= 0 or trainable <= 0 or not trainable_names:
+        raise RuntimeError("actor LoRA runtime evidence found no trainable LoRA parameters")
+    try:
+        coverage = validate_qwen_all_linear_coverage(trainable_names)
+    except ValueError as error:
+        raise RuntimeError(f"actor Qwen all-linear coverage validation failed: {error}") from error
+    names_digest = hashlib.sha256()
+    for name in sorted(trainable_names):
+        encoded = name.encode("utf-8")
+        names_digest.update(len(encoded).to_bytes(8, "big"))
+        names_digest.update(encoded)
+    cuda_peak = cuda_peak_reserved_loader()
+    host_available = host_mem_available_loader()
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (cuda_peak, host_available)
+    ):
+        raise RuntimeError("actor memory probe returned invalid byte counts")
+    return {
+        "rank": rank,
+        "total_parameter_count": total,
+        "trainable_parameter_count": trainable,
+        "trainable_tensor_count": len(trainable_names),
+        "lora_layer_count": coverage.layer_count,
+        "lora_projection_suffixes": list(coverage.projection_suffixes),
+        "non_lora_trainable_parameter_count": 0,
+        "only_lora_trainable": True,
+        "trainable_parameter_names_sha256": names_digest.hexdigest(),
+        "cuda_peak_reserved_bytes": cuda_peak,
+        "host_mem_available_bytes": host_available,
+    }
 
 
 @dataclass(frozen=True)
@@ -544,6 +630,10 @@ class VeRLWorkerSession:
     verl_pinned_sha: str | None = None
     initial_verl_provenance: dict[str, Any] | None = None
     final_verl_provenance: dict[str, Any] | None = None
+    _worker_close_calls: int = 0
+    _ray_shutdown_calls: int = 0
+    _ray_shutdown_complete: bool = False
+    _close_error: BaseException | None = None
 
     def save_checkpoint(self, path: Path, step: int) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -575,6 +665,125 @@ class VeRLWorkerSession:
                 f"actor optimizer-step evidence must agree across ranks; got {values!r}"
             )
         return values[0]
+
+    def lora_runtime_evidence(self) -> dict[str, Any]:
+        """Require every actor rank to prove that only LoRA tensors are trainable."""
+
+        if (
+            self.lora_rank != 16
+            or self.lora_alpha != 32
+            or self.lora_target_modules != ("all-linear",)
+        ):
+            raise ServerFactoryError(
+                "Capsule LoRA runtime evidence requires rank=16, alpha=32, all-linear"
+            )
+        probe = getattr(self.actor_rollout_wg, "get_capsule_lora_runtime_evidence", None)
+        if not callable(probe):
+            raise ServerFactoryError(
+                "pinned VeRL actor worker does not expose LoRA runtime evidence"
+            )
+        records: list[Mapping[str, Any]] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+                return
+            if not isinstance(value, Mapping):
+                raise ServerFactoryError(
+                    f"actor LoRA runtime probe returned an invalid value: {value!r}"
+                )
+            records.append(value)
+
+        collect(probe())
+        if len(records) != self.data_parallel_world_size:
+            raise ServerFactoryError(
+                "actor LoRA runtime rank count does not match data parallelism"
+            )
+        normalized: list[dict[str, Any]] = []
+        ranks: set[int] = set()
+        for record in records:
+            rank = record.get("rank")
+            total = record.get("total_parameter_count")
+            trainable = record.get("trainable_parameter_count")
+            trainable_tensors = record.get("trainable_tensor_count")
+            lora_layer_count = record.get("lora_layer_count")
+            lora_projection_suffixes = record.get("lora_projection_suffixes")
+            non_lora = record.get("non_lora_trainable_parameter_count")
+            names_sha256 = record.get("trainable_parameter_names_sha256")
+            cuda_peak = record.get("cuda_peak_reserved_bytes")
+            host_available = record.get("host_mem_available_bytes")
+            integer_values = (rank, total, trainable, trainable_tensors, non_lora, cuda_peak)
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in integer_values
+            ):
+                raise ServerFactoryError("actor LoRA runtime evidence contains non-integer counts")
+            if (
+                rank < 0
+                or rank in ranks
+                or total <= 0
+                or trainable <= 0
+                or trainable > total
+                or trainable_tensors <= 0
+                or trainable_tensors != QWEN25_ALL_LINEAR_TENSOR_COUNT
+                or lora_layer_count != QWEN25_CODER_7B_LAYER_COUNT
+                or lora_projection_suffixes != list(QWEN25_ALL_LINEAR_PROJECTIONS)
+                or non_lora != 0
+                or record.get("only_lora_trainable") is not True
+            ):
+                raise ServerFactoryError(
+                    "actor LoRA runtime evidence found a non-LoRA trainable parameter "
+                    "or invalid parameter counts"
+                )
+            if (
+                not isinstance(names_sha256, str)
+                or len(names_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in names_sha256)
+            ):
+                raise ServerFactoryError("actor LoRA trainable-name SHA-256 is invalid")
+            if cuda_peak < 0 or cuda_peak > 70 * 1024**3:
+                raise ServerFactoryError(
+                    "actor CUDA peak reserved memory exceeds the 70 GiB Gate 6 limit"
+                )
+            if (
+                isinstance(host_available, bool)
+                or not isinstance(host_available, int)
+                or host_available <= 0
+            ):
+                raise ServerFactoryError("actor host MemAvailable evidence is invalid")
+            ranks.add(rank)
+            normalized.append(dict(record))
+        normalized.sort(key=lambda item: int(item["rank"]))
+        return {
+            "lora_rank": 16,
+            "lora_alpha": 32,
+            "lora_target_modules": ["all-linear"],
+            "worker_count": len(normalized),
+            "worker_ranks": [int(record["rank"]) for record in normalized],
+            "trainable_parameter_name_sha256s": [
+                str(record["trainable_parameter_names_sha256"])
+                for record in normalized
+            ],
+            "total_parameter_count": sum(
+                int(record["total_parameter_count"]) for record in normalized
+            ),
+            "trainable_parameter_count": sum(
+                int(record["trainable_parameter_count"]) for record in normalized
+            ),
+            "non_lora_trainable_parameter_count": 0,
+            "only_lora_trainable": True,
+            "lora_layer_count": QWEN25_CODER_7B_LAYER_COUNT,
+            "lora_projection_suffixes": list(QWEN25_ALL_LINEAR_PROJECTIONS),
+            "lora_tensor_count_per_worker": QWEN25_ALL_LINEAR_TENSOR_COUNT,
+            "cuda_peak_reserved_bytes": max(
+                int(record["cuda_peak_reserved_bytes"]) for record in normalized
+            ),
+            "host_mem_available_min_bytes": min(
+                int(record["host_mem_available_bytes"]) for record in normalized
+            ),
+            "workers": normalized,
+        }
 
     def verl_provenance(self) -> dict[str, Any]:
         """Require the driver and every actor rank to see one clean pinned VeRL tree."""
@@ -666,10 +875,47 @@ class VeRLWorkerSession:
     def close(self) -> None:
         if not self.owns_ray:
             raise ServerFactoryError("Capsule VeRL sessions must own their isolated Ray runtime")
+        if self._ray_shutdown_complete:
+            if self._close_error is not None:
+                raise self._close_error
+            return
+        self._worker_close_calls += 1
+        failure = self._close_error
         try:
-            self.final_verl_provenance = self.verl_provenance()
-        finally:
+            if self.final_verl_provenance is None:
+                self.final_verl_provenance = self.verl_provenance()
+        except BaseException as error:
+            failure = failure or error
+        try:
+            self._ray_shutdown_calls += 1
             self.ray_module.shutdown()
+        except BaseException as error:
+            failure = failure or error
+        is_initialized = getattr(self.ray_module, "is_initialized", None)
+        try:
+            self._ray_shutdown_complete = not callable(is_initialized) or not is_initialized()
+        except BaseException as error:
+            failure = failure or error
+        if not self._ray_shutdown_complete:
+            failure = failure or ServerFactoryError(
+                "Ray remained initialized after Capsule worker shutdown"
+            )
+        self._close_error = failure
+        if failure is not None:
+            raise failure
+
+    def ray_release_evidence(self) -> dict[str, Any]:
+        if (
+            self._worker_close_calls != 1
+            or self._ray_shutdown_calls != 1
+            or not self._ray_shutdown_complete
+        ):
+            raise ServerFactoryError("Capsule worker/Ray release is incomplete")
+        return {
+            "worker_close_calls": self._worker_close_calls,
+            "ray_shutdown_calls": self._ray_shutdown_calls,
+            "ray_shutdown_complete": True,
+        }
 
 
 def _verify_imported_verl_path(verl_path: Path) -> None:
@@ -711,6 +957,7 @@ def _pinned_ray_runtime_env(
     env_vars["PYTHONPATH"] = os.pathsep.join((pinned, *path_entries))
     env_vars["CAPX_PINNED_VERL_SOURCE_PATH"] = pinned
     env_vars["CAPX_PINNED_VERL_SHA"] = expected_sha
+    env_vars["PYTHONDONTWRITEBYTECODE"] = "1"
     resolved["env_vars"] = env_vars
     return resolved
 
@@ -827,7 +1074,9 @@ def _resolve_verl_worker_topology(verl_config: Any) -> VeRLWorkerTopology:
 
     lora_rank = _config_value(model, "lora_rank", 0)
     if isinstance(lora_rank, bool) or not isinstance(lora_rank, int) or lora_rank < 0:
-        raise ServerFactoryError("VeRL actor_rollout_ref.model.lora_rank must be a non-negative integer")
+        raise ServerFactoryError(
+            "VeRL actor_rollout_ref.model.lora_rank must be a non-negative integer"
+        )
     if lora_rank == 0:
         return VeRLWorkerTopology(
             worker_roles=("actor_rollout", "ref"),
@@ -840,7 +1089,8 @@ def _resolve_verl_worker_topology(verl_config: Any) -> VeRLWorkerTopology:
     lora_alpha = _config_value(model, "lora_alpha", None)
     if isinstance(lora_alpha, bool) or not isinstance(lora_alpha, int) or lora_alpha < 1:
         raise ServerFactoryError(
-            "VeRL actor_rollout_ref.model.lora_alpha must be a positive integer when LoRA is enabled"
+            "VeRL actor_rollout_ref.model.lora_alpha must be a positive integer when "
+            "LoRA is enabled"
         )
     raw_targets = _config_value(model, "target_modules", None)
     if isinstance(raw_targets, str):
@@ -1169,6 +1419,25 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
                         f"optimizer parameter steps disagree on rank {self.rank}: {steps!r}"
                     )
                 return steps[0]
+
+            @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+            def get_capsule_lora_runtime_evidence(self) -> dict[str, Any]:
+                from capx.rl.capsule.server_factory import (
+                    _actor_lora_runtime_record,
+                    _host_mem_available_bytes,
+                )
+
+                actor_model = getattr(self, "actor_module_fsdp", None)
+                if actor_model is None:
+                    raise RuntimeError("actor worker has no FSDP actor module")
+                return _actor_lora_runtime_record(
+                    actor_model,
+                    rank=int(self.rank),
+                    cuda_peak_reserved_loader=lambda: int(
+                        torch.cuda.max_memory_reserved()
+                    ),
+                    host_mem_available_loader=_host_mem_available_bytes,
+                )
 
         remote_worker = ray.remote(CapsuleActorRolloutRefWorker)
         global_pool = "capsule_global_pool"
