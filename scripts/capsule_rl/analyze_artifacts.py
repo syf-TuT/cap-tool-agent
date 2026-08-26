@@ -79,6 +79,9 @@ _LLAMA_ARCHIVE_SHA256 = (
 _CONTROLLER_GGUF_SHA256 = (
     "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c"
 )
+_EXTERNAL_CONTROLLER_ATTESTATION_TYPE = "external_controller_runtime_attestation"
+_EXTERNAL_CONTROLLER_ENDPOINT = "https://coding.dashscope.aliyuncs.com/v1"
+_EXTERNAL_CONTROLLER_MODEL = "qwen3.7-plus"
 GATE_VERIFIERS = {
     "preflight": verify_preflight_gate_artifact,
     "seed": verify_seed_gate_artifact,
@@ -659,6 +662,61 @@ def _verify_controller_attestation_artifact(
     payload, sha256 = _load_gate_artifact_snapshot(
         path, "launcher_controller_attestation"
     )
+    if payload.get("artifact_type") == _EXTERNAL_CONTROLLER_ATTESTATION_TYPE:
+        config_fields = {
+            "mode",
+            "endpoint",
+            "model",
+            "api_key_env",
+            "request_timeout_s",
+            "max_output_tokens",
+            "stream",
+            "enable_thinking",
+            "temperature",
+        }
+        expected_fields = {
+            "schema_version",
+            "artifact_type",
+            "ownership",
+            *config_fields,
+            "credential_present",
+            "controller_binding_sha256",
+        }
+        if set(payload) != expected_fields:
+            raise GateArtifactError(
+                "external Controller attestation schema is incomplete or unexpected"
+            )
+        expected_config = {
+            "mode": "external",
+            "endpoint": _EXTERNAL_CONTROLLER_ENDPOINT,
+            "model": _EXTERNAL_CONTROLLER_MODEL,
+            "api_key_env": "CAPX_CONTROLLER_API_KEY",
+            "request_timeout_s": 300.0,
+            "max_output_tokens": 4096,
+            "stream": False,
+            "enable_thinking": False,
+            "temperature": 0.7,
+        }
+        actual_config = {field_name: payload.get(field_name) for field_name in config_fields}
+        encoded = json.dumps(
+            actual_config,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        binding_sha256 = hashlib.sha256(encoded).hexdigest()
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("ownership") != "external"
+            or payload.get("credential_present") is not True
+            or actual_config != expected_config
+            or payload.get("controller_binding_sha256") != binding_sha256
+        ):
+            raise GateArtifactError(
+                "external Controller attestation does not bind the fixed request contract"
+            )
+        return payload, sha256
+
     expected_fields = {
         "schema_version",
         "artifact_type",
@@ -766,20 +824,40 @@ def _verify_owned_cleanup_artifact(
     expected_names = {"controller", "program", "pyroki"}
     seen_names: set[str] = set()
     seen_processes: set[tuple[int, int]] = set()
+    ownership_by_name: dict[str, str] = {}
     for service in services:
-        if not isinstance(service, Mapping) or set(service) != {
+        if not isinstance(service, Mapping):
+            raise GateArtifactError("owned-service cleanup entry schema is invalid")
+        name = service.get("name")
+        ownership = service.get("ownership")
+        if name == "controller" and ownership == "external":
+            if set(service) != {
+                "name",
+                "ownership",
+                "termination_confirmed",
+            } or service.get("termination_confirmed") is not None:
+                raise GateArtifactError("external Controller cleanup entry is invalid")
+            if name in seen_names:
+                raise GateArtifactError(
+                    "owned-service cleanup entry is invalid or duplicated"
+                )
+            seen_names.add(name)
+            ownership_by_name[name] = ownership
+            continue
+        if set(service) != {
             "name",
+            "ownership",
             "pid",
             "starttime_ticks",
             "termination_confirmed",
         }:
             raise GateArtifactError("owned-service cleanup entry schema is invalid")
-        name = service.get("name")
         pid = service.get("pid")
         starttime_ticks = service.get("starttime_ticks")
         if (
             name not in expected_names
             or name in seen_names
+            or ownership != "owned"
             or isinstance(pid, bool)
             or not isinstance(pid, int)
             or pid < 1
@@ -817,9 +895,12 @@ def _verify_owned_cleanup_artifact(
                         f"owned service {name} is still running at final Gate 7"
                     )
         seen_names.add(name)
+        ownership_by_name[str(name)] = str(ownership)
         seen_processes.add((pid, starttime_ticks))
     if seen_names != expected_names:
         raise GateArtifactError("owned-service cleanup is missing a required service")
+    if ownership_by_name.get("program") != "owned" or ownership_by_name.get("pyroki") != "owned":
+        raise GateArtifactError("Program and PyRoKi cleanup entries must be owned")
     return payload, sha256
 
 
@@ -1061,6 +1142,20 @@ def finalize_runtime_audit(
     if actual_candidate != expected_candidate:
         raise GateArtifactError("Gate 7 candidate does not match the final gate chain")
 
+    if controller.get("artifact_type") == _EXTERNAL_CONTROLLER_ATTESTATION_TYPE:
+        controller_summary = {
+            "controller_mode": "external",
+            "controller_endpoint": controller["endpoint"],
+            "controller_model": controller["model"],
+            "controller_binding_sha256": controller["controller_binding_sha256"],
+        }
+    else:
+        controller_summary = {
+            "controller_mode": "local",
+            "controller_endpoint": "http://127.0.0.1:8102/v1",
+            "controller_model": "qwen2.5-coder-7b-controller-q4_k_m",
+            "controller_binding_sha256": controller["runtime_tree_sha256"],
+        }
     summary.pop("runtime_verification_pending", None)
     summary.update(
         {
@@ -1080,10 +1175,7 @@ def finalize_runtime_audit(
             "continuous_memory_maximum_sample_gap_ms": memory[
                 "maximum_sample_gap_ms"
             ],
-            "controller_archive_sha256": controller["archive_sha256"],
-            "controller_binary_sha256": controller["binary_sha256"],
-            "controller_gguf_sha256": controller["gguf_sha256"],
-            "controller_runtime_tree_sha256": controller["runtime_tree_sha256"],
+            **controller_summary,
             "owned_service_cleanup_completed": cleanup["cleanup_completed"],
             "owned_service_cleanup_count": len(cleanup["services"]),
             "oom_profile": initial_audit["retry_name"],

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib
+import json
 import sys
 import time
 import types
@@ -20,6 +21,7 @@ from scripts.capsule_rl import (
     server_adapter,
     server_preflight,
 )
+from scripts.capsule_rl import launch_owned_services as owned_launcher
 
 from scripts.capsule_rl.launch_owned_services import (
     AuditSnapshot,
@@ -129,9 +131,14 @@ class FakeRuntime:
             repo_is_dirty=True,
         )
 
-    def verify_runtime_inputs(self, _context: RuntimeContext, _workflow: dict) -> dict:
+    def verify_runtime_inputs(self, _context: RuntimeContext, workflow: dict) -> dict:
         self.verified_inputs += 1
         self.events.append("verify-inputs")
+        controller = workflow["services"]["controller"]
+        if controller.get("mode") == "external":
+            return owned_launcher._external_controller_attestation(
+                controller, credential_present=True
+            )
         return {
             "schema_version": 1,
             "artifact_type": "llama_cpp_b10516_runtime_attestation",
@@ -214,6 +221,85 @@ class FakeRuntime:
             process_identity not in self.active_identities
             and identity.name not in self.unconfirmed_termination_names
         )
+
+
+def _write_external_controller_workflow(tmp_path: Path) -> Path:
+    workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+    workflow["services"]["controller"] = {
+        "mode": "external",
+        "endpoint": "https://coding.dashscope.aliyuncs.com/v1",
+        "model": "qwen3.7-plus",
+        "api_key_env": "CAPX_CONTROLLER_API_KEY",
+        "request_timeout_s": 300.0,
+        "max_output_tokens": 4096,
+        "stream": False,
+        "enable_thinking": False,
+        "temperature": 0.7,
+    }
+    path = tmp_path / "external-controller-workflow.yaml"
+    path.write_text(yaml.safe_dump(workflow, sort_keys=False), encoding="utf-8")
+    return path
+
+
+class ExternalControllerFakeRuntime(FakeRuntime):
+    def verify_runtime_inputs(self, _context: RuntimeContext, workflow: dict) -> dict:
+        self.verified_inputs += 1
+        self.events.append("verify-inputs")
+        controller = workflow["services"]["controller"]
+        return owned_launcher._external_controller_attestation(
+            controller, credential_present=True
+        )
+
+
+def test_external_controller_workflow_renders_only_owned_services(tmp_path: Path) -> None:
+    workflow_path = _write_external_controller_workflow(tmp_path)
+
+    workflow = load_owned_services_workflow(workflow_path)
+    services = _render_services(workflow, capsule_config_path=CAPSULE_PATH)
+
+    assert set(services) == {"program", "pyroki"}
+    assert workflow["services"]["controller"]["model"] == "qwen3.7-plus"
+    assert workflow["services"]["controller"]["max_output_tokens"] == 4096
+    assert "controller-secret" not in yaml.safe_dump(workflow)
+
+
+def test_external_controller_is_not_spawned_and_has_explicit_cleanup_evidence(
+    tmp_path: Path,
+) -> None:
+    workflow_path = _write_external_controller_workflow(tmp_path)
+    runtime = ExternalControllerFakeRuntime(tmp_path)
+
+    result = execute_owned_service_workflow(
+        workflow_path=workflow_path,
+        profile_path=PROFILE_PATH,
+        capsule_config_path=CAPSULE_PATH,
+        runtime=runtime,
+        dry_run=False,
+    )
+
+    assert [item[0] for item in runtime.spawned] == ["program", "pyroki"]
+    assert len(runtime.terminated) == 2
+    attestation = json.loads(
+        (result.artifact_dir / "launcher_controller_attestation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert attestation["artifact_type"] == "external_controller_runtime_attestation"
+    assert attestation["ownership"] == "external"
+    assert attestation["credential_present"] is True
+    assert "controller-secret" not in json.dumps(attestation)
+    cleanup = json.loads(
+        (result.artifact_dir / "launcher_owned_cleanup.json").read_text(encoding="utf-8")
+    )
+    assert cleanup["services"][0] == {
+        "name": "controller",
+        "ownership": "external",
+        "termination_confirmed": None,
+    }
+    assert [service["ownership"] for service in cleanup["services"][1:]] == [
+        "owned",
+        "owned",
+    ]
 
 
 def test_repository_single_a800_profile_matches_exact_contract() -> None:
@@ -515,29 +601,17 @@ def test_repository_owned_workflow_matches_exact_service_and_audit_contract() ->
         "--port",
         "8101",
     ]
-    assert workflow["services"]["controller"]["argv_template"] == [
-        "{controller_binary}",
-        "--model",
-        "{controller_gguf}",
-        "--alias",
-        "{controller_alias}",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "8102",
-        "--n-gpu-layers",
-        "0",
-        "--parallel",
-        "1",
-        "--ctx-size",
-        "16384",
-    ]
-    assert workflow["services"]["controller"]["version_tag"] == "b10516"
-    assert (
-        workflow["services"]["controller"]["model_sha256"]
-        == "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c"
-    )
-    assert workflow["services"]["controller"]["env"]["CUDA_VISIBLE_DEVICES"] == ""
+    assert workflow["services"]["controller"] == {
+        "mode": "external",
+        "endpoint": "https://coding.dashscope.aliyuncs.com/v1",
+        "model": "qwen3.7-plus",
+        "api_key_env": "CAPX_CONTROLLER_API_KEY",
+        "request_timeout_s": 300.0,
+        "max_output_tokens": 4096,
+        "stream": False,
+        "enable_thinking": False,
+        "temperature": 0.7,
+    }
     assert workflow["services"]["program"]["env"] == {
         "CUDA_VISIBLE_DEVICES": "",
         "CAPX_PROGRAM_API_KEY": "{env:CAPX_PROGRAM_API_KEY}",
@@ -589,9 +663,7 @@ def test_resolved_service_and_gate_environments_isolate_capsule_credentials(
         name: LinuxRuntime._resolve_env(command.env)
         for name, command in services.items()
     }
-    assert resolved_services["controller"]["LLAMA_API_KEY"] == "controller-secret"
-    assert "CAPX_CONTROLLER_API_KEY" not in resolved_services["controller"]
-    assert "CAPX_PROGRAM_API_KEY" not in resolved_services["controller"]
+    assert set(resolved_services) == {"program", "pyroki"}
     assert resolved_services["program"]["CAPX_PROGRAM_API_KEY"] == "program-secret"
     assert "CAPX_CONTROLLER_API_KEY" not in resolved_services["program"]
     assert "CAPX_PROGRAM_API_KEY" not in resolved_services["pyroki"]
@@ -648,7 +720,7 @@ def test_dry_run_renders_exact_commands_and_does_not_create_outputs(tmp_path: Pa
         "--port",
         "8101",
     ]
-    assert result.rendered_services["controller"].env["CUDA_VISIBLE_DEVICES"] == ""
+    assert set(result.rendered_services) == {"program", "pyroki"}
     assert result.rendered_services["pyroki"].env["JAX_PLATFORMS"] == "cpu"
 
 
@@ -662,7 +734,7 @@ def test_supervisor_runs_services_then_gates_then_cleans_up(tmp_path: Path) -> N
         dry_run=False,
     )
 
-    assert [item[0] for item in runtime.spawned] == ["controller", "program", "pyroki"]
+    assert [item[0] for item in runtime.spawned] == ["program", "pyroki"]
     assert runtime.gates == [
         "gate01_preflight",
         "gate02_seed",
@@ -674,8 +746,8 @@ def test_supervisor_runs_services_then_gates_then_cleans_up(tmp_path: Path) -> N
         "gate07_audit",
         "gate07_finalize",
     ]
-    assert len(runtime.terminated) == 3
-    assert len(runtime.confirmed) == 3
+    assert len(runtime.terminated) == 2
+    assert len(runtime.confirmed) == 2
     assert result.audit.gpu_free_vram_mib == 80000
     assert result.run_id == result.controller_seed_run_ids[0]
     assert result.capsule_config_path == result.attempts[-1].capsule_config_path
@@ -684,7 +756,7 @@ def test_supervisor_runs_services_then_gates_then_cleans_up(tmp_path: Path) -> N
     attestation_path = result.artifact_dir / "launcher_controller_attestation.json"
     assert attestation_path.is_file()
     attestation = yaml.safe_load(attestation_path.read_text(encoding="utf-8"))
-    assert attestation["artifact_type"] == "llama_cpp_b10516_runtime_attestation"
+    assert attestation["artifact_type"] == "external_controller_runtime_attestation"
     cleanup_path = result.artifact_dir / "launcher_owned_cleanup.json"
     cleanup = yaml.safe_load(cleanup_path.read_text(encoding="utf-8"))
     assert cleanup["run_id"] == result.run_id
@@ -694,23 +766,21 @@ def test_supervisor_runs_services_then_gates_then_cleans_up(tmp_path: Path) -> N
         "program",
         "pyroki",
     ]
-    assert runtime.events.index("verify-inputs") < runtime.events.index(
-        "spawn:controller"
-    )
-    controller_ready = runtime.events.index("ready:controller")
+    assert cleanup["services"][0]["ownership"] == "external"
+    assert runtime.events.index("verify-inputs") < runtime.events.index("spawn:program")
     first_memory_after_controller = next(
         index
         for index, event in enumerate(runtime.events)
-        if index > controller_ready and event.startswith("memory:")
+        if event.startswith("memory:")
     )
     assert first_memory_after_controller < runtime.events.index("spawn:program")
     for gate in runtime.gates[:-1]:
         gate_index = runtime.events.index(f"gate:{gate}")
         assert runtime.events[gate_index + 1].startswith("memory:")
-    assert runtime.events.index("terminate:controller") < runtime.events.index(
+    assert runtime.events.index("terminate:program") < runtime.events.index(
         "gate:gate07_finalize"
     )
-    assert runtime.events.index("confirm-terminated:controller") < runtime.events.index(
+    assert runtime.events.index("confirm-terminated:program") < runtime.events.index(
         "gate:gate07_finalize"
     )
 
@@ -731,15 +801,15 @@ def test_noop_terminate_without_probe_confirmation_blocks_cleanup_and_finalizer(
         )
 
     attempt = runtime.configured_attempts[0]
-    assert len(runtime.confirmed) == 3
+    assert len(runtime.confirmed) == 2
     assert not (attempt.artifact_dir / "launcher_owned_cleanup.json").exists()
     assert "gate07_finalize" not in runtime.gates
 
 
 def test_readiness_or_gate_failure_cleans_up_earlier_owned_processes(tmp_path: Path) -> None:
     runtime = FakeRuntime(tmp_path)
-    runtime.ready_fail_after.add("controller")
-    with pytest.raises(RuntimeError, match="controller readiness failed"):
+    runtime.ready_fail_after.add("program")
+    with pytest.raises(RuntimeError, match="program readiness failed"):
         execute_owned_service_workflow(
             workflow_path=WORKFLOW_PATH,
             profile_path=PROFILE_PATH,
@@ -747,7 +817,7 @@ def test_readiness_or_gate_failure_cleans_up_earlier_owned_processes(tmp_path: P
             runtime=runtime,
             dry_run=False,
         )
-    assert [item[0] for item in runtime.spawned] == ["controller"]
+    assert [item[0] for item in runtime.spawned] == ["program"]
     assert len(runtime.terminated) == 1
 
     runtime = FakeRuntime(tmp_path / "gate-failure")
@@ -760,7 +830,7 @@ def test_readiness_or_gate_failure_cleans_up_earlier_owned_processes(tmp_path: P
             runtime=runtime,
             dry_run=False,
         )
-    assert len(runtime.terminated) == 3
+    assert len(runtime.terminated) == 2
     assert runtime.gates[:4] == [
         "gate01_preflight",
         "gate02_seed",
@@ -1012,7 +1082,7 @@ def test_cleanup_preserves_primary_failure_and_attempts_every_owned_process(
             dry_run=False,
         )
 
-    assert len(runtime.terminated) == 3
+    assert len(runtime.terminated) == 2
     attempt = runtime.configured_attempts[0]
     assert not (attempt.artifact_dir / "launcher_owned_cleanup.json").exists()
 
@@ -1038,7 +1108,7 @@ def test_failure_retains_audit_owned_pid_and_memory_evidence(tmp_path: Path) -> 
     assert audit["snapshot"]["gpu_name"] == "NVIDIA A800 80GB PCIe"
 
     process_records = sorted(attempt.artifact_dir.glob("launcher_owned_process_*.json"))
-    assert len(process_records) == 3
+    assert len(process_records) == 2
     recorded_identities = []
     for record_path in process_records:
         raw = record_path.read_text(encoding="utf-8")
@@ -1089,8 +1159,8 @@ def test_continuous_memory_breach_stops_services_and_is_immutable(
     assert evidence["passed"] is False
     assert evidence["minimum_available_mib"] == 12000
     assert evidence["required_mib"] == 12288
-    assert [item[0] for item in runtime.spawned] == ["controller"]
-    assert len(runtime.terminated) == 1
+    assert runtime.spawned == []
+    assert runtime.terminated == []
     assert (attempt.artifact_dir / "launcher_failure.json").is_file()
 
 
@@ -1146,8 +1216,8 @@ def test_post_controller_90gib_check_precedes_continuous_monitor(
     assert point["required_mib"] == 92160
     assert point["passed"] is False
     assert not (attempt.artifact_dir / "launcher_continuous_memory.json").exists()
-    assert [item[0] for item in runtime.spawned] == ["controller"]
-    assert len(runtime.terminated) == 1
+    assert runtime.spawned == []
+    assert runtime.terminated == []
 
 
 def test_linux_spawn_closes_parent_service_log_handle(

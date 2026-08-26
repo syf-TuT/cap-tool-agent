@@ -62,6 +62,9 @@ LLAMA_ARCHIVE_SHA256 = (
     "f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35"
 )
 MAX_CONTROLLER_SEED_RUN_IDS = 3
+EXTERNAL_CONTROLLER_ENDPOINT = "https://coding.dashscope.aliyuncs.com/v1"
+EXTERNAL_CONTROLLER_MODEL = "qwen3.7-plus"
+EXTERNAL_CONTROLLER_ATTESTATION_TYPE = "external_controller_runtime_attestation"
 _CAPSULE_CREDENTIAL_ENV_NAMES = frozenset(
     {"CAPX_PROGRAM_API_KEY", "CAPX_CONTROLLER_API_KEY"}
 )
@@ -339,6 +342,68 @@ def _require_equal(actual: Any, expected: Any, field_name: str) -> None:
         raise OwnedServicesConfigError(f"{field_name} must be {expected!r}")
 
 
+def _external_controller_config(controller: Mapping[str, Any]) -> dict[str, Any]:
+    expected_fields = {
+        "mode",
+        "endpoint",
+        "model",
+        "api_key_env",
+        "request_timeout_s",
+        "max_output_tokens",
+        "stream",
+        "enable_thinking",
+        "temperature",
+    }
+    if set(controller) != expected_fields:
+        raise OwnedServicesConfigError(
+            "external Controller fields are incomplete or unexpected"
+        )
+    expected = {
+        "mode": "external",
+        "endpoint": EXTERNAL_CONTROLLER_ENDPOINT,
+        "model": EXTERNAL_CONTROLLER_MODEL,
+        "api_key_env": "CAPX_CONTROLLER_API_KEY",
+        "request_timeout_s": 300.0,
+        "max_output_tokens": 4096,
+        "stream": False,
+        "enable_thinking": False,
+        "temperature": 0.7,
+    }
+    for field_name, expected_value in expected.items():
+        _require_equal(
+            controller.get(field_name),
+            expected_value,
+            f"controller.{field_name}",
+        )
+    return dict(controller)
+
+
+def _external_controller_binding_sha256(controller: Mapping[str, Any]) -> str:
+    config = _external_controller_config(controller)
+    encoded = json.dumps(
+        config, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _external_controller_attestation(
+    controller: Mapping[str, Any], *, credential_present: bool
+) -> dict[str, Any]:
+    config = _external_controller_config(controller)
+    if credential_present is not True:
+        raise OwnedServicesConfigError(
+            "external Controller credential environment is unset"
+        )
+    return {
+        "schema_version": 1,
+        "artifact_type": EXTERNAL_CONTROLLER_ATTESTATION_TYPE,
+        "ownership": "external",
+        **config,
+        "credential_present": True,
+        "controller_binding_sha256": _external_controller_binding_sha256(config),
+    }
+
+
 def _require_path(payload: Mapping[str, Any], dotted_path: str) -> Any:
     current: Any = payload
     for field in dotted_path.split("."):
@@ -526,21 +591,33 @@ def load_owned_services_workflow(path: str | Path) -> dict[str, Any]:
     _require_equal(set(services), {"controller", "program", "pyroki"}, "services")
 
     controller = _mapping(services, "controller")
-    _require_equal(controller.get("version_tag"), "b10516", "controller.version_tag")
-    _require_equal(controller.get("model_sha256"), CONTROLLER_GGUF_SHA256, "controller GGUF SHA")
-    _require_equal(controller.get("archive_sha256"), LLAMA_ARCHIVE_SHA256, "llama archive SHA")
-    controller_argv = _string_list(controller.get("argv_template"), "controller.argv_template")
-    for required in ("--model", "--alias", "--n-gpu-layers", "--parallel", "--ctx-size"):
-        if required not in controller_argv:
-            raise OwnedServicesConfigError(f"controller command is missing {required}")
-    _require_equal(
-        _mapping(controller, "env"),
-        {
-            "CUDA_VISIBLE_DEVICES": "",
-            "LLAMA_API_KEY": "{env:CAPX_CONTROLLER_API_KEY}",
-        },
-        "Controller environment",
-    )
+    controller_mode = controller.get("mode", "local")
+    if controller_mode == "external":
+        _external_controller_config(controller)
+    elif controller_mode == "local":
+        _require_equal(controller.get("version_tag"), "b10516", "controller.version_tag")
+        _require_equal(
+            controller.get("model_sha256"), CONTROLLER_GGUF_SHA256, "controller GGUF SHA"
+        )
+        _require_equal(
+            controller.get("archive_sha256"), LLAMA_ARCHIVE_SHA256, "llama archive SHA"
+        )
+        controller_argv = _string_list(
+            controller.get("argv_template"), "controller.argv_template"
+        )
+        for required in ("--model", "--alias", "--n-gpu-layers", "--parallel", "--ctx-size"):
+            if required not in controller_argv:
+                raise OwnedServicesConfigError(f"controller command is missing {required}")
+        _require_equal(
+            _mapping(controller, "env"),
+            {
+                "CUDA_VISIBLE_DEVICES": "",
+                "LLAMA_API_KEY": "{env:CAPX_CONTROLLER_API_KEY}",
+            },
+            "Controller environment",
+        )
+    else:
+        raise OwnedServicesConfigError("controller.mode must be local or external")
     program = _mapping(services, "program")
     program_argv = _string_list(
         program.get("argv_template"), "program.argv_template"
@@ -600,6 +677,40 @@ def _file_content_sha256(path: Path) -> str:
 
 
 def _validated_controller_attestation(payload: Mapping[str, Any]) -> dict[str, Any]:
+    if payload.get("artifact_type") == EXTERNAL_CONTROLLER_ATTESTATION_TYPE:
+        config_fields = {
+            "mode",
+            "endpoint",
+            "model",
+            "api_key_env",
+            "request_timeout_s",
+            "max_output_tokens",
+            "stream",
+            "enable_thinking",
+            "temperature",
+        }
+        required_fields = {
+            "schema_version",
+            "artifact_type",
+            "ownership",
+            *config_fields,
+            "credential_present",
+            "controller_binding_sha256",
+        }
+        if set(payload) != required_fields:
+            raise OwnedServicesConfigError(
+                "external Controller attestation fields do not match schema version 1"
+            )
+        config = {field_name: payload[field_name] for field_name in config_fields}
+        expected = _external_controller_attestation(
+            config, credential_present=payload.get("credential_present") is True
+        )
+        if dict(payload) != expected or payload.get("schema_version") != 1:
+            raise OwnedServicesConfigError(
+                "external Controller attestation does not match the fixed runtime contract"
+            )
+        return expected
+
     required_fields = {
         "schema_version",
         "artifact_type",
@@ -731,12 +842,25 @@ def _render_services(
     replacements = {
         "python": _string(runtime.get("python_executable"), "runtime.python_executable"),
         "capsule_config": str(capsule_config_path),
-        "controller_binary": _string(controller.get("binary_path"), "controller.binary_path"),
-        "controller_gguf": _string(controller.get("gguf_path"), "controller.gguf_path"),
-        "controller_alias": _string(controller.get("model_alias"), "controller.model_alias"),
     }
+    service_names = ["program", "pyroki"]
+    if controller.get("mode", "local") == "local":
+        replacements.update(
+            {
+                "controller_binary": _string(
+                    controller.get("binary_path"), "controller.binary_path"
+                ),
+                "controller_gguf": _string(
+                    controller.get("gguf_path"), "controller.gguf_path"
+                ),
+                "controller_alias": _string(
+                    controller.get("model_alias"), "controller.model_alias"
+                ),
+            }
+        )
+        service_names.insert(0, "controller")
     result: dict[str, RenderedCommand] = {}
-    for name in ("controller", "program", "pyroki"):
+    for name in service_names:
         service = _mapping(services, name)
         result[name] = RenderedCommand(
             argv=_render(
@@ -894,13 +1018,32 @@ def _materialize_capsule_config(
     program_service.update({"mode": "actor_identity", "model": model["path"]})
     config["program_service"] = program_service
     controller_service = _mapping(config, "controller_service")
-    controller_service.update(
-        {
-            "model": controller["model_alias"],
-            "request_timeout_s": 300.0,
-            "max_output_tokens": 512,
-        }
-    )
+    if controller.get("mode", "local") == "external":
+        controller_service.update(
+            {
+                field_name: controller[field_name]
+                for field_name in (
+                    "endpoint",
+                    "model",
+                    "api_key_env",
+                    "request_timeout_s",
+                    "max_output_tokens",
+                    "stream",
+                    "enable_thinking",
+                    "temperature",
+                )
+            }
+        )
+    else:
+        controller_service.update(
+            {
+                "model": controller["model_alias"],
+                "request_timeout_s": 300.0,
+                "max_output_tokens": 4096,
+                "stream": False,
+                "enable_thinking": False,
+            }
+        )
     config["controller_service"] = controller_service
     with destination.open("x", encoding="utf-8", newline="\n") as stream:
         yaml.safe_dump(config, stream, sort_keys=False, allow_unicode=True)
@@ -966,12 +1109,20 @@ def _write_owned_process(
 
 
 def _write_owned_cleanup(
-    path: Path, *, run_id: str, identities: Sequence[ProcessIdentity]
+    path: Path,
+    *,
+    run_id: str,
+    identities: Sequence[ProcessIdentity],
+    controller_mode: str,
 ) -> None:
-    expected_names = ("controller", "program", "pyroki")
+    expected_names = (
+        ("controller", "program", "pyroki")
+        if controller_mode == "local"
+        else ("program", "pyroki")
+    )
     if tuple(identity.name for identity in identities) != expected_names:
         raise RuntimeError(
-            "owned-service cleanup evidence requires controller, program, and pyroki"
+            "owned-service cleanup evidence does not match Controller ownership"
         )
     process_identities = {
         (identity.pid, identity.starttime_ticks) for identity in identities
@@ -985,9 +1136,21 @@ def _write_owned_cleanup(
             "artifact_type": "single_a800_owned_service_cleanup",
             "run_id": run_id,
             "cleanup_completed": True,
-            "services": [
+            "services": (
+                []
+                if controller_mode == "local"
+                else [
+                    {
+                        "name": "controller",
+                        "ownership": "external",
+                        "termination_confirmed": None,
+                    }
+                ]
+            )
+            + [
                 {
                     "name": identity.name,
+                    "ownership": "owned",
                     "pid": identity.pid,
                     "starttime_ticks": identity.starttime_ticks,
                     "termination_confirmed": True,
@@ -1087,11 +1250,41 @@ def _run_attempt(
     owned: list[ProcessIdentity] = []
     memory_monitor: _ContinuousMemoryMonitor | None = None
     primary_error: BaseException | None = None
+
+    def start_memory_monitor() -> _ContinuousMemoryMonitor:
+        _check_memory(
+            runtime,
+            workflow,
+            after_controller=True,
+            stage="post-controller",
+            evidence_path=artifact_dir / "launcher_memory_00_post-controller.json",
+        )
+        continuous_loader = getattr(
+            runtime,
+            "continuous_mem_available_mib",
+            runtime.mem_available_mib,
+        )
+        monitor = _ContinuousMemoryMonitor(
+            loader=continuous_loader,
+            required_mib=_mapping(workflow, "hardware")[
+                "mem_available_during_run_required_mib"
+            ],
+            evidence_path=artifact_dir / "launcher_continuous_memory.json",
+            interval_s=float(getattr(runtime, "memory_monitor_interval_s", 1.0)),
+        )
+        monitor.start()
+        return monitor
+
+    controller_mode = _mapping(_mapping(workflow, "services"), "controller").get(
+        "mode", "local"
+    )
     try:
-        for service_name in ("controller", "program", "pyroki"):
+        if controller_mode == "external":
+            memory_monitor = start_memory_monitor()
+            memory_monitor.raise_if_breached()
+        for service_name, command in services.items():
             if memory_monitor is not None:
                 memory_monitor.raise_if_breached()
-            command = services[service_name]
             identity = runtime.spawn(service_name, command.argv, command.env)
             owned.append(identity)
             _write_owned_process(
@@ -1103,31 +1296,7 @@ def _run_attempt(
             if memory_monitor is not None:
                 memory_monitor.raise_if_breached()
             if service_name == "controller":
-                _check_memory(
-                    runtime,
-                    workflow,
-                    after_controller=True,
-                    stage="post-controller",
-                    evidence_path=artifact_dir / "launcher_memory_00_post-controller.json",
-                )
-                continuous_loader = getattr(
-                    runtime,
-                    "continuous_mem_available_mib",
-                    runtime.mem_available_mib,
-                )
-                memory_monitor = _ContinuousMemoryMonitor(
-                    loader=continuous_loader,
-                    required_mib=_mapping(workflow, "hardware")[
-                        "mem_available_during_run_required_mib"
-                    ],
-                    evidence_path=(
-                        artifact_dir / "launcher_continuous_memory.json"
-                    ),
-                    interval_s=float(
-                        getattr(runtime, "memory_monitor_interval_s", 1.0)
-                    ),
-                )
-                memory_monitor.start()
+                memory_monitor = start_memory_monitor()
                 memory_monitor.raise_if_breached()
         for gate_index, gate_name in enumerate(GATE_ORDER, start=1):
             if memory_monitor is not None:
@@ -1184,6 +1353,7 @@ def _run_attempt(
         artifact_dir / "launcher_owned_cleanup.json",
         run_id=attempt.run_id,
         identities=owned,
+        controller_mode=str(controller_mode),
     )
     finalizer = gates["gate07_finalize"]
     runtime.run_gate("gate07_finalize", finalizer.argv, finalizer.env)
@@ -1432,6 +1602,16 @@ class LinuxRuntime:
         self, _context: RuntimeContext, workflow: Mapping[str, Any]
     ) -> dict[str, Any]:
         controller = _mapping(_mapping(workflow, "services"), "controller")
+        if controller.get("mode", "local") == "external":
+            api_key_env = _string(
+                controller.get("api_key_env"), "controller.api_key_env"
+            )
+            attestation = _external_controller_attestation(
+                controller,
+                credential_present=bool(os.environ.get(api_key_env)),
+            )
+            self._controller_attestation = attestation
+            return attestation
         try:
             attestation = _validated_controller_attestation(
                 attest_llama_cpp_runtime(

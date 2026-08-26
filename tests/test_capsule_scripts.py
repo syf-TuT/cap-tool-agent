@@ -32,6 +32,7 @@ from scripts.capsule_rl import (
     check_seed_determinism,
     common,
     controller_collector_smoke,
+    launch_owned_services,
     one_step_trainer_smoke,
     oracle_clean_replay,
     materialize_resolved_dataset,
@@ -3995,6 +3996,7 @@ def _write_owned_cleanup(path: Path, *, run_id: str) -> None:
                 "services": [
                     {
                         "name": name,
+                        "ownership": "owned",
                         "pid": 4100 + index,
                         "starttime_ticks": 41000 + index,
                         "termination_confirmed": True,
@@ -4194,6 +4196,74 @@ def test_owned_cleanup_verifier_rejects_a_still_running_process(tmp_path: Path) 
         )
 
 
+def test_external_controller_attestation_and_cleanup_are_verified_without_a_pid(
+    tmp_path: Path,
+) -> None:
+    controller = {
+        "mode": "external",
+        "endpoint": "https://coding.dashscope.aliyuncs.com/v1",
+        "model": "qwen3.7-plus",
+        "api_key_env": "CAPX_CONTROLLER_API_KEY",
+        "request_timeout_s": 300.0,
+        "max_output_tokens": 4096,
+        "stream": False,
+        "enable_thinking": False,
+        "temperature": 0.7,
+    }
+    attestation = launch_owned_services._external_controller_attestation(
+        controller, credential_present=True
+    )
+    attestation_path = tmp_path / "launcher_controller_attestation.json"
+    attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
+
+    verified, _sha256 = analyze_artifacts._verify_controller_attestation_artifact(
+        attestation_path
+    )
+
+    assert verified == attestation
+    assert "controller-secret" not in json.dumps(verified)
+
+    cleanup_path = tmp_path / "launcher_owned_cleanup.json"
+    cleanup_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_type": "single_a800_owned_service_cleanup",
+                "run_id": "external-run",
+                "cleanup_completed": True,
+                "services": [
+                    {
+                        "name": "controller",
+                        "ownership": "external",
+                        "termination_confirmed": None,
+                    },
+                    {
+                        "name": "program",
+                        "ownership": "owned",
+                        "pid": 900001,
+                        "starttime_ticks": 1001,
+                        "termination_confirmed": True,
+                    },
+                    {
+                        "name": "pyroki",
+                        "ownership": "owned",
+                        "pid": 900002,
+                        "starttime_ticks": 1002,
+                        "termination_confirmed": True,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cleanup, _sha256 = analyze_artifacts._verify_owned_cleanup_artifact(
+        cleanup_path, expected_run_id="external-run"
+    )
+
+    assert cleanup["services"][0]["ownership"] == "external"
+
+
 def test_gate7_finalization_binds_candidate_and_continuous_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4268,9 +4338,8 @@ def test_gate7_finalization_binds_candidate_and_continuous_memory(
         memory_path
     )
     assert final["minimum_mem_available_mib"] == 19000
-    assert final["controller_runtime_tree_sha256"] == controller[
-        "runtime_tree_sha256"
-    ]
+    assert final["controller_mode"] == "local"
+    assert final["controller_binding_sha256"] == controller["runtime_tree_sha256"]
     assert final["owned_service_cleanup_completed"] is True
     assert final["owned_service_cleanup_count"] == 3
     assert final["initial_hardware"]["gpu_name"] == "NVIDIA A800 80GB PCIe"

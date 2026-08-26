@@ -99,14 +99,10 @@ def valid_final_runtime_audit(
         "minimum_mem_available_mib": 19000,
         "continuous_memory_sample_count": 2,
         "continuous_memory_maximum_sample_gap_ms": 1000,
-        "controller_archive_sha256": (
-            "f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35"
-        ),
-        "controller_binary_sha256": "2" * 64,
-        "controller_gguf_sha256": (
-            "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c"
-        ),
-        "controller_runtime_tree_sha256": "3" * 64,
+        "controller_mode": "external",
+        "controller_endpoint": "https://coding.dashscope.aliyuncs.com/v1",
+        "controller_model": "qwen3.7-plus",
+        "controller_binding_sha256": "3" * 64,
         "owned_service_cleanup_completed": True,
         "owned_service_cleanup_count": 3,
         "oom_profile": "base_dynamic_fp32",

@@ -117,10 +117,10 @@ _FINAL_RUNTIME_AUDIT_FIELDS = frozenset(
         "minimum_mem_available_mib",
         "continuous_memory_sample_count",
         "continuous_memory_maximum_sample_gap_ms",
-        "controller_archive_sha256",
-        "controller_binary_sha256",
-        "controller_gguf_sha256",
-        "controller_runtime_tree_sha256",
+        "controller_mode",
+        "controller_endpoint",
+        "controller_model",
+        "controller_binding_sha256",
         "owned_service_cleanup_completed",
         "owned_service_cleanup_count",
         "oom_profile",
@@ -146,17 +146,12 @@ _FINAL_RUNTIME_AUDIT_SHA256_FIELDS = frozenset(
         "launcher_owned_cleanup_sha256",
         "launcher_initial_audit_sha256",
         "launcher_post_controller_memory_sha256",
-        "controller_binary_sha256",
-        "controller_runtime_tree_sha256",
+        "controller_binding_sha256",
         "resolved_profile_sha256",
     }
 )
-_LLAMA_CPP_B10516_ARCHIVE_SHA256 = (
-    "f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35"
-)
-_QWEN25_CODER_7B_Q4_K_M_GGUF_SHA256 = (
-    "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c"
-)
+_EXTERNAL_CONTROLLER_ENDPOINT = "https://coding.dashscope.aliyuncs.com/v1"
+_EXTERNAL_CONTROLLER_MODEL = "qwen3.7-plus"
 _SINGLE_A800_OOM_PROFILES = frozenset(
     {
         "base_dynamic_fp32",
@@ -238,13 +233,21 @@ def validate_final_runtime_audit(payload: Mapping[str, Any]) -> None:
             raise GateArtifactError(
                 f"final Gate 7 runtime audit {field_name} must be lowercase SHA-256"
             )
-    if payload.get("controller_archive_sha256") != _LLAMA_CPP_B10516_ARCHIVE_SHA256:
+    controller_mode = payload.get("controller_mode")
+    controller_endpoint = payload.get("controller_endpoint")
+    controller_model = payload.get("controller_model")
+    if controller_mode not in {"local", "external"}:
+        raise GateArtifactError("final Gate 7 runtime audit Controller mode is invalid")
+    if not isinstance(controller_endpoint, str) or not controller_endpoint:
+        raise GateArtifactError("final Gate 7 runtime audit Controller endpoint is invalid")
+    if not isinstance(controller_model, str) or not controller_model:
+        raise GateArtifactError("final Gate 7 runtime audit Controller model is invalid")
+    if controller_mode == "external" and (
+        controller_endpoint != _EXTERNAL_CONTROLLER_ENDPOINT
+        or controller_model != _EXTERNAL_CONTROLLER_MODEL
+    ):
         raise GateArtifactError(
-            "final Gate 7 runtime audit must bind the fixed llama.cpp b10516 archive"
-        )
-    if payload.get("controller_gguf_sha256") != _QWEN25_CODER_7B_Q4_K_M_GGUF_SHA256:
-        raise GateArtifactError(
-            "final Gate 7 runtime audit must bind the fixed Qwen Q4_K_M Controller GGUF"
+            "final Gate 7 runtime audit does not bind the fixed external Controller"
         )
 
     counter_fields = (
@@ -393,7 +396,7 @@ def validate_final_runtime_audit(payload: Mapping[str, Any]) -> None:
         or payload.get("owned_service_cleanup_count") != 3
     ):
         raise GateArtifactError(
-            "final Gate 7 runtime audit must prove cleanup of all three owned services"
+            "final Gate 7 runtime audit must bind all three logical services"
         )
     if payload.get("oom_profile") not in _SINGLE_A800_OOM_PROFILES:
         raise GateArtifactError("final Gate 7 runtime audit OOM profile is invalid")
