@@ -15,6 +15,8 @@ env/
 .openrouterkey
 .nvinferencekeys
 .capx_skills.json
+# One-off Codex staging files/directories; reusable scripts belong under scripts/.
+/.codex_*
 .codex_*.py
 .codex_start_services_*.sh
 .codex-model-cache/
