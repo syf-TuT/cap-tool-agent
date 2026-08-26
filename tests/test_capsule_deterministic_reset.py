@@ -203,6 +203,27 @@ def test_cube_stack_constructors_receive_seed_in_all_three_branches() -> None:
     assert all("seed" in {keyword.arg for keyword in call.keywords} for call in stack_calls)
 
 
+def test_cube_lift_constructors_receive_seed_in_all_three_branches() -> None:
+    tree = _source_tree("capx/envs/simulators/robosuite_cube_lift.py")
+    lift_calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr == "Lift":
+            lift_calls.append(node)
+
+    assert len(lift_calls) == 3
+    assert all(
+        any(
+            keyword.arg == "seed"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "seed"
+            for keyword in call.keywords
+        )
+        for call in lift_calls
+    )
+
+
 def test_cube_reset_reseeds_before_calling_robosuite_reset() -> None:
     tree = _source_tree("capx/envs/simulators/robosuite_cubes.py")
     reset_method = next(
@@ -226,3 +247,29 @@ def test_cube_reset_reseeds_before_calling_robosuite_reset() -> None:
     )
 
     assert reseed_position < reset_position
+
+
+def test_cube_lift_reset_reseeds_before_calling_robosuite_reset() -> None:
+    tree = _source_tree("capx/envs/simulators/robosuite_cube_lift.py")
+    reset_method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "reset"
+    )
+    calls = [node for node in ast.walk(reset_method) if isinstance(node, ast.Call)]
+    reseed_positions = [
+        call.lineno
+        for call in calls
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "_reseed_robosuite"
+    ]
+    reset_position = next(
+        call.lineno
+        for call in calls
+        if isinstance(call.func, ast.Attribute)
+        and call.func.attr == "reset"
+        and isinstance(call.func.value, ast.Attribute)
+        and call.func.value.attr == "robosuite_env"
+    )
+
+    assert reseed_positions, "Cube Lift reset must reseed the Robosuite owner"
+    assert reseed_positions[0] < reset_position
