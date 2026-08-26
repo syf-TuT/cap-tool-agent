@@ -1161,7 +1161,9 @@ class ConcreteGateRuntime:
         try:
             oracle_source = getattr(probe, "oracle_code", None)
             if not isinstance(oracle_source, str) or not oracle_source.strip():
-                raise ServerAdapterError("Cube Stack environment does not expose oracle_code")
+                raise ServerAdapterError(
+                    "configured environment does not expose oracle_code"
+                )
         finally:
             close = getattr(probe, "close", None)
             if callable(close):
@@ -1178,9 +1180,8 @@ class ConcreteGateRuntime:
                     seed,
                     program_sample_id=f"{task.task_id}:seed-{seed}:oracle",
                 )
-                process = getattr(backend, "_process", None)
-                pid = getattr(process, "pid", None)
-                if not isinstance(pid, int):
+                pid = backend.worker_pid
+                if isinstance(pid, bool) or not isinstance(pid, int):
                     raise ServerAdapterError("clean replay backend did not expose a worker PID")
                 namespace_fresh, api_state_cleared = self._reset_evidence(result)
                 records.append(

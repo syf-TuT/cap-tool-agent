@@ -129,6 +129,14 @@ class PersistentProcessReplayBackend:
         self._process: mp.Process | None = None
         self._closed = False
 
+    @property
+    def worker_pid(self) -> int | None:
+        process = self._process
+        if process is None or not process.is_alive():
+            return None
+        pid = process.pid
+        return pid if isinstance(pid, int) and not isinstance(pid, bool) else None
+
     def _start_worker(self) -> None:
         if self._closed:
             raise WorkerCrashedError("replay backend is closed")

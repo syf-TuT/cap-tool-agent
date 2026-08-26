@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import deque
 from collections.abc import Mapping
 from copy import deepcopy
@@ -400,6 +401,7 @@ class _ProcessFakeEnv:
                 "sandbox_rc": 7,
                 "error_type": None,
                 "error_message": None,
+                "worker_pid": os.getpid(),
                 "call_order": list(self.calls),
             },
         )
@@ -584,3 +586,37 @@ def test_persistent_process_backend_runs_only_reset_then_full_program_step() -> 
         ("step", "RESULT = 'done'"),
     )
     assert result.sandbox_rc == 7
+
+
+def test_persistent_process_backend_exposes_live_child_pid_for_sequential_replays() -> None:
+    backend = PersistentProcessReplayBackend(_process_fake_env_factory, start_method="spawn")
+
+    assert backend.worker_pid is None
+    try:
+        first = backend.execute(_task(seed=23), "RESULT = 'first'", 23, 5.0)
+        first_pid = backend.worker_pid
+        second = backend.execute(_task(seed=23), "RESULT = 'second'", 23, 5.0)
+        second_pid = backend.worker_pid
+    finally:
+        backend.close()
+
+    assert isinstance(first_pid, int)
+    assert first_pid == first["step"]["info"]["worker_pid"]
+    assert second_pid == first_pid
+    assert second["step"]["info"]["worker_pid"] == first_pid
+    assert backend.worker_pid is None
+
+
+class _ExitedProcess:
+    pid = 12345
+
+    @staticmethod
+    def is_alive() -> bool:
+        return False
+
+
+def test_persistent_process_backend_hides_exited_worker_pid() -> None:
+    backend = PersistentProcessReplayBackend(_process_fake_env_factory)
+    backend._process = _ExitedProcess()  # type: ignore[assignment]
+
+    assert backend.worker_pid is None

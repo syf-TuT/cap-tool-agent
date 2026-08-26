@@ -1530,6 +1530,147 @@ def test_oracle_reset_evidence_is_read_from_typed_replay_diagnostics() -> None:
         server_adapter.ConcreteGateRuntime._reset_evidence(SimpleNamespace(diagnostics={}))
 
 
+def test_concrete_oracle_uses_public_persistent_worker_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from capx.rl.capsule import evaluator as evaluator_module
+    from capx.rl.capsule import server_factory
+
+    task = TaskInstanceV1(
+        task_id="cube-lift-5",
+        environment_seed=5,
+        prompt="lift the cube",
+        environment="robosuite_cube_lift",
+        api="franka_control_privileged",
+        privilege="privileged",
+        initial_state_sha256="a" * 64,
+    )
+    observed = {"worker_pid_reads": 0, "execute_calls": 0, "closed": False}
+
+    class _Probe:
+        oracle_code = "close_gripper()"
+
+        def close(self) -> None:
+            return None
+
+    class _Factory:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def __call__(self, _task: TaskInstanceV1) -> _Probe:
+            return _Probe()
+
+    class _Backend:
+        def __init__(self, _factory: object) -> None:
+            pass
+
+        @property
+        def worker_pid(self) -> int:
+            observed["worker_pid_reads"] += 1
+            return 4321
+
+        @property
+        def _process(self) -> object:
+            raise AssertionError("oracle must not inspect backend._process")
+
+        def execute(
+            self,
+            replay_task: TaskInstanceV1,
+            _source: str,
+            _seed: int,
+            _timeout_s: float,
+        ) -> dict[str, object]:
+            observed["execute_calls"] += 1
+            return {
+                "reset_info": {
+                    "initial_state_sha256": replay_task.initial_state_sha256,
+                    "capsule_reset_evidence": {
+                        "namespace_fresh": True,
+                        "api_state_cleared": True,
+                        "api_reset_count": 1,
+                        "api_reset_confirmed_count": 1,
+                    },
+                },
+                "step": {
+                    "reward": 1.0,
+                    "terminated": True,
+                    "truncated": False,
+                    "info": {
+                        "task_completed": True,
+                        "sandbox_rc": 0,
+                        "error_type": None,
+                        "error_message": None,
+                    },
+                },
+            }
+
+        def replace_worker(self) -> None:
+            raise AssertionError("successful oracle replay must not replace its worker")
+
+        def close(self) -> None:
+            observed["closed"] = True
+
+    monkeypatch.setattr(server_factory, "YamlEnvironmentFactory", _Factory)
+    monkeypatch.setattr(evaluator_module, "PersistentProcessReplayBackend", _Backend)
+    runtime = server_adapter.ConcreteGateRuntime(
+        {
+            "task": {"config_path": "cube-lift.yaml"},
+            "runtime": {"project_root": str(tmp_path)},
+        }
+    )
+    monkeypatch.setattr(runtime, "_task_for_seed", lambda _seed: task)
+
+    evidence = runtime.oracle(5, 2, run_id="run-01")
+
+    assert [replay["worker_id"] for replay in evidence["replays"]] == [
+        "pid:4321",
+        "pid:4321",
+    ]
+    assert observed == {"worker_pid_reads": 2, "execute_calls": 2, "closed": True}
+
+
+def test_concrete_oracle_missing_source_error_is_task_neutral(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from capx.rl.capsule import server_factory
+
+    task = TaskInstanceV1(
+        task_id="cube-lift-5",
+        environment_seed=5,
+        prompt="lift the cube",
+        environment="robosuite_cube_lift",
+        api="franka_control_privileged",
+        privilege="privileged",
+        initial_state_sha256="a" * 64,
+    )
+
+    class _Probe:
+        def close(self) -> None:
+            return None
+
+    class _Factory:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def __call__(self, _task: TaskInstanceV1) -> _Probe:
+            return _Probe()
+
+    monkeypatch.setattr(server_factory, "YamlEnvironmentFactory", _Factory)
+    runtime = server_adapter.ConcreteGateRuntime(
+        {
+            "task": {"config_path": "cube-lift.yaml"},
+            "runtime": {"project_root": str(tmp_path)},
+        }
+    )
+    monkeypatch.setattr(runtime, "_task_for_seed", lambda _seed: task)
+
+    with pytest.raises(
+        server_adapter.ServerAdapterError,
+        match="^configured environment does not expose oracle_code$",
+    ):
+        runtime.oracle(5, 2, run_id="run-01")
+
+
 def _guided_payload(run_id: str) -> dict[str, object]:
     task_id = "cube-stack-5"
     prompt = "stack the cubes"
