@@ -35,6 +35,7 @@ OOM_LADDER = (
     "vllm_util_026",
     "fixed_microbatch_1",
     "fsdp_base_bf16",
+    "fsdp_base_bf16_vllm_util_045",
 )
 GATE_ORDER = (
     "gate01_preflight",
@@ -676,9 +677,11 @@ def _retry_profile(base_profile: Mapping[str, Any], retry_name: str) -> dict[str
         rollout["log_prob_micro_batch_size_per_gpu"] = 1
         ref["log_prob_use_dynamic_bsz"] = False
         ref["log_prob_micro_batch_size_per_gpu"] = 1
-    if retry_name == OOM_LADDER[3]:
+    if retry_name in OOM_LADDER[3:]:
         actor["fsdp_config"]["model_dtype"] = "bf16"
         ref["fsdp_config"]["model_dtype"] = "bf16"
+    if retry_name == OOM_LADDER[4]:
+        rollout["gpu_memory_utilization"] = 0.45
     profile["capsule_runtime"]["oom_profile"] = retry_name
     return profile
 

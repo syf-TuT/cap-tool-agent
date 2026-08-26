@@ -163,6 +163,7 @@ _SINGLE_A800_OOM_PROFILES = frozenset(
         "vllm_util_026",
         "fixed_microbatch_1",
         "fsdp_base_bf16",
+        "fsdp_base_bf16_vllm_util_045",
     }
 )
 

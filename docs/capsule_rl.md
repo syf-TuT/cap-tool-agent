@@ -112,6 +112,7 @@ base_dynamic_fp32
 vllm_util_026          # 仅将 vLLM utilization 0.30 -> 0.26
 fixed_microbatch_1     # 保留 0.26，actor/rollout/ref 改固定 microbatch 1
 fsdp_base_bf16         # 保留前两项，再将 actor/ref FSDP model_dtype 改为 BF16
+fsdp_base_bf16_vllm_util_045  # 保留 BF16/microbatch 1，将 vLLM utilization 改为 0.45
 ```
 
 任何 fallback 都不会缩短 10240 token cap，也不会改变 7+1 group、KL 或 GRPO 语义。

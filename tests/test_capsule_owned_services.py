@@ -551,6 +551,7 @@ def test_repository_owned_workflow_matches_exact_service_and_audit_contract() ->
         "vllm_util_026",
         "fixed_microbatch_1",
         "fsdp_base_bf16",
+        "fsdp_base_bf16_vllm_util_045",
     ]
     assert workflow["runtime"]["verl_pinned_sha"] == "d62da4950573d7a4b7ef2362337952e7ab59e78d"
     assert workflow["runtime"]["max_controller_seed_run_ids"] == 3
@@ -785,10 +786,16 @@ def test_retry_profile_materialization_is_exact_and_semantics_preserving(tmp_pat
         retry_name="fsdp_base_bf16",
         destination=tmp_path / "retry-03.yaml",
     )
+    retry_four = materialize_retry_profile(
+        base_profile=base_profile,
+        retry_name="fsdp_base_bf16_vllm_util_045",
+        destination=tmp_path / "retry-04.yaml",
+    )
 
     payload_one = yaml.safe_load(retry_one.read_text(encoding="utf-8"))
     payload_two = yaml.safe_load(retry_two.read_text(encoding="utf-8"))
     payload_three = yaml.safe_load(retry_three.read_text(encoding="utf-8"))
+    payload_four = yaml.safe_load(retry_four.read_text(encoding="utf-8"))
 
     assert payload_one["actor_rollout_ref"]["rollout"][
         "gpu_memory_utilization"
@@ -809,7 +816,14 @@ def test_retry_profile_materialization_is_exact_and_semantics_preserving(tmp_pat
     assert payload_three["actor_rollout_ref"]["ref"]["log_prob_use_dynamic_bsz"] is False
     assert payload_three["actor_rollout_ref"]["actor"]["fsdp_config"]["model_dtype"] == "bf16"
     assert payload_three["actor_rollout_ref"]["ref"]["fsdp_config"]["model_dtype"] == "bf16"
-    for payload in (payload_one, payload_two, payload_three):
+    assert payload_four["actor_rollout_ref"]["rollout"][
+        "gpu_memory_utilization"
+    ] == pytest.approx(0.45)
+    assert payload_four["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is False
+    assert payload_four["actor_rollout_ref"]["ref"]["log_prob_use_dynamic_bsz"] is False
+    assert payload_four["actor_rollout_ref"]["actor"]["fsdp_config"]["model_dtype"] == "bf16"
+    assert payload_four["actor_rollout_ref"]["ref"]["fsdp_config"]["model_dtype"] == "bf16"
+    for payload in (payload_one, payload_two, payload_three, payload_four):
         assert payload["actor_rollout_ref"]["actor"]["ppo_max_token_len_per_gpu"] == 10240
         assert payload["actor_rollout_ref"]["rollout"]["max_model_len"] == 10240
         assert (
@@ -886,7 +900,7 @@ def test_oom_retries_are_cumulative_new_profiles_and_retain_evidence(
     tmp_path: Path,
 ) -> None:
     runtime = FakeRuntime(tmp_path)
-    runtime.oom_failures_remaining = 3
+    runtime.oom_failures_remaining = 4
 
     result = execute_owned_service_workflow(
         workflow_path=WORKFLOW_PATH,
@@ -901,10 +915,11 @@ def test_oom_retries_are_cumulative_new_profiles_and_retain_evidence(
         "vllm_util_026",
         "fixed_microbatch_1",
         "fsdp_base_bf16",
+        "fsdp_base_bf16_vllm_util_045",
     ]
-    assert len({attempt.run_id for attempt in result.attempts}) == 4
-    assert len({attempt.profile_sha256 for attempt in result.attempts}) == 4
-    for failed in result.attempts[:3]:
+    assert len({attempt.run_id for attempt in result.attempts}) == 5
+    assert len({attempt.profile_sha256 for attempt in result.attempts}) == 5
+    for failed in result.attempts[:4]:
         assert (failed.artifact_dir / "launcher_failure.json").is_file()
     for attempt in result.attempts:
         assert hashlib.sha256(attempt.profile_path.read_bytes()).hexdigest() == (
@@ -912,7 +927,7 @@ def test_oom_retries_are_cumulative_new_profiles_and_retain_evidence(
         )
     final = yaml.safe_load(result.attempts[-1].profile_path.read_text(encoding="utf-8"))
     root = final["actor_rollout_ref"]
-    assert root["rollout"]["gpu_memory_utilization"] == pytest.approx(0.26)
+    assert root["rollout"]["gpu_memory_utilization"] == pytest.approx(0.45)
     assert root["actor"]["use_dynamic_bsz"] is False
     assert root["ref"]["log_prob_use_dynamic_bsz"] is False
     assert root["actor"]["fsdp_config"]["model_dtype"] == "bf16"

@@ -71,6 +71,7 @@ _OOM_PROFILES = {
     "vllm_util_026",
     "fixed_microbatch_1",
     "fsdp_base_bf16",
+    "fsdp_base_bf16_vllm_util_045",
 }
 _LLAMA_ARCHIVE_SHA256 = (
     "f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35"
