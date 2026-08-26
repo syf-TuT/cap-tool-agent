@@ -72,6 +72,16 @@ CLEAN_REPLAY_CONFIG = (
     / "capsule_rl"
     / "franka_robosuite_cube_stack_privileged_clean_replay.yaml"
 )
+LIFT_CONFIG_TEMPLATE = (
+    REPOSITORY_ROOT
+    / "env_configs"
+    / "cube_lifting"
+    / "capsule_rl"
+    / "franka_robosuite_cube_lift_capsule_smoke.yaml"
+)
+LIFT_SOURCE_TASKS = LIFT_CONFIG_TEMPLATE.with_name(
+    "cube_lift_capsule_source_tasks.jsonl"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -244,6 +254,60 @@ def test_all_server_entrypoints_exist_and_advertise_safe_validation_mode() -> No
         source = (scripts_dir / filename).read_text(encoding="utf-8")
         assert "--validate-only" in source or "--dry-run" in source
         assert "if __name__ == \"__main__\"" in source
+
+
+def test_cube_lift_repository_template_loads_without_runtime_path_checks() -> None:
+    loaded = common.load_and_validate_server_config(
+        LIFT_CONFIG_TEMPLATE,
+        check_runtime_paths=False,
+    )
+
+    assert loaded["task"]["profile"] == "robosuite_cube_lift_privileged_highlevel"
+    assert loaded["capsule"]["group_size"] == 8
+    assert loaded["capsule"]["base_samples_before_repair"] == 7
+    assert loaded["algorithm"]["adv_estimator"] == "grpo"
+    assert loaded["controller_service"]["frozen"] is True
+
+
+def test_cube_lift_source_task_exposes_only_existing_high_level_functions() -> None:
+    source_lines = [
+        line
+        for line in LIFT_SOURCE_TASKS.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert len(source_lines) == 1
+    record = json.loads(source_lines[0])
+    assert set(record) == {"task_id", "prompt"}
+    assert record["task_id"] == "cube-lift-red-cube"
+
+    prompt = record["prompt"]
+    declared_functions = {
+        line[3:].split("(", maxsplit=1)[0]
+        for line in prompt.splitlines()
+        if line.startswith("- `") and "(" in line
+    }
+    assert declared_functions == {
+        "get_object_pose",
+        "sample_grasp_pose",
+        "goto_pose",
+        "open_gripper",
+        "close_gripper",
+    }
+    assert "pick up the red cube and lift it" in prompt
+    assert "Only the five high-level functions below are available" in prompt
+    assert "`get_object_pose(object_name, return_bbox_extent=False)`" in prompt
+    assert "`sample_grasp_pose(object_name)`" in prompt
+    assert "`goto_pose(position, quaternion_wxyz, z_approach=0.0)`" in prompt
+    assert "`open_gripper()`" in prompt
+    assert "`close_gripper()`" in prompt
+    assert "WXYZ" in prompt
+    assert "one complete executable Python program" in prompt
+    assert "without Markdown code fences" in prompt
+    assert "Do not access a raw environment object" in prompt
+    assert "Do not use low-level joint control" in prompt
+    for unavailable_function in ("grasp", "lift", "pick_and_lift", "home_pose"):
+        assert f"`{unavailable_function}(" not in prompt
 
 
 def test_server_config_validation_checks_algorithm_and_runtime_invariants(tmp_path: Path) -> None:

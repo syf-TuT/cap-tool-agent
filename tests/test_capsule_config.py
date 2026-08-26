@@ -7,6 +7,10 @@ import pytest
 import yaml
 
 from capx.rl.capsule.compat import CapsuleConfigError, validate_capsule_config
+from capx.rl.capsule.task_profiles import (
+    collect_environment_profile_errors,
+    resolve_task_profile,
+)
 
 
 CONFIG_PATH = (
@@ -20,6 +24,16 @@ CLEAN_REPLAY_CONFIG_PATH = CONFIG_PATH.with_name(
     "franka_robosuite_cube_stack_privileged_clean_replay.yaml"
 )
 LIFT_PROFILE_NAME = "robosuite_cube_lift_privileged_highlevel"
+LIFT_CONFIG_PATH = (
+    Path(__file__).parents[1]
+    / "env_configs"
+    / "cube_lifting"
+    / "capsule_rl"
+    / "franka_robosuite_cube_lift_capsule_smoke.yaml"
+)
+LIFT_CLEAN_REPLAY_CONFIG_PATH = LIFT_CONFIG_PATH.with_name(
+    "franka_robosuite_cube_lift_privileged_clean_replay.yaml"
+)
 
 
 def valid_config() -> dict:
@@ -328,3 +342,86 @@ def test_clean_replay_environment_template_disables_render_and_video() -> None:
     assert config["env"]["cfg"]["viser_debug"] is False
     assert config["record_video"] is False
     assert config["num_workers"] == 1
+
+
+def test_cube_lift_repository_template_preserves_capsule_contract() -> None:
+    stack_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    lift_config = yaml.safe_load(LIFT_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    validate_capsule_config(lift_config)
+
+    assert lift_config["task"]["profile"] == LIFT_PROFILE_NAME
+    assert tuple(
+        lift_config["task"][field]
+        for field in ("environment", "api", "privilege")
+    ) == (
+        "robosuite_cube_lift",
+        "franka_control_privileged",
+        "privileged",
+    )
+    assert lift_config["task"]["config_path"] == str(
+        LIFT_CLEAN_REPLAY_CONFIG_PATH.relative_to(Path(__file__).parents[1])
+    ).replace("\\", "/")
+    assert lift_config["task"]["render"] is False
+    assert lift_config["task"]["record_video"] is False
+
+    for field in ("schema_version", "trainer_factory"):
+        assert lift_config[field] == stack_config[field]
+    for section in (
+        "controller_service",
+        "capsule",
+        "actor_rollout_ref",
+        "algorithm",
+        "reward_model",
+        "server_validation",
+    ):
+        assert lift_config[section] == stack_config[section]
+    for field in ("run_id", "verl_source_path", "verl_pinned_sha", "requires"):
+        assert lift_config["runtime"][field] == stack_config["runtime"][field]
+    for field in ("mode", "endpoint", "api_key_env"):
+        assert lift_config["program_service"][field] == stack_config["program_service"][field]
+    assert lift_config["program_service"]["model"] == lift_config["runtime"][
+        "program_model_path"
+    ]
+
+    system_prompt = lift_config["program_service"]["system_prompt"]
+    assert "one complete independently executable Python robot program" in system_prompt
+    assert "without Markdown code fences" in system_prompt
+    assert "high-level robot functions documented in the task prompt" in system_prompt
+    assert "WXYZ" in system_prompt
+
+
+def test_cube_lift_clean_replay_environment_matches_selected_profile() -> None:
+    lift_config = yaml.safe_load(LIFT_CONFIG_PATH.read_text(encoding="utf-8"))
+    environment = yaml.safe_load(
+        LIFT_CLEAN_REPLAY_CONFIG_PATH.read_text(encoding="utf-8")
+    )
+
+    profile = resolve_task_profile(lift_config)
+    assert collect_environment_profile_errors(environment, profile) == ()
+    assert environment == {
+        "env": {
+            "_target_": "capx.envs.tasks.franka.franka_lift.FrankaLiftCodeEnv",
+            "cfg": {
+                "_target_": "capx.envs.tasks.base.CodeExecEnvConfig",
+                "low_level": "franka_robosuite_cube_lift_low_level",
+                "privileged": True,
+                "enable_render": False,
+                "viser_debug": False,
+                "apis": ["FrankaControlPrivilegedApi"],
+            },
+        },
+        "api_servers": [
+            {
+                "_target_": "capx.serving.launch_pyroki_server.main",
+                "port": 8116,
+                "host": "127.0.0.1",
+                "robot": "panda_description",
+                "target_link": "panda_hand",
+            }
+        ],
+        "record_video": False,
+        "output_dir": "./outputs/cube_lift_privileged_clean_replay",
+        "trials": 1,
+        "num_workers": 1,
+    }
