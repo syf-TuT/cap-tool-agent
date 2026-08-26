@@ -1,4 +1,4 @@
-"""Canonical Cube Stack initial-state hashing without simulator imports."""
+"""Canonical task-specific cube initial-state hashing without simulator imports."""
 
 from __future__ import annotations
 
@@ -30,10 +30,20 @@ def _canonical_pose(values: Sequence[object], name: str) -> list[float]:
         raise ValueError(f"{name} pose must contain xyz plus a WXYZ quaternion")
     position = [_finite_float(value, f"{name} pose") for value in values[:3]]
     quaternion = [_finite_float(value, f"{name} quaternion") for value in values[3:]]
-    norm = math.sqrt(sum(value * value for value in quaternion))
+    squared_norm = sum(value * value for value in quaternion)
+    if math.isfinite(squared_norm):
+        normalized_values = quaternion
+        norm = math.sqrt(squared_norm)
+    else:
+        scale = max(abs(value) for value in quaternion)
+        normalized_values = [value / scale for value in quaternion]
+        norm = math.hypot(*normalized_values)
     if norm == 0.0:
         raise ValueError(f"{name} quaternion must be non-zero")
-    quaternion = [_finite_float(value / norm, f"{name} quaternion") for value in quaternion]
+    quaternion = [
+        _finite_float(value / norm, f"{name} quaternion")
+        for value in normalized_values
+    ]
     first_nonzero = next((value for value in quaternion if value != 0.0), 1.0)
     if first_nonzero < 0.0:
         quaternion = [-value if value != 0.0 else 0.0 for value in quaternion]

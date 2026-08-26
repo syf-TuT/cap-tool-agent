@@ -90,6 +90,24 @@ def test_cube_lift_initial_state_accepts_primary_pose_and_normalizes_representat
     assert canonical["robot_joints"][-1] == 0.0
 
 
+@pytest.mark.parametrize(
+    ("quaternion", "expected"),
+    [
+        ([1e308, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]),
+        ([1e308, 1e308, 1e308, 1e308], [0.5, 0.5, 0.5, 0.5]),
+    ],
+)
+def test_cube_lift_initial_state_normalizes_extreme_finite_quaternion(
+    quaternion: list[float], expected: list[float]
+) -> None:
+    canonical = canonicalize_cube_lift_initial_state(
+        {"primary": [0.1, 0.0, 0.03, *quaternion]},
+        [0.0] * 7,
+    )
+
+    assert canonical["cube_poses"]["primary"][3:] == expected
+
+
 def test_cube_lift_initial_state_hash_changes_with_cube_position_or_robot_joint() -> None:
     poses = _lift_poses()
     moved_cube = _lift_poses()
@@ -119,7 +137,7 @@ def test_cube_lift_initial_state_hash_changes_with_cube_position_or_robot_joint(
         ({"primary": [float("nan"), 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]}, [0.0] * 7),
         (_lift_poses(), [0.0] * 6),
         (_lift_poses(), [0.0] * 8),
-        (_lift_poses(), [False, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        (_lift_poses(), [False, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         (_lift_poses(), [0.0, 0.0, 0.0, 0.0, 0.0, float("inf"), 0.0]),
     ],
 )
