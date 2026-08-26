@@ -354,6 +354,17 @@ def test_execution_contract_rejects_wrong_arguments(
         smoke.validate_execution_contract(**arguments)
 
 
+def test_execution_contract_rejects_finite_noncanonical_timeout(tmp_path: Path) -> None:
+    with pytest.raises(smoke.CubeLiftSmokeError, match="exactly 180"):
+        smoke.validate_execution_contract(
+            seed_sequence=(5, 6, 5),
+            replay_seed=5,
+            replays=2,
+            timeout_s=179.0,
+            output_path=tmp_path / "smoke.json",
+        )
+
+
 @pytest.mark.parametrize("name", ("gate03_oracle.json", "gate-07-result.json"))
 def test_execution_contract_rejects_formal_gate_artifact_names(
     tmp_path: Path, name: str

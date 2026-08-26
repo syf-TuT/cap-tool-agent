@@ -257,6 +257,8 @@ def validate_execution_contract(
         or float(timeout_s) <= 0
     ):
         raise CubeLiftSmokeError("timeout must be finite and positive")
+    if float(timeout_s) != 180.0:
+        raise CubeLiftSmokeError("smoke timeout must be exactly 180 seconds")
     if output_path is None:
         raise CubeLiftSmokeError("--output is required outside --validate-only")
     output = Path(output_path).expanduser().resolve()
