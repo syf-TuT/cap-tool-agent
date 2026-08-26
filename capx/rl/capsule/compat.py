@@ -527,12 +527,17 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
     ):
         errors.append("controller_service.request_timeout_s must be a positive finite number")
     max_output_tokens = _get(config, "controller_service.max_output_tokens")
-    if max_output_tokens is not _MISSING and (
-        isinstance(max_output_tokens, bool)
+    if (
+        max_output_tokens is _MISSING
+        or isinstance(max_output_tokens, bool)
         or not isinstance(max_output_tokens, int)
         or max_output_tokens < 1
     ):
         errors.append("controller_service.max_output_tokens must be a positive integer")
+    for field_name in ("stream", "enable_thinking"):
+        value = _get(config, f"controller_service.{field_name}")
+        if value is not False:
+            errors.append(f"controller_service.{field_name} must be explicitly false")
     temperature = _get(config, "controller_service.temperature")
     if (
         isinstance(temperature, bool)

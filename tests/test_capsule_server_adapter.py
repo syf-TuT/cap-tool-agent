@@ -22,6 +22,30 @@ from capx.rl.capsule.schema import (
     TaskInstanceV1,
 )
 from scripts.capsule_rl import server_adapter
+
+
+def test_controller_runtime_config_forwards_explicit_external_request_contract() -> None:
+    config = {
+        "capsule": {"max_controller_turns": 12},
+        "controller_service": {
+            "endpoint": "https://coding.dashscope.aliyuncs.com/v1",
+            "model": "qwen3.7-plus",
+            "api_key_env": "CAPX_CONTROLLER_API_KEY",
+            "request_timeout_s": 300.0,
+            "max_output_tokens": 4096,
+            "stream": False,
+            "enable_thinking": False,
+            "temperature": 0.7,
+        },
+    }
+
+    controller_config = server_adapter._controller_runtime_config(config)
+
+    assert controller_config.endpoint == "https://coding.dashscope.aliyuncs.com/v1"
+    assert controller_config.model == "qwen3.7-plus"
+    assert controller_config.max_output_tokens == 4096
+    assert controller_config.stream is False
+    assert controller_config.enable_thinking is False
 from scripts.capsule_rl.common import artifact_file_sha256
 
 

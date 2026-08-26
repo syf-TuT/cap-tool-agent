@@ -52,12 +52,14 @@ def valid_config() -> dict:
             "api_key_env": "CAPX_PROGRAM_API_KEY",
         },
         "controller_service": {
-            "endpoint": "http://127.0.0.1:8102/v1",
-            "model": "controller-model",
+            "endpoint": "https://coding.dashscope.aliyuncs.com/v1",
+            "model": "qwen3.7-plus",
             "api_key_env": "CAPX_CONTROLLER_API_KEY",
             "frozen": True,
             "request_timeout_s": 300.0,
-            "max_output_tokens": 512,
+            "max_output_tokens": 4096,
+            "stream": False,
+            "enable_thinking": False,
             "temperature": 0.7,
         },
         "capsule": {
@@ -112,11 +114,16 @@ def test_complete_capsule_config_is_accepted() -> None:
     validate_capsule_config(valid_config())
 
 
-def test_controller_output_limit_can_be_omitted_for_512_token_runtime_default() -> None:
+@pytest.mark.parametrize(
+    "field_name",
+    ["max_output_tokens", "stream", "enable_thinking"],
+)
+def test_controller_request_contract_must_be_explicit(field_name: str) -> None:
     config = valid_config()
-    del config["controller_service"]["max_output_tokens"]
+    del config["controller_service"][field_name]
 
-    validate_capsule_config(config)
+    with pytest.raises(CapsuleConfigError, match=field_name):
+        validate_capsule_config(config)
 
 
 @pytest.mark.parametrize(
@@ -147,6 +154,10 @@ def test_controller_output_limit_can_be_omitted_for_512_token_runtime_default() 
         (("controller_service", "request_timeout_s"), 0.0, "request_timeout_s"),
         (("controller_service", "max_output_tokens"), True, "max_output_tokens"),
         (("controller_service", "max_output_tokens"), 0, "max_output_tokens"),
+        (("controller_service", "stream"), True, "stream"),
+        (("controller_service", "stream"), "false", "stream"),
+        (("controller_service", "enable_thinking"), True, "enable_thinking"),
+        (("controller_service", "enable_thinking"), "false", "enable_thinking"),
         (("program_service", "mode"), "generation", "actor_identity"),
         (("task", "render"), True, "render"),
         (("capsule", "max_controller_turns"), 13, "12"),
@@ -196,8 +207,14 @@ def test_repository_template_contains_all_local_and_server_contract_fields() -> 
     assert config["task"]["record_video"] is False
     assert config["controller_service"]["api_key_env"] == "CAPX_CONTROLLER_API_KEY"
     assert config["program_service"]["mode"] == "actor_identity"
+    assert config["controller_service"]["endpoint"] == (
+        "https://coding.dashscope.aliyuncs.com/v1"
+    )
+    assert config["controller_service"]["model"] == "qwen3.7-plus"
     assert config["controller_service"]["request_timeout_s"] == 300.0
-    assert config["controller_service"]["max_output_tokens"] == 512
+    assert config["controller_service"]["max_output_tokens"] == 4096
+    assert config["controller_service"]["stream"] is False
+    assert config["controller_service"]["enable_thinking"] is False
     assert "api_key" not in config["controller_service"]
     assert config["server_validation"]["gates"][:3] == [
         "preflight",

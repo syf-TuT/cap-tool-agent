@@ -41,7 +41,9 @@ class FrozenControllerConfig:
     frozen: bool = True
     max_turns: int = 12
     request_timeout_s: float = 300.0
-    max_output_tokens: int = 512
+    max_output_tokens: int = 4096
+    stream: bool = False
+    enable_thinking: bool = False
     temperature: float = 0.7
 
     def __post_init__(self) -> None:
@@ -71,6 +73,12 @@ class FrozenControllerConfig:
             raise TypeError("max_output_tokens must be an integer")
         if self.max_output_tokens < 1:
             raise ValueError("max_output_tokens must be a positive integer")
+        for field_name in ("stream", "enable_thinking"):
+            value = getattr(self, field_name)
+            if not isinstance(value, bool):
+                raise TypeError(f"{field_name} must be a boolean")
+            if value is not False:
+                raise ValueError(f"{field_name} must be false for the frozen Controller")
         if (
             isinstance(self.temperature, bool)
             or not isinstance(self.temperature, (int, float))
@@ -121,6 +129,8 @@ class OpenAICompatibleControllerTransport:
             messages=list(messages),
             temperature=float(self.config.temperature),
             max_tokens=self.config.max_output_tokens,
+            stream=self.config.stream,
+            extra_body={"enable_thinking": self.config.enable_thinking},
             response_format={"type": "json_object"},
         )
         choices = getattr(response, "choices", None)

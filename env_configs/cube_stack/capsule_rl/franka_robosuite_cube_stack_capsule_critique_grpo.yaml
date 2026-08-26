@@ -41,12 +41,14 @@ program_service:
   api_key_env: CAPX_PROGRAM_API_KEY
 
 controller_service:
-  endpoint: http://127.0.0.1:8102/v1
-  model: /path/to/frozen_controller_checkpoint
+  endpoint: https://coding.dashscope.aliyuncs.com/v1
+  model: qwen3.7-plus
   api_key_env: CAPX_CONTROLLER_API_KEY
   frozen: true
   request_timeout_s: 300.0
-  max_output_tokens: 512
+  max_output_tokens: 4096
+  stream: false
+  enable_thinking: false
   temperature: 0.7
 
 capsule:

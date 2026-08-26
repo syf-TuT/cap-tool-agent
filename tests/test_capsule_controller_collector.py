@@ -315,7 +315,9 @@ def test_frozen_controller_config_is_strict() -> None:
     )
     assert config.frozen is True
     assert config.request_timeout_s == 300.0
-    assert config.max_output_tokens == 512
+    assert config.max_output_tokens == 4096
+    assert config.stream is False
+    assert config.enable_thinking is False
 
     with pytest.raises(ValueError, match="frozen"):
         FrozenControllerConfig(
@@ -339,6 +341,15 @@ def test_frozen_controller_config_is_strict() -> None:
                 api_key_env="CAPX_CONTROLLER_API_KEY",
                 max_output_tokens=invalid,
             )
+    for field_name in ("stream", "enable_thinking"):
+        for invalid in (True, "false", 0, None):
+            with pytest.raises((TypeError, ValueError), match=field_name):
+                FrozenControllerConfig(
+                    endpoint="http://controller.invalid/v1",
+                    model="controller-model",
+                    api_key_env="CAPX_CONTROLLER_API_KEY",
+                    **{field_name: invalid},
+                )
 
 
 def test_openai_transport_is_lazy_and_uses_dedicated_credentials(monkeypatch) -> None:
@@ -362,8 +373,8 @@ def test_openai_transport_is_lazy_and_uses_dedicated_credentials(monkeypatch) ->
 
     monkeypatch.setenv("CAPX_CONTROLLER_API_KEY", "controller-secret")
     config = FrozenControllerConfig(
-        endpoint="http://controller.invalid/v1",
-        model="controller-model",
+        endpoint="https://coding.dashscope.aliyuncs.com/v1",
+        model="qwen3.7-plus",
         api_key_env="CAPX_CONTROLLER_API_KEY",
     )
     transport = OpenAICompatibleControllerTransport(config, client_factory=factory)
@@ -375,16 +386,18 @@ def test_openai_transport_is_lazy_and_uses_dedicated_credentials(monkeypatch) ->
     assert client_construction == [
         {
             "api_key": "controller-secret",
-            "base_url": "http://controller.invalid/v1",
+            "base_url": "https://coding.dashscope.aliyuncs.com/v1",
             "timeout": 300.0,
         }
     ]
     assert calls == [
         {
-            "model": "controller-model",
+            "model": "qwen3.7-plus",
             "messages": [{"role": "user", "content": "repair"}],
             "temperature": 0.7,
-            "max_tokens": 512,
+            "max_tokens": 4096,
+            "stream": False,
+            "extra_body": {"enable_thinking": False},
             "response_format": {"type": "json_object"},
         }
     ]

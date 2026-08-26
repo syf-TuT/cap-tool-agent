@@ -27,6 +27,7 @@ from capx.rl.capsule.actor_identity import (
     build_actor_identity,
     verify_actor_identity_payload,
 )
+from capx.rl.capsule.controller import FrozenControllerConfig
 from capx.rl.capsule.schema import (
     ProgramReplayResultV1,
     ReplayOutcome,
@@ -63,6 +64,23 @@ from .common import (
 
 class ServerAdapterError(RuntimeError):
     """A server gate cannot produce trustworthy evidence."""
+
+
+def _controller_runtime_config(config: Mapping[str, Any]) -> FrozenControllerConfig:
+    capsule = config["capsule"]
+    controller = config["controller_service"]
+    return FrozenControllerConfig(
+        endpoint=str(controller["endpoint"]),
+        model=str(controller["model"]),
+        api_key_env=str(controller["api_key_env"]),
+        frozen=True,
+        max_turns=int(capsule["max_controller_turns"]),
+        request_timeout_s=float(controller["request_timeout_s"]),
+        max_output_tokens=int(controller["max_output_tokens"]),
+        stream=controller["stream"],
+        enable_thinking=controller["enable_thinking"],
+        temperature=float(controller["temperature"]),
+    )
 
 
 def _derive_training_tensor_evidence(result: Any, group: Any) -> dict[str, Any]:
@@ -1017,7 +1035,6 @@ class ConcreteGateRuntime:
     def _open_collection_session(self, task: TaskInstanceV1) -> _CollectionSession:
         from capx.rl.capsule.controller import (
             ControllerRepairCollector,
-            FrozenControllerConfig,
             OpenAICompatibleControllerTransport,
         )
         from capx.rl.capsule.evaluator import (
@@ -1036,7 +1053,6 @@ class ConcreteGateRuntime:
         )
 
         capsule = self.config["capsule"]
-        controller = self.config["controller_service"]
         program = self.config["program_service"]
         workers = start_verl_workers(self.config)
         evaluator = None
@@ -1061,16 +1077,7 @@ class ConcreteGateRuntime:
                 response_token_limit=int(capsule["revision_response_max_tokens"]),
                 system_prompt=system_prompt,
             )
-            controller_config = FrozenControllerConfig(
-                endpoint=str(controller["endpoint"]),
-                model=str(controller["model"]),
-                api_key_env=str(controller["api_key_env"]),
-                frozen=True,
-                max_turns=int(capsule["max_controller_turns"]),
-                request_timeout_s=float(controller["request_timeout_s"]),
-                max_output_tokens=int(controller.get("max_output_tokens", 512)),
-                temperature=float(controller["temperature"]),
-            )
+            controller_config = _controller_runtime_config(self.config)
             repair_collector = ControllerRepairCollector(
                 transport=OpenAICompatibleControllerTransport(controller_config),
                 max_turns=controller_config.max_turns,
