@@ -28,6 +28,7 @@ from capx.rl.capsule.actor_identity import (
     verify_actor_identity_payload,
 )
 from capx.rl.capsule.compat import CapsuleConfigError, validate_capsule_config
+from capx.rl.capsule.controller import python_base_unit_spans
 from capx.rl.capsule.lora_contract import (
     QWEN25_ALL_LINEAR_PROJECTIONS,
     QWEN25_ALL_LINEAR_TENSOR_COUNT,
@@ -1577,6 +1578,63 @@ def _typed_trace(value: object, field_name: str) -> RepairTraceV1:
         ) from error
 
 
+def _verify_explicit_protocol_repairs(
+    trace: RepairTraceV1,
+    p0_result: ProgramReplayResultV1,
+) -> None:
+    if any(edit.before_source == edit.after_source for edit in trace.edits):
+        raise GateArtifactError("collector trace must not commit no-op replacement edits")
+
+    expected_spans = python_base_unit_spans(trace.base_source)
+    protocol_unit_ids = ("fence_open", "fence_close", "protocol_suffix")
+    expected_protocol_ids = [
+        span.unit_id for span in expected_spans if span.unit_id in protocol_unit_ids
+    ]
+    if not expected_protocol_ids:
+        return
+
+    expected_units = [
+        (
+            f"base:{span.unit_id}",
+            span.start_offset,
+            span.end_offset,
+            trace.base_source[span.start_offset : span.end_offset],
+        )
+        for span in expected_spans
+    ]
+    actual_units = [
+        (unit.target, unit.start_offset, unit.end_offset, unit.source)
+        for unit in trace.base_units
+    ]
+    if actual_units != expected_units:
+        raise GateArtifactError(
+            "fenced Actor P0 must expose exact explicit protocol repair units"
+        )
+    if (
+        p0_result.outcome is not ReplayOutcome.PROGRAM_ERROR
+        or p0_result.error_type != "SyntaxError"
+        or p0_result.raw_reward != 0.0
+    ):
+        raise GateArtifactError("fenced Actor P0 must preserve its SyntaxError and zero reward")
+
+    required_targets = [f"base:{unit_id}" for unit_id in expected_protocol_ids]
+    protocol_edit_turns: list[int] = []
+    for target in required_targets:
+        target_edits = [edit for edit in trace.edits if edit.target == target]
+        if len(target_edits) != 1 or target_edits[0].after_source != "":
+            raise GateArtifactError(
+                "fenced Actor P0 requires one explicit protocol deletion per target"
+            )
+        protocol_edit_turns.append(target_edits[0].turn_index)
+    semantic_turns = [
+        edit.turn_index for edit in trace.edits if edit.target not in required_targets
+    ]
+    if semantic_turns and min(semantic_turns) < max(protocol_edit_turns):
+        raise GateArtifactError(
+            "explicit protocol deletions must precede semantic repair edits"
+        )
+
+
 def _typed_group(value: object, field_name: str = "learning_group") -> LearningGroupV1:
     if not isinstance(value, Mapping):
         raise GateArtifactError(f"{field_name} must be a LearningGroupV1 mapping")
@@ -1890,6 +1948,7 @@ def verify_collector_gate_artifact(payload: Mapping[str, Any]) -> None:
             or trace.base_source_sha256 != p0_result.source_sha256
         ):
             raise GateArtifactError("collector trace must be rooted in its typed failed P0 result")
+        _verify_explicit_protocol_repairs(trace, p0_result)
         if trace.repair_trajectory_id in trajectory_ids:
             raise GateArtifactError("collector repair trajectory IDs must be unique")
         trajectory_ids.add(trace.repair_trajectory_id)

@@ -17,12 +17,13 @@ from .repair import BaseUnitSpan, RepairDraft
 from .schema import ProgramReplayResultV1, RepairTraceV1, ReplayOutcome, TaskInstanceV1
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_OUTER_PYTHON_FENCE = re.compile(
-    r"\A(?P<open>```(?:python|py)?[^\S\r\n]*(?:\r\n|\n))"
-    r"(?P<body>.*)"
-    r"(?P<close>```[^\S\r\n]*(?:(?:\r\n|\n))?)\Z",
-    re.IGNORECASE | re.DOTALL,
+_PYTHON_FENCE_OPEN = re.compile(
+    r"\A```(?:python|py)?[^\S\r\n]*(?:\r\n|\n)", re.IGNORECASE
 )
+_PYTHON_FENCE_CLOSE = re.compile(
+    r"^[^\S\r\n]*```[^\S\r\n]*(?:\r\n|\n|$)", re.MULTILINE
+)
+_PROTOCOL_UNIT_IDS = ("fence_open", "fence_close", "protocol_suffix")
 
 
 class ControllerTransport(Protocol):
@@ -212,20 +213,33 @@ def python_base_unit_spans(source: str) -> tuple[BaseUnitSpan, ...]:
     if spans:
         return spans
 
-    fenced = _OUTER_PYTHON_FENCE.fullmatch(source)
-    if fenced is not None:
-        opener = fenced.group("open")
-        body = fenced.group("body")
-        closer = fenced.group("close")
-        body_start = len(opener)
+    opener = _PYTHON_FENCE_OPEN.match(source)
+    closer = _PYTHON_FENCE_CLOSE.search(source, opener.end()) if opener is not None else None
+    if opener is not None and closer is not None:
+        body_start = opener.end()
+        body = source[body_start : closer.start()]
         body_spans = _python_statement_spans(body, source_offset=body_start)
         if body_spans:
-            close_start = body_start + len(body)
-            return (
-                BaseUnitSpan("fence_open", 0, body_start, opener),
+            spans = [
+                BaseUnitSpan("fence_open", 0, body_start, source[:body_start]),
                 *body_spans,
-                BaseUnitSpan("fence_close", close_start, len(source), closer),
-            )
+                BaseUnitSpan(
+                    "fence_close",
+                    closer.start(),
+                    closer.end(),
+                    source[closer.start() : closer.end()],
+                ),
+            ]
+            if closer.end() < len(source):
+                spans.append(
+                    BaseUnitSpan(
+                        "protocol_suffix",
+                        closer.end(),
+                        len(source),
+                        source[closer.end() :],
+                    )
+                )
+            return tuple(spans)
 
     return (BaseUnitSpan("program", 0, len(source), source),)
 
@@ -242,7 +256,9 @@ Targets are stable across revisions. Return one JSON object and no Markdown.
 Markdown fences in the immutable Actor P0 are protocol errors already observed by replay. Never
 treat them as valid Python or silently clean them. When base:fence_open and base:fence_close are
 available, remove each fence explicitly with a replace action whose source is the empty string;
-both committed edits must occur before finishing or making semantic repairs.
+when base:protocol_suffix is available, explicitly remove that trailing non-program text too.
+Complete every remaining protocol repair before finishing or making semantic repairs. Never edit
+a completed protocol target again.
 """
 
 
@@ -252,6 +268,12 @@ def _state_message(
     draft: RepairDraft,
     feedback: str,
 ) -> str:
+    editable_units = draft.editable_units
+    required_protocol_targets = [
+        f"base:{unit_id}"
+        for unit_id in _PROTOCOL_UNIT_IDS
+        if f"base:{unit_id}" in editable_units
+    ]
     state = {
         "task_id": task.task_id,
         "environment_seed": task.environment_seed,
@@ -259,7 +281,16 @@ def _state_message(
         "task_prompt": task.prompt,
         "current_revision": draft.current_revision,
         "current_source": draft.current_source,
-        "editable_units": draft.editable_units,
+        "editable_units": editable_units,
+        "protocol_repairs": {
+            "required_targets": required_protocol_targets,
+            "remaining_targets": [
+                target for target in required_protocol_targets if editable_units[target] != ""
+            ],
+            "completed_targets": [
+                target for target in required_protocol_targets if editable_units[target] == ""
+            ],
+        },
         "base_failure": {
             "outcome": p0_result.outcome.value,
             "raw_reward": p0_result.raw_reward,

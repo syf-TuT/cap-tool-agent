@@ -114,6 +114,22 @@ def test_python_base_units_expose_fences_without_cleaning_actor_source() -> None
     ]
 
 
+def test_python_base_units_expose_trailing_protocol_text_without_cleaning() -> None:
+    source = "```python\nprint('ok')\n```\nHere is the requested program.\n"
+
+    spans = python_base_unit_spans(source)
+
+    assert source == "```python\nprint('ok')\n```\nHere is the requested program.\n"
+    assert [
+        (span.unit_id, source[span.start_offset : span.end_offset]) for span in spans
+    ] == [
+        ("fence_open", "```python\n"),
+        ("group_0", "print('ok')"),
+        ("fence_close", "```\n"),
+        ("protocol_suffix", "Here is the requested program.\n"),
+    ]
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -168,6 +184,48 @@ def test_collector_requires_explicit_fence_edits_after_recorded_p0_failure() -> 
         "base:fence_close",
     ]
     assert trace.base_source == source
+    assert trace.final_source == "print('ok')\n"
+    assert trace.reconstruct() == trace.final_source
+
+
+def test_collector_tracks_protocol_repairs_and_rejects_repeated_empty_replace() -> None:
+    source = "```python\nprint('ok')\n```\nExplanation.\n"
+    p0 = ProgramCandidate("base-fenced-suffix", source)
+    transport = _ScriptedTransport(
+        [
+            _action("replace", target="base:fence_open", source=""),
+            _action("replace", target="base:fence_open", source=""),
+            _action("replace", target="base:fence_close", source=""),
+            _action("replace", target="base:protocol_suffix", source=""),
+            _action("finish", rationale="protocol bytes removed explicitly"),
+        ]
+    )
+
+    trace = ControllerRepairCollector(transport=transport, max_turns=5)(
+        _task(), p0, _syntax_failure(p0), 0, 0, "repair-fenced-suffix"
+    )
+
+    assert [edit.target for edit in trace.edits] == [
+        "base:fence_open",
+        "base:fence_close",
+        "base:protocol_suffix",
+    ]
+    assert trace.edits[1].turn_index == 3
+    assert trace.audits[0].turn_index == 2
+    assert trace.audits[0].event_type == "invalid"
+    assert "must change" in trace.audits[0].message
+    second_state = json.loads(transport.calls[1][1]["content"])
+    third_state = json.loads(transport.calls[2][1]["content"])
+    assert second_state["protocol_repairs"] == {
+        "completed_targets": ["base:fence_open"],
+        "remaining_targets": ["base:fence_close", "base:protocol_suffix"],
+        "required_targets": [
+            "base:fence_open",
+            "base:fence_close",
+            "base:protocol_suffix",
+        ],
+    }
+    assert third_state["protocol_repairs"] == second_state["protocol_repairs"]
     assert trace.final_source == "print('ok')\n"
     assert trace.reconstruct() == trace.final_source
 

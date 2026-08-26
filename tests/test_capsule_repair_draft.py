@@ -172,6 +172,26 @@ def test_duplicate_recovery_target_is_invalid_and_does_not_advance_revision():
     assert draft.audits[-1].event_type == "invalid"
 
 
+def test_replace_must_change_target_source_and_does_not_advance_revision():
+    draft = make_draft()
+
+    result = draft.submit(
+        {
+            "action": "replace",
+            "target": "base:move",
+            "source": "move(x)",
+            "rationale": "repeat the current bytes",
+        }
+    )
+
+    assert result.committed is False
+    assert result.audit is not None
+    assert result.audit.event_type == "invalid"
+    assert "must change" in result.audit.message
+    assert draft.current_revision == 0
+    assert draft.current_source == BASE_SOURCE
+
+
 def test_every_controller_submission_consumes_one_of_twelve_turns():
     draft = make_draft(max_turns=12)
 

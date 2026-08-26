@@ -16,6 +16,7 @@ import yaml
 
 from capx.rl.capsule import main_ppo
 from capx.rl.capsule.actor_identity import actor_binding_sha256, build_actor_identity
+from capx.rl.capsule.controller import python_base_unit_spans
 from capx.rl.capsule.group import RepairAttempt, deterministic_group_uid
 from capx.rl.capsule.repair import BaseUnitSpan, RepairDraft
 from capx.rl.capsule.schema import (
@@ -3362,6 +3363,134 @@ def _complete_gate_payloads(checkpoint: Path) -> dict[str, dict[str, object]]:
             "guided_artifact_sha256": "f" * 64,
         },
     }
+
+
+def _collector_payload_with_fenced_p0(
+    tmp_path: Path, *, explicit_protocol_edits: bool
+) -> dict[str, object]:
+    checkpoint = tmp_path / "fenced-checkpoint"
+    checkpoint.mkdir()
+    payload = _complete_gate_payloads(checkpoint)["collector"]
+    fenced_source = "```python\nprint('ok')\n```\nExplanation.\n"
+    selected_results: list[ProgramReplayResultV1] = []
+    for index in range(7):
+        is_fenced = index == 0
+        source = fenced_source if is_fenced else f"collector_failed_{index} = True\n"
+        selected_results.append(
+            ProgramReplayResultV1(
+                task_id="cube-stack-5",
+                environment_seed=5,
+                program_sample_id=f"collector-base-{index}",
+                source=source,
+                initial_state_sha256="a" * 64,
+                outcome=(
+                    ReplayOutcome.PROGRAM_ERROR if is_fenced else ReplayOutcome.TASK_FAILURE
+                ),
+                raw_reward=0.0,
+                binary_reward=0.0,
+                task_completed=False,
+                error_type="SyntaxError" if is_fenced else None,
+                error_message="invalid syntax (<actor>, line 1)" if is_fenced else None,
+                diagnostics={
+                    "evaluator_attempt_history": [
+                        {
+                            "attempt": 1,
+                            "outcome": "program_error" if is_fenced else "task_failure",
+                            "worker_replaced": False,
+                            "retry_scheduled": False,
+                            "error_type": "SyntaxError" if is_fenced else None,
+                            "error_message": (
+                                "invalid syntax (<actor>, line 1)" if is_fenced else None
+                            ),
+                        }
+                    ],
+                    "reset_info": {
+                        "capsule_reset_evidence": {
+                            "namespace_fresh": True,
+                            "api_state_cleared": True,
+                            "api_reset_count": 1,
+                            "api_reset_confirmed_count": 1,
+                        }
+                    },
+                },
+            )
+        )
+
+    records: list[dict[str, object]] = []
+    for rank, result in enumerate(selected_results[:2]):
+        for trajectory_index in range(2):
+            base_units = (
+                python_base_unit_spans(result.source)
+                if rank != 0 or explicit_protocol_edits
+                else (BaseUnitSpan("program", 0, len(result.source), result.source),)
+            )
+            draft = RepairDraft(
+                task_id=result.task_id,
+                environment_seed=result.environment_seed,
+                program_sample_id=result.program_sample_id,
+                repair_trajectory_id=f"fenced-repair-{rank}-{trajectory_index}",
+                base_source=result.source,
+                base_units=base_units,
+            )
+            if rank == 0:
+                if explicit_protocol_edits:
+                    for target in (
+                        "base:fence_open",
+                        "base:fence_close",
+                        "base:protocol_suffix",
+                    ):
+                        draft.submit({"action": "replace", "target": target, "source": ""})
+                else:
+                    draft.submit(
+                        {
+                            "action": "replace",
+                            "target": "base:program",
+                            "source": "print('ok')\n",
+                        }
+                    )
+            draft.submit({"action": "finish", "rationale": "complete"})
+            records.append(
+                {
+                    "p0_rank": rank,
+                    "trajectory_index": trajectory_index,
+                    "trace": draft.to_trace().to_dict(),
+                }
+            )
+
+    payload["base_results"] = [result.to_dict() for result in selected_results[:2]]
+    payload["selected_batch_results"] = [result.to_dict() for result in selected_results]
+    payload["replay_events"] = [
+        {
+            "batch_index": 0,
+            "base_index": index,
+            "selected_batch": True,
+            "result": result.to_dict(),
+        }
+        for index, result in enumerate(selected_results)
+    ]
+    payload["repair_traces"] = records
+    return payload
+
+
+def test_collector_verifier_rejects_whole_program_cleanup_of_fenced_p0(
+    tmp_path: Path,
+) -> None:
+    payload = _collector_payload_with_fenced_p0(
+        tmp_path, explicit_protocol_edits=False
+    )
+
+    with pytest.raises(common.GateArtifactError, match="explicit protocol"):
+        common.verify_collector_gate_artifact(payload)
+
+
+def test_collector_verifier_accepts_explicit_fence_and_suffix_deletions(
+    tmp_path: Path,
+) -> None:
+    payload = _collector_payload_with_fenced_p0(
+        tmp_path, explicit_protocol_edits=True
+    )
+
+    common.verify_collector_gate_artifact(payload)
 
 
 def _write_test_lora_adapter(

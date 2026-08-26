@@ -298,6 +298,8 @@ class RepairDraft:
         source = action.get("source")
         if not isinstance(source, str):
             raise RepairInvariantError("replace source must be a string")
+        if source == self._current_units[target]:
+            raise RepairInvariantError("replace must change the target source")
         origin = "base" if target.startswith("base:") else "recovery"
         return self._commit(
             action="replace",

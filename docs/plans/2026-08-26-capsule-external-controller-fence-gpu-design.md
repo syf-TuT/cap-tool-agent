@@ -16,14 +16,21 @@ identity, raw source, error type, error message, diagnostics, and reward remain 
 repair trajectory and are included in the Controller state.
 
 After that failure, unit discovery may describe the immutable bytes without changing them. For a
-single outer Markdown code fence it exposes stable `base:fence_open` and `base:fence_close`
-targets, plus editable Python units from the enclosed body when the body parses. The Controller
-prompt identifies the fence as an Actor protocol error and instructs the Controller to remove the
-two fence targets with explicit `replace` actions whose replacement source is empty. Each action
-is recorded in the normal immutable edit ledger. The repaired `PT/P_hat` is reconstructed only
-from committed edits; it is then replayed from the same initial state and scored independently.
-The unit discovery helper never returns cleaned source and never commits an edit on the
-Controller's behalf.
+Markdown code fence at the start of the Actor response it exposes stable `base:fence_open` and
+`base:fence_close` targets, plus editable Python units from the enclosed body when the body
+parses. If raw text follows the closing fence, those bytes remain available as a separate
+`base:protocol_suffix` target. This avoids turning a fenced response with trailing explanation
+into a whole-program cleanup target.
+
+The Controller prompt identifies every protocol target as an Actor protocol error and instructs
+the Controller to remove each one with an explicit `replace` action whose replacement source is
+empty. Every action is recorded in the normal immutable edit ledger and must precede semantic
+repairs. A replacement which leaves a target byte-identical is rejected into the audit stream and
+does not create a revision. The repaired `PT/P_hat` is reconstructed only from committed edits;
+it is then replayed from the same initial state and scored independently. Gate 4 independently
+re-derives the expected units from the immutable P0, rejects whole-program fence cleanup, and
+checks the typed SyntaxError, zero reward, deletions, and edit order. The unit discovery helper
+never returns cleaned source and never commits an edit on the Controller's behalf.
 
 Malformed or incomplete fences retain the existing whole-program fallback. They are still
 executed unchanged as P0 and require an explicit Controller replacement if they are to be
@@ -80,6 +87,8 @@ no parallel normalization artifact is introduced.
 - A fenced Actor response that is never explicitly repaired remains reward zero.
 - A Controller response that silently returns cleaned Python instead of a valid edit remains a
   `parse_failure` or invalid action; the collector does not infer an edit.
+- A repeated empty replacement of an already-deleted protocol target is an invalid no-op audit,
+  not a committed revision.
 - External API timeout, authentication failure, invalid response shape, or multiple choices is an
   infrastructure/protocol failure and stops the affected Gate with immutable failure evidence.
 - PyRoKi CUDA initialization failure is a service readiness failure; the launcher cleans up only
@@ -90,7 +99,10 @@ no parallel normalization artifact is introduced.
 ## Tests and remote acceptance
 
 Pure tests first demonstrate that fenced source is unchanged, the raw replay failure reaches the
-Controller, explicit fence edits produce the repaired source, and no edit means no cleaned source.
+Controller, trailing prose remains a separate protocol target, explicit protocol edits produce
+the repaired source, no-op replacements do not advance revision, and no edit means no cleaned
+source. Gate-verifier tests reject whole-program cleanup and accept only the typed explicit-edit
+lineage.
 Transport tests assert synchronous requests, disabled thinking, 4096 tokens, dedicated credentials,
 and no secret serialization. Owned-service tests cover external Controller non-spawn/non-cleanup,
 local-mode compatibility, PyRoKi CUDA environment, resolved-config drift, and Gate 7 cleanup

@@ -74,7 +74,9 @@ def test_single_a800_docs_bind_materialized_config_and_two_phase_gate7() -> None
     assert "`stream=false`" in documentation
     assert "`enable_thinking=false`" in documentation
     assert "Markdown fence 本身属于 Actor 协议错误" in documentation
-    assert "Controller 显式提交删除 fence open/close repair unit 的 edit" in documentation
+    assert "Controller 显式提交删除 fence open/close（以及存在时的 trailing suffix）" in documentation
+    assert "whole-program cleanup" in documentation
+    assert "no-op 被拒绝并进入 audit" in documentation
     assert (
         "--capsule-config /root/autodl-tmp/cap-x/artifacts/"
         "cube_stack_capsule_rl_prepare/capsule_rl.resolved.yaml"

@@ -4,7 +4,7 @@
 
 **Goal:** Make fenced Actor output fail unchanged as P0, require explicit Controller fence-removal edits, use synchronous non-thinking `qwen3.7-plus` responses up to 4096 tokens, and run PyRoKi on the single A800 before rerunning Gate 1--7.
 
-**Architecture:** Preserve the clean-replay boundary and enhance only repair unit discovery so an already-failed fenced P0 exposes two stable fence targets. Extend the frozen OpenAI-compatible transport and the single-A800 owned launcher with a typed external-service mode, non-secret external Controller attestation, and PyRoKi CUDA policy while retaining local Controller compatibility.
+**Architecture:** Preserve the clean-replay boundary and enhance only repair unit discovery so an already-failed fenced P0 exposes stable fence targets plus a trailing protocol-suffix target when needed. Extend the frozen OpenAI-compatible transport and the single-A800 owned launcher with a typed external-service mode, non-secret external Controller attestation, and PyRoKi CUDA policy while retaining local Controller compatibility.
 
 **Tech Stack:** Python 3.10+, dataclasses, OpenAI Python SDK, YAML/JSON, pytest, WSL2 `uv run --no-sync`, SeeTaCloud SSH, VeRL/FSDP/vLLM, JAX/PyRoKi.
 
