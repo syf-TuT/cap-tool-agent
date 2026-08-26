@@ -21,6 +21,8 @@ from typing import Any, Protocol
 
 import numpy as np
 import torch
+import yaml
+from omegaconf import OmegaConf
 
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.configs.loader import DictLoader
@@ -164,10 +166,30 @@ class YamlEnvironmentFactory:
     """Pickle-safe factory used by spawned clean-replay workers."""
 
     config_path: str
+    config_bytes: bytes | None = None
+
+    def _load_config(self) -> Any:
+        if self.config_bytes is None:
+            return DictLoader.load(self.config_path)
+        if not isinstance(self.config_bytes, bytes):
+            raise ServerFactoryError("environment config snapshot must be bytes")
+        try:
+            config_text = self.config_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ServerFactoryError(
+                f"environment config must be a UTF-8 YAML snapshot: {self.config_path}"
+            ) from error
+        try:
+            loaded = OmegaConf.create(yaml.unsafe_load(config_text))
+            return OmegaConf.to_container(loaded, resolve=True)
+        except Exception as error:
+            raise ServerFactoryError(
+                f"cannot parse environment config snapshot {self.config_path}: {error}"
+            ) from error
 
     def __call__(self, task: TaskInstanceV1) -> Any:
         del task
-        config = DictLoader.load(self.config_path)
+        config = self._load_config()
         if not isinstance(config, Mapping) or "env" not in config:
             raise ServerFactoryError(
                 f"environment config must contain an env factory: {self.config_path}"

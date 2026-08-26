@@ -8,6 +8,7 @@ Ray, VeRL, or an optimizer.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -68,6 +69,7 @@ class SmokeInputs:
     profile: CapsuleTaskProfile
     environment_payload: Mapping[str, Any]
     environment_path: Path
+    environment_bytes: bytes
     environment_sha256: str
     source_row: Mapping[str, str]
     source_path: Path
@@ -209,14 +211,15 @@ def load_smoke_inputs(config_path: str | Path, source_path: str | Path) -> Smoke
     return SmokeInputs(
         config=config,
         config_path=resolved_config,
-        config_sha256=common.artifact_file_sha256(resolved_config),
+        config_sha256=hashlib.sha256(config_bytes).hexdigest(),
         profile=profile,
         environment_payload=environment_payload,
         environment_path=environment_path,
-        environment_sha256=common.artifact_file_sha256(environment_path),
+        environment_bytes=environment_bytes,
+        environment_sha256=hashlib.sha256(environment_bytes).hexdigest(),
         source_row=source_row,
         source_path=resolved_source,
-        source_sha256=common.artifact_file_sha256(resolved_source),
+        source_sha256=hashlib.sha256(source_bytes).hexdigest(),
         pyroki_host=pyroki_host,
         pyroki_port=pyroki_port,
     )
@@ -521,7 +524,9 @@ def execute_smoke(
 
     load_runtime = _load_runtime_components if runtime_loader is None else runtime_loader
     components = load_runtime()
-    factory = components.environment_factory_type(str(inputs.environment_path))
+    factory = components.environment_factory_type(
+        str(inputs.environment_path), config_bytes=inputs.environment_bytes
+    )
     hashes, oracle_source = _probe_environment(factory, seeds)
     seed_five_hash = validate_seed_hashes(seeds, hashes)
     task = build_task_instance(

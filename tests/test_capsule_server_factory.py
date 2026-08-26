@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -686,6 +687,53 @@ def test_yaml_environment_factory_is_lazy_and_pickle_safe(monkeypatch, tmp_path:
     task = SimpleNamespace()
     assert factory(task) is marker
     assert calls[0]["path"] == str(config_path)
+
+
+def test_yaml_environment_factory_snapshot_survives_mutation_between_probe_and_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "environment.yaml"
+    snapshot = (
+        b"environment_label: validated\n"
+        b"env:\n"
+        b"  _target_: fake.Environment\n"
+        b"  label: ${environment_label}\n"
+    )
+    config_path.write_bytes(snapshot)
+    instantiated: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "capx.rl.capsule.server_factory.DictLoader.load",
+        lambda _path: pytest.fail("snapshot-backed factory must not reopen its path"),
+    )
+    monkeypatch.setattr(
+        "capx.rl.capsule.server_factory.instantiate",
+        lambda value: instantiated.append(dict(value)) or dict(value),
+    )
+    factory = YamlEnvironmentFactory(str(config_path), config_bytes=snapshot)
+
+    probe_environment = factory(SimpleNamespace())
+    config_path.write_bytes(
+        b"environment_label: mutated\n"
+        b"env:\n"
+        b"  _target_: changed.Environment\n"
+        b"  label: ${environment_label}\n"
+    )
+    spawned_factory = pickle.loads(pickle.dumps(factory))
+    worker_environment = spawned_factory(SimpleNamespace())
+
+    expected = {"_target_": "fake.Environment", "label": "validated"}
+    assert probe_environment == expected
+    assert worker_environment == expected
+    assert instantiated == [expected, expected]
+
+
+def test_yaml_environment_factory_snapshot_parse_failure_is_typed(tmp_path: Path) -> None:
+    config_path = tmp_path / "environment.yaml"
+    config_path.write_text("env: {_target_: fake.Environment}\n", encoding="utf-8")
+    factory = YamlEnvironmentFactory(str(config_path), config_bytes=b"\xff")
+
+    with pytest.raises(ServerFactoryError, match="UTF-8.*snapshot"):
+        factory(SimpleNamespace())
 
 
 def test_program_generator_rejects_prompt_overflow() -> None:

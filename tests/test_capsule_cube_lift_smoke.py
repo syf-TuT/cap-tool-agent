@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -148,8 +149,9 @@ def _runtime_components(
     )
 
     class Factory:
-        def __init__(self, config_path: str) -> None:
+        def __init__(self, config_path: str, config_bytes: bytes | None = None) -> None:
             self.config_path = config_path
+            self.config_bytes = config_bytes
             self.calls: list[object] = []
             state.factory_instances.append(self)
 
@@ -242,6 +244,38 @@ def test_load_smoke_inputs_validates_profile_environment_and_source(tmp_path: Pa
     assert inputs.config_sha256 == common.artifact_file_sha256(config_path)
     assert inputs.environment_sha256 == common.artifact_file_sha256(environment_path)
     assert inputs.source_sha256 == common.artifact_file_sha256(source_path)
+
+
+def test_load_smoke_inputs_hashes_the_bytes_it_validated_when_files_mutate_after_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, environment_path, source_path = _write_inputs(tmp_path)
+    original_bytes = {
+        "config": config_path.read_bytes(),
+        "environment": environment_path.read_bytes(),
+        "source": source_path.read_bytes(),
+    }
+    real_source_loader = smoke._load_source_row
+
+    def mutate_after_all_reads(raw_bytes: bytes, path: Path) -> dict[str, str]:
+        row = dict(real_source_loader(raw_bytes, path))
+        config_path.write_bytes(b"changed config bytes\n")
+        environment_path.write_bytes(b"changed environment bytes\n")
+        source_path.write_bytes(b"changed source bytes\n")
+        return row
+
+    monkeypatch.setattr(smoke, "_load_source_row", mutate_after_all_reads)
+
+    inputs = smoke.load_smoke_inputs(config_path, source_path)
+
+    assert config_path.read_bytes() != original_bytes["config"]
+    assert environment_path.read_bytes() != original_bytes["environment"]
+    assert source_path.read_bytes() != original_bytes["source"]
+    assert inputs.config_sha256 == hashlib.sha256(original_bytes["config"]).hexdigest()
+    assert inputs.environment_sha256 == hashlib.sha256(
+        original_bytes["environment"]
+    ).hexdigest()
+    assert inputs.source_sha256 == hashlib.sha256(original_bytes["source"]).hexdigest()
 
 
 @pytest.mark.parametrize(
@@ -500,6 +534,32 @@ def test_execute_smoke_uses_one_backend_and_evaluator_for_both_replays(
     assert evaluator.closed is True
     assert state.backend_instances[0].closed is True
     assert json.loads(output.read_text(encoding="utf-8")) == payload
+
+
+def test_execute_smoke_pins_validated_environment_bytes_before_probe(
+    tmp_path: Path,
+) -> None:
+    config_path, environment_path, source_path = _write_inputs(tmp_path)
+    validated_environment_bytes = environment_path.read_bytes()
+    inputs = smoke.load_smoke_inputs(config_path, source_path)
+    environment_path.write_bytes(b"env: {_target_: changed.Environment}\n")
+    state = _runtime_components()
+
+    payload = smoke.execute_smoke(
+        inputs,
+        seed_sequence=(5, 6, 5),
+        replay_seed=5,
+        replays=2,
+        timeout_s=180.0,
+        output_path=tmp_path / "smoke.json",
+        readiness_checker=lambda host, port: None,
+        runtime_loader=lambda: state.components,
+    )
+
+    assert state.factory_instances[0].config_bytes == validated_environment_bytes
+    assert payload["environment_sha256"] == hashlib.sha256(
+        validated_environment_bytes
+    ).hexdigest()
 
 
 def test_execute_smoke_artifact_is_explicitly_non_training_and_non_gate(tmp_path: Path) -> None:
