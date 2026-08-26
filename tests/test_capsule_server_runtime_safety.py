@@ -17,6 +17,7 @@ from capx.rl.capsule.server_factory import (
     ServerFactoryError,
     VeRLWorkerSession,
     _bind_pinned_verl_import,
+    _bind_project_import_root,
     _capsule_data_parallel_world_size,
     _close_runtime_resources,
     _configure_verl_training_schedule,
@@ -150,11 +151,12 @@ def test_pinned_verl_binding_imports_exact_validated_checkout(
 
 
 def test_ray_runtime_env_propagates_pinned_verl_without_mutating_input(tmp_path: Path) -> None:
+    project = tmp_path / "project"
     pinned = tmp_path / "pinned"
     runtime_env = {"env_vars": {"PYTHONPATH": "/existing", "KEEP": "yes"}}
     pinned_sha = "a" * 40
 
-    resolved = _pinned_ray_runtime_env(runtime_env, pinned, pinned_sha)
+    resolved = _pinned_ray_runtime_env(runtime_env, project, pinned, pinned_sha)
 
     assert resolved is not runtime_env
     assert runtime_env["env_vars"]["PYTHONPATH"] == "/existing"
@@ -162,10 +164,26 @@ def test_ray_runtime_env_propagates_pinned_verl_without_mutating_input(tmp_path:
     assert resolved["env_vars"]["CAPX_PINNED_VERL_SHA"] == pinned_sha
     assert resolved["env_vars"]["PYTHONDONTWRITEBYTECODE"] == "1"
     assert resolved["env_vars"]["PYTHONPATH"].split(os.pathsep) == [
+        str(project.resolve()),
         str(pinned.resolve()),
         "/existing",
     ]
     assert resolved["env_vars"]["KEEP"] == "yes"
+
+
+def test_project_import_root_precedes_pinned_verl_for_spawn_main(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    pinned = tmp_path / "pinned"
+    project.mkdir()
+    pinned.mkdir()
+    previous_sys_path = list(sys.path)
+    sys.path[:] = [str(pinned), "/existing"]
+    try:
+        _bind_project_import_root(project)
+
+        assert sys.path[:3] == [str(project.resolve()), str(pinned), "/existing"]
+    finally:
+        sys.path[:] = previous_sys_path
 
 
 def test_verl_schedule_is_bounded_by_dataset_rows_and_epochs() -> None:

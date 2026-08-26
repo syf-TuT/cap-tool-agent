@@ -12,6 +12,7 @@ import ast
 import hashlib
 import json
 import os
+import sys
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -936,8 +937,21 @@ def _bind_pinned_verl_import(verl_path: Path) -> None:
         raise ServerFactoryError(str(error)) from error
 
 
+def _bind_project_import_root(project_root: Path) -> None:
+    """Keep the repository package root ahead of VeRL for spawned main-module imports."""
+
+    root = project_root.expanduser().resolve()
+    sys.path[:] = [
+        entry for entry in sys.path if Path(entry or ".").resolve() != root
+    ]
+    sys.path.insert(0, str(root))
+
+
 def _pinned_ray_runtime_env(
-    runtime_env: object, verl_path: Path, expected_sha: str
+    runtime_env: object,
+    project_root: Path,
+    verl_path: Path,
+    expected_sha: str,
 ) -> dict[str, Any]:
     """Copy a Ray runtime env and make the validated VeRL checkout explicit to workers."""
 
@@ -951,10 +965,14 @@ def _pinned_ray_runtime_env(
     existing_pythonpath = env_vars.get("PYTHONPATH", os.environ.get("PYTHONPATH", ""))
     if not isinstance(existing_pythonpath, str):
         raise ServerFactoryError("Ray PYTHONPATH must be text")
+    project = str(project_root.expanduser().resolve())
     pinned = str(verl_path.expanduser().resolve())
+    explicit_paths = {Path(project), Path(pinned)}
     path_entries = [entry for entry in existing_pythonpath.split(os.pathsep) if entry]
-    path_entries = [entry for entry in path_entries if Path(entry).resolve() != Path(pinned)]
-    env_vars["PYTHONPATH"] = os.pathsep.join((pinned, *path_entries))
+    path_entries = [
+        entry for entry in path_entries if Path(entry).resolve() not in explicit_paths
+    ]
+    env_vars["PYTHONPATH"] = os.pathsep.join((project, pinned, *path_entries))
     env_vars["CAPX_PINNED_VERL_SOURCE_PATH"] = pinned
     env_vars["CAPX_PINNED_VERL_SHA"] = expected_sha
     env_vars["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1321,6 +1339,7 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
     if topology.shares_actor_reference:
         _verify_lora_reference_source_contract(verl_path)
     _bind_pinned_verl_import(verl_path)
+    _bind_project_import_root(project_root)
 
     import ray
     from omegaconf import OmegaConf
@@ -1350,7 +1369,7 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
         OmegaConf.merge(default_runtime_env, configured_runtime_env), resolve=True
     )
     ray_init["runtime_env"] = _pinned_ray_runtime_env(
-        merged_runtime_env, verl_path, expected_verl_sha
+        merged_runtime_env, project_root, verl_path, expected_verl_sha
     )
     try:
         ray.init(**ray_init)
