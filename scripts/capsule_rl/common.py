@@ -1613,9 +1613,11 @@ def _verify_explicit_protocol_repairs(
     if (
         p0_result.outcome is not ReplayOutcome.PROGRAM_ERROR
         or p0_result.error_type != "SyntaxError"
-        or p0_result.raw_reward != 0.0
+        or p0_result.binary_reward != 0.0
     ):
-        raise GateArtifactError("fenced Actor P0 must preserve its SyntaxError and zero reward")
+        raise GateArtifactError(
+            "fenced Actor P0 must preserve its SyntaxError and zero binary reward"
+        )
 
     required_targets = [f"base:{unit_id}" for unit_id in expected_protocol_ids]
     protocol_edit_turns: list[int] = []

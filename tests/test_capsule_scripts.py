@@ -3386,7 +3386,7 @@ def _collector_payload_with_fenced_p0(
                 outcome=(
                     ReplayOutcome.PROGRAM_ERROR if is_fenced else ReplayOutcome.TASK_FAILURE
                 ),
-                raw_reward=0.0,
+                raw_reward=0.25,
                 binary_reward=0.0,
                 task_completed=False,
                 error_type="SyntaxError" if is_fenced else None,

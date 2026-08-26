@@ -358,20 +358,22 @@ Markdown fence 本身属于 Actor 协议错误，collector 不得在执行前静
 ```text
 Actor 原始输出
 -> 原样执行
--> SyntaxError、reward=0，并记录 P0
+-> SyntaxError、binary reward=0，并记录 P0（dense raw_reward 仍原样保留）
 -> Controller 显式提交删除 fence open/close（以及存在时的 trailing suffix）repair unit 的 edit
 -> 形成新的 PT/P_hat
 -> 重新执行并独立评分
 ```
 
-因此，只有 replay 已经留下原始 fenced source、SyntaxError 和 reward 0 后，repair unit discovery
+因此，只有 replay 已经留下原始 fenced source、SyntaxError 和 binary reward 0 后，repair unit
+discovery
 才会向 Controller 暴露 `fence_open`、内部 Python AST groups 与 `fence_close`。若 closing fence
 后还有解释文字或其他原始字节，discovery 还会原样暴露 `protocol_suffix`，而不是把整个响应退化为
 可被一次重写的 `program` 单元。Controller 必须对两个 fence unit 以及存在的 suffix unit 分别提交
 显式空字符串 replacement；这些 protocol edit 必须早于任何 semantic edit。`finish`、无 edit、
 whole-program cleanup 或 launcher 自行剥离 fence 都不构成修复。对已为空的 target 再次提交空
 replacement 会作为 no-op 被拒绝并进入 audit，不产生 revision。Gate 4 会从 P0 原始字节重新推导
-这些单元，并交叉验证 SyntaxError、reward 0、edit 顺序和最终 lineage。删除后的程序是新的 lineage
+这些单元，并交叉验证 SyntaxError、binary reward 0、edit 顺序和最终 lineage；用于 P0 排序和诊断的
+dense `raw_reward` 不会被改写或强制归零。删除后的程序是新的 lineage
 节点，其 source hash、replay 与 reward 必须单独记录。
 `repair_traces` 每条记录包含 `p0_rank`、`trajectory_index` 和可由 `RepairTraceV1` 精确重建
 的 `trace`；四条记录覆盖完整 2×2，trace identity/hash 必须与对应 P0 一致，且

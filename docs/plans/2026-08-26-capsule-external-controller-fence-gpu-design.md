@@ -11,8 +11,9 @@ only become executable through auditable Controller edits followed by an indepen
 
 The Actor source remains immutable input to the first clean replay. No extraction, trimming,
 fence removal, or syntax normalization occurs before P0 execution. A fenced response therefore
-produces the normal typed `SyntaxError` replay result with binary reward zero. The failed replay
-identity, raw source, error type, error message, diagnostics, and reward remain attached to the
+produces the normal typed `SyntaxError` replay result with binary reward zero. Any dense raw
+reward used for ranking or diagnostics remains unchanged. The failed replay identity, raw source,
+error type, error message, diagnostics, and rewards remain attached to the
 repair trajectory and are included in the Controller state.
 
 After that failure, unit discovery may describe the immutable bytes without changing them. For a
@@ -29,8 +30,8 @@ repairs. A replacement which leaves a target byte-identical is rejected into the
 does not create a revision. The repaired `PT/P_hat` is reconstructed only from committed edits;
 it is then replayed from the same initial state and scored independently. Gate 4 independently
 re-derives the expected units from the immutable P0, rejects whole-program fence cleanup, and
-checks the typed SyntaxError, zero reward, deletions, and edit order. The unit discovery helper
-never returns cleaned source and never commits an edit on the Controller's behalf.
+checks the typed SyntaxError, zero binary reward, deletions, and edit order. The unit discovery
+helper never returns cleaned source and never commits an edit on the Controller's behalf.
 
 Malformed or incomplete fences retain the existing whole-program fallback. They are still
 executed unchanged as P0 and require an explicit Controller replacement if they are to be
