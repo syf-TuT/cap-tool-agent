@@ -20,7 +20,7 @@ The Cube Lift profile is fixed to the following contract:
 - privilege: `privileged: true`;
 - Program output: one complete executable Python program;
 - robot primitives: `get_object_pose`, `sample_grasp_pose`, `goto_pose`,
-  `open_gripper`, `close_gripper`, and the existing simulated home operation;
+  `open_gripper`, and `close_gripper`;
 - services: PyRoKi only;
 - rendering and video: disabled for replay.
 
