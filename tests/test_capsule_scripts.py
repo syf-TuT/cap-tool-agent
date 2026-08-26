@@ -2933,6 +2933,100 @@ def test_guided_verifier_enforces_deterministic_p0_selection() -> None:
         common.verify_guided_gate_artifact(payload)
 
 
+def test_guided_verifier_accepts_discarded_fallback_in_evaluation_order() -> None:
+    payload = _guided_gate_payload()
+    selected_events = payload["replay_events"]
+    for event in selected_events:
+        event["group_attempt_index"] = 1
+
+    fallback_member = LearningMemberV1(
+        member_type="base",
+        program_sample_id="base-7",
+        prompt="stack the cubes",
+        response="failed_7 = True\n",
+        reward=0.0,
+    )
+    selected_group = LearningGroupV1.from_dict(payload["learning_group"])
+    fallback_group = LearningGroupV1(
+        task_id=selected_group.task_id,
+        environment_seed=selected_group.environment_seed,
+        group_uid=selected_group.group_uid,
+        initial_state_sha256=selected_group.initial_state_sha256,
+        members=(*selected_group.members[:7], fallback_member),
+        skip_actor_update=True,
+        metadata={"guided_member_selected": False},
+    )
+    fallback_result = _replay_result(
+        program_sample_id=fallback_member.program_sample_id,
+        source=fallback_member.response,
+        success=False,
+    )
+    fallback_attempts = deepcopy(payload["repair_attempts"])
+    first_attempt = fallback_attempts[0]
+    first_attempt["status"] = "revision_failed"
+    first_attempt["selected"] = False
+    first_attempt["revision_result"].update(
+        {
+            "outcome": "task_failure",
+            "raw_reward": 0.25,
+            "binary_reward": 0.0,
+            "task_completed": False,
+        }
+    )
+    first_attempt["revision_result"]["diagnostics"]["evaluator_attempt_history"][0][
+        "outcome"
+    ] = "task_failure"
+    fallback_base_results = [
+        ProgramReplayResultV1.from_dict(result) for result in payload["base_results"]
+    ] + [fallback_result]
+    fallback_replays = [
+        *fallback_base_results[:7],
+        ProgramReplayResultV1.from_dict(first_attempt["pt_result"]),
+        ProgramReplayResultV1.from_dict(first_attempt["revision_result"]),
+        fallback_base_results[7],
+    ]
+    discarded_events = [
+        {
+            "group_attempt_index": 0,
+            "result_index": index,
+            "selected_group": False,
+            "result": result.to_dict(),
+        }
+        for index, result in enumerate(fallback_replays)
+    ]
+    payload.update(
+        {
+            "selected_group_attempt_index": 1,
+            "discarded_group_attempts": [
+                {
+                    "group_attempt_index": 0,
+                    "reason": "no_guided_member",
+                    "message": "assembled fallback group had no PT/P_hat double-success",
+                    "replay_results": [result.to_dict() for result in fallback_replays],
+                    "partial_repair_attempts": [],
+                    "assembly": {
+                        "group": fallback_group.to_dict(),
+                        "base_results": [result.to_dict() for result in fallback_base_results],
+                        "repair_attempts": fallback_attempts,
+                    },
+                }
+            ],
+            "replay_events": [*discarded_events, *selected_events],
+        }
+    )
+    payload.update(
+        common.summarize_replay_results(
+            tuple(
+                ProgramReplayResultV1.from_dict(event["result"])
+                for event in payload["replay_events"]
+            ),
+            require_attempt_history=True,
+        )
+    )
+
+    common.verify_guided_gate_artifact(payload)
+
+
 @pytest.mark.parametrize(
     ("field_name", "invalid_value", "message"),
     [

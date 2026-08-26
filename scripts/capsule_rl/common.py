@@ -2297,12 +2297,17 @@ def verify_guided_gate_artifact(payload: Mapping[str, Any]) -> None:
                 ) from error
             if discarded_assembly.group.metadata.get("guided_member_selected") is True:
                 raise GateArtifactError("discarded fallback assembly unexpectedly selected guided")
-            assembly_replays = list(discarded_assembly.base_results)
+            # The assembler evaluates the seven repair-triggering base programs first,
+            # then PT/P_hat candidates, and only then samples the eighth fallback base
+            # when no guided revision succeeds.  Preserve that execution order here;
+            # ``base_results`` stores all eight bases together for group provenance.
+            assembly_replays = list(discarded_assembly.base_results[:7])
             for repair_attempt in discarded_assembly.repair_attempts:
                 if repair_attempt.pt_result is not None:
                     assembly_replays.append(repair_attempt.pt_result)
                 if repair_attempt.revision_result is not None:
                     assembly_replays.append(repair_attempt.revision_result)
+            assembly_replays.extend(discarded_assembly.base_results[7:])
             if [result.to_dict() for result in event_results] != [
                 result.to_dict() for result in assembly_replays
             ]:
