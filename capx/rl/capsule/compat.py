@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .config_validation import validate_capsule_training_config
+from .task_profiles import collect_task_profile_errors
 
 # Official VeRL v0.6.1 tag.
 PINNED_VERL_SHA = "d62da4950573d7a4b7ef2362337952e7ab59e78d"
@@ -388,13 +389,6 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
     exact_values = (
         ("schema_version", 1, "schema v1 is the only supported artifact contract"),
         ("runtime.verl_pinned_sha", PINNED_VERL_SHA, "the adapter targets one pinned VeRL"),
-        ("runtime.requires.egl", True, "Cube Stack server replay requires EGL"),
-        ("runtime.requires.pyroki", True, "privileged Controller replay requires PyRoKi"),
-        ("task.environment", "robosuite_cube_stack", "MVP covers Cube Stack only"),
-        ("task.api", "franka_control_privileged", "MVP uses the privileged Franka API"),
-        ("task.privilege", "privileged", "unprivileged collection is out of scope"),
-        ("task.render", False, "local/server training must not render"),
-        ("task.record_video", False, "training collection must not record video"),
         (
             "controller_service.frozen",
             True,
@@ -470,6 +464,7 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
     )
     for path, expected, reason in exact_values:
         _require_exact(config, path, expected, reason, errors)
+    errors.extend(collect_task_profile_errors(config))
 
     for path in (
         "runtime.verl_source_path",

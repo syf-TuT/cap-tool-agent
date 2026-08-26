@@ -19,6 +19,7 @@ CONFIG_PATH = (
 CLEAN_REPLAY_CONFIG_PATH = CONFIG_PATH.with_name(
     "franka_robosuite_cube_stack_privileged_clean_replay.yaml"
 )
+LIFT_PROFILE_NAME = "robosuite_cube_lift_privileged_highlevel"
 
 
 def valid_config() -> dict:
@@ -110,8 +111,101 @@ def valid_config() -> dict:
     }
 
 
-def test_complete_capsule_config_is_accepted() -> None:
-    validate_capsule_config(valid_config())
+def valid_lift_config() -> dict:
+    config = deepcopy(valid_config())
+    config["task"].update(
+        {
+            "profile": LIFT_PROFILE_NAME,
+            "environment": "robosuite_cube_lift",
+            "config_path": (
+                "env_configs/cube_lifting/capsule_rl/"
+                "franka_robosuite_cube_lift_privileged_clean_replay.yaml"
+            ),
+        }
+    )
+    return config
+
+
+def test_legacy_cube_stack_config_without_profile_is_accepted() -> None:
+    config = valid_config()
+
+    assert "profile" not in config["task"]
+    validate_capsule_config(config)
+
+
+def test_explicit_cube_stack_profile_is_accepted() -> None:
+    config = valid_config()
+    config["task"]["profile"] = "robosuite_cube_stack_privileged"
+
+    validate_capsule_config(config)
+
+
+def test_explicit_privileged_highlevel_cube_lift_profile_is_accepted() -> None:
+    validate_capsule_config(valid_lift_config())
+
+
+def test_cube_lift_requires_an_explicit_profile() -> None:
+    config = valid_lift_config()
+    del config["task"]["profile"]
+
+    with pytest.raises(CapsuleConfigError, match=r"task\.profile.*explicit"):
+        validate_capsule_config(config)
+
+
+def test_unknown_task_profile_is_rejected() -> None:
+    config = valid_config()
+    config["task"]["profile"] = "unknown_profile"
+
+    with pytest.raises(CapsuleConfigError, match=r"task\.profile.*unknown_profile"):
+        validate_capsule_config(config)
+
+
+@pytest.mark.parametrize(
+    ("path", "bad_value"),
+    [
+        (("task", "environment"), "robosuite_cube_stack"),
+        (("task", "api"), "franka_control"),
+        (("task", "privilege"), "unprivileged"),
+        (("task", "render"), True),
+        (("task", "record_video"), True),
+        (("runtime", "requires", "egl"), False),
+        (("runtime", "requires", "pyroki"), False),
+    ],
+)
+def test_selected_task_profile_rejects_contract_mismatch(path, bad_value) -> None:
+    config = valid_lift_config()
+    current = config
+    for key in path[:-1]:
+        current = current[key]
+    current[path[-1]] = bad_value
+
+    with pytest.raises(CapsuleConfigError) as caught:
+        validate_capsule_config(config)
+
+    message = str(caught.value)
+    assert LIFT_PROFILE_NAME in message
+    assert ".".join(path) in message
+
+
+def test_task_profile_mismatches_are_aggregated() -> None:
+    config = valid_lift_config()
+    config["task"]["render"] = True
+    config["runtime"]["requires"]["egl"] = False
+
+    with pytest.raises(CapsuleConfigError) as caught:
+        validate_capsule_config(config)
+
+    message = str(caught.value)
+    assert "task.render" in message
+    assert "runtime.requires.egl" in message
+
+
+def test_boolean_task_privilege_remains_invalid() -> None:
+    config = valid_lift_config()
+    config["task"]["privilege"] = True
+
+    with pytest.raises(CapsuleConfigError, match=r"task\.privilege.*'privileged'"):
+        validate_capsule_config(config)
 
 
 @pytest.mark.parametrize(
