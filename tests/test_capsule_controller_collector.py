@@ -132,6 +132,35 @@ def test_collector_runs_edit_sequence_without_replay_and_reconstructs_pt() -> No
     assert "NameError: missing helper" in joined_prompts
 
 
+def test_collector_sends_only_system_and_latest_complete_state_each_turn() -> None:
+    p0 = ProgramCandidate("base-0", "broken = True\n")
+    append_response = _action(
+        "append",
+        generation_id="recovery_1",
+        unit_id="body",
+        source="recover = True\n",
+        rationale="add recovery",
+    )
+    transport = _ScriptedTransport([append_response, _action("finish")])
+    collector = ControllerRepairCollector(transport=transport, max_turns=2)
+
+    collector(_task(), p0, _failure(p0), 0, 0, "repair-0")
+
+    assert [[message["role"] for message in call] for call in transport.calls] == [
+        ["system", "user"],
+        ["system", "user"],
+    ]
+    first_state = json.loads(transport.calls[0][1]["content"])
+    latest_state = json.loads(transport.calls[1][1]["content"])
+    assert first_state["current_revision"] == 0
+    assert first_state["current_source"] == p0.source
+    assert first_state["feedback"] == "start repair"
+    assert latest_state["current_revision"] == 1
+    assert latest_state["current_source"] == "broken = True\n\nrecover = True\n"
+    assert latest_state["feedback"] == "committed revision 1 at recovery:recovery_1:body"
+    assert append_response not in transport.calls[1][1]["content"]
+
+
 def test_invalid_and_inspect_actions_only_enter_audit() -> None:
     transport = _ScriptedTransport(
         [

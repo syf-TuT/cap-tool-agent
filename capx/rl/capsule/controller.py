@@ -286,16 +286,14 @@ class ControllerRepairCollector:
             base_units=python_base_unit_spans(p0.source),
             max_turns=self.max_turns,
         )
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": _state_message(task, p0_result, draft, "start repair"),
-            },
-        ]
+        system_message = {"role": "system", "content": _SYSTEM_PROMPT}
+        state_message = {
+            "role": "user",
+            "content": _state_message(task, p0_result, draft, "start repair"),
+        }
         for _ in range(self.max_turns):
             try:
-                response = self.transport.complete(tuple(messages))
+                response = self.transport.complete((system_message, state_message))
             except ControllerProtocolError:
                 raise
             except Exception as error:
@@ -305,7 +303,6 @@ class ControllerRepairCollector:
             if not isinstance(response, str):
                 raise ControllerProtocolError("Controller transport response must be text")
             submission = draft.submit_json(response)
-            messages.append({"role": "assistant", "content": response})
             if draft.finished:
                 break
             if submission.committed and submission.edit is not None:
@@ -320,12 +317,10 @@ class ControllerRepairCollector:
                 )
             else:
                 raise ControllerProtocolError("repair draft returned no edit or audit")
-            messages.append(
-                {
-                    "role": "user",
-                    "content": _state_message(task, p0_result, draft, feedback),
-                }
-            )
+            state_message = {
+                "role": "user",
+                "content": _state_message(task, p0_result, draft, feedback),
+            }
         return draft.to_trace()
 
     def close(self) -> None:
