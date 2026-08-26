@@ -58,11 +58,7 @@ def canonicalize_cube_initial_state(
     return {"cube_poses": canonical_poses, "robot_joints": canonical_joints}
 
 
-def cube_initial_state_sha256(
-    cube_poses: Mapping[str, Sequence[object]],
-    robot_joints: Sequence[object],
-) -> str:
-    payload = canonicalize_cube_initial_state(cube_poses, robot_joints)
+def _initial_state_sha256(payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(
         payload,
         allow_nan=False,
@@ -71,6 +67,14 @@ def cube_initial_state_sha256(
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def cube_initial_state_sha256(
+    cube_poses: Mapping[str, Sequence[object]],
+    robot_joints: Sequence[object],
+) -> str:
+    payload = canonicalize_cube_initial_state(cube_poses, robot_joints)
+    return _initial_state_sha256(payload)
 
 
 def cube_initial_state_sha256_from_observation(
@@ -87,8 +91,48 @@ def cube_initial_state_sha256_from_observation(
     return cube_initial_state_sha256(cube_poses, robot_joints)
 
 
+def canonicalize_cube_lift_initial_state(
+    cube_poses: Mapping[str, Sequence[object]],
+    robot_joints: Sequence[object],
+) -> dict[str, Any]:
+    """Return a stable JSON-compatible representation for Cube Lift reset state."""
+
+    if set(cube_poses) != {"primary"}:
+        raise ValueError("cube_poses must contain exactly primary")
+    if len(robot_joints) != _JOINT_COUNT:
+        raise ValueError("robot_joints must contain exactly seven values")
+    canonical_poses = {"primary": _canonical_pose(cube_poses["primary"], "primary")}
+    canonical_joints = [_finite_float(value, "robot joint") for value in robot_joints]
+    return {"cube_poses": canonical_poses, "robot_joints": canonical_joints}
+
+
+def cube_lift_initial_state_sha256(
+    cube_poses: Mapping[str, Sequence[object]],
+    robot_joints: Sequence[object],
+) -> str:
+    payload = canonicalize_cube_lift_initial_state(cube_poses, robot_joints)
+    return _initial_state_sha256(payload)
+
+
+def cube_lift_initial_state_sha256_from_observation(
+    observation: Mapping[str, Any],
+    robot_joints: Sequence[object],
+) -> str | None:
+    """Hash privileged Cube Lift state, while leaving visual resets unchanged."""
+
+    cube_poses = observation.get("cube_poses")
+    if cube_poses is None:
+        return None
+    if not isinstance(cube_poses, Mapping):
+        raise ValueError("observation cube_poses must be a mapping")
+    return cube_lift_initial_state_sha256(cube_poses, robot_joints)
+
+
 __all__ = [
+    "canonicalize_cube_lift_initial_state",
     "canonicalize_cube_initial_state",
+    "cube_lift_initial_state_sha256",
+    "cube_lift_initial_state_sha256_from_observation",
     "cube_initial_state_sha256",
     "cube_initial_state_sha256_from_observation",
 ]
