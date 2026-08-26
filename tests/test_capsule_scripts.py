@@ -83,6 +83,60 @@ LIFT_CONFIG_TEMPLATE = (
 LIFT_SOURCE_TASKS = LIFT_CONFIG_TEMPLATE.with_name(
     "cube_lift_capsule_source_tasks.jsonl"
 )
+CUBE_LIFT_SOURCE_PROMPT_LINES = (
+    (
+        "Your task is to pick up the red cube and lift it. "
+        "Only the five high-level functions below are available:"
+    ),
+    (
+        "- `get_object_pose(object_name, return_bbox_extent=False)` returns the object's XYZ "
+        "position, WXYZ quaternion, and optional bounding-box extent."
+    ),
+    (
+        "- `sample_grasp_pose(object_name)` returns a grasp XYZ position and WXYZ quaternion."
+    ),
+    (
+        "- `goto_pose(position, quaternion_wxyz, z_approach=0.0)` moves the gripper to a pose "
+        "and can approach along its local Z axis."
+    ),
+    "- `open_gripper()` opens the gripper.",
+    "- `close_gripper()` closes the gripper.",
+    (
+        "All quaternion values use WXYZ order. Do not access a raw environment object. "
+        "Do not use low-level joint control. Return one complete executable Python program "
+        "as code only, without Markdown code fences."
+    ),
+)
+CUBE_LIFT_SOURCE_CALLABLE_SIGNATURES = (
+    "get_object_pose(object_name, return_bbox_extent=False)",
+    "sample_grasp_pose(object_name)",
+    "goto_pose(position, quaternion_wxyz, z_approach=0.0)",
+    "open_gripper()",
+    "close_gripper()",
+)
+
+
+def _assert_cube_lift_source_prompt_contract(prompt: str) -> None:
+    assert tuple(prompt.splitlines()) == CUBE_LIFT_SOURCE_PROMPT_LINES
+
+    callable_signatures = tuple(
+        re.findall(r"`([a-z][a-z0-9_]*\([^`\n]*\))`", prompt)
+    )
+    assert callable_signatures == CUBE_LIFT_SOURCE_CALLABLE_SIGNATURES
+    assert "pick up the red cube and lift it" in prompt
+    assert "Only the five high-level functions below are available" in prompt
+    assert "WXYZ" in prompt
+    assert "one complete executable Python program" in prompt
+    assert "as code only" in prompt
+    assert "without Markdown code fences" in prompt
+    assert "Do not access a raw environment object" in prompt
+    assert "Do not use low-level joint control" in prompt
+    for unavailable_token in ("home_pose", "pick_and_lift"):
+        assert re.search(rf"\b{unavailable_token}\b", prompt) is None
+    for unavailable_function in ("grasp", "lift"):
+        assert re.search(rf"\b{unavailable_function}\s*\(", prompt) is None
+    assert re.search(r"\benv\s*\.", prompt) is None
+    assert re.search(r"\bAPIS\s*\[", prompt, flags=re.IGNORECASE) is None
 
 
 @pytest.fixture(autouse=True)
@@ -283,36 +337,25 @@ def test_cube_lift_source_task_exposes_only_existing_high_level_functions() -> N
     assert record["task_id"] == "cube-lift-red-cube"
 
     prompt = record["prompt"]
-    declared_functions = {
-        line[3:].split("(", maxsplit=1)[0]
-        for line in prompt.splitlines()
-        if line.startswith("- `") and "(" in line
-    }
-    assert declared_functions == {
-        "get_object_pose",
-        "sample_grasp_pose",
-        "goto_pose",
-        "open_gripper",
-        "close_gripper",
-    }
-    function_like_names = set(
-        re.findall(r"\b([a-z][a-z0-9_]*)\s*\(", prompt)
-    )
-    assert function_like_names == declared_functions
-    assert "pick up the red cube and lift it" in prompt
-    assert "Only the five high-level functions below are available" in prompt
-    assert "`get_object_pose(object_name, return_bbox_extent=False)`" in prompt
-    assert "`sample_grasp_pose(object_name)`" in prompt
-    assert "`goto_pose(position, quaternion_wxyz, z_approach=0.0)`" in prompt
-    assert "`open_gripper()`" in prompt
-    assert "`close_gripper()`" in prompt
-    assert "WXYZ" in prompt
-    assert "one complete executable Python program" in prompt
-    assert "without Markdown code fences" in prompt
-    assert "Do not access a raw environment object" in prompt
-    assert "Do not use low-level joint control" in prompt
-    for unavailable_function in ("grasp", "lift", "pick_and_lift", "home_pose"):
-        assert re.search(rf"\b{unavailable_function}\s*\(", prompt) is None
+    _assert_cube_lift_source_prompt_contract(prompt)
+
+
+@pytest.mark.parametrize(
+    "extra_declaration",
+    (
+        "- `goto_pose(position, quaternion_xyzw, z_approach=0.0)` uses XYZW order.",
+        "- `home_pose` moves the robot to its home configuration.",
+    ),
+)
+def test_cube_lift_source_prompt_contract_rejects_adversarial_api_drift(
+    extra_declaration: str,
+) -> None:
+    source_line = LIFT_SOURCE_TASKS.read_text(encoding="utf-8").strip()
+    canonical_prompt = json.loads(source_line)["prompt"]
+    adversarial_prompt = f"{canonical_prompt}\n{extra_declaration}"
+
+    with pytest.raises(AssertionError):
+        _assert_cube_lift_source_prompt_contract(adversarial_prompt)
 
 
 def test_server_config_validation_checks_algorithm_and_runtime_invariants(tmp_path: Path) -> None:
