@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 from copy import deepcopy
@@ -294,6 +295,10 @@ def test_cube_lift_source_task_exposes_only_existing_high_level_functions() -> N
         "open_gripper",
         "close_gripper",
     }
+    function_like_names = set(
+        re.findall(r"\b([a-z][a-z0-9_]*)\s*\(", prompt)
+    )
+    assert function_like_names == declared_functions
     assert "pick up the red cube and lift it" in prompt
     assert "Only the five high-level functions below are available" in prompt
     assert "`get_object_pose(object_name, return_bbox_extent=False)`" in prompt
@@ -307,7 +312,7 @@ def test_cube_lift_source_task_exposes_only_existing_high_level_functions() -> N
     assert "Do not access a raw environment object" in prompt
     assert "Do not use low-level joint control" in prompt
     for unavailable_function in ("grasp", "lift", "pick_and_lift", "home_pose"):
-        assert f"`{unavailable_function}(" not in prompt
+        assert re.search(rf"\b{unavailable_function}\s*\(", prompt) is None
 
 
 def test_server_config_validation_checks_algorithm_and_runtime_invariants(tmp_path: Path) -> None:
