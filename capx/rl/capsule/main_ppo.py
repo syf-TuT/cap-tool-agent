@@ -43,6 +43,11 @@ from .stable_io import (
     StablePathError,
     read_stable_regular_file,
 )
+from .task_profiles import (
+    CapsuleTaskProfileError,
+    collect_environment_profile_errors,
+    resolve_task_profile,
+)
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -265,6 +270,37 @@ class _RuntimeDependencySnapshot:
     environment_config: StableFileSnapshot | None
 
 
+def _validate_environment_snapshot(
+    config: Mapping[str, Any], snapshot: StableFileSnapshot
+) -> None:
+    """Validate the already captured environment bytes without reopening the path."""
+
+    try:
+        environment_text = snapshot.raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise TrainerFactoryError(
+            "resolved environment config is not valid UTF-8 YAML"
+        ) from error
+    try:
+        environment_payload = yaml.safe_load(environment_text)
+    except yaml.YAMLError as error:
+        raise TrainerFactoryError(
+            f"resolved environment config is not valid YAML: {error}"
+        ) from error
+    if not isinstance(environment_payload, Mapping):
+        raise TrainerFactoryError("resolved environment config YAML root must be a mapping")
+    try:
+        profile = resolve_task_profile(config)
+    except CapsuleTaskProfileError as error:
+        raise TrainerFactoryError(str(error)) from error
+    errors = collect_environment_profile_errors(environment_payload, profile)
+    if errors:
+        raise TrainerFactoryError(
+            "resolved environment config does not match the selected Capsule task profile: "
+            + "; ".join(errors)
+        )
+
+
 def _snapshot_runtime_dependencies(
     config: Mapping[str, Any],
     *,
@@ -286,6 +322,7 @@ def _snapshot_runtime_dependencies(
         environment_snapshot = _stable_file_snapshot(
             environment_path, "resolved environment config"
         )
+        _validate_environment_snapshot(config, environment_snapshot)
     environment_sha256 = (
         environment_snapshot.sha256 if environment_snapshot is not None else None
     )

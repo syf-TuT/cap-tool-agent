@@ -76,6 +76,14 @@ _LEGACY_CUBE_STACK_IDENTITY = (
     ROBOSUITE_CUBE_STACK_PRIVILEGED.privilege,
 )
 _MISSING = object()
+_PYROKI_SERVER_FIELDS = MappingProxyType(
+    {
+        "host": "127.0.0.1",
+        "port": 8116,
+        "robot": "panda_description",
+        "target_link": "panda_hand",
+    }
+)
 
 
 class CapsuleTaskProfileError(ValueError):
@@ -115,6 +123,8 @@ def resolve_task_profile(config: Mapping[str, Any]) -> CapsuleTaskProfile:
 def _matches_exact(actual: Any, expected: Any) -> bool:
     if isinstance(expected, bool):
         return isinstance(actual, bool) and actual is expected
+    if isinstance(expected, int):
+        return type(actual) is int and actual == expected
     return actual == expected
 
 
@@ -178,12 +188,85 @@ def collect_task_profile_errors(config: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(errors)
 
 
+def collect_environment_profile_errors(
+    payload: Mapping[str, Any], profile: CapsuleTaskProfile
+) -> tuple[str, ...]:
+    """Return environment-YAML mismatches for ``profile`` without file I/O."""
+
+    if not isinstance(payload, Mapping):
+        return ("environment config root must be a mapping",)
+    if not isinstance(profile, CapsuleTaskProfile):
+        raise TypeError("profile must be a CapsuleTaskProfile")
+
+    errors: list[str] = []
+    for path, expected in (
+        (("env", "_target_"), profile.env_target),
+        (("env", "cfg", "_target_"), profile.env_config_target),
+        (("env", "cfg", "low_level"), profile.low_level),
+        (("env", "cfg", "privileged"), True),
+        (("env", "cfg", "enable_render"), False),
+        (("env", "cfg", "viser_debug"), False),
+        (("env", "cfg", "apis"), list(profile.api_classes)),
+        (("record_video",), False),
+        (("num_workers",), 1),
+    ):
+        _collect_exact_error(
+            payload,
+            path=path,
+            expected=expected,
+            profile=profile,
+            errors=errors,
+        )
+
+    servers = payload.get("api_servers", _MISSING)
+    required_count = len(profile.required_server_targets)
+    if not isinstance(servers, list):
+        errors.append(
+            f"api_servers must be a list with exactly {required_count} server(s) for task "
+            f"profile {profile.name!r}; got {_display(servers)}"
+        )
+        return tuple(errors)
+    if len(servers) != required_count:
+        errors.append(
+            f"api_servers must contain exactly {required_count} server(s) for task profile "
+            f"{profile.name!r}; got {len(servers)}"
+        )
+
+    expected_server_keys = {"_target_", *_PYROKI_SERVER_FIELDS}
+    for index, expected_target in enumerate(profile.required_server_targets):
+        if index >= len(servers):
+            break
+        server = servers[index]
+        path_prefix = f"api_servers[{index}]"
+        if not isinstance(server, Mapping):
+            errors.append(f"{path_prefix} must be a mapping; got {server!r}")
+            continue
+        if set(server) != expected_server_keys:
+            errors.append(
+                f"{path_prefix} must contain exact keys {sorted(expected_server_keys)!r}; "
+                f"got {sorted(str(key) for key in server)!r}"
+            )
+        for field_name, expected in (
+            ("_target_", expected_target),
+            *_PYROKI_SERVER_FIELDS.items(),
+        ):
+            actual = server.get(field_name, _MISSING)
+            if not _matches_exact(actual, expected):
+                errors.append(
+                    f"{path_prefix}.{field_name} must be {expected!r} for task profile "
+                    f"{profile.name!r}; got {_display(actual)}"
+                )
+
+    return tuple(errors)
+
+
 __all__ = [
     "CAPSULE_TASK_PROFILES",
     "ROBOSUITE_CUBE_LIFT_PRIVILEGED_HIGHLEVEL",
     "ROBOSUITE_CUBE_STACK_PRIVILEGED",
     "CapsuleTaskProfile",
     "CapsuleTaskProfileError",
+    "collect_environment_profile_errors",
     "collect_task_profile_errors",
     "resolve_task_profile",
 ]

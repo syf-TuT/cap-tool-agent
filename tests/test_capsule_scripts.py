@@ -176,6 +176,66 @@ def _server_config(tmp_path: Path) -> Path:
     return path
 
 
+def _matching_lift_environment_payload() -> dict[str, object]:
+    return {
+        "env": {
+            "_target_": "capx.envs.tasks.franka.franka_lift.FrankaLiftCodeEnv",
+            "cfg": {
+                "_target_": "capx.envs.tasks.base.CodeExecEnvConfig",
+                "low_level": "franka_robosuite_cube_lift_low_level",
+                "privileged": True,
+                "enable_render": False,
+                "viser_debug": False,
+                "apis": ["FrankaControlPrivilegedApi"],
+            },
+        },
+        "api_servers": [
+            {
+                "_target_": "capx.serving.launch_pyroki_server.main",
+                "host": "127.0.0.1",
+                "port": 8116,
+                "robot": "panda_description",
+                "target_link": "panda_hand",
+            }
+        ],
+        "record_video": False,
+        "num_workers": 1,
+    }
+
+
+def _lift_server_config(tmp_path: Path) -> tuple[Path, Path]:
+    config_path = _server_config(tmp_path)
+    environment_path = tmp_path / "staged" / "renamed-lift-environment.yaml"
+    environment_path.parent.mkdir()
+    environment_path.write_text(
+        yaml.safe_dump(_matching_lift_environment_payload(), sort_keys=False),
+        encoding="utf-8",
+    )
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["task"].update(
+        {
+            "profile": "robosuite_cube_lift_privileged_highlevel",
+            "environment": "robosuite_cube_lift",
+            "api": "franka_control_privileged",
+            "privilege": "privileged",
+            "render": False,
+            "record_video": False,
+            "config_path": str(environment_path),
+        }
+    )
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    return config_path, environment_path
+
+
+def _replace_nested_value(
+    payload: dict[str, object], path: tuple[str | int, ...], value: object
+) -> None:
+    current: object = payload
+    for part in path[:-1]:
+        current = current[part]  # type: ignore[index]
+    current[path[-1]] = value  # type: ignore[index]
+
+
 def test_all_server_entrypoints_exist_and_advertise_safe_validation_mode() -> None:
     root = Path(__file__).resolve().parents[1]
     scripts_dir = root / "scripts" / "capsule_rl"
@@ -199,6 +259,143 @@ def test_server_config_validation_checks_algorithm_and_runtime_invariants(tmp_pa
     config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
     with pytest.raises(common.ConfigValidationError, match="render"):
         common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+
+def test_server_config_accepts_matching_staged_lift_environment_yaml(
+    tmp_path: Path,
+) -> None:
+    config_path, environment_path = _lift_server_config(tmp_path)
+
+    loaded = common.load_and_validate_server_config(
+        config_path, check_runtime_paths=True
+    )
+
+    assert loaded["task"]["profile"] == "robosuite_cube_lift_privileged_highlevel"
+    assert loaded["task"]["config_path"] == str(environment_path)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "bad_value", "message"),
+    [
+        (
+            ("env", "_target_"),
+            "capx.envs.tasks.franka.franka_pick_place.FrankaPickPlaceCodeEnv",
+            r"env\._target_",
+        ),
+        (
+            ("env", "cfg", "_target_"),
+            "example.WrongConfig",
+            r"env\.cfg\._target_",
+        ),
+        (
+            ("env", "cfg", "low_level"),
+            "franka_robosuite_cubes_low_level",
+            r"low_level",
+        ),
+        (("env", "cfg", "privileged"), False, r"privileged"),
+        (("env", "cfg", "enable_render"), True, r"enable_render"),
+        (("env", "cfg", "viser_debug"), True, r"viser_debug"),
+        (("env", "cfg", "apis"), ["FrankaControlApi"], r"apis"),
+        (("record_video",), True, r"record_video"),
+        (("num_workers",), 2, r"num_workers"),
+        (
+            ("api_servers", 0, "_target_"),
+            "example.wrong_server",
+            r"api_servers\[0\]\._target_",
+        ),
+        (("api_servers", 0, "host"), "0.0.0.0", r"host"),
+        (("api_servers", 0, "port"), 8117, r"port"),
+        (("api_servers", 0, "robot"), "ur5e", r"robot"),
+        (("api_servers", 0, "target_link"), "panda_link8", r"target_link"),
+        (("api_servers",), [], r"exactly 1"),
+        (
+            ("api_servers",),
+            [
+                {
+                    "_target_": "capx.serving.launch_pyroki_server.main",
+                    "host": "127.0.0.1",
+                    "port": 8116,
+                    "robot": "panda_description",
+                    "target_link": "panda_hand",
+                },
+                {
+                    "_target_": "capx.serving.launch_pyroki_server.main",
+                    "host": "127.0.0.1",
+                    "port": 8116,
+                    "robot": "panda_description",
+                    "target_link": "panda_hand",
+                },
+            ],
+            r"exactly 1",
+        ),
+        (
+            ("api_servers",),
+            [
+                {
+                    "_target_": "capx.serving.launch_pyroki_server.main",
+                    "host": "127.0.0.1",
+                    "port": 8116,
+                    "robot": "panda_description",
+                    "target_link": "panda_hand",
+                    "unexpected": True,
+                }
+            ],
+            r"exact keys",
+        ),
+    ],
+)
+def test_server_config_rejects_lift_environment_profile_drift(
+    field_path: tuple[str | int, ...],
+    bad_value: object,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    config_path, environment_path = _lift_server_config(tmp_path)
+    environment = yaml.safe_load(environment_path.read_text(encoding="utf-8"))
+    _replace_nested_value(environment, field_path, bad_value)
+    environment_path.write_text(
+        yaml.safe_dump(environment, sort_keys=False), encoding="utf-8"
+    )
+
+    with pytest.raises(common.ConfigValidationError, match=message):
+        common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+
+@pytest.mark.parametrize(
+    ("environment_bytes", "message"),
+    [
+        (b"\xff", "UTF-8"),
+        (b"env: [", "YAML"),
+        (b"- not-a-mapping\n", "mapping"),
+    ],
+)
+def test_server_config_reports_typed_environment_yaml_errors(
+    environment_bytes: bytes,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    config_path, environment_path = _lift_server_config(tmp_path)
+    environment_path.write_bytes(environment_bytes)
+
+    with pytest.raises(common.ConfigValidationError, match=message):
+        common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+
+def test_server_config_without_runtime_path_checks_does_not_open_environment_yaml(
+    tmp_path: Path,
+) -> None:
+    config_path, environment_path = _lift_server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    missing_path = environment_path.parent / "does-not-exist.yaml"
+    config["task"]["config_path"] = str(missing_path)
+
+    loaded = common.load_and_validate_server_config_bytes(
+        yaml.safe_dump(config, sort_keys=False).encode("utf-8"),
+        check_runtime_paths=False,
+    )
+
+    assert loaded["task"]["config_path"] == str(missing_path)
+    assert not missing_path.exists()
 
 
 def test_server_config_bytes_loader_validates_the_supplied_snapshot(tmp_path: Path) -> None:
@@ -626,7 +823,7 @@ def test_preflight_rechecks_mutable_inputs_after_typed_verification(
     config_path = _server_config(tmp_path)
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     environment_path = tmp_path / "environment.yaml"
-    environment_path.write_text("task: CubeStack\n", encoding="utf-8")
+    environment_path.write_bytes(CLEAN_REPLAY_CONFIG.read_bytes())
     config["task"]["config_path"] = str(environment_path)
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     config = _prepare_successful_preflight(config_path, monkeypatch)
@@ -1509,7 +1706,7 @@ def test_materialize_resolver_consumes_staged_dependency_a_during_a_to_b_to_a(
     config_payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if dependency_kind == "environment":
         dependency_path = tmp_path / "environment.yaml"
-        dependency_path.write_text("task: CubeStack\n", encoding="utf-8")
+        dependency_path.write_bytes(CLEAN_REPLAY_CONFIG.read_bytes())
         config_payload["task"]["config_path"] = str(dependency_path)
         replacement = b"task: AttackerTask\n"
         resolver_field = ("task", "config_path")

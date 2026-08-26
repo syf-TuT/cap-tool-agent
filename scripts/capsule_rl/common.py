@@ -51,6 +51,11 @@ from capx.rl.capsule.stable_io import (
     pin_absolute_path,
     read_stable_regular_file,
 )
+from capx.rl.capsule.task_profiles import (
+    CapsuleTaskProfileError,
+    collect_environment_profile_errors,
+    resolve_task_profile,
+)
 from capx.rl.capsule.telemetry import summarize_replay_results
 
 SCHEMA_VERSION = 1
@@ -910,6 +915,34 @@ def _validate_resolved_verl_config(path: Path) -> None:
     _mapping(root.get("data"), "resolved VeRL config.data")
 
 
+def _validate_environment_config_bytes(
+    environment_bytes: bytes,
+    config: Mapping[str, Any],
+) -> None:
+    """Parse and validate environment YAML without importing simulator modules."""
+
+    try:
+        environment_text = environment_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ConfigValidationError("task.config_path must be UTF-8 YAML") from error
+    try:
+        environment_payload = yaml.safe_load(environment_text)
+    except yaml.YAMLError as error:
+        raise ConfigValidationError(f"task.config_path is not valid YAML: {error}") from error
+    if not isinstance(environment_payload, Mapping):
+        raise ConfigValidationError("task.config_path YAML root must be a mapping")
+    try:
+        profile = resolve_task_profile(config)
+    except CapsuleTaskProfileError as error:
+        raise ConfigValidationError(str(error)) from error
+    errors = collect_environment_profile_errors(environment_payload, profile)
+    if errors:
+        raise ConfigValidationError(
+            "task.config_path does not match the selected Capsule task profile: "
+            + "; ".join(errors)
+        )
+
+
 def load_and_validate_server_config(
     config_path: str | Path,
     *,
@@ -1034,11 +1067,19 @@ def load_and_validate_server_config_bytes(
         if environment_config is not None:
             if not isinstance(environment_config, str) or not environment_config:
                 raise ConfigValidationError("task.config_path must be a non-empty path")
+            environment_path = _resolve_path(environment_config, project_root)
             _validate_existing_path(
-                _resolve_path(environment_config, project_root),
+                environment_path,
                 "task.config_path",
                 directory=False,
             )
+            try:
+                environment_bytes = environment_path.read_bytes()
+            except OSError as error:
+                raise ConfigValidationError(
+                    f"cannot read task.config_path YAML {environment_path}: {error}"
+                ) from error
+            _validate_environment_config_bytes(environment_bytes, config)
         python_executable = runtime.get("python_executable", sys.executable)
         if not isinstance(python_executable, str) or not python_executable:
             raise ConfigValidationError("runtime.python_executable must be non-empty")

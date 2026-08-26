@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import json
 import os
 import subprocess
@@ -162,7 +163,39 @@ def valid_local_config(tmp_path: Path) -> dict:
         "trainer: {}\n",
         encoding="utf-8",
     )
-    environment_config.write_text("task: CubeStack\n", encoding="utf-8")
+    environment_config.write_text(
+        yaml.safe_dump(
+            {
+                "env": {
+                    "_target_": (
+                        "capx.envs.tasks.franka.franka_pick_place."
+                        "FrankaPickPlaceCodeEnv"
+                    ),
+                    "cfg": {
+                        "_target_": "capx.envs.tasks.base.CodeExecEnvConfig",
+                        "low_level": "franka_robosuite_cubes_low_level",
+                        "privileged": True,
+                        "enable_render": False,
+                        "viser_debug": False,
+                        "apis": ["FrankaControlPrivilegedApi"],
+                    },
+                },
+                "api_servers": [
+                    {
+                        "_target_": "capx.serving.launch_pyroki_server.main",
+                        "host": "127.0.0.1",
+                        "port": 8116,
+                        "robot": "panda_description",
+                        "target_link": "panda_hand",
+                    }
+                ],
+                "record_video": False,
+                "num_workers": 1,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
     gate7_audit.parent.mkdir(parents=True)
     output_parent.mkdir(parents=True)
     config["runtime"].update(
@@ -658,6 +691,60 @@ def test_validate_only_reports_missing_environment_dependency_as_typed_error(
 
     assert main_ppo.main(["--config", str(path), "--validate-only"]) == 2
     assert "cannot hash runtime dependencies" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("environment_bytes", "message"),
+    [
+        (
+            yaml.safe_dump(
+                {
+                    "env": {
+                        "_target_": "example.WrongEnvironment",
+                        "cfg": {},
+                    }
+                }
+            ).encode("utf-8"),
+            r"env\._target_",
+        ),
+        (b"env: [", "YAML"),
+    ],
+)
+def test_runtime_dependency_snapshot_rejects_environment_profile_drift_as_typed_error(
+    environment_bytes: bytes,
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = valid_local_config(tmp_path)
+    environment_path = project_path(
+        config, config["task"]["config_path"], "task.config_path"
+    )
+    environment_path.write_bytes(environment_bytes)
+    resolved_verl_path = project_path(
+        config,
+        config["runtime"]["verl_resolved_config_path"],
+        "runtime.verl_resolved_config_path",
+    )
+    resolved_snapshot = main_ppo.read_stable_regular_file(
+        resolved_verl_path, label="resolved VeRL config dependency"
+    )
+    real_import = builtins.__import__
+
+    def guarded_import(name: str, *args: object, **kwargs: object):
+        if name == "robosuite" or name.startswith("robosuite.") or name.startswith(
+            "capx.envs"
+        ):
+            raise AssertionError("environment profile validation must not import a simulator")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    with pytest.raises(main_ppo.TrainerFactoryError, match=message):
+        main_ppo._snapshot_runtime_dependencies(
+            config,
+            resolved_verl_config=resolved_snapshot,
+        )
 
 
 def test_validate_only_reports_config_failure_without_running_compatibility(
