@@ -17,6 +17,12 @@ from .repair import BaseUnitSpan, RepairDraft
 from .schema import ProgramReplayResultV1, RepairTraceV1, ReplayOutcome, TaskInstanceV1
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_OUTER_PYTHON_FENCE = re.compile(
+    r"\A(?P<open>```(?:python|py)?[^\S\r\n]*(?:\r\n|\n))"
+    r"(?P<body>.*)"
+    r"(?P<close>```[^\S\r\n]*(?:(?:\r\n|\n))?)\Z",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class ControllerTransport(Protocol):
@@ -143,17 +149,13 @@ def _character_offset(lines: list[str], line_starts: list[int], line: int, byte_
     return line_starts[line - 1] + character_column
 
 
-def python_base_unit_spans(source: str) -> tuple[BaseUnitSpan, ...]:
-    """Create stable editable units from top-level statements, with a whole-source fallback."""
-
-    if not isinstance(source, str):
-        raise TypeError("source must be text")
+def _python_statement_spans(source: str, *, source_offset: int = 0) -> tuple[BaseUnitSpan, ...]:
     try:
         module = ast.parse(source, mode="exec")
     except (SyntaxError, ValueError):
-        module = None
-    if module is None or not module.body:
-        return (BaseUnitSpan("program", 0, len(source), source),)
+        return ()
+    if not module.body:
+        return ()
 
     lines = source.splitlines(keepends=True)
     line_starts: list[int] = []
@@ -173,22 +175,49 @@ def python_base_unit_spans(source: str) -> tuple[BaseUnitSpan, ...]:
         end_line = getattr(node, "end_lineno", None)
         end_column = getattr(node, "end_col_offset", None)
         if end_line is None or end_column is None:
-            return (BaseUnitSpan("program", 0, len(source), source),)
+            return ()
         start = _character_offset(lines, line_starts, start_node.lineno, start_node.col_offset)
         end = _character_offset(lines, line_starts, end_line, end_column)
         if start < 0 or end < start or end > len(source):
-            return (BaseUnitSpan("program", 0, len(source), source),)
+            return ()
         spans.append(
             BaseUnitSpan(
                 f"group_{index}",
-                start,
-                end,
+                source_offset + start,
+                source_offset + end,
                 source[start:end],
             )
         )
     if any(left.end_offset > right.start_offset for left, right in zip(spans, spans[1:])):
-        return (BaseUnitSpan("program", 0, len(source), source),)
+        return ()
     return tuple(spans)
+
+
+def python_base_unit_spans(source: str) -> tuple[BaseUnitSpan, ...]:
+    """Describe immutable P0 bytes as stable editable units without normalizing source."""
+
+    if not isinstance(source, str):
+        raise TypeError("source must be text")
+    spans = _python_statement_spans(source)
+    if spans:
+        return spans
+
+    fenced = _OUTER_PYTHON_FENCE.fullmatch(source)
+    if fenced is not None:
+        opener = fenced.group("open")
+        body = fenced.group("body")
+        closer = fenced.group("close")
+        body_start = len(opener)
+        body_spans = _python_statement_spans(body, source_offset=body_start)
+        if body_spans:
+            close_start = body_start + len(body)
+            return (
+                BaseUnitSpan("fence_open", 0, body_start, opener),
+                *body_spans,
+                BaseUnitSpan("fence_close", close_start, len(source), closer),
+            )
+
+    return (BaseUnitSpan("program", 0, len(source), source),)
 
 
 _SYSTEM_PROMPT = """You are a frozen repair Controller for a robot Python program.
@@ -200,6 +229,10 @@ replay. Allowed actions are:
 - {"action":"inspect","message":"..."}
 - {"action":"finish","rationale":"..."}
 Targets are stable across revisions. Return one JSON object and no Markdown.
+Markdown fences in the immutable Actor P0 are protocol errors already observed by replay. Never
+treat them as valid Python or silently clean them. When base:fence_open and base:fence_close are
+available, remove each fence explicitly with a replace action whose source is the empty string;
+both committed edits must occur before finishing or making semantic repairs.
 """
 
 

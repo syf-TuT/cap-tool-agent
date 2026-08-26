@@ -46,6 +46,24 @@ def _failure(p0: ProgramCandidate) -> ProgramReplayResultV1:
     )
 
 
+def _syntax_failure(p0: ProgramCandidate) -> ProgramReplayResultV1:
+    task = _task()
+    return ProgramReplayResultV1(
+        task_id=task.task_id,
+        environment_seed=task.environment_seed,
+        program_sample_id=p0.program_sample_id,
+        source=p0.source,
+        initial_state_sha256=task.initial_state_sha256,
+        outcome=ReplayOutcome.PROGRAM_ERROR,
+        raw_reward=0.0,
+        binary_reward=0.0,
+        task_completed=False,
+        error_type="SyntaxError",
+        error_message="invalid syntax (<actor>, line 1)",
+        diagnostics={"stderr": "SyntaxError: invalid syntax"},
+    )
+
+
 class _ScriptedTransport:
     def __init__(self, responses: list[object]) -> None:
         self.responses = list(responses)
@@ -76,7 +94,37 @@ def test_python_base_units_are_stable_top_level_statement_spans() -> None:
     ]
 
 
-@pytest.mark.parametrize("source", ["if (", "# comments only\n", ""])
+def test_python_base_units_expose_fences_without_cleaning_actor_source() -> None:
+    source = "```python\nprint('ok')\n```\n"
+
+    spans = python_base_unit_spans(source)
+
+    assert source == "```python\nprint('ok')\n```\n"
+    assert [
+        (span.unit_id, source[span.start_offset : span.end_offset]) for span in spans
+    ] == [
+        ("fence_open", "```python\n"),
+        ("group_0", "print('ok')"),
+        ("fence_close", "```\n"),
+    ]
+    assert [span.expected_source for span in spans] == [
+        "```python\n",
+        "print('ok')",
+        "```\n",
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "if (",
+        "# comments only\n",
+        "",
+        "```python\nprint('missing close')\n",
+        "prefix\n```python\nprint('not outer')\n```\n",
+        "```python\nif (\n```\n",
+    ],
+)
 def test_python_base_units_fall_back_to_whole_program_for_unparseable_source(source: str) -> None:
     spans = python_base_unit_spans(source)
 
@@ -84,6 +132,58 @@ def test_python_base_units_fall_back_to_whole_program_for_unparseable_source(sou
     assert spans[0].unit_id == "program"
     assert spans[0].start_offset == 0
     assert spans[0].end_offset == len(source)
+
+
+def test_collector_requires_explicit_fence_edits_after_recorded_p0_failure() -> None:
+    source = "```python\nprint('ok')\n```\n"
+    p0 = ProgramCandidate("base-fenced", source)
+    transport = _ScriptedTransport(
+        [
+            _action(
+                "replace",
+                target="base:fence_open",
+                source="",
+                rationale="remove the Actor protocol fence opener",
+            ),
+            _action(
+                "replace",
+                target="base:fence_close",
+                source="",
+                rationale="remove the Actor protocol fence closer",
+            ),
+            _action("finish", rationale="the fenced P0 is now executable Python"),
+        ]
+    )
+
+    trace = ControllerRepairCollector(transport=transport, max_turns=3)(
+        _task(), p0, _syntax_failure(p0), 0, 0, "repair-fenced"
+    )
+
+    first_state = json.loads(transport.calls[0][1]["content"])
+    assert first_state["current_source"] == source
+    assert first_state["base_failure"]["error_type"] == "SyntaxError"
+    assert first_state["base_failure"]["raw_reward"] == 0.0
+    assert [edit.target for edit in trace.edits] == [
+        "base:fence_open",
+        "base:fence_close",
+    ]
+    assert trace.base_source == source
+    assert trace.final_source == "print('ok')\n"
+    assert trace.reconstruct() == trace.final_source
+
+
+def test_collector_never_cleans_fence_without_a_controller_edit() -> None:
+    source = "```python\nprint('ok')\n```\n"
+    p0 = ProgramCandidate("base-fenced", source)
+    transport = _ScriptedTransport([_action("finish", rationale="no repair")])
+
+    trace = ControllerRepairCollector(transport=transport, max_turns=1)(
+        _task(), p0, _syntax_failure(p0), 0, 0, "repair-unmodified-fence"
+    )
+
+    assert trace.edits == ()
+    assert trace.base_source == source
+    assert trace.final_source == source
 
 
 def test_collector_runs_edit_sequence_without_replay_and_reconstructs_pt() -> None:
