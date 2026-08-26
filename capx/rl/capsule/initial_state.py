@@ -25,24 +25,43 @@ def _finite_float(value: object, name: str) -> float:
     return 0.0 if result == 0.0 else result
 
 
+def _raw_finite_float(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a finite real number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be a finite real number")
+    return result
+
+
 def _canonical_pose(values: Sequence[object], name: str) -> list[float]:
     if len(values) != _POSE_LENGTH:
         raise ValueError(f"{name} pose must contain xyz plus a WXYZ quaternion")
     position = [_finite_float(value, f"{name} pose") for value in values[:3]]
     quaternion = [_finite_float(value, f"{name} quaternion") for value in values[3:]]
-    squared_norm = sum(value * value for value in quaternion)
-    if math.isfinite(squared_norm):
-        normalized_values = quaternion
-        norm = math.sqrt(squared_norm)
-    else:
-        scale = max(abs(value) for value in quaternion)
-        normalized_values = [value / scale for value in quaternion]
-        norm = math.hypot(*normalized_values)
+    norm = math.sqrt(sum(value * value for value in quaternion))
     if norm == 0.0:
         raise ValueError(f"{name} quaternion must be non-zero")
+    quaternion = [_finite_float(value / norm, f"{name} quaternion") for value in quaternion]
+    first_nonzero = next((value for value in quaternion if value != 0.0), 1.0)
+    if first_nonzero < 0.0:
+        quaternion = [-value if value != 0.0 else 0.0 for value in quaternion]
+    return position + quaternion
+
+
+def _canonical_lift_pose(values: Sequence[object], name: str) -> list[float]:
+    if len(values) != _POSE_LENGTH:
+        raise ValueError(f"{name} pose must contain xyz plus a WXYZ quaternion")
+    position = [_finite_float(value, f"{name} pose") for value in values[:3]]
+    quaternion = [_raw_finite_float(value, f"{name} quaternion") for value in values[3:]]
+    scale = max(abs(value) for value in quaternion)
+    if scale == 0.0:
+        raise ValueError(f"{name} quaternion must be non-zero")
+    scaled_quaternion = [value / scale for value in quaternion]
+    norm = math.hypot(*scaled_quaternion)
     quaternion = [
         _finite_float(value / norm, f"{name} quaternion")
-        for value in normalized_values
+        for value in scaled_quaternion
     ]
     first_nonzero = next((value for value in quaternion if value != 0.0), 1.0)
     if first_nonzero < 0.0:
@@ -111,7 +130,9 @@ def canonicalize_cube_lift_initial_state(
         raise ValueError("cube_poses must contain exactly primary")
     if len(robot_joints) != _JOINT_COUNT:
         raise ValueError("robot_joints must contain exactly seven values")
-    canonical_poses = {"primary": _canonical_pose(cube_poses["primary"], "primary")}
+    canonical_poses = {
+        "primary": _canonical_lift_pose(cube_poses["primary"], "primary")
+    }
     canonical_joints = [_finite_float(value, "robot joint") for value in robot_joints]
     return {"cube_poses": canonical_poses, "robot_joints": canonical_joints}
 

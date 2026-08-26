@@ -108,6 +108,28 @@ def test_cube_lift_initial_state_normalizes_extreme_finite_quaternion(
     assert canonical["cube_poses"]["primary"][3:] == expected
 
 
+def test_cube_lift_quaternion_normalization_is_scale_invariant_before_rounding() -> None:
+    small = {"primary": [0.1, 0.0, 0.03, 4e-11, 1e-10, 0.0, 0.0]}
+    reference = {"primary": [0.1, 0.0, 0.03, 0.4, 1.0, 0.0, 0.0]}
+    joints = [0.0] * 7
+
+    assert canonicalize_cube_lift_initial_state(small, joints) == (
+        canonicalize_cube_lift_initial_state(reference, joints)
+    )
+    assert cube_lift_initial_state_sha256(small, joints) == (
+        cube_lift_initial_state_sha256(reference, joints)
+    )
+
+
+def test_cube_lift_quaternion_normalization_preserves_tiny_nonzero_direction() -> None:
+    canonical = canonicalize_cube_lift_initial_state(
+        {"primary": [0.1, 0.0, 0.03, 1e-300, 0.0, 0.0, 0.0]},
+        [0.0] * 7,
+    )
+
+    assert canonical["cube_poses"]["primary"][3:] == [1.0, 0.0, 0.0, 0.0]
+
+
 def test_cube_lift_initial_state_hash_changes_with_cube_position_or_robot_joint() -> None:
     poses = _lift_poses()
     moved_cube = _lift_poses()
