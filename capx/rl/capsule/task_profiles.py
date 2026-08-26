@@ -84,6 +84,16 @@ _PYROKI_SERVER_FIELDS = MappingProxyType(
         "target_link": "panda_hand",
     }
 )
+_ENV_CONFIG_KEYS = frozenset(
+    {
+        "_target_",
+        "low_level",
+        "privileged",
+        "enable_render",
+        "viser_debug",
+        "apis",
+    }
+)
 
 
 class CapsuleTaskProfileError(ValueError):
@@ -199,6 +209,18 @@ def collect_environment_profile_errors(
         raise TypeError("profile must be a CapsuleTaskProfile")
 
     errors: list[str] = []
+    env = payload.get("env", _MISSING)
+    env_cfg = env.get("cfg", _MISSING) if isinstance(env, Mapping) else _MISSING
+    if not isinstance(env_cfg, Mapping):
+        errors.append(
+            f"env.cfg must be a mapping with exact keys {sorted(_ENV_CONFIG_KEYS)!r}; "
+            f"got {_display(env_cfg)}"
+        )
+    elif set(env_cfg) != _ENV_CONFIG_KEYS:
+        errors.append(
+            f"env.cfg must contain exact keys {sorted(_ENV_CONFIG_KEYS)!r}; "
+            f"got {sorted(str(key) for key in env_cfg)!r}"
+        )
     for path, expected in (
         (("env", "_target_"), profile.env_target),
         (("env", "cfg", "_target_"), profile.env_config_target),

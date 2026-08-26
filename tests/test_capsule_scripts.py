@@ -296,6 +296,22 @@ def test_server_config_accepts_matching_staged_lift_environment_yaml(
         (("env", "cfg", "enable_render"), True, r"enable_render"),
         (("env", "cfg", "viser_debug"), True, r"viser_debug"),
         (("env", "cfg", "apis"), ["FrankaControlApi"], r"apis"),
+        (("env", "cfg", "prompt"), "override prompt", r"env\.cfg.*exact keys.*prompt"),
+        (
+            ("env", "cfg", "oracle_code"),
+            "raise RuntimeError('override')",
+            r"env\.cfg.*exact keys.*oracle_code",
+        ),
+        (
+            ("env", "cfg", "task_only_prompt"),
+            "override task-only prompt",
+            r"env\.cfg.*exact keys.*task_only_prompt",
+        ),
+        (
+            ("env", "cfg", "multi_turn_prompt"),
+            "override multi-turn prompt",
+            r"env\.cfg.*exact keys.*multi_turn_prompt",
+        ),
         (("record_video",), True, r"record_video"),
         (("num_workers",), 2, r"num_workers"),
         (
