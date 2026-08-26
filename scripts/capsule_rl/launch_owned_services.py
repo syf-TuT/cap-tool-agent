@@ -633,8 +633,12 @@ def load_owned_services_workflow(path: str | Path) -> dict[str, Any]:
     )
     _require_equal(
         _mapping(_mapping(services, "pyroki"), "env"),
-        {"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"},
-        "PyRoKi CPU environment",
+        {
+            "CUDA_VISIBLE_DEVICES": "0",
+            "JAX_PLATFORMS": "cuda",
+            "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+        },
+        "PyRoKi CUDA environment",
     )
     gate_credentials = {
         "gate01_preflight": frozenset(_CAPSULE_CREDENTIAL_ENV_NAMES),

@@ -58,8 +58,9 @@ services:
       - -m
       - capx.serving.launch_pyroki_server
     env:
-      CUDA_VISIBLE_DEVICES: ""
-      JAX_PLATFORMS: cpu
+      CUDA_VISIBLE_DEVICES: "0"
+      JAX_PLATFORMS: cuda
+      XLA_PYTHON_CLIENT_PREALLOCATE: "false"
     readiness:
       url: http://127.0.0.1:8116/docs
       timeout_s: 600

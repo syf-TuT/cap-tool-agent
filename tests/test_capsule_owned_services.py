@@ -617,8 +617,9 @@ def test_repository_owned_workflow_matches_exact_service_and_audit_contract() ->
         "CAPX_PROGRAM_API_KEY": "{env:CAPX_PROGRAM_API_KEY}",
     }
     assert workflow["services"]["pyroki"]["env"] == {
-        "CUDA_VISIBLE_DEVICES": "",
-        "JAX_PLATFORMS": "cpu",
+        "CUDA_VISIBLE_DEVICES": "0",
+        "JAX_PLATFORMS": "cuda",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
     }
     assert workflow["oom_ladder"] == [
         "base_dynamic_fp32",
@@ -721,7 +722,11 @@ def test_dry_run_renders_exact_commands_and_does_not_create_outputs(tmp_path: Pa
         "8101",
     ]
     assert set(result.rendered_services) == {"program", "pyroki"}
-    assert result.rendered_services["pyroki"].env["JAX_PLATFORMS"] == "cpu"
+    assert result.rendered_services["pyroki"].env == {
+        "CUDA_VISIBLE_DEVICES": "0",
+        "JAX_PLATFORMS": "cuda",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
 
 
 def test_supervisor_runs_services_then_gates_then_cleans_up(tmp_path: Path) -> None:
