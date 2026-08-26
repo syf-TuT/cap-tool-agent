@@ -34,9 +34,10 @@ env_configs/cube_stack/capsule_rl/franka_robosuite_cube_stack_capsule_critique_g
 - privileged Cube Stack 环境、`FrankaControlPrivilegedApi`、EGL 与模型权重均可访问；
 - `render: false`、`record_video: false`、Controller `frozen: true`。
 
-Program actor-identity 与 Controller 必须是两个独立的本地服务。实际 Program rollout 始终来自
-VeRL 的 trainable actor；identity 服务不参与生成。Controller 是冻结的本机 CPU
-`llama.cpp` 服务，不接外部模型 API，其模型和凭据不得指向正在更新的 actor。
+Program actor-identity 是 launcher 拥有的本地身份服务；Controller 则是逻辑独立、由外部托管的
+冻结模型，不属于 launcher 进程树。实际 Program rollout 始终来自 VeRL 的 trainable actor；
+identity 服务不参与生成。Controller 固定使用外部 `qwen3.7-plus`，其模型和凭据不得指向正在
+更新的 actor。
 
 Program 的 base/revision 采样由 pinned VeRL checkout 中同一个 trainable actor/rollout worker
 完成，随后也由该 worker 计算 old log-prob 并更新；不能把一个未同步的外部 Program endpoint
@@ -79,30 +80,26 @@ profile 是按 v0.6.1 `_generated_ppo_trainer.yaml` 展开的可直接加载配�
 
 启动前 launcher 只读校验：恰好一张 A800 80GB（兼容 PCIe 与 SXM4 的 NVIDIA 名称）、
 free VRAM 至少 77824 MiB、任一既有 GPU process 不得超过 512 MiB、RAM 至少
-122880 MiB、`/dev/shm` 至少 12288 MiB、实验磁盘至少 81920 MiB。Controller ready 后
-`MemAvailable` 必须仍有 92160 MiB；每个 gate 后不得低于 12288 MiB。Git HEAD/dirty 状态、
+122880 MiB、`/dev/shm` 至少 12288 MiB、实验磁盘至少 81920 MiB。外部 Controller 配置和
+credential presence 校验后，`MemAvailable` 必须仍有 92160 MiB；每个 gate 后不得低于
+12288 MiB。Git HEAD/dirty 状态、
 系统、CUDA 与 driver 会进入审计快照；dirty 状态本身不会被 launcher 当成硬件失败，Gate 1
 仍会执行仓库自己的不可变 provenance 校验。
-Controller 通过 92160 MiB 点检后，launcher 还会以 1 秒间隔启动独立采样线程，覆盖后续
+该 92160 MiB 点检通过后，launcher 还会以 1 秒间隔启动独立采样线程，覆盖后续
 Program/PyRoKi readiness、Gate 1--7 和 adapter reload；任一样本低于 12288 MiB 都会令
 attempt 失败。
 
-Controller 不调用 OpenAI、OpenRouter 或其他外部模型；它使用本机 CPU 上的官方 llama.cpp
-`b10516` Ubuntu x64 archive（SHA-256
-`f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35`）和官方
-Qwen2.5-Coder-7B-Instruct Q4_K_M GGUF（SHA-256
-`509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c`）。launcher
-先复核两个固定 hash，再安全解析归档，拒绝逃逸路径、特殊节点、重复 server 和不安全链接；归档内
-每个普通文件与安全符号链接都必须与实际解压树逐字节一致。`llama-server --version` 的有边界
-数值字段必须为 build `10516`，启动后 `/proc/<pid>/exe` 也必须与归档 server 的 SHA-256 一致。
-官方归档保留顶层 `llama-b10516/`：归档文件放在 `.codex-downloads/`，解压后 binary 路径为
-`.codex-downloads/llama-b10516/llama-server`，不能把归档再放进该解压目录。
-完整证明独占写入 `launcher_controller_attestation.json`，并在最终 Gate 7 再次从落盘字节重算。
-Controller 随后以固定 alias 启动
-`--n-gpu-layers 0 --parallel 1 --ctx-size 16384`。`CAPX_CONTROLLER_API_KEY` 只在子进程
-内部映射为 `LLAMA_API_KEY`，不会写进 argv、渲染结果或日志。Program actor-identity、
-Controller 和 PyRoKi 均清空 `CUDA_VISIBLE_DEVICES`；Gate 子进程才显式使用
-`CUDA_VISIBLE_DEVICES=0` 与 `MUJOCO_GL=egl`。
+Controller 固定调用 `https://coding.dashscope.aliyuncs.com/v1` 的 `qwen3.7-plus`。每次请求的
+`max_tokens=4096`、`stream=false`、`enable_thinking=false`、timeout 300 秒，并要求 JSON object
+响应；任一字段漂移都 fail closed。`CAPX_CONTROLLER_API_KEY` 必须由执行 shell 交互式注入，
+不得写入配置、命令行、仓库、日志或审计文件。launcher 不启动或清理外部 Controller 进程，
+但会独占写入 `launcher_controller_attestation.json`，绑定 endpoint、model、请求参数、credential
+环境变量名与 `controller_binding_sha256`；Gate 7 finalizer 会从落盘证据独立重算该绑定。
+
+Program actor-identity 清空 `CUDA_VISIBLE_DEVICES`。PyRoKi 与 Gate 子进程使用 A800：PyRoKi
+固定设置 `CUDA_VISIBLE_DEVICES=0`、`JAX_PLATFORMS=cuda` 和
+`XLA_PYTHON_CLIENT_PREALLOCATE=false`；Gate 子进程同时设置 `MUJOCO_GL=egl`。PyRoKi readiness
+失败或没有实际 CUDA JAX device 时停止，不允许静默回退 CPU。
 
 OOM fallback 是累计而不是互相独立的 profile，每一级都物化新的 resolved VeRL YAML、
 profile SHA 和 run ID，并保留失败目录：
@@ -136,24 +133,26 @@ python -m scripts.capsule_rl.launch_owned_services \
   --dry-run
 ```
 
-dry-run 会做只读硬件、controller/model provenance 校验并渲染 base attempt，但不会创建目录、
+dry-run 会做只读硬件、Controller 请求契约与 actor model provenance 校验，并渲染 base attempt，
+但不会创建目录、
 reserve run ID、启动服务或写 artifact。执行模式以 `Popen` PID 加
 `/proc/<pid>/stat` starttime 识别本轮服务；cleanup 只终止 starttime 仍匹配的进程组。已有
 output、artifact 或 checkpoint 路径一律拒绝覆盖，失败时保留已生成的 Gate 证据和
 `launcher_failure.json`。每个实际 attempt 在任何服务启动前独占写入
 `launcher_initial_audit.json`；每次 spawn 立即写入仅含 PID、starttime、argv hash、env key
-名称及 credential-key 标记的 `launcher_owned_process_*.json`，不落盘环境变量值。Controller
-启动后和每个 Gate 后的 RAM 阈值检查也分别写入不可覆盖的 `launcher_memory_*.json`，因此
+名称及 credential-key 标记的 `launcher_owned_process_*.json`，不落盘环境变量值。外部
+Controller 配置校验后和每个 Gate 后的 RAM 阈值检查也分别写入不可覆盖的
+`launcher_memory_*.json`，因此
 readiness、Gate 或 cleanup 失败仍保留足够的归属与资源证据。
 连续采样的完整时间偏移、样本数、最大采样间隔和最低 `MemAvailable` 独占写入
 `launcher_continuous_memory.json`；最大采样间隔超过 5 秒也视为证据不完整并令 attempt 失败。
 Gate 7 在监控范围内先发布 `gate07_audit.candidate.json`/`.md`，其中明确记录
 `runtime_verified: false` 以及等待 launcher 内存和 owned-service cleanup 最终化。launcher 停止
 监控并成功清理本轮服务后，独占写入 `launcher_owned_cleanup.json`，再运行独立 finalizer；
-finalizer 重新验证 gate chain、candidate、连续内存、Controller 运行树、cleanup 证据和不存在
-`launcher_failure.json`，同时绑定启动前 A800/RAM/shm/disk 审计和 Controller ready 后的
+finalizer 重新验证 gate chain、candidate、连续内存、外部 Controller 请求契约、cleanup 证据和
+不存在 `launcher_failure.json`，同时绑定启动前 A800/RAM/shm/disk 审计和 Controller 配置校验后的
 90 GiB `MemAvailable` 点检，然后独占发布正式 `gate07_audit.json`/`.md` 并把
-`runtime_verified` 改为 `true`。监控违规、采样缺口、Controller 漂移或 cleanup 失败都不会留下
+`runtime_verified` 改为 `true`。监控违规、采样缺口、Controller 配置漂移或 cleanup 失败都不会留下
 正式 true 报告。finalizer 从重算到发布后复验始终监视 Gate、checkpoint 和 launcher 证据；
 任何期间修改都会回滚本轮刚发布的 JSON/Markdown。正式审计使用精确 schema，后续
 materializer 和 `main_ppo` 不接受只有 `runtime_verified: true` 的缩减或伪造 JSON。
@@ -279,7 +278,8 @@ dependency identity。
 ### 1. Preflight
 
 Preflight 确认提交 SHA、VeRL pinned SHA、依赖路径、GPU/CUDA、`MUJOCO_GL=egl`、Program
-模型、两个服务凭据/端口、PyRoKi 和 resolved environment SHA-256：
+模型、Program 服务凭据/端口、外部 Controller 凭据与 endpoint、PyRoKi 和 resolved environment
+SHA-256：
 
 ```bash
 python -m scripts.capsule_rl.server_preflight \
@@ -352,6 +352,22 @@ reward、task-completed、truncated、fatal error、源码 hash、初态 hash �
 中间 edit 不进入 simulator replay。此 gate 允许没有成功 guided candidate，但必须保存四条
 完整 RepairTrace/Audit，并证明 Controller frozen。`base_results` 保存两个 typed、semantic
 failure 的 `ProgramReplayResultV1`；infra/evaluator error 不得伪装成 reward 0。
+
+Markdown fence 本身属于 Actor 协议错误，collector 不得在执行前静默清洗。完整顺序固定为：
+
+```text
+Actor 原始输出
+-> 原样执行
+-> SyntaxError、reward=0，并记录 P0
+-> Controller 显式提交删除 fence open/close repair unit 的 edit
+-> 形成新的 PT/P_hat
+-> 重新执行并独立评分
+```
+
+因此，只有 replay 已经留下原始 fenced source、SyntaxError 和 reward 0 后，repair unit discovery
+才会向 Controller 暴露 `fence_open`、内部 Python AST groups 与 `fence_close`。Controller 必须对
+两个 fence unit 提交显式空字符串 replacement；`finish`、无 edit 或 launcher 自行剥离 fence 都不
+构成修复。删除后的程序是新的 lineage 节点，其 source hash、replay 与 reward 必须单独记录。
 `repair_traces` 每条记录包含 `p0_rank`、`trajectory_index` 和可由 `RepairTraceV1` 精确重建
 的 `trace`；四条记录覆盖完整 2×2，trace identity/hash 必须与对应 P0 一致，且
 `intermediate_replay_count` 必须为 0：
@@ -462,7 +478,7 @@ python -m scripts.capsule_rl.analyze_artifacts \
 
 finalizer 重新计算全部持久化证据，校验 candidate、连续内存、Controller attestation 与 cleanup
 artifact 的 SHA/聚合值，并拒绝任何 `launcher_failure.json`。只有 gate 1--6、adapter reload、
-连续内存、Controller 运行树与 cleanup 全部通过时，
+连续内存、外部 Controller 配置/hash 绑定与 cleanup 全部通过时，
 正式报告才写入 `runtime_verified: true`、六项 gate 状态、reload 状态、内存证据及 artifact hash
 chain，才能把状态升级为“Capsule-RL runtime verified”；正式多-seed 训练、成功率比较和消融
 不属于这些 smoke gate。JSON 与 Markdown 报告先分别写入 staging，再作为一对发布；第二个文件

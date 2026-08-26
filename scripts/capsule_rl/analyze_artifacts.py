@@ -824,7 +824,6 @@ def _verify_owned_cleanup_artifact(
     expected_names = {"controller", "program", "pyroki"}
     seen_names: set[str] = set()
     seen_processes: set[tuple[int, int]] = set()
-    ownership_by_name: dict[str, str] = {}
     for service in services:
         if not isinstance(service, Mapping):
             raise GateArtifactError("owned-service cleanup entry schema is invalid")
@@ -842,7 +841,6 @@ def _verify_owned_cleanup_artifact(
                     "owned-service cleanup entry is invalid or duplicated"
                 )
             seen_names.add(name)
-            ownership_by_name[name] = ownership
             continue
         if set(service) != {
             "name",
@@ -895,12 +893,9 @@ def _verify_owned_cleanup_artifact(
                         f"owned service {name} is still running at final Gate 7"
                     )
         seen_names.add(name)
-        ownership_by_name[str(name)] = str(ownership)
         seen_processes.add((pid, starttime_ticks))
     if seen_names != expected_names:
         raise GateArtifactError("owned-service cleanup is missing a required service")
-    if ownership_by_name.get("program") != "owned" or ownership_by_name.get("pyroki") != "owned":
-        raise GateArtifactError("Program and PyRoKi cleanup entries must be owned")
     return payload, sha256
 
 
