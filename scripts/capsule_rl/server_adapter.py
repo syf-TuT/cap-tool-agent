@@ -1633,7 +1633,8 @@ class ConcreteGateRuntime:
                     ]
                     if not grad_values or not any(value > 0 for value in grad_values):
                         raise ServerAdapterError(
-                            "actor metrics contain no positive finite gradient norm"
+                            "actor metrics contain no positive finite gradient norm: "
+                            f"{json.dumps(metrics, sort_keys=True)}"
                         )
                     gradient_norm = max(grad_values)
                     rollout_mode = getattr(workers, "rollout_mode", None)
