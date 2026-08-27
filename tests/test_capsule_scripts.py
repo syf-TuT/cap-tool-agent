@@ -4171,12 +4171,21 @@ def test_fp32_adapter_reload_stops_host_monitor_when_model_load_fails(
         def from_pretrained(*_args: object, **_kwargs: object) -> object:
             raise RuntimeError("tokenizer load failed")
 
+    def current_device() -> int:
+        observed["cuda_device_checks"] = observed.get("cuda_device_checks", 0) + 1
+        return 0
+
+    def reset_peak_memory_stats(_device: int) -> None:
+        if observed.get("cuda_device_checks") != 1:
+            raise RuntimeError("CUDA allocator was not initialized")
+
     fake_cuda = SimpleNamespace(
         is_available=lambda: True,
         device_count=lambda: 1,
+        current_device=current_device,
         manual_seed_all=lambda _seed: None,
         empty_cache=lambda: None,
-        reset_peak_memory_stats=lambda _device: None,
+        reset_peak_memory_stats=reset_peak_memory_stats,
     )
     fake_torch = SimpleNamespace(
         cuda=fake_cuda,
@@ -4197,7 +4206,12 @@ def test_fp32_adapter_reload_stops_host_monitor_when_model_load_fails(
             adapter_path=tmp_path / "adapter",
         )
 
-    assert observed == {"starts": 1, "samples": 2, "stops": 1}
+    assert observed == {
+        "cuda_device_checks": 1,
+        "starts": 1,
+        "samples": 2,
+        "stops": 1,
+    }
 
 
 def test_adapter_reload_cli_runs_after_gate6_and_writes_immutable_bound_artifact(

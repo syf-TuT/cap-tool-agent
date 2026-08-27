@@ -114,6 +114,8 @@ def run_fp32_adapter_reload(
     from .server_adapter import _HostMemoryMonitor
 
     device = "cuda:0"
+    if torch.cuda.current_device() != 0:
+        raise AdapterReloadError("adapter reload could not initialize cuda:0")
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
     torch.cuda.empty_cache()
