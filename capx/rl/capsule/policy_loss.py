@@ -162,8 +162,10 @@ def capsule_critique_policy_loss(
 
 def _config_get(config: Any, key: str, default: Any = _NO_DEFAULT) -> Any:
     if isinstance(config, Mapping):
-        if key in config:
+        try:
             return config[key]
+        except (AttributeError, KeyError):
+            pass
     else:
         getter = getattr(config, "get", None)
         if callable(getter):

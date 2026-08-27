@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator, Mapping
 
 import pytest
 
@@ -231,6 +232,52 @@ def test_verl_wrapper_reads_nested_gamma_and_returns_the_four_tuple() -> None:
         advantages,
         response_mask,
         config=config,
+        rollout_is_weights=guided_mask,
+    )
+    expected = capsule_critique_policy_loss(
+        old,
+        logp,
+        advantages,
+        response_mask,
+        guided_mask,
+        capsule_gamma=0.2,
+    )
+
+    assert len(actual) == 4
+    for left, right in zip(actual, expected, strict=True):
+        torch.testing.assert_close(left, right)
+
+
+def test_verl_wrapper_reads_nested_gamma_from_verl_style_mapping() -> None:
+    class VerlStyleActorConfig(Mapping[str, object]):
+        def __init__(self) -> None:
+            self.clip_ratio = 0.2
+            self.clip_ratio_low = None
+            self.clip_ratio_high = None
+            self.clip_ratio_c = 3.0
+            self.policy_loss = {"capsule_gamma": 0.2}
+
+        def __getitem__(self, key: str) -> object:
+            return getattr(self, key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(vars(self))
+
+        def __len__(self) -> int:
+            return len(vars(self))
+
+    old = torch.tensor([[0.0]])
+    logp = torch.tensor([[math.log(0.4)]])
+    advantages = torch.tensor([[1.5]])
+    response_mask = torch.tensor([[True]])
+    guided_mask = torch.tensor([[True]])
+
+    actual = verl_capsule_critique_policy_loss(
+        old,
+        logp,
+        advantages,
+        response_mask,
+        config=VerlStyleActorConfig(),
         rollout_is_weights=guided_mask,
     )
     expected = capsule_critique_policy_loss(
