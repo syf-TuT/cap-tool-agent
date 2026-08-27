@@ -192,6 +192,23 @@ def _read_host_mem_available_bytes(path: Path = Path("/proc/meminfo")) -> int:
     raise ServerAdapterError("/proc/meminfo omitted a positive MemAvailable value")
 
 
+def _finite_numeric_metric_values(value: object) -> list[float] | None:
+    if isinstance(value, (str, bytes, bool)):
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return [numeric] if math.isfinite(numeric) else None
+    if isinstance(value, Sequence):
+        flattened: list[float] = []
+        for item in value:
+            item_values = _finite_numeric_metric_values(item)
+            if item_values is None:
+                return None
+            flattened.extend(item_values)
+        return flattened or None
+    return None
+
+
 class _HostMemoryMonitor:
     """Poll MemAvailable from before worker startup until after Ray shutdown."""
 
@@ -1474,19 +1491,9 @@ class ConcreteGateRuntime:
             if not isinstance(candidate, Mapping):
                 continue
             for key, value in candidate.items():
-                if not isinstance(key, str) or isinstance(value, (str, bytes, bool)):
+                if not isinstance(key, str):
                     continue
-                numeric_values: list[float] = []
-                values = value if isinstance(value, Sequence) else (value,)
-                for item in values:
-                    if (
-                        isinstance(item, bool)
-                        or not isinstance(item, (int, float))
-                        or not math.isfinite(float(item))
-                    ):
-                        numeric_values = []
-                        break
-                    numeric_values.append(float(item))
+                numeric_values = _finite_numeric_metric_values(value)
                 if numeric_values:
                     metrics[key] = sum(numeric_values) / len(numeric_values)
         if not metrics:

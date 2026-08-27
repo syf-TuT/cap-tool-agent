@@ -1408,6 +1408,26 @@ def test_actor_metric_extraction_requires_finite_numeric_evidence() -> None:
         server_adapter.ConcreteGateRuntime._actor_metrics({"metrics": {"loss": float("nan")}})
 
 
+def test_actor_metric_extraction_flattens_verl_worker_metric_lists() -> None:
+    actor_output = type(
+        "ActorOutput",
+        (),
+        {
+            "meta_info": {
+                "metrics": {
+                    "actor/grad_norm": [[1.0, 2.0]],
+                    "actor/pg_loss": [[-0.5], [-0.25]],
+                }
+            }
+        },
+    )()
+
+    assert server_adapter.ConcreteGateRuntime._actor_metrics(actor_output) == {
+        "actor/grad_norm": 1.5,
+        "actor/pg_loss": -0.375,
+    }
+
+
 def test_collection_cleanup_attempts_collector_evaluator_and_workers() -> None:
     events: list[str] = []
 
