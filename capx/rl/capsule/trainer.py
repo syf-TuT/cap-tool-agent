@@ -866,6 +866,8 @@ class CapsuleCritiqueRayTrainer:
             raise TypeError(
                 "LoRA actor reference output must contain VeRL old_log_probs"
             )
+        if "entropys" in tensors:
+            del tensors["entropys"]
         if "ref_log_prob" in tensors:
             raise ValueError("LoRA actor reference output unexpectedly contains ref_log_prob")
         tensors["ref_log_prob"] = tensors.pop("old_log_probs")
@@ -879,6 +881,9 @@ class CapsuleCritiqueRayTrainer:
 
         if not assembly.group.skip_actor_update:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+            old_log_prob_tensors = _tensor_batch(old_log_prob)
+            if "entropys" in old_log_prob_tensors:
+                del old_log_prob_tensors["entropys"]
             batch = _merge_batch(batch, old_log_prob)
             execution_trace.append("old_logprob")
             if self.ref_policy_wg is not None:

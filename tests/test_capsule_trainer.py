@@ -225,11 +225,31 @@ class _DataProtoLike:
         self.meta_info: dict[str, Any] = {}
 
 
+class _StrictDataProtoLike(_DataProtoLike):
+    def union(self, other: Any) -> "_StrictDataProtoLike":
+        source = getattr(other, "batch", other)
+        for key, value in source.items():
+            if key in self.batch:
+                assert self.batch[key].equal(value), (
+                    f"{key} in tensor_dict1 and tensor_dict2 are not the same object"
+                )
+            else:
+                self.batch[key] = value
+        return self
+
+
 class _LoRAEncoder(_Encoder):
     def encode(
         self, prompts: tuple[str, ...], responses: tuple[str, ...]
     ) -> _DataProtoLike:
         return _DataProtoLike(super().encode(prompts, responses))
+
+
+class _StrictLoRAEncoder(_Encoder):
+    def encode(
+        self, prompts: tuple[str, ...], responses: tuple[str, ...]
+    ) -> _StrictDataProtoLike:
+        return _StrictDataProtoLike(super().encode(prompts, responses))
 
 
 def _config() -> dict[str, Any]:
@@ -398,6 +418,44 @@ def test_lora_reference_logprob_uses_same_actor_with_adapter_disabled_in_order()
         "reference_logprob",
         "update",
     )
+    assert "is_lora" not in result.batch.meta_info
+
+
+def test_lora_reference_drops_entropy_diagnostics_before_strict_union() -> None:
+    events: list[str] = []
+
+    class _EntropyLoRAActor(_Actor):
+        def compute_log_prob(self, batch):
+            adapter_disabled = batch.meta_info.get("is_lora") is True
+            events.append("reference_logprob" if adapter_disabled else "old_logprob")
+            log_prob = -2.0 if adapter_disabled else -1.0
+            entropy = 2.0 if adapter_disabled else 1.0
+            return {
+                "old_log_probs": torch.full_like(
+                    batch.batch["response_mask"], log_prob, dtype=torch.float32
+                ),
+                "entropys": torch.full_like(
+                    batch.batch["response_mask"], entropy, dtype=torch.float32
+                ),
+            }
+
+    actor = _EntropyLoRAActor(events)
+    trainer = CapsuleCritiqueRayTrainer(
+        assembler=_Assembler(events, _assembly([0.0] * 7 + [1.0])),
+        batch_encoder=_StrictLoRAEncoder(),
+        actor_rollout_wg=actor,
+        ref_policy_wg=actor,
+        reference_policy_mode="actor_base_adapter_disabled",
+        artifact_sink=MemoryArtifactSink(),
+        config=_config(),
+        event_log=events,
+    )
+
+    result = trainer.run_step(_task())
+
+    assert torch.all(result.batch.batch["old_log_probs"] == -1.0)
+    assert torch.all(result.batch.batch["ref_log_prob"] == -2.0)
+    assert "entropys" not in result.batch.batch
     assert "is_lora" not in result.batch.meta_info
 
 
