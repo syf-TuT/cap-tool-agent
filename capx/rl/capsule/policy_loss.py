@@ -202,8 +202,8 @@ def verl_capsule_critique_policy_loss(
     loss_agg_mode: str = "token-mean",
     config: Any | None = None,
     rollout_is_weights: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """VeRL policy-loss signature; reinterpret its optional IS slot as the guided mask."""
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """VeRL policy-loss adapter; reinterpret its optional IS slot as the guided mask."""
 
     if config is None:
         raise ValueError("Capsule policy loss requires an actor config")
@@ -220,7 +220,7 @@ def verl_capsule_critique_policy_loss(
             f"VeRL {VERL_MASK_SLOT} must carry the boolean {GUIDED_TOKEN_MASK_FIELD}, "
             "not numeric rollout importance weights"
         )
-    return capsule_critique_policy_loss(
+    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = capsule_critique_policy_loss(
         old_log_prob,
         log_prob,
         advantages,
@@ -232,6 +232,11 @@ def verl_capsule_critique_policy_loss(
         clip_ratio_c=_config_get(config, "clip_ratio_c", 3.0),
         capsule_gamma=_policy_loss_config_get(config, "capsule_gamma", 0.1),
     )
+    return pg_loss, {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+    }
 
 
 def map_guided_token_mask_to_verl_slot(batch: Mapping[str, Any]) -> dict[str, Any]:

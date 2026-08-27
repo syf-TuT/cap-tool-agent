@@ -212,7 +212,7 @@ def test_verl_wrapper_fails_closed_when_guided_mask_slot_is_missing() -> None:
         )
 
 
-def test_verl_wrapper_reads_nested_gamma_and_returns_the_four_tuple() -> None:
+def test_verl_wrapper_reads_nested_gamma_and_returns_verl_loss_metrics_pair() -> None:
     old = torch.tensor([[0.0]])
     logp = torch.tensor([[math.log(0.4)]])
     advantages = torch.tensor([[1.5]])
@@ -243,9 +243,14 @@ def test_verl_wrapper_reads_nested_gamma_and_returns_the_four_tuple() -> None:
         capsule_gamma=0.2,
     )
 
-    assert len(actual) == 4
-    for left, right in zip(actual, expected, strict=True):
-        torch.testing.assert_close(left, right)
+    assert len(actual) == 2
+    pg_loss, pg_metrics = actual
+    torch.testing.assert_close(pg_loss, expected[0])
+    assert pg_metrics == {
+        "actor/pg_clipfrac": expected[1].detach().item(),
+        "actor/ppo_kl": expected[2].detach().item(),
+        "actor/pg_clipfrac_lower": expected[3].detach().item(),
+    }
 
 
 def test_verl_wrapper_reads_nested_gamma_from_verl_style_mapping() -> None:
@@ -289,9 +294,14 @@ def test_verl_wrapper_reads_nested_gamma_from_verl_style_mapping() -> None:
         capsule_gamma=0.2,
     )
 
-    assert len(actual) == 4
-    for left, right in zip(actual, expected, strict=True):
-        torch.testing.assert_close(left, right)
+    assert len(actual) == 2
+    pg_loss, pg_metrics = actual
+    torch.testing.assert_close(pg_loss, expected[0])
+    assert pg_metrics == {
+        "actor/pg_clipfrac": expected[1].detach().item(),
+        "actor/ppo_kl": expected[2].detach().item(),
+        "actor/pg_clipfrac_lower": expected[3].detach().item(),
+    }
 
 
 @pytest.mark.parametrize(
