@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import hashlib
 import json
 import os
@@ -21,6 +20,7 @@ from typing import Any
 
 import yaml
 
+from scripts.capsule_rl.common import SINGLE_A800_OOM_PROFILE
 from scripts.capsule_rl.llama_attestation import (
     ATTESTATION_ARTIFACT_TYPE,
     LlamaRuntimeAttestationError,
@@ -30,13 +30,6 @@ from scripts.capsule_rl.llama_attestation import (
 )
 
 
-OOM_LADDER = (
-    "base_dynamic_fp32",
-    "vllm_util_026",
-    "fixed_microbatch_1",
-    "fsdp_base_bf16",
-    "fsdp_base_bf16_vllm_util_045",
-)
 GATE_ORDER = (
     "gate01_preflight",
     "gate02_seed",
@@ -145,12 +138,11 @@ class RuntimeContext:
     output_root: Path
     artifact_root: Path
     checkpoint_root: Path
-    retry_name: str
 
 
 @dataclass(frozen=True)
 class AttemptResult:
-    retry_name: str
+    oom_profile: str
     run_id: str
     profile_sha256: str
     profile_path: Path
@@ -431,7 +423,7 @@ def _require_gate_credentials(
 
 
 def load_single_a800_resolved_profile(path: str | Path) -> dict[str, Any]:
-    """Validate the v0.6.1 one-A800 LoRA base profile."""
+    """Validate the fixed v0.6.1 one-A800 LoRA profile."""
 
     payload = _load_yaml(path)
     actor_rollout_ref = _mapping(payload, "actor_rollout_ref")
@@ -489,14 +481,19 @@ def load_single_a800_resolved_profile(path: str | Path) -> dict[str, Any]:
     ):
         _require_equal(model.get(field), expected, f"model.{field}")
     _require_equal(actor.get("strategy"), "fsdp", "actor.strategy")
-    _require_equal(actor.get("use_dynamic_bsz"), True, "actor.use_dynamic_bsz")
+    _require_equal(actor.get("use_dynamic_bsz"), False, "actor.use_dynamic_bsz")
+    _require_equal(
+        actor.get("ppo_micro_batch_size_per_gpu"),
+        1,
+        "actor.ppo_micro_batch_size_per_gpu",
+    )
     _require_equal(actor.get("ppo_max_token_len_per_gpu"), 10240, "actor token cap")
     for field, expected in (
         ("fsdp_size", 1),
         ("param_offload", True),
         ("optimizer_offload", False),
         ("offload_policy", False),
-        ("model_dtype", "fp32"),
+        ("model_dtype", "bf16"),
         ("dtype", "bfloat16"),
     ):
         _require_equal(fsdp.get(field), expected, f"actor.fsdp_config.{field}")
@@ -508,14 +505,23 @@ def load_single_a800_resolved_profile(path: str | Path) -> dict[str, Any]:
         "pipeline_model_parallel_size",
     ):
         _require_equal(_positive_int(rollout.get(field), f"rollout.{field}"), 1, field)
-    _require_equal(float(rollout.get("gpu_memory_utilization")), 0.30, "vLLM util")
+    _require_equal(float(rollout.get("gpu_memory_utilization")), 0.45, "vLLM util")
     for field in (
         "free_cache_engine",
         "enforce_eager",
         "enable_chunked_prefill",
-        "log_prob_use_dynamic_bsz",
     ):
         _require_equal(_bool(rollout.get(field), f"rollout.{field}"), True, field)
+    _require_equal(
+        _bool(rollout.get("log_prob_use_dynamic_bsz"), "rollout.log_prob_use_dynamic_bsz"),
+        False,
+        "rollout.log_prob_use_dynamic_bsz",
+    )
+    _require_equal(
+        rollout.get("log_prob_micro_batch_size_per_gpu"),
+        1,
+        "rollout.log_prob_micro_batch_size_per_gpu",
+    )
     for field in (
         "max_num_batched_tokens",
         "max_model_len",
@@ -524,14 +530,19 @@ def load_single_a800_resolved_profile(path: str | Path) -> dict[str, Any]:
         _require_equal(_positive_int(rollout.get(field), f"rollout.{field}"), 10240, field)
     _require_equal(rollout.get("max_num_seqs"), 1, "rollout.max_num_seqs")
     _require_equal(rollout.get("load_format"), "safetensors", "rollout.load_format")
-    _require_equal(ref.get("log_prob_use_dynamic_bsz"), True, "ref dynamic batch")
+    _require_equal(ref.get("log_prob_use_dynamic_bsz"), False, "ref dynamic batch")
+    _require_equal(
+        ref.get("log_prob_micro_batch_size_per_gpu"),
+        1,
+        "ref.log_prob_micro_batch_size_per_gpu",
+    )
     _require_equal(ref.get("log_prob_max_token_len_per_gpu"), 10240, "ref token cap")
     for field, expected in (
         ("fsdp_size", 1),
         ("param_offload", True),
         ("optimizer_offload", False),
         ("offload_policy", False),
-        ("model_dtype", "fp32"),
+        ("model_dtype", "bf16"),
         ("dtype", "bfloat16"),
     ):
         _require_equal(ref_fsdp.get(field), expected, f"ref.fsdp_config.{field}")
@@ -544,11 +555,16 @@ def load_single_a800_resolved_profile(path: str | Path) -> dict[str, Any]:
         "actor_base_adapter_disabled",
         "capsule_runtime.reference_policy_mode",
     )
+    _require_equal(
+        capsule_runtime.get("oom_profile"),
+        SINGLE_A800_OOM_PROFILE,
+        "capsule_runtime.oom_profile",
+    )
     return payload
 
 
 def load_owned_services_workflow(path: str | Path) -> dict[str, Any]:
-    """Validate fixed service, hardware, provenance, and retry contracts."""
+    """Validate fixed service, hardware, provenance, and profile contracts."""
 
     payload = _load_yaml(path)
     runtime = _mapping(payload, "runtime")
@@ -581,7 +597,11 @@ def load_owned_services_workflow(path: str | Path) -> dict[str, Any]:
     for field, expected in required_hardware.items():
         _require_equal(_positive_int(hardware.get(field), f"hardware.{field}"), expected, field)
     _require_equal(paths.get("forbid_overwrite"), True, "paths.forbid_overwrite")
-    _require_equal(list(payload.get("oom_ladder", ())), list(OOM_LADDER), "oom_ladder")
+    _require_equal(
+        payload.get("oom_profile"), SINGLE_A800_OOM_PROFILE, "oom_profile"
+    )
+    if "oom_ladder" in payload:
+        raise OwnedServicesConfigError("oom_ladder is obsolete for the fixed A800 profile")
     _require_equal(list(payload.get("gates", ())), list(GATE_ORDER), "gates")
     _require_equal(
         set(_mapping(payload, "gate_commands")),
@@ -777,52 +797,18 @@ def _validated_controller_attestation(payload: Mapping[str, Any]) -> dict[str, A
     return result
 
 
-def _retry_profile(base_profile: Mapping[str, Any], retry_name: str) -> dict[str, Any]:
-    profile = copy.deepcopy(dict(base_profile))
-    root = profile["actor_rollout_ref"]
-    actor, rollout, ref = root["actor"], root["rollout"], root["ref"]
-    if retry_name not in OOM_LADDER:
-        raise OwnedServicesConfigError(f"unknown retry profile: {retry_name}")
-    if retry_name in OOM_LADDER[1:]:
-        rollout["gpu_memory_utilization"] = 0.26
-    if retry_name in OOM_LADDER[2:]:
-        actor["use_dynamic_bsz"] = False
-        actor["ppo_micro_batch_size_per_gpu"] = 1
-        rollout["log_prob_use_dynamic_bsz"] = False
-        rollout["log_prob_micro_batch_size_per_gpu"] = 1
-        ref["log_prob_use_dynamic_bsz"] = False
-        ref["log_prob_micro_batch_size_per_gpu"] = 1
-    if retry_name in OOM_LADDER[3:]:
-        actor["fsdp_config"]["model_dtype"] = "bf16"
-        ref["fsdp_config"]["model_dtype"] = "bf16"
-    if retry_name == OOM_LADDER[4]:
-        rollout["gpu_memory_utilization"] = 0.45
-    profile["capsule_runtime"]["oom_profile"] = retry_name
-    return profile
-
-
-def materialize_retry_profile(
-    *, base_profile: Mapping[str, Any], retry_name: str, destination: Path
-) -> Path:
-    profile = _retry_profile(base_profile, retry_name)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("x", encoding="utf-8", newline="\n") as stream:
-        yaml.safe_dump(profile, stream, sort_keys=False, allow_unicode=True)
-    return destination
-
-
 def _attempt_run_id(
-    capsule_config_bytes: bytes, profile: Mapping[str, Any], retry_name: str
+    capsule_config_bytes: bytes, profile: Mapping[str, Any]
 ) -> tuple[str, str]:
     profile_sha = hashlib.sha256(_canonical_yaml_bytes(profile)).hexdigest()
     digest = hashlib.sha256(
         capsule_config_bytes
         + b"\0"
-        + retry_name.encode("ascii")
+        + SINGLE_A800_OOM_PROFILE.encode("ascii")
         + b"\0"
         + profile_sha.encode("ascii")
     ).hexdigest()
-    return f"{retry_name}-{digest[:12]}", profile_sha
+    return f"{SINGLE_A800_OOM_PROFILE}-{digest[:12]}", profile_sha
 
 
 def _render(tokens: Sequence[str], replacements: Mapping[str, str]) -> list[str]:
@@ -1055,10 +1041,10 @@ def _materialize_capsule_config(
 
 def _write_failure(path: Path, error: BaseException, attempt: AttemptResult) -> None:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_type": "single_a800_launcher_failure",
         "run_id": attempt.run_id,
-        "retry_name": attempt.retry_name,
+        "oom_profile": attempt.oom_profile,
         "error_type": type(error).__name__,
         "error": str(error),
         "oom": bool(isinstance(error, GateCommandError) and error.oom),
@@ -1072,10 +1058,10 @@ def _write_initial_audit(
     _write_json_exclusive(
         path,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "artifact_type": "single_a800_initial_audit",
             "run_id": attempt.run_id,
-            "retry_name": attempt.retry_name,
+            "oom_profile": attempt.oom_profile,
             "profile_sha256": attempt.profile_sha256,
             "snapshot": asdict(snapshot),
         },
@@ -1176,14 +1162,12 @@ def _attempt_paths(context: RuntimeContext, run_id: str) -> tuple[Path, Path, Pa
 def _hypothetical_attempt(
     context: RuntimeContext,
     capsule_bytes: bytes,
-    base_profile: Mapping[str, Any],
-    retry_name: str,
+    profile: Mapping[str, Any],
 ) -> AttemptResult:
-    profile = _retry_profile(base_profile, retry_name)
-    run_id, profile_sha = _attempt_run_id(capsule_bytes, profile, retry_name)
+    run_id, profile_sha = _attempt_run_id(capsule_bytes, profile)
     output_dir, artifact_dir, _ = _attempt_paths(context, run_id)
     return AttemptResult(
-        retry_name=retry_name,
+        oom_profile=SINGLE_A800_OOM_PROFILE,
         run_id=run_id,
         profile_sha256=profile_sha,
         profile_path=artifact_dir / "resolved" / "verl.yaml",
@@ -1196,7 +1180,7 @@ def _hypothetical_attempt(
 def _controller_seed_attempt(base: AttemptResult, seed_index: int) -> AttemptResult:
     run_id = build_controller_seed_run_ids(base.run_id)[seed_index - 1]
     return AttemptResult(
-        retry_name=base.retry_name,
+        oom_profile=base.oom_profile,
         run_id=run_id,
         profile_sha256=base.profile_sha256,
         profile_path=base.artifact_dir.parent / run_id / "resolved" / "verl.yaml",
@@ -1373,7 +1357,7 @@ def execute_owned_service_workflow(
     dry_run: bool,
 ) -> WorkflowResult:
     workflow = load_owned_services_workflow(workflow_path)
-    base_profile = load_single_a800_resolved_profile(profile_path)
+    profile = load_single_a800_resolved_profile(profile_path)
     capsule_path = Path(capsule_config_path).expanduser().resolve()
     if capsule_path.is_file():
         capsule_bytes = capsule_path.read_bytes()
@@ -1398,16 +1382,20 @@ def execute_owned_service_workflow(
         output_root=roots[0],
         artifact_root=roots[1],
         checkpoint_root=roots[2],
-        retry_name=OOM_LADDER[0],
     )
     audit = runtime.collect_audit_snapshot(context)
     _validate_audit(audit, workflow)
     controller_attestation = _validated_controller_attestation(
         runtime.verify_runtime_inputs(context, workflow)
     )
-    first_base = _hypothetical_attempt(context, capsule_bytes, base_profile, OOM_LADDER[0])
-    first = _controller_seed_attempt(first_base, 1)
-    first_seed_run_ids = build_controller_seed_run_ids(first_base.run_id)
+    base_attempt = _hypothetical_attempt(context, capsule_bytes, profile)
+    first = _controller_seed_attempt(base_attempt, 1)
+    max_controller_seed_run_ids = _mapping(workflow, "runtime")[
+        "max_controller_seed_run_ids"
+    ]
+    seed_run_ids = build_controller_seed_run_ids(
+        base_attempt.run_id, max_controller_seed_run_ids
+    )
     first_services = _render_services(workflow, capsule_config_path=first.capsule_config_path)
     if dry_run:
         return WorkflowResult(
@@ -1417,66 +1405,46 @@ def execute_owned_service_workflow(
             capsule_config_path=first.capsule_config_path,
             rendered_services=first_services,
             audit=audit,
-            controller_seed_run_ids=first_seed_run_ids,
+            controller_seed_run_ids=seed_run_ids,
             attempts=(first,),
         )
     attempted: list[AttemptResult] = []
-    max_controller_seed_run_ids = _mapping(workflow, "runtime")[
-        "max_controller_seed_run_ids"
-    ]
-    for index, retry_name in enumerate(OOM_LADDER):
-        profile = _retry_profile(base_profile, retry_name)
-        base_attempt = _hypothetical_attempt(
-            context, capsule_bytes, base_profile, retry_name
-        )
-        seed_run_ids = build_controller_seed_run_ids(
-            base_attempt.run_id, max_controller_seed_run_ids
-        )
-        advance_oom_ladder = False
-        for seed_index in range(1, max_controller_seed_run_ids + 1):
-            attempt = _controller_seed_attempt(base_attempt, seed_index)
-            attempted.append(attempt)
-            try:
-                services = _run_attempt(
-                    workflow=workflow,
-                    context=context,
-                    attempt=attempt,
-                    profile=profile,
-                    audit=audit,
-                    controller_attestation=controller_attestation,
-                    runtime=runtime,
-                )
-            except BaseException as error:
-                if attempt.artifact_dir.is_dir():
-                    failure = attempt.artifact_dir / "launcher_failure.json"
-                    if not failure.exists():
-                        _write_failure(failure, error, attempt)
-                if isinstance(error, GateCommandError) and error.guided_retry:
-                    if seed_index < max_controller_seed_run_ids:
-                        continue
-                    raise
-                if (
-                    isinstance(error, GateCommandError)
-                    and error.oom
-                    and error.gate_name in GPU_OOM_GATES
-                ):
-                    if index < len(OOM_LADDER) - 1:
-                        advance_oom_ladder = True
-                        break
-                raise
-            return WorkflowResult(
-                run_id=attempt.run_id,
-                output_dir=attempt.output_dir,
-                artifact_dir=attempt.artifact_dir,
-                capsule_config_path=attempt.capsule_config_path,
-                rendered_services=services,
+    for seed_index in range(1, max_controller_seed_run_ids + 1):
+        attempt = _controller_seed_attempt(base_attempt, seed_index)
+        attempted.append(attempt)
+        try:
+            services = _run_attempt(
+                workflow=workflow,
+                context=context,
+                attempt=attempt,
+                profile=profile,
                 audit=audit,
-                controller_seed_run_ids=seed_run_ids,
-                attempts=tuple(attempted),
+                controller_attestation=controller_attestation,
+                runtime=runtime,
             )
-        if advance_oom_ladder:
-            continue
-    raise AssertionError("OOM ladder exhausted without a terminal error")
+        except BaseException as error:
+            if attempt.artifact_dir.is_dir():
+                failure = attempt.artifact_dir / "launcher_failure.json"
+                if not failure.exists():
+                    _write_failure(failure, error, attempt)
+            if (
+                isinstance(error, GateCommandError)
+                and error.guided_retry
+                and seed_index < max_controller_seed_run_ids
+            ):
+                continue
+            raise
+        return WorkflowResult(
+            run_id=attempt.run_id,
+            output_dir=attempt.output_dir,
+            artifact_dir=attempt.artifact_dir,
+            capsule_config_path=attempt.capsule_config_path,
+            rendered_services=services,
+            audit=audit,
+            controller_seed_run_ids=seed_run_ids,
+            attempts=tuple(attempted),
+        )
+    raise AssertionError("controller seed loop exhausted without a terminal result")
 
 
 class LinuxRuntime:

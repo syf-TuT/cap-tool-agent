@@ -4622,15 +4622,15 @@ def _write_initial_launcher_audit(
     run_id: str,
     git_sha: str,
     profile_sha256: str,
-    retry_name: str = "base_dynamic_fp32",
+    oom_profile: str = common.SINGLE_A800_OOM_PROFILE,
 ) -> None:
     path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "artifact_type": "single_a800_initial_audit",
                 "run_id": run_id,
-                "retry_name": retry_name,
+                "oom_profile": oom_profile,
                 "profile_sha256": profile_sha256,
                 "snapshot": {
                     "gpu_name": "NVIDIA A800 80GB PCIe",
@@ -4657,7 +4657,7 @@ def _write_initial_launcher_audit(
 
 
 def _write_resolved_verl_profile(
-    directory: Path, *, retry_name: str = "base_dynamic_fp32"
+    directory: Path, *, oom_profile: str = common.SINGLE_A800_OOM_PROFILE
 ) -> tuple[Path, str]:
     profile_path = directory / "resolved" / "verl.yaml"
     profile_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4665,7 +4665,7 @@ def _write_resolved_verl_profile(
         yaml.safe_dump(
             {
                 "actor_rollout_ref": {"model": {"lora_rank": 16}},
-                "capsule_runtime": {"oom_profile": retry_name},
+                "capsule_runtime": {"oom_profile": oom_profile},
             },
             sort_keys=False,
         ),
@@ -4714,14 +4714,14 @@ def _prepare_successful_gate7_finalization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    profile_retry_name: str = "base_dynamic_fp32",
-    initial_retry_name: str = "base_dynamic_fp32",
+    profile_oom_profile: str = common.SINGLE_A800_OOM_PROFILE,
+    initial_oom_profile: str = common.SINGLE_A800_OOM_PROFILE,
     initial_profile_sha256: str | None = None,
 ) -> tuple[list[str], Path, str]:
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     profile_path, profile_sha256 = _write_resolved_verl_profile(
-        tmp_path, retry_name=profile_retry_name
+        tmp_path, oom_profile=profile_oom_profile
     )
     payloads = _complete_gate_payloads(checkpoint)
     _bind_gate_payloads_to_resolved_profile(
@@ -4754,7 +4754,7 @@ def _prepare_successful_gate7_finalization(
         run_id=candidate["run_id"],
         git_sha=candidate["git_sha"],
         profile_sha256=initial_profile_sha256 or profile_sha256,
-        retry_name=initial_retry_name,
+        oom_profile=initial_oom_profile,
     )
     _write_post_controller_memory(
         tmp_path / "launcher_memory_00_post-controller.json"
@@ -5084,19 +5084,39 @@ def test_gate7_finalization_rejects_tampered_initial_profile_sha(
         analyze_artifacts.main(final_args)
 
 
-def test_gate7_finalization_rejects_retry_name_different_from_profile_oom_mode(
+def test_initial_audit_rejects_legacy_retry_schema(tmp_path: Path) -> None:
+    audit_path = tmp_path / "launcher_initial_audit.json"
+    _write_initial_launcher_audit(
+        audit_path,
+        run_id="fixed-profile-run",
+        git_sha="a" * 40,
+        profile_sha256="b" * 64,
+    )
+    payload = json.loads(audit_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 1
+    payload["retry_name"] = payload.pop("oom_profile")
+    audit_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(common.GateArtifactError, match="schema"):
+        analyze_artifacts._verify_initial_audit_artifact(
+            audit_path,
+            expected_run_id="fixed-profile-run",
+            expected_git_sha="a" * 40,
+        )
+
+
+def test_gate7_finalization_rejects_oom_profile_different_from_resolved_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     final_args, _profile_path, _profile_sha256 = (
         _prepare_successful_gate7_finalization(
             tmp_path,
             monkeypatch,
-            profile_retry_name="base_dynamic_fp32",
-            initial_retry_name="vllm_util_026",
+            profile_oom_profile="removed_profile",
         )
     )
 
-    with pytest.raises(common.GateArtifactError, match="oom_profile.*retry_name"):
+    with pytest.raises(common.GateArtifactError, match="oom_profile.*initial audit"):
         analyze_artifacts.main(final_args)
 
 
