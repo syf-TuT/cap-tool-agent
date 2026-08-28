@@ -244,9 +244,4 @@ gate_commands:
       - "{launcher_owned_cleanup}"
     env: {}
 
-oom_ladder:
-  - base_dynamic_fp32
-  - vllm_util_026
-  - fixed_microbatch_1
-  - fsdp_base_bf16
-  - fsdp_base_bf16_vllm_util_045
+oom_profile: fsdp_base_bf16_vllm_util_045

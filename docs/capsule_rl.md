@@ -101,26 +101,22 @@ Program actor-identity 清空 `CUDA_VISIBLE_DEVICES`。PyRoKi 与 Gate 子进程
 `XLA_PYTHON_CLIENT_PREALLOCATE=false`；Gate 子进程同时设置 `MUJOCO_GL=egl`。PyRoKi readiness
 失败或没有实际 CUDA JAX device 时停止，不允许静默回退 CPU。
 
-OOM fallback 是累计而不是互相独立的 profile，每一级都物化新的 resolved VeRL YAML、
-profile SHA 和 run ID，并保留失败目录：
+Single-A800 工作流只允许固定 profile：
 
 ```text
-base_dynamic_fp32
-vllm_util_026          # 仅将 vLLM utilization 0.30 -> 0.26
-fixed_microbatch_1     # 保留 0.26，actor/rollout/ref 改固定 microbatch 1
-fsdp_base_bf16         # 保留前两项，再将 actor/ref FSDP model_dtype 改为 BF16
-fsdp_base_bf16_vllm_util_045  # 保留 BF16/microbatch 1，将 vLLM utilization 改为 0.45
+fsdp_base_bf16_vllm_util_045
 ```
 
-任何 fallback 都不会缩短 10240 token cap，也不会改变 7+1 group、KL 或 GRPO 语义。
+该 profile 直接使用 actor/ref FSDP BF16、actor/rollout/ref 固定 microbatch 1 和 vLLM
+`gpu_memory_utilization=0.45`，同时保持 10240 token cap、7+1 group、KL 与 GRPO 语义不变。
 每个 attempt 的 `resolved/verl.yaml` 字节 SHA 同时绑定 run ID、initial audit、Gate chain 和最终
-audit；其 `capsule_runtime.oom_profile` 必须与 launcher retry 名一致，不能只修改审计字段冒充
-另一个 fallback。
-只有 GPU Gate 2--6 日志中识别出的 CUDA OOM 才能推进该 ladder；Gate 1、adapter reload、
-Gate 7 的 OOM 与所有非 OOM 失败立即停止。每个 OOM profile 固定最多使用三个新的 Controller
-随机性 run ID；第三次仍无法得到 seed-5 guided success 时立即停止。只有识别出的 GPU OOM
-才能进入下一个 profile，并为它生成另一组三个新 run ID，不能跨 profile 复用，也不能降低
-Gate 5 标准。Gate 6 子进程退出（并完成 Ray shutdown）后，
+audit；`capsule_runtime.oom_profile`、workflow `oom_profile` 与审计字段必须全部等于上述固定名。
+旧的多档 profile、`oom_ladder` 和 `retry_name` 审计 schema 均不再接受。
+
+任何 Gate 的 CUDA OOM 都会立即停止，不会切换 profile。固定 profile 仍最多使用三个新的
+Controller 随机性 run ID；前两次 Gate 5 未得到 seed-5 guided success 时可在同一 profile 下
+重试，第三次仍失败则立即停止，且不能降低 Gate 5 标准。Gate 6 子进程退出（并完成 Ray
+shutdown）后，
 launcher 才执行独立的 `scripts.capsule_rl.adapter_reload_smoke`，随后执行 Gate 7。
 
 dry-run 示例：
@@ -133,7 +129,8 @@ python -m scripts.capsule_rl.launch_owned_services \
   --dry-run
 ```
 
-dry-run 会做只读硬件、Controller 请求契约与 actor model provenance 校验，并渲染 base attempt，
+dry-run 会做只读硬件、Controller 请求契约与 actor model provenance 校验，并渲染固定
+profile attempt，
 但不会创建目录、
 reserve run ID、启动服务或写 artifact。执行模式以 `Popen` PID 加
 `/proc/<pid>/stat` starttime 识别本轮服务；cleanup 只终止 starttime 仍匹配的进程组。已有

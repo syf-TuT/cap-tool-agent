@@ -36,7 +36,6 @@ from scripts.capsule_rl.launch_owned_services import (
     main,
     load_owned_services_workflow,
     load_single_a800_resolved_profile,
-    materialize_retry_profile,
     _gate_artifacts,
     _gate_log_indicates_gpu_oom,
     _llama_build_number,
@@ -321,7 +320,8 @@ def test_repository_single_a800_profile_matches_exact_contract() -> None:
     assert model["use_remove_padding"] is True
     assert model["use_shm"] is False
     assert actor["strategy"] == "fsdp"
-    assert actor["use_dynamic_bsz"] is True
+    assert actor["use_dynamic_bsz"] is False
+    assert actor["ppo_micro_batch_size_per_gpu"] == 1
     assert actor["ppo_max_token_len_per_gpu"] == 10240
     assert actor["fsdp_config"]["param_offload"] is True
     assert actor["fsdp_config"]["optimizer_offload"] is False
@@ -330,7 +330,7 @@ def test_repository_single_a800_profile_matches_exact_contract() -> None:
     assert rollout["tensor_model_parallel_size"] == 1
     assert rollout["data_parallel_size"] == 1
     assert rollout["pipeline_model_parallel_size"] == 1
-    assert rollout["gpu_memory_utilization"] == pytest.approx(0.30)
+    assert rollout["gpu_memory_utilization"] == pytest.approx(0.45)
     assert rollout["free_cache_engine"] is True
     assert rollout["enforce_eager"] is True
     assert rollout["max_num_batched_tokens"] == 10240
@@ -338,15 +338,21 @@ def test_repository_single_a800_profile_matches_exact_contract() -> None:
     assert rollout["enable_chunked_prefill"] is True
     assert rollout["max_num_seqs"] == 1
     assert rollout["load_format"] == "safetensors"
-    assert rollout["log_prob_use_dynamic_bsz"] is True
+    assert rollout["log_prob_use_dynamic_bsz"] is False
+    assert rollout["log_prob_micro_batch_size_per_gpu"] == 1
     assert rollout["log_prob_max_token_len_per_gpu"] == 10240
-    assert actor["fsdp_config"]["model_dtype"] == "fp32"
-    assert ref["log_prob_use_dynamic_bsz"] is True
+    assert actor["fsdp_config"]["model_dtype"] == "bf16"
+    assert ref["log_prob_use_dynamic_bsz"] is False
+    assert ref["log_prob_micro_batch_size_per_gpu"] == 1
     assert ref["log_prob_max_token_len_per_gpu"] == 10240
     assert ref["fsdp_config"]["param_offload"] is True
+    assert ref["fsdp_config"]["model_dtype"] == "bf16"
     assert profile["trainer"]["n_gpus_per_node"] == 1
     assert profile["trainer"]["nnodes"] == 1
     assert profile["trainer"]["total_epochs"] == 1
+    assert profile["capsule_runtime"]["oom_profile"] == (
+        "fsdp_base_bf16_vllm_util_045"
+    )
 
 
 def test_single_a800_profile_has_every_pre_ray_worker_access_surface() -> None:
@@ -621,13 +627,8 @@ def test_repository_owned_workflow_matches_exact_service_and_audit_contract() ->
         "JAX_PLATFORMS": "cuda",
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
     }
-    assert workflow["oom_ladder"] == [
-        "base_dynamic_fp32",
-        "vllm_util_026",
-        "fixed_microbatch_1",
-        "fsdp_base_bf16",
-        "fsdp_base_bf16_vllm_util_045",
-    ]
+    assert workflow["oom_profile"] == "fsdp_base_bf16_vllm_util_045"
+    assert "oom_ladder" not in workflow
     assert workflow["runtime"]["verl_pinned_sha"] == "d62da4950573d7a4b7ef2362337952e7ab59e78d"
     assert workflow["runtime"]["max_controller_seed_run_ids"] == 3
 
@@ -705,7 +706,7 @@ def test_dry_run_renders_exact_commands_and_does_not_create_outputs(tmp_path: Pa
         dry_run=True,
     )
 
-    assert result.run_id.startswith("base_dynamic_fp32-")
+    assert result.run_id.startswith("fsdp_base_bf16_vllm_util_045-")
     assert result.output_dir.exists() is False
     assert result.artifact_dir.exists() is False
     assert result.capsule_config_path == result.attempts[0].capsule_config_path
@@ -844,71 +845,6 @@ def test_readiness_or_gate_failure_cleans_up_earlier_owned_processes(tmp_path: P
     ]
 
 
-def test_retry_profile_materialization_is_exact_and_semantics_preserving(tmp_path: Path) -> None:
-    base_profile = load_single_a800_resolved_profile(PROFILE_PATH)
-    retry_one = materialize_retry_profile(
-        base_profile=base_profile,
-        retry_name="vllm_util_026",
-        destination=tmp_path / "retry-01.yaml",
-    )
-    retry_two = materialize_retry_profile(
-        base_profile=base_profile,
-        retry_name="fixed_microbatch_1",
-        destination=tmp_path / "retry-02.yaml",
-    )
-    retry_three = materialize_retry_profile(
-        base_profile=base_profile,
-        retry_name="fsdp_base_bf16",
-        destination=tmp_path / "retry-03.yaml",
-    )
-    retry_four = materialize_retry_profile(
-        base_profile=base_profile,
-        retry_name="fsdp_base_bf16_vllm_util_045",
-        destination=tmp_path / "retry-04.yaml",
-    )
-
-    payload_one = yaml.safe_load(retry_one.read_text(encoding="utf-8"))
-    payload_two = yaml.safe_load(retry_two.read_text(encoding="utf-8"))
-    payload_three = yaml.safe_load(retry_three.read_text(encoding="utf-8"))
-    payload_four = yaml.safe_load(retry_four.read_text(encoding="utf-8"))
-
-    assert payload_one["actor_rollout_ref"]["rollout"][
-        "gpu_memory_utilization"
-    ] == pytest.approx(0.26)
-    assert payload_two["actor_rollout_ref"]["rollout"][
-        "gpu_memory_utilization"
-    ] == pytest.approx(0.26)
-    assert payload_two["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is False
-    assert payload_two["actor_rollout_ref"]["actor"]["ppo_micro_batch_size_per_gpu"] == 1
-    assert payload_two["actor_rollout_ref"]["rollout"]["log_prob_use_dynamic_bsz"] is False
-    assert payload_two["actor_rollout_ref"]["rollout"]["log_prob_micro_batch_size_per_gpu"] == 1
-    assert payload_two["actor_rollout_ref"]["ref"]["log_prob_use_dynamic_bsz"] is False
-    assert payload_two["actor_rollout_ref"]["ref"]["log_prob_micro_batch_size_per_gpu"] == 1
-    assert payload_three["actor_rollout_ref"]["rollout"][
-        "gpu_memory_utilization"
-    ] == pytest.approx(0.26)
-    assert payload_three["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is False
-    assert payload_three["actor_rollout_ref"]["ref"]["log_prob_use_dynamic_bsz"] is False
-    assert payload_three["actor_rollout_ref"]["actor"]["fsdp_config"]["model_dtype"] == "bf16"
-    assert payload_three["actor_rollout_ref"]["ref"]["fsdp_config"]["model_dtype"] == "bf16"
-    assert payload_four["actor_rollout_ref"]["rollout"][
-        "gpu_memory_utilization"
-    ] == pytest.approx(0.45)
-    assert payload_four["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is False
-    assert payload_four["actor_rollout_ref"]["ref"]["log_prob_use_dynamic_bsz"] is False
-    assert payload_four["actor_rollout_ref"]["actor"]["fsdp_config"]["model_dtype"] == "bf16"
-    assert payload_four["actor_rollout_ref"]["ref"]["fsdp_config"]["model_dtype"] == "bf16"
-    for payload in (payload_one, payload_two, payload_three, payload_four):
-        assert payload["actor_rollout_ref"]["actor"]["ppo_max_token_len_per_gpu"] == 10240
-        assert payload["actor_rollout_ref"]["rollout"]["max_model_len"] == 10240
-        assert (
-            payload["actor_rollout_ref"]["ref"].get(
-                "log_prob_max_token_len_per_gpu", 10240
-            )
-            == 10240
-        )
-
-
 def test_existing_run_artifact_or_checkpoint_is_refused(tmp_path: Path) -> None:
     runtime = FakeRuntime(tmp_path)
     output_root = tmp_path / "outputs"
@@ -971,11 +907,10 @@ def test_gate_templates_parse_with_real_repository_clis(tmp_path: Path) -> None:
     adapter_reload_smoke.build_parser().parse_args(reload_argv[3:])
 
 
-def test_oom_retries_are_cumulative_new_profiles_and_retain_evidence(
+def test_real_attempt_materializes_only_the_fixed_profile(
     tmp_path: Path,
 ) -> None:
     runtime = FakeRuntime(tmp_path)
-    runtime.oom_failures_remaining = 4
 
     result = execute_owned_service_workflow(
         workflow_path=WORKFLOW_PATH,
@@ -985,22 +920,13 @@ def test_oom_retries_are_cumulative_new_profiles_and_retain_evidence(
         dry_run=False,
     )
 
-    assert [attempt.retry_name for attempt in result.attempts] == [
-        "base_dynamic_fp32",
-        "vllm_util_026",
-        "fixed_microbatch_1",
-        "fsdp_base_bf16",
-        "fsdp_base_bf16_vllm_util_045",
-    ]
-    assert len({attempt.run_id for attempt in result.attempts}) == 5
-    assert len({attempt.profile_sha256 for attempt in result.attempts}) == 5
-    for failed in result.attempts[:4]:
-        assert (failed.artifact_dir / "launcher_failure.json").is_file()
-    for attempt in result.attempts:
-        assert hashlib.sha256(attempt.profile_path.read_bytes()).hexdigest() == (
-            attempt.profile_sha256
-        )
-    final = yaml.safe_load(result.attempts[-1].profile_path.read_text(encoding="utf-8"))
+    assert len(result.attempts) == 1
+    attempt = result.attempts[0]
+    assert attempt.oom_profile == "fsdp_base_bf16_vllm_util_045"
+    assert hashlib.sha256(attempt.profile_path.read_bytes()).hexdigest() == (
+        attempt.profile_sha256
+    )
+    final = yaml.safe_load(attempt.profile_path.read_text(encoding="utf-8"))
     root = final["actor_rollout_ref"]
     assert root["rollout"]["gpu_memory_utilization"] == pytest.approx(0.45)
     assert root["actor"]["use_dynamic_bsz"] is False
@@ -1024,32 +950,30 @@ def test_gate1_oom_stops_without_changing_profile(tmp_path: Path) -> None:
         )
 
     assert failure.value.gate_name == "gate01_preflight"
-    assert [attempt.retry_name for attempt in runtime.configured_attempts] == [
-        "base_dynamic_fp32"
+    assert [attempt.oom_profile for attempt in runtime.configured_attempts] == [
+        "fsdp_base_bf16_vllm_util_045"
     ]
 
 
-def test_gate2_vllm_oom_advances_to_utilization_026(tmp_path: Path) -> None:
+def test_gpu_oom_stops_after_the_fixed_profile(tmp_path: Path) -> None:
     runtime = FakeRuntime(tmp_path)
     runtime.oom_failures_remaining = 1
     runtime.oom_failure_gate = "gate02_seed"
 
-    result = execute_owned_service_workflow(
-        workflow_path=WORKFLOW_PATH,
-        profile_path=PROFILE_PATH,
-        capsule_config_path=CAPSULE_PATH,
-        runtime=runtime,
-        dry_run=False,
-    )
+    with pytest.raises(GateCommandError) as failure:
+        execute_owned_service_workflow(
+            workflow_path=WORKFLOW_PATH,
+            profile_path=PROFILE_PATH,
+            capsule_config_path=CAPSULE_PATH,
+            runtime=runtime,
+            dry_run=False,
+        )
 
-    assert [attempt.retry_name for attempt in result.attempts] == [
-        "base_dynamic_fp32",
-        "vllm_util_026",
-    ]
-    resolved = yaml.safe_load(result.attempts[-1].profile_path.read_text(encoding="utf-8"))
-    assert resolved["actor_rollout_ref"]["rollout"][
-        "gpu_memory_utilization"
-    ] == pytest.approx(0.26)
+    assert failure.value.gate_name == "gate02_seed"
+    assert len(runtime.configured_attempts) == 1
+    assert runtime.configured_attempts[0].oom_profile == (
+        "fsdp_base_bf16_vllm_util_045"
+    )
 
 
 def test_guided_randomness_uses_at_most_three_new_run_ids(tmp_path: Path) -> None:
@@ -1066,6 +990,9 @@ def test_guided_randomness_uses_at_most_three_new_run_ids(tmp_path: Path) -> Non
 
     assert len(result.attempts) == 3
     assert [attempt.run_id for attempt in result.attempts] == result.controller_seed_run_ids
+    assert {attempt.oom_profile for attempt in result.attempts} == {
+        "fsdp_base_bf16_vllm_util_045"
+    }
     assert result.attempts[0].run_id.endswith("controller-seed-1")
     assert result.attempts[1].run_id.endswith("controller-seed-2")
     assert result.attempts[2].run_id.endswith("controller-seed-3")

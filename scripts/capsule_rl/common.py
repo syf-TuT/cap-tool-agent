@@ -160,15 +160,7 @@ _FINAL_RUNTIME_AUDIT_SHA256_FIELDS = frozenset(
 )
 _EXTERNAL_CONTROLLER_ENDPOINT = "https://coding.dashscope.aliyuncs.com/v1"
 _EXTERNAL_CONTROLLER_MODEL = "qwen3.7-plus"
-_SINGLE_A800_OOM_PROFILES = frozenset(
-    {
-        "base_dynamic_fp32",
-        "vllm_util_026",
-        "fixed_microbatch_1",
-        "fsdp_base_bf16",
-        "fsdp_base_bf16_vllm_util_045",
-    }
-)
+SINGLE_A800_OOM_PROFILE = "fsdp_base_bf16_vllm_util_045"
 
 
 class ConfigValidationError(ValueError):
@@ -406,7 +398,7 @@ def validate_final_runtime_audit(payload: Mapping[str, Any]) -> None:
         raise GateArtifactError(
             "final Gate 7 runtime audit must bind all three logical services"
         )
-    if payload.get("oom_profile") not in _SINGLE_A800_OOM_PROFILES:
+    if payload.get("oom_profile") != SINGLE_A800_OOM_PROFILE:
         raise GateArtifactError("final Gate 7 runtime audit OOM profile is invalid")
     if payload.get("resolved_profile_sha256") != payload.get(
         "verl_resolved_config_sha256"

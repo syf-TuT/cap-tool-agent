@@ -105,7 +105,7 @@ def valid_final_runtime_audit(
         "controller_binding_sha256": "3" * 64,
         "owned_service_cleanup_completed": True,
         "owned_service_cleanup_count": 3,
-        "oom_profile": "base_dynamic_fp32",
+        "oom_profile": "fsdp_base_bf16_vllm_util_045",
         "resolved_profile_sha256": verl_resolved_config_sha256,
         "initial_hardware": {
             "gpu_name": "NVIDIA A800 80GB PCIe",
@@ -123,6 +123,14 @@ def valid_final_runtime_audit(
 
 def test_final_runtime_audit_accepts_the_complete_schema() -> None:
     validate_final_runtime_audit(valid_final_runtime_audit())
+
+
+def test_final_runtime_audit_rejects_non_fixed_oom_profile() -> None:
+    payload = valid_final_runtime_audit()
+    payload["oom_profile"] = "base_dynamic_fp32"
+
+    with pytest.raises(GateArtifactError, match="OOM profile"):
+        validate_final_runtime_audit(payload)
 
 
 def test_final_runtime_audit_rejects_forged_minimal_true_flag() -> None:

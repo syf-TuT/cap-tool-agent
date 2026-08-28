@@ -27,6 +27,7 @@ from capx.rl.capsule.stable_io import (
 from .common import (
     CANONICAL_EXECUTION_MODE,
     GateArtifactError,
+    SINGLE_A800_OOM_PROFILE,
     add_validation_arguments,
     gate_failure_artifact_path,
     validation_requested,
@@ -65,13 +66,6 @@ _AUDIT_META_FILENAMES = {
     "launcher_owned_cleanup.json",
     "launcher_initial_audit.json",
     "launcher_memory_00_post-controller.json",
-}
-_OOM_PROFILES = {
-    "base_dynamic_fp32",
-    "vllm_util_026",
-    "fixed_microbatch_1",
-    "fsdp_base_bf16",
-    "fsdp_base_bf16_vllm_util_045",
 }
 _LLAMA_ARCHIVE_SHA256 = (
     "f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35"
@@ -911,16 +905,16 @@ def _verify_initial_audit_artifact(
         "schema_version",
         "artifact_type",
         "run_id",
-        "retry_name",
+        "oom_profile",
         "profile_sha256",
         "snapshot",
     }:
         raise GateArtifactError("initial hardware audit schema is incomplete or unexpected")
     if (
-        payload.get("schema_version") != 1
+        payload.get("schema_version") != 2
         or payload.get("artifact_type") != "single_a800_initial_audit"
         or payload.get("run_id") != expected_run_id
-        or payload.get("retry_name") not in _OOM_PROFILES
+        or payload.get("oom_profile") != SINGLE_A800_OOM_PROFILE
         or not _is_lower_sha256(payload.get("profile_sha256"))
     ):
         raise GateArtifactError("initial hardware audit identity is invalid")
@@ -1033,7 +1027,7 @@ def _verify_resolved_verl_profile(
     *,
     initial_profile_sha256: object,
     candidate_profile_sha256: object,
-    retry_name: object,
+    initial_oom_profile: object,
 ) -> str:
     try:
         snapshot = read_stable_regular_file(path, label="resolved VeRL profile")
@@ -1057,9 +1051,9 @@ def _verify_resolved_verl_profile(
         if isinstance(capsule_runtime, Mapping)
         else None
     )
-    if oom_profile != retry_name:
+    if oom_profile != initial_oom_profile:
         raise GateArtifactError(
-            "resolved VeRL capsule_runtime.oom_profile does not match initial audit retry_name"
+            "resolved VeRL capsule_runtime.oom_profile does not match initial audit oom_profile"
         )
     return snapshot.sha256
 
@@ -1123,7 +1117,7 @@ def finalize_runtime_audit(
         root / "resolved" / "verl.yaml",
         initial_profile_sha256=initial_audit.get("profile_sha256"),
         candidate_profile_sha256=candidate.get("verl_resolved_config_sha256"),
-        retry_name=initial_audit.get("retry_name"),
+        initial_oom_profile=initial_audit.get("oom_profile"),
     )
     summary = audit_gate_directory(root)
     if resolved_profile_sha256 != summary.get("verl_resolved_config_sha256"):
@@ -1173,7 +1167,7 @@ def finalize_runtime_audit(
             **controller_summary,
             "owned_service_cleanup_completed": cleanup["cleanup_completed"],
             "owned_service_cleanup_count": len(cleanup["services"]),
-            "oom_profile": initial_audit["retry_name"],
+            "oom_profile": initial_audit["oom_profile"],
             "resolved_profile_sha256": resolved_profile_sha256,
             "initial_hardware": {
                 "gpu_name": initial_audit["snapshot"]["gpu_name"],
