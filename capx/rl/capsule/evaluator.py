@@ -9,6 +9,8 @@ from dataclasses import replace
 from multiprocessing.connection import Connection
 from typing import Any, Protocol
 
+from capx.utils.program_source import normalize_program_source
+
 from .schema import ProgramReplayResultV1, ReplayOutcome, TaskInstanceV1, source_sha256
 
 
@@ -307,6 +309,7 @@ class CleanReplayEvaluator:
         task: TaskInstanceV1,
         source: str,
         *,
+        executed_source: str,
         program_sample_id: str | None,
         outcome: ReplayOutcome,
         attempts: int,
@@ -321,6 +324,14 @@ class CleanReplayEvaluator:
         error_message: str | None = None,
         diagnostics: Mapping[str, Any] | None = None,
     ) -> ProgramReplayResultV1:
+        result_diagnostics = {} if diagnostics is None else dict(diagnostics)
+        result_diagnostics.update(
+            {
+                "raw_source_sha256": source_sha256(source),
+                "executed_source_sha256": source_sha256(executed_source),
+                "source_normalized": executed_source != source,
+            }
+        )
         return ProgramReplayResultV1(
             task_id=task.task_id,
             environment_seed=task.environment_seed,
@@ -341,13 +352,14 @@ class CleanReplayEvaluator:
             error_type=error_type,
             error_message=error_message,
             attempts=attempts,
-            diagnostics={} if diagnostics is None else diagnostics,
+            diagnostics=result_diagnostics,
         )
 
     def _classify_payload(
         self,
         task: TaskInstanceV1,
         source: str,
+        executed_source: str,
         payload: Mapping[str, Any],
         attempts: int,
         program_sample_id: str | None,
@@ -414,6 +426,7 @@ class CleanReplayEvaluator:
         return self._result(
             task,
             source,
+            executed_source=executed_source,
             program_sample_id=program_sample_id,
             outcome=outcome,
             attempts=attempts,
@@ -478,13 +491,15 @@ class CleanReplayEvaluator:
         attempts = 0
         last_failure: tuple[ReplayOutcome, BaseException] | None = None
         attempt_history: list[dict[str, Any]] = []
+        executed_source = normalize_program_source(source)
         while attempts <= self.max_failure_retries:
             attempts += 1
             try:
-                payload = self.backend.execute(task, source, seed, self.timeout_s)
+                payload = self.backend.execute(task, executed_source, seed, self.timeout_s)
                 result = self._classify_payload(
                     task,
                     source,
+                    executed_source,
                     payload,
                     attempts,
                     program_sample_id,
@@ -503,6 +518,7 @@ class CleanReplayEvaluator:
                 result = self._result(
                     task,
                     source,
+                    executed_source=executed_source,
                     program_sample_id=program_sample_id,
                     outcome=ReplayOutcome.PROGRAM_TIMEOUT,
                     attempts=attempts,
@@ -552,6 +568,7 @@ class CleanReplayEvaluator:
         result = self._result(
             task,
             source,
+            executed_source=executed_source,
             program_sample_id=program_sample_id,
             outcome=outcome,
             attempts=attempts,

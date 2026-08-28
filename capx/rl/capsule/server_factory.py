@@ -62,6 +62,7 @@ from .schema import TaskInstanceV1
 from .trainer import (
     AtomicJsonArtifactSink,
     CapsuleCritiqueRayTrainer,
+    GroupAttemptBudgetExhausted,
 )
 
 
@@ -1697,22 +1698,36 @@ class CapsuleServerRuntime:
                 ),
                 artifact_sink=AtomicJsonArtifactSink(output_dir / "groups"),
                 config=self.config,
+                max_group_attempts=capsule["max_group_attempts"],
             )
             claim_root = output_dir / "checkpoints" / safe_run_id
             checkpoint = claim_root / "final" / "actor"
             with AtomicCheckpointClaim(checkpoint, claim_root=claim_root) as checkpoint_claim:
                 verl_provenance_before = workers.verl_provenance()
                 optimizer_step_before = workers.optimizer_step()
-                results = trainer.fit(scheduled_tasks)
-                actor_updates = sum(not result.skipped_actor_update for result in results)
-                discarded_groups = tuple(getattr(trainer, "discarded_groups", ()))
-                discard_audit = _write_discard_audit(
-                    discard_audit_path, discarded_groups
-                )
-                if not results and discarded_groups:
+                try:
+                    results = trainer.fit(scheduled_tasks)
+                except GroupAttemptBudgetExhausted as error:
+                    discarded_group_attempts = tuple(
+                        getattr(trainer, "discarded_groups", ())
+                    )
+                    discard_audit = _write_discard_audit(
+                        discard_audit_path, discarded_group_attempts
+                    )
                     raise ServerFactoryError(
-                        "all scheduled groups were discarded; no checkpoint was written; "
-                        f"inspect {discard_audit}"
+                        f"{error}; no checkpoint was written; inspect {discard_audit}"
+                    ) from error
+                actor_updates = sum(not result.skipped_actor_update for result in results)
+                discarded_group_attempts = tuple(
+                    getattr(trainer, "discarded_groups", ())
+                )
+                discard_audit = _write_discard_audit(
+                    discard_audit_path, discarded_group_attempts
+                )
+                if len(results) != len(scheduled_tasks):
+                    raise ServerFactoryError(
+                        f"training completed {len(results)} of {len(scheduled_tasks)} scheduled "
+                        "groups; no checkpoint was written"
                     )
                 optimizer_step_after = workers.optimizer_step()
                 optimizer_step_delta = optimizer_step_after - optimizer_step_before
@@ -1736,7 +1751,7 @@ class CapsuleServerRuntime:
                     )
             run_status = (
                 "completed_no_updates_all_constant"
-                if results and actor_updates == 0 and not discarded_groups
+                if results and actor_updates == 0
                 else "completed"
             )
             return {
@@ -1744,11 +1759,15 @@ class CapsuleServerRuntime:
                 "task_count": len(tasks),
                 "scheduled_group_count": len(scheduled_tasks),
                 "step_count": len(results),
+                "completed_group_count": len(results),
                 "actor_updates": actor_updates,
                 "skipped_actor_updates": sum(result.skipped_actor_update for result in results),
-                "discarded_groups": len(discarded_groups),
-                "discard_reasons": [record.reason for record in discarded_groups],
-                "discarded_group_records": [record.to_dict() for record in discarded_groups],
+                "discarded_groups": len(discarded_group_attempts),
+                "discarded_group_attempts": len(discarded_group_attempts),
+                "discard_reasons": [record.reason for record in discarded_group_attempts],
+                "discarded_group_records": [
+                    record.to_dict() for record in discarded_group_attempts
+                ],
                 "discard_audit": None if discard_audit is None else str(discard_audit),
                 "optimizer_step_before": optimizer_step_before,
                 "optimizer_step_after": optimizer_step_after,

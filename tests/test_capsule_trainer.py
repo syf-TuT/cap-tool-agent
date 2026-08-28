@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -25,6 +26,7 @@ from capx.rl.capsule.schema import (
 from capx.rl.capsule.trainer import (
     AtomicJsonArtifactSink,
     CapsuleCritiqueRayTrainer,
+    GroupAttemptBudgetExhausted,
     MemoryArtifactSink,
     TokenBudgetExceeded,
     TokenizerGroupEncoder,
@@ -256,7 +258,22 @@ def _config() -> dict[str, Any]:
     return {"algorithm": {"rollout_is": False, "rollout_is_threshold": None}}
 
 
-def test_fit_audits_discarded_group_and_continues_with_later_task() -> None:
+@pytest.mark.parametrize("max_group_attempts", [0, -1, True])
+def test_trainer_requires_positive_integer_group_attempt_budget(
+    max_group_attempts: object,
+) -> None:
+    with pytest.raises(ValueError, match="max_group_attempts"):
+        CapsuleCritiqueRayTrainer(
+            assembler=SimpleNamespace(),
+            batch_encoder=_Encoder(),
+            actor_rollout_wg=_Actor([]),
+            artifact_sink=MemoryArtifactSink(),
+            config=_config(),
+            max_group_attempts=max_group_attempts,  # type: ignore[arg-type]
+        )
+
+
+def test_fit_retries_discarded_group_for_same_task_before_continuing() -> None:
     infra_result = ProgramReplayResultV1(
         task_id="cube-stack-5",
         environment_seed=5,
@@ -319,7 +336,8 @@ def test_fit_audits_discarded_group_and_continues_with_later_task() -> None:
 
     results = trainer.fit((_task(), _task()))
 
-    assert len(results) == 1
+    assert len(results) == 2
+    assert trainer.assembler.calls == 3
     assert trainer.discarded_count == 1
     assert trainer.discard_reasons == ("infra_retry_exhausted",)
     assert len(trainer.discarded_groups) == 1
@@ -328,6 +346,7 @@ def test_fit_audits_discarded_group_and_continues_with_later_task() -> None:
     assert record.task_id == "cube-stack-5"
     assert record.environment_seed == 5
     assert record.initial_state_sha256 == "a" * 64
+    assert record.group_attempt_index == 0
     assert record.reason == "infra_retry_exhausted"
     assert record.message == "infra_retry_exhausted: worker remained poisoned"
     assert record.replay_results == (infra_result,)
@@ -336,6 +355,42 @@ def test_fit_audits_discarded_group_and_continues_with_later_task() -> None:
     assert record.to_dict()["retry_count"] == 2
     assert record.to_dict()["infra_failures"] == 3
     assert events[0] == "discard:infra_retry_exhausted"
+
+
+def test_fit_raises_after_three_discarded_attempts_for_same_task() -> None:
+    class _AlwaysDiscard:
+        clean_evaluator = None
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def assemble(self, _task: TaskInstanceV1) -> GroupAssemblyResult:
+            self.calls += 1
+            raise GroupDiscarded("base_sampling_error", f"invalid response {self.calls}")
+
+    assembler = _AlwaysDiscard()
+    trainer = CapsuleCritiqueRayTrainer(
+        assembler=assembler,
+        batch_encoder=_Encoder(),
+        actor_rollout_wg=_Actor([]),
+        artifact_sink=MemoryArtifactSink(),
+        config=_config(),
+        max_group_attempts=3,
+    )
+
+    with pytest.raises(GroupAttemptBudgetExhausted, match="3 attempts") as captured:
+        trainer.fit((_task(),))
+
+    assert captured.value.task == _task()
+    assert captured.value.max_group_attempts == 3
+    assert assembler.calls == 3
+    assert trainer.discarded_count == 3
+    assert tuple(record.group_attempt_index for record in trainer.discarded_groups) == (
+        0,
+        1,
+        2,
+    )
+    assert trainer.discard_reasons == ("base_sampling_error",) * 3
 
 
 def test_fit_does_not_swallow_non_discard_exceptions() -> None:

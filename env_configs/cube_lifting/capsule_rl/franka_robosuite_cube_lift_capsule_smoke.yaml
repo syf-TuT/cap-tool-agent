@@ -59,6 +59,7 @@ controller_service:
 
 capsule:
   group_size: 8
+  max_group_attempts: 3
   base_samples_before_repair: 7
   p0_count: 2
   repair_trajectories_per_p0: 2

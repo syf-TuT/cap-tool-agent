@@ -92,6 +92,7 @@ class DiscardedGroupRecord:
     initial_state_sha256: str
     reason: str
     message: str
+    group_attempt_index: int = 0
     replay_results: tuple[ProgramReplayResultV1, ...] = ()
     partial_repair_attempts: tuple[RepairAttempt, ...] = ()
     schema_version: int = 1
@@ -103,6 +104,7 @@ class DiscardedGroupRecord:
             "task_id": self.task_id,
             "environment_seed": self.environment_seed,
             "initial_state_sha256": self.initial_state_sha256,
+            "group_attempt_index": self.group_attempt_index,
             "reason": self.reason,
             "message": self.message,
             "replay_results": [result.to_dict() for result in self.replay_results],
@@ -111,6 +113,18 @@ class DiscardedGroupRecord:
             ],
             **summarize_replay_results(self.replay_results),
         }
+
+
+class GroupAttemptBudgetExhausted(RuntimeError):
+    """A scheduled task could not produce one valid group within its attempt budget."""
+
+    def __init__(self, task: TaskInstanceV1, max_group_attempts: int) -> None:
+        super().__init__(
+            f"group collection for {task.task_id} seed {task.environment_seed} exhausted "
+            f"after {max_group_attempts} attempts"
+        )
+        self.task = task
+        self.max_group_attempts = max_group_attempts
 
 
 class MemoryArtifactSink:
@@ -374,6 +388,7 @@ class CapsuleCritiqueRayTrainer:
         ref_policy_wg: Any | None = None,
         reference_policy_mode: str = "standalone",
         event_log: list[str] | None = None,
+        max_group_attempts: int = 3,
     ) -> None:
         from .policy_loss import validate_capsule_training_config
 
@@ -390,6 +405,12 @@ class CapsuleCritiqueRayTrainer:
                 "reference_policy_mode must be standalone or actor_base_adapter_disabled"
             )
         if (
+            isinstance(max_group_attempts, bool)
+            or not isinstance(max_group_attempts, int)
+            or max_group_attempts < 1
+        ):
+            raise ValueError("max_group_attempts must be a positive integer")
+        if (
             reference_policy_mode == "actor_base_adapter_disabled"
             and ref_policy_wg is not actor_rollout_wg
         ):
@@ -404,6 +425,7 @@ class CapsuleCritiqueRayTrainer:
         self.artifact_sink = artifact_sink
         self.config = config
         self.events = event_log if event_log is not None else []
+        self.max_group_attempts = max_group_attempts
         self._discarded_groups: list[DiscardedGroupRecord] = []
         self._actor_updates_completed = 0
 
@@ -924,29 +946,36 @@ class CapsuleCritiqueRayTrainer:
         clean_evaluator = getattr(self.assembler, "clean_evaluator", None)
         drain_history = getattr(clean_evaluator, "drain_history", None)
         for task_index, task in enumerate(tasks):
-            if callable(drain_history):
-                drain_history()
-            try:
-                result = self.run_step(task)
-            except GroupDiscarded as error:
-                replay_results = drain_history() if callable(drain_history) else ()
-                self._discarded_groups.append(
-                    DiscardedGroupRecord(
-                        task_index=task_index,
-                        task_id=task.task_id,
-                        environment_seed=task.environment_seed,
-                        initial_state_sha256=task.initial_state_sha256,
-                        reason=error.reason,
-                        message=str(error),
-                        replay_results=replay_results,
-                        partial_repair_attempts=tuple(error.partial_repair_attempts),
+            for group_attempt_index in range(self.max_group_attempts):
+                if callable(drain_history):
+                    drain_history()
+                try:
+                    result = self.run_step(task)
+                except GroupDiscarded as error:
+                    replay_results = drain_history() if callable(drain_history) else ()
+                    self._discarded_groups.append(
+                        DiscardedGroupRecord(
+                            task_index=task_index,
+                            task_id=task.task_id,
+                            environment_seed=task.environment_seed,
+                            initial_state_sha256=task.initial_state_sha256,
+                            reason=error.reason,
+                            message=str(error),
+                            group_attempt_index=group_attempt_index,
+                            replay_results=replay_results,
+                            partial_repair_attempts=tuple(error.partial_repair_attempts),
+                        )
                     )
-                )
-                self.events.append(f"discard:{error.reason}")
-                continue
-            if callable(drain_history):
-                drain_history()
-            results.append(result)
+                    self.events.append(f"discard:{error.reason}")
+                    if group_attempt_index + 1 == self.max_group_attempts:
+                        raise GroupAttemptBudgetExhausted(
+                            task, self.max_group_attempts
+                        ) from error
+                    continue
+                if callable(drain_history):
+                    drain_history()
+                results.append(result)
+                break
         return tuple(results)
 
 
@@ -959,6 +988,7 @@ __all__ = [
     "AtomicJsonArtifactSink",
     "CapsuleCritiqueRayTrainer",
     "DiscardedGroupRecord",
+    "GroupAttemptBudgetExhausted",
     "MemoryArtifactSink",
     "TokenBudgetExceeded",
     "TokenizerGroupEncoder",

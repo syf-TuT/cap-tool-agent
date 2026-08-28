@@ -23,6 +23,7 @@ from PIL import Image
 
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.configs.loader import DictLoader
+from capx.utils.program_source import normalize_program_source
 
 # Re-export LLM client symbols for backward compatibility
 from capx.llm.client import (  # noqa: F401
@@ -214,22 +215,10 @@ def _extract_code(content: str) -> list[str]:
     Returns:
         Extracted Python code list
     """
-    fence_start = "```python\n"
-    fence_end = "```"
-    start_idx = 0
-    end_idx = len(content) + 1
-    if fence_start in content:
-        start_idx = content.find(fence_start) + len(fence_start)
-        content = content[start_idx:]
-    if fence_end in content:
-        end_idx = content.rfind(fence_end)
-        content = content[:end_idx]
-
-    content = content.strip()
     # NOTE: might gen empty code block at the end
     # content_list = content.split("breakpoint_code_block()")
 
-    return [content]
+    return [normalize_program_source(content)]
 
 
 def _build_multi_turn_decision_prompt_legacy(

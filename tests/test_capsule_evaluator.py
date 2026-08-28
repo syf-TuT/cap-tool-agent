@@ -19,7 +19,7 @@ from capx.rl.capsule.evaluator import (
     configure_default_evaluator,
     evaluate_program,
 )
-from capx.rl.capsule.schema import ReplayOutcome, TaskInstanceV1
+from capx.rl.capsule.schema import ReplayOutcome, TaskInstanceV1, source_sha256
 from capx.rl.capsule.telemetry import summarize_replay_results
 
 STATE_HASH = "a" * 64
@@ -123,6 +123,34 @@ def test_sandbox_rc_is_diagnostic_only_and_does_not_override_success() -> None:
 
     assert result.outcome is ReplayOutcome.SUCCESS
     assert result.sandbox_rc == 19
+
+
+def test_evaluator_executes_normalized_source_but_preserves_raw_identity() -> None:
+    backend = _FakeBackend([_payload(reward=1.0, task_completed=True, terminated=True)])
+    evaluator = CleanReplayEvaluator(backend)
+    raw_source = "```python\npass\n```"
+
+    result = evaluator.evaluate_program(_task(), raw_source, seed=5)
+
+    assert backend.calls == [(_task(), "pass", 5, 120.0)]
+    assert result.source == raw_source
+    assert result.source_sha256 == source_sha256(raw_source)
+    assert result.diagnostics["raw_source_sha256"] == source_sha256(raw_source)
+    assert result.diagnostics["executed_source_sha256"] == source_sha256("pass")
+    assert result.diagnostics["source_normalized"] is True
+
+
+def test_evaluator_reports_unchanged_unfenced_execution_source() -> None:
+    backend = _FakeBackend([_payload(reward=0.2)])
+    evaluator = CleanReplayEvaluator(backend)
+
+    result = evaluator.evaluate_program(_task(), "pass", seed=5)
+
+    assert backend.calls == [(_task(), "pass", 5, 120.0)]
+    assert result.source == "pass"
+    assert result.diagnostics["raw_source_sha256"] == source_sha256("pass")
+    assert result.diagnostics["executed_source_sha256"] == source_sha256("pass")
+    assert result.diagnostics["source_normalized"] is False
 
 
 @pytest.mark.parametrize(

@@ -79,6 +79,7 @@ def valid_config() -> dict:
         },
         "capsule": {
             "group_size": 8,
+            "max_group_attempts": 3,
             "base_samples_before_repair": 7,
             "p0_count": 2,
             "repair_trajectories_per_p0": 2,
@@ -239,6 +240,7 @@ def test_controller_request_contract_must_be_explicit(field_name: str) -> None:
     [
         (("schema_version",), True, "schema"),
         (("capsule", "group_size"), True, "eight-member"),
+        (("capsule", "max_group_attempts"), 2, "three"),
         (("actor_rollout_ref", "rollout", "n"), 7, "n=8"),
         (("algorithm", "adv_estimator"), "gae", "grpo"),
         (("algorithm", "norm_adv_by_std_in_grpo"), True, "std"),

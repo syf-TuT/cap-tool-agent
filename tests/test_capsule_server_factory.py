@@ -23,7 +23,7 @@ from capx.rl.capsule.server_factory import (
     load_task_instances,
     resolve_task_instances,
 )
-from capx.rl.capsule.trainer import DiscardedGroupRecord
+from capx.rl.capsule.trainer import DiscardedGroupRecord, GroupAttemptBudgetExhausted
 
 
 CONFIG_PATH = (
@@ -800,6 +800,7 @@ def test_server_runtime_binds_components_without_starting_external_services(
     class _Trainer:
         def __init__(self, **kwargs):
             assert kwargs["ref_policy_wg"] is not None
+            assert kwargs["max_group_attempts"] == 3
             events.append("trainer:init")
 
         def fit(self, tasks):
@@ -835,6 +836,8 @@ def test_server_runtime_binds_components_without_starting_external_services(
     ).fit()
 
     assert result["step_count"] == 1
+    assert result["completed_group_count"] == 1
+    assert result["discarded_group_attempts"] == 0
     assert result["actor_updates"] == 1
     assert result["optimizer_step_delta"] == 1
     assert result["status"] == "completed"
@@ -842,7 +845,7 @@ def test_server_runtime_binds_components_without_starting_external_services(
     assert events[-3:] == ["checkpoint:1", "evaluator:close", "workers:close"]
 
 
-def test_server_runtime_persists_full_discard_audit_and_refuses_empty_run(
+def test_server_runtime_persists_exhausted_attempt_audit_and_refuses_checkpoint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     dataset = tmp_path / "tasks.jsonl"
@@ -887,16 +890,114 @@ def test_server_runtime_persists_full_discard_audit_and_refuses_empty_run(
 
     class _Trainer:
         def __init__(self, **_kwargs):
-            self.discarded_groups = (
+            self.discarded_groups = tuple(
                 DiscardedGroupRecord(
                     task_index=0,
                     task_id=task.task_id,
                     environment_seed=task.environment_seed,
                     initial_state_sha256=task.initial_state_sha256,
-                    reason="unknown_replay_reward",
-                    message="typed evaluator returned infra_error",
-                ),
+                    reason="base_sampling_error",
+                    message=f"invalid response on attempt {attempt + 1}",
+                    group_attempt_index=attempt,
+                )
+                for attempt in range(3)
             )
+
+        def fit(self, _tasks):
+            raise GroupAttemptBudgetExhausted(task, 3)
+
+    monkeypatch.setattr(
+        "capx.rl.capsule.server_factory.PersistentProcessReplayBackend",
+        lambda environment_factory: SimpleNamespace(environment_factory=environment_factory),
+    )
+    monkeypatch.setattr("capx.rl.capsule.server_factory.CleanReplayEvaluator", _Evaluator)
+    monkeypatch.setattr(
+        "capx.rl.capsule.server_factory.CandidateCleanReplayAdapter",
+        lambda evaluator: SimpleNamespace(evaluator=evaluator),
+    )
+    monkeypatch.setattr("capx.rl.capsule.server_factory.CapsuleCritiqueRayTrainer", _Trainer)
+
+    runtime = CapsuleServerRuntime(
+        config,
+        worker_starter=lambda _config: _Workers(),
+        task_loader=lambda _config: (task,),
+    )
+    with pytest.raises(ServerFactoryError, match="exhausted.*3 attempts"):
+        runtime.fit()
+
+    audit_paths = list((tmp_path / "outputs" / "discarded_groups").glob("*.json"))
+    assert len(audit_paths) == 1
+    audit_path = audit_paths[0]
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert len(audit["discarded_groups"]) == 3
+    assert [
+        record["group_attempt_index"] for record in audit["discarded_groups"]
+    ] == [0, 1, 2]
+    assert {record["reason"] for record in audit["discarded_groups"]} == {
+        "base_sampling_error"
+    }
+    assert events == ["evaluator:close", "workers:close"]
+
+    def forbidden_worker_starter(_config):
+        raise AssertionError("an existing run audit must be rejected before workers start")
+
+    retry = CapsuleServerRuntime(
+        config,
+        worker_starter=forbidden_worker_starter,
+        task_loader=lambda _config: (task,),
+    )
+    with pytest.raises(FileExistsError, match="discard audit already exists"):
+        retry.fit()
+
+
+def test_server_runtime_refuses_incomplete_result_count_before_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dataset = tmp_path / "tasks.jsonl"
+    dataset.write_text(json.dumps(_task_record()) + "\n", encoding="utf-8")
+    config = _config(tmp_path, dataset)
+    task = load_task_instances(config)[0]
+    events: list[str] = []
+
+    class _Workers:
+        actor_rollout_wg = SimpleNamespace()
+        ref_policy_wg = SimpleNamespace()
+        tokenizer = _Tokenizer()
+        data_proto_factory = _DataProto
+        total_epochs = 1
+
+        def optimizer_step(self):
+            return 0
+
+        def verl_provenance(self):
+            return {
+                "source_path": str((tmp_path / "verl").resolve()),
+                "expected_sha": "e" * 40,
+                "actual_sha": "e" * 40,
+                "clean": True,
+                "worker_count": 1,
+                "worker_ranks": [0],
+                "worker_module_paths": ["/pinned/verl/__init__.py"],
+            }
+
+        def save_checkpoint(self, _path, _step):
+            raise AssertionError("incomplete training must not write a checkpoint")
+
+        def close(self):
+            events.append("workers:close")
+
+    class _Evaluator:
+        def __init__(self, _backend):
+            pass
+
+        def close(self):
+            events.append("evaluator:close")
+
+    class _Trainer:
+        discarded_groups = ()
+
+        def __init__(self, **_kwargs):
+            pass
 
         def fit(self, _tasks):
             return ()
@@ -917,24 +1018,7 @@ def test_server_runtime_persists_full_discard_audit_and_refuses_empty_run(
         worker_starter=lambda _config: _Workers(),
         task_loader=lambda _config: (task,),
     )
-    with pytest.raises(ServerFactoryError, match="all scheduled groups were discarded"):
+    with pytest.raises(ServerFactoryError, match="completed 0 of 1 scheduled groups"):
         runtime.fit()
 
-    audit_paths = list((tmp_path / "outputs" / "discarded_groups").glob("*.json"))
-    assert len(audit_paths) == 1
-    audit_path = audit_paths[0]
-    audit = json.loads(audit_path.read_text(encoding="utf-8"))
-    assert audit["discarded_groups"][0]["reason"] == "unknown_replay_reward"
-    assert audit["discarded_groups"][0]["message"].endswith("infra_error")
     assert events == ["evaluator:close", "workers:close"]
-
-    def forbidden_worker_starter(_config):
-        raise AssertionError("an existing run audit must be rejected before workers start")
-
-    retry = CapsuleServerRuntime(
-        config,
-        worker_starter=forbidden_worker_starter,
-        task_loader=lambda _config: (task,),
-    )
-    with pytest.raises(FileExistsError, match="discard audit already exists"):
-        retry.fit()

@@ -400,6 +400,11 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
             "Program HTTP service exposes actor identity only; VeRL owns generation",
         ),
         ("capsule.group_size", 8, "Capsule-Critique uses one eight-member group"),
+        (
+            "capsule.max_group_attempts",
+            3,
+            "each scheduled seed permits exactly three group collection attempts",
+        ),
         ("capsule.base_samples_before_repair", 7, "repair triggers only after seven failures"),
         ("capsule.p0_count", 2, "repair ranks exactly two P0 programs"),
         ("capsule.repair_trajectories_per_p0", 2, "each P0 receives two trajectories"),
