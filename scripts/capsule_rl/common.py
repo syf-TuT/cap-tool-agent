@@ -45,6 +45,7 @@ from capx.rl.capsule.schema import (
     RepairTraceV1,
     ReplayOutcome,
     TaskInstanceV1,
+    source_sha256,
 )
 from capx.rl.capsule.stable_io import (
     StablePathError,
@@ -57,6 +58,7 @@ from capx.rl.capsule.task_profiles import (
     resolve_task_profile,
 )
 from capx.rl.capsule.telemetry import summarize_replay_results
+from capx.utils.program_source import normalize_program_source
 
 SCHEMA_VERSION = 1
 CANONICAL_EXECUTION_MODE = "repository_server_adapter_v1"
@@ -1651,14 +1653,16 @@ def _verify_explicit_protocol_repairs(
         raise GateArtifactError(
             "fenced Actor P0 must expose exact explicit protocol repair units"
         )
-    if (
-        p0_result.outcome is not ReplayOutcome.PROGRAM_ERROR
-        or p0_result.error_type != "SyntaxError"
-        or p0_result.binary_reward != 0.0
+    diagnostics = p0_result.diagnostics
+    expected_executed_source = normalize_program_source(trace.base_source)
+    if diagnostics.get("source_normalized") is not True:
+        raise GateArtifactError("fenced Actor P0 must prove source normalization")
+    if diagnostics.get("raw_source_sha256") != source_sha256(trace.base_source):
+        raise GateArtifactError("fenced Actor P0 raw source hash is invalid")
+    if diagnostics.get("executed_source_sha256") != source_sha256(
+        expected_executed_source
     ):
-        raise GateArtifactError(
-            "fenced Actor P0 must preserve its SyntaxError and zero binary reward"
-        )
+        raise GateArtifactError("fenced Actor P0 executed source hash is invalid")
 
     required_targets = [f"base:{unit_id}" for unit_id in expected_protocol_ids]
     protocol_edit_turns: list[int] = []

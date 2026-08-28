@@ -27,6 +27,7 @@ from capx.rl.capsule.schema import (
     ReplayOutcome,
     TaskInstanceV1,
 )
+from capx.utils.program_source import normalize_program_source
 from scripts.capsule_rl import (
     adapter_reload_smoke,
     analyze_artifacts,
@@ -3797,6 +3798,7 @@ def _collector_payload_with_fenced_p0(
     for index in range(7):
         is_fenced = index == 0
         source = fenced_source if is_fenced else f"collector_failed_{index} = True\n"
+        executed_source = normalize_program_source(source)
         selected_results.append(
             ProgramReplayResultV1(
                 task_id="cube-stack-5",
@@ -3804,25 +3806,26 @@ def _collector_payload_with_fenced_p0(
                 program_sample_id=f"collector-base-{index}",
                 source=source,
                 initial_state_sha256="a" * 64,
-                outcome=(
-                    ReplayOutcome.PROGRAM_ERROR if is_fenced else ReplayOutcome.TASK_FAILURE
-                ),
+                outcome=ReplayOutcome.TASK_FAILURE,
                 raw_reward=0.25,
                 binary_reward=0.0,
                 task_completed=False,
-                error_type="SyntaxError" if is_fenced else None,
-                error_message="invalid syntax (<actor>, line 1)" if is_fenced else None,
+                error_type=None,
+                error_message=None,
                 diagnostics={
+                    "raw_source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                    "executed_source_sha256": hashlib.sha256(
+                        executed_source.encode("utf-8")
+                    ).hexdigest(),
+                    "source_normalized": executed_source != source,
                     "evaluator_attempt_history": [
                         {
                             "attempt": 1,
-                            "outcome": "program_error" if is_fenced else "task_failure",
+                            "outcome": "task_failure",
                             "worker_replaced": False,
                             "retry_scheduled": False,
-                            "error_type": "SyntaxError" if is_fenced else None,
-                            "error_message": (
-                                "invalid syntax (<actor>, line 1)" if is_fenced else None
-                            ),
+                            "error_type": None,
+                            "error_message": None,
                         }
                     ],
                     "reset_info": {
@@ -3912,6 +3915,44 @@ def test_collector_verifier_accepts_explicit_fence_and_suffix_deletions(
     )
 
     common.verify_collector_gate_artifact(payload)
+
+
+def _set_fenced_p0_diagnostic(
+    payload: dict[str, object], field_name: str, value: object
+) -> None:
+    base_result = payload["base_results"][0]
+    selected_result = payload["selected_batch_results"][0]
+    replay_result = payload["replay_events"][0]["result"]
+    for result in (base_result, selected_result, replay_result):
+        diagnostics = result["diagnostics"]
+        if value is None:
+            diagnostics.pop(field_name, None)
+        else:
+            diagnostics[field_name] = value
+
+
+def test_collector_verifier_rejects_missing_fenced_source_normalization(
+    tmp_path: Path,
+) -> None:
+    payload = _collector_payload_with_fenced_p0(
+        tmp_path, explicit_protocol_edits=True
+    )
+    _set_fenced_p0_diagnostic(payload, "source_normalized", None)
+
+    with pytest.raises(common.GateArtifactError, match="prove source normalization"):
+        common.verify_collector_gate_artifact(payload)
+
+
+def test_collector_verifier_rejects_mismatched_fenced_executed_source_hash(
+    tmp_path: Path,
+) -> None:
+    payload = _collector_payload_with_fenced_p0(
+        tmp_path, explicit_protocol_edits=True
+    )
+    _set_fenced_p0_diagnostic(payload, "executed_source_sha256", "f" * 64)
+
+    with pytest.raises(common.GateArtifactError, match="executed source hash is invalid"):
+        common.verify_collector_gate_artifact(payload)
 
 
 def _write_test_lora_adapter(
