@@ -28,6 +28,7 @@ from capx.rl.capsule.actor_identity import (
     verify_actor_identity_payload,
 )
 from capx.rl.capsule.controller import FrozenControllerConfig
+from capx.rl.capsule.program_protocol import program_response_token_limit, validate_program_prompt
 from capx.rl.capsule.schema import (
     ProgramReplayResultV1,
     ReplayOutcome,
@@ -1050,6 +1051,7 @@ class ConcreteGateRuntime:
         return matches[0]
 
     def _open_collection_session(self, task: TaskInstanceV1) -> _CollectionSession:
+        validate_program_prompt(self.config, task.prompt)
         from capx.rl.capsule.controller import (
             ControllerRepairCollector,
             OpenAICompatibleControllerTransport,
@@ -1091,7 +1093,7 @@ class ConcreteGateRuntime:
                 tokenizer=workers.tokenizer,
                 data_proto_factory=workers.data_proto_factory,
                 prompt_token_limit=int(capsule["revision_input_max_tokens"]),
-                response_token_limit=int(capsule["revision_response_max_tokens"]),
+                response_token_limit=program_response_token_limit(self.config),
                 system_prompt=system_prompt,
             )
             controller_config = _controller_runtime_config(self.config)
@@ -1113,7 +1115,7 @@ class ConcreteGateRuntime:
                 tokenizer=workers.tokenizer,
                 data_proto_factory=workers.data_proto_factory,
                 prompt_token_limit=int(capsule["revision_input_max_tokens"]),
-                response_token_limit=int(capsule["revision_response_max_tokens"]),
+                response_token_limit=program_response_token_limit(self.config),
                 system_prompt=system_prompt,
             )
             return _CollectionSession(
@@ -1601,7 +1603,7 @@ class ConcreteGateRuntime:
                         tokenizer=workers.tokenizer,
                         data_proto_factory=workers.data_proto_factory,
                         prompt_token_limit=int(capsule["revision_input_max_tokens"]),
-                        response_token_limit=int(capsule["revision_response_max_tokens"]),
+                        response_token_limit=program_response_token_limit(self.config),
                         system_prompt=system_prompt,
                     )
                     sink = MemoryArtifactSink()

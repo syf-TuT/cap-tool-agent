@@ -13,6 +13,8 @@ from uuid import uuid4
 
 import yaml
 
+from capx.rl.capsule.program_protocol import validate_program_prompt
+
 from .common import (
     ConfigValidationError,
     add_validation_arguments,
@@ -91,6 +93,8 @@ def prepare(
     # required to exist yet. Schema/service invariants and the source JSONL are still validated.
     config = load_and_validate_server_config(config_file, check_runtime_paths=False)
     records = _expand_records(_load_source_records(source_file), seeds)
+    for record in records:
+        validate_program_prompt(config, record["prompt"])
     dataset_path = destination / "capsule_rl.dataset.jsonl"
     resolved_config_path = destination / "capsule_rl.resolved.yaml"
     if destination.exists():

@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .config_validation import validate_capsule_training_config
+from .program_protocol import ProgramProtocolError, program_sampling
 from .task_profiles import collect_task_profile_errors
 
 # Official VeRL v0.6.1 tag.
@@ -386,6 +387,10 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
     if not isinstance(config, Mapping):
         raise CapsuleConfigError("Capsule config must be a mapping")
     errors: list[str] = []
+    try:
+        program_sampling(config)
+    except ProgramProtocolError as error:
+        errors.append(str(error))
     exact_values = (
         ("schema_version", 1, "schema v1 is the only supported artifact contract"),
         ("runtime.verl_pinned_sha", PINNED_VERL_SHA, "the adapter targets one pinned VeRL"),

@@ -58,6 +58,11 @@ from .lora_contract import (
     QWEN25_CODER_7B_LAYER_COUNT,
     validate_qwen_all_linear_coverage,
 )
+from .program_protocol import (
+    program_response_token_limit,
+    program_sampling,
+    validate_program_prompt,
+)
 from .schema import TaskInstanceV1
 from .trainer import (
     AtomicJsonArtifactSink,
@@ -324,6 +329,7 @@ def load_task_instances(
                 "seed-resolution gate before training"
             )
         task = TaskInstanceV1.from_dict(data)
+        validate_program_prompt(config, task.prompt)
         if task.environment_seed < 0:
             raise ServerFactoryError(
                 f"dataset row {index} environment_seed must be non-negative"
@@ -1320,9 +1326,24 @@ def _load_resolved_verl_config(config: Mapping[str, Any], project_root: Path) ->
         verl_config.actor_rollout_ref.rollout.prompt_length = int(
             capsule["revision_input_max_tokens"]
         )
-        verl_config.actor_rollout_ref.rollout.response_length = int(
-            capsule["revision_response_max_tokens"]
-        )
+        verl_config.actor_rollout_ref.rollout.response_length = program_response_token_limit(config)
+        sampling = program_sampling(config)
+        if sampling:
+            rollout = verl_config.actor_rollout_ref.rollout
+            for field in ("temperature", "top_p", "top_k", "repetition_penalty"):
+                rollout[field] = sampling[field]
+            # Encoding pads complete prompts and responses to these sizes. Keep the model,
+            # inference batching and log-prob budgets consistent with that actual capacity.
+            capacity = rollout.prompt_length + rollout.response_length
+            for field in ("max_model_len", "max_num_batched_tokens", "log_prob_max_token_len_per_gpu"):
+                rollout[field] = max(int(rollout.get(field) or 0), capacity)
+            for section, field in (
+                (verl_config.actor_rollout_ref.actor, "ppo_max_token_len_per_gpu"),
+                (verl_config.actor_rollout_ref.ref, "log_prob_max_token_len_per_gpu"),
+            ):
+                section[field] = max(int(section.get(field) or 0), capacity)
+            verl_config.data.max_prompt_length = rollout.prompt_length
+            verl_config.data.max_response_length = rollout.response_length
         verl_config.actor_rollout_ref.actor.use_kl_loss = True
         verl_config.actor_rollout_ref.actor.kl_loss_coef = float(capsule_actor["kl_loss_coef"])
         verl_config.actor_rollout_ref.actor.ppo_epochs = 1
@@ -1654,7 +1675,7 @@ class CapsuleServerRuntime:
                 tokenizer=workers.tokenizer,
                 data_proto_factory=workers.data_proto_factory,
                 prompt_token_limit=int(capsule["revision_input_max_tokens"]),
-                response_token_limit=int(capsule["revision_response_max_tokens"]),
+                response_token_limit=program_response_token_limit(self.config),
                 system_prompt=system_prompt,
             )
             controller_config = FrozenControllerConfig(
@@ -1685,7 +1706,7 @@ class CapsuleServerRuntime:
                 tokenizer=workers.tokenizer,
                 data_proto_factory=workers.data_proto_factory,
                 prompt_token_limit=int(capsule["revision_input_max_tokens"]),
-                response_token_limit=int(capsule["revision_response_max_tokens"]),
+                response_token_limit=program_response_token_limit(self.config),
                 system_prompt=system_prompt,
             )
             trainer = CapsuleCritiqueRayTrainer(

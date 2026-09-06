@@ -387,10 +387,9 @@ def test_cube_lift_repository_template_preserves_capsule_contract() -> None:
     ]
 
     system_prompt = lift_config["program_service"]["system_prompt"]
-    assert "one complete independently executable Python robot program" in system_prompt
-    assert "without Markdown code fences" in system_prompt
-    assert "high-level robot functions documented in the task prompt" in system_prompt
-    assert "WXYZ" in system_prompt
+    assert system_prompt == (
+        "You are a helpful assistant that generates Python code to directly solve the task."
+    )
 
 
 def test_cube_lift_clean_replay_environment_matches_selected_profile() -> None:

@@ -14,7 +14,7 @@ runtime:
   # Official VeRL v0.6.1 tag.
   verl_pinned_sha: d62da4950573d7a4b7ef2362337952e7ab59e78d
   # Fully composed pinned VeRL PPO config containing hardware/batch/rollout settings. The
-  # project factory overrides only the Capsule invariants and model/output paths.
+  # project factory applies Capsule invariants, the declared Program protocol, and runtime paths.
   verl_resolved_config_path: /path/to/resolved_verl_ppo.yaml
   dataset_path: /path/to/cube_lift_capsule_rl_dataset.jsonl
   program_model_path: /path/to/cube_lift_program_actor_checkpoint
@@ -41,10 +41,17 @@ program_service:
   model: /path/to/cube_lift_program_actor_checkpoint
   api_key_env: CAPX_PROGRAM_API_KEY
   system_prompt: >-
-    Generate exactly one complete independently executable Python robot program. Output only
-    executable Python code without Markdown code fences. Use only the high-level robot functions
-    documented in the task prompt; never access a raw environment object or issue low-level joint
-    commands. All pose quaternions use WXYZ order.
+    You are a helpful assistant that generates Python code to directly solve the task.
+  # Audited privileged baseline messages (2417-character user prompt, five documented APIs).
+  system_prompt_sha256: b7dadbc1bd88bf7b26a0b11ed1431aea6ada50e5b7f9dc2e663a813bb887e8bc
+  prompt_sha256: 3c1b29055ddaf99a5729fc9757cfa28590d1f9a537b0c513af3d80c32ceaf460
+  # Authoritative Program decoder values override historical resolved VeRL defaults.
+  sampling:
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    repetition_penalty: 1.1
+    max_tokens: 4096
 
 controller_service:
   endpoint: https://coding.dashscope.aliyuncs.com/v1
