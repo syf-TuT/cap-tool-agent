@@ -65,7 +65,10 @@ def run(config_path: Path, output_dir: Path, seeds: tuple[int, ...], samples: in
                     "seed": seed, "sample": index, "outcome": result.outcome.value,
                     "reward": result.binary_reward, "error": result.error_message,
                 }), flush=True)
-                atomic_write_json(output_dir / "progress.json", {"groups": groups})
+                atomic_write_json(
+                    output_dir / f"sample_{seed:03d}_{index:03d}.json",
+                    {"seed": seed, "sample": index, "result": result.to_dict()},
+                )
             group["outcome_counts"] = dict(Counter(r["outcome"] for r in group["results"]))
             group["successes"] = group["outcome_counts"].get("success", 0)
         after = session.workers.optimizer_step()
