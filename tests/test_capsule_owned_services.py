@@ -375,7 +375,7 @@ def test_single_a800_profile_has_every_pre_ray_worker_access_surface() -> None:
     assert root["actor"]["policy_loss"]["capsule_gamma"] == pytest.approx(0.1)
     assert root["actor"]["ppo_micro_batch_size"] is None
     assert root["rollout"]["_target_"] == "verl.workers.config.RolloutConfig"
-    assert root["rollout"]["temperature"] == pytest.approx(1.0)
+    assert root["rollout"]["temperature"] == pytest.approx(0.7)
     assert root["rollout"]["log_prob_micro_batch_size"] is None
     assert root["ref"]["log_prob_micro_batch_size"] is None
     assert root["ref"]["fsdp_config"]["_target_"] == (

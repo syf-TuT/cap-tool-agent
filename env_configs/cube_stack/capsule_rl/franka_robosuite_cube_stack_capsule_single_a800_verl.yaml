@@ -138,7 +138,7 @@ actor_rollout_ref:
     _target_: verl.workers.config.RolloutConfig
     name: vllm
     mode: sync
-    temperature: 1.0
+    temperature: 0.7
     top_k: -1
     top_p: 1.0
     prompt_length: 8192

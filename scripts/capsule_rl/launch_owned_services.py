@@ -455,7 +455,7 @@ def load_single_a800_resolved_profile(path: str | Path) -> dict[str, Any]:
         "actor_rollout_ref.actor.policy_loss.capsule_gamma": 0.1,
         "actor_rollout_ref.actor.ppo_micro_batch_size": None,
         "actor_rollout_ref.rollout._target_": "verl.workers.config.RolloutConfig",
-        "actor_rollout_ref.rollout.temperature": 1.0,
+        "actor_rollout_ref.rollout.temperature": 0.7,
         "actor_rollout_ref.rollout.log_prob_micro_batch_size": None,
         "actor_rollout_ref.ref.log_prob_micro_batch_size": None,
         "actor_rollout_ref.ref.fsdp_config._target_": (
