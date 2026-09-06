@@ -48,6 +48,7 @@ def run(config_path: Path, output_dir: Path, seeds: tuple[int, ...], samples: in
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "response_token_limit": session.generator.response_token_limit,
             "effective_rollout": OmegaConf.to_container(resolved.actor_rollout_ref.rollout),
+            "worker_sampling": session.workers.program_sampling_evidence,
             "optimizer_step_before": before,
             "verl_provenance": session.workers.verl_provenance(),
         })

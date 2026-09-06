@@ -660,6 +660,7 @@ class VeRLWorkerSession:
     verl_pinned_sha: str | None = None
     initial_verl_provenance: dict[str, Any] | None = None
     final_verl_provenance: dict[str, Any] | None = None
+    program_sampling_evidence: list[dict[str, Any]] | None = None
     _worker_close_calls: int = 0
     _ray_shutdown_calls: int = 0
     _ray_shutdown_complete: bool = False
@@ -1330,8 +1331,11 @@ def _load_resolved_verl_config(config: Mapping[str, Any], project_root: Path) ->
         sampling = program_sampling(config)
         if sampling:
             rollout = verl_config.actor_rollout_ref.rollout
-            for field in ("temperature", "top_p", "top_k", "repetition_penalty"):
+            for field in ("temperature", "top_p", "top_k"):
                 rollout[field] = sampling[field]
+            # VeRL v0.6.1's typed RolloutConfig omits repetition_penalty. Install the
+            # full SamplingParams on each actual rollout worker after initialization.
+            rollout.pop("repetition_penalty", None)
             # Encoding pads complete prompts and responses to these sizes. Keep the model,
             # inference batching and log-prob budgets consistent with that actual capacity.
             capacity = rollout.prompt_length + rollout.response_length
@@ -1424,6 +1428,18 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
 
     try:
         class CapsuleActorRolloutRefWorker(ActorRolloutRefWorker):
+            @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+            def configure_capsule_program_sampling(self, sampling: dict[str, Any]) -> dict[str, Any]:
+                from vllm import SamplingParams
+
+                if not hasattr(self.rollout, "sampling_params"):
+                    raise RuntimeError("Program protocol requires the synchronous vLLM rollout")
+                params = SamplingParams(n=1, logprobs=0, detokenize=False, **sampling)
+                self.rollout.sampling_params = params
+                actual = {key: getattr(params, key) for key in sampling}
+                print(f"Capsule Program sampling parameters: {actual}", flush=True)
+                return actual
+
             @register(dispatch_mode=Dispatch.ONE_TO_ALL)
             def get_capsule_verl_provenance(self) -> dict[str, Any]:
                 import verl
@@ -1539,6 +1555,12 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
         actor_rollout_wg, ref_policy_wg = _initialize_verl_worker_groups(
             groups, topology
         )
+        sampling = program_sampling(config)
+        sampling_evidence = None
+        if sampling:
+            sampling_evidence = actor_rollout_wg.configure_capsule_program_sampling(sampling)
+            if not sampling_evidence or any(record != sampling for record in sampling_evidence):
+                raise ServerFactoryError("rollout workers did not retain the Program sampling protocol")
         tokenizer = hf_tokenizer(
             verl_config.actor_rollout_ref.model.path,
             trust_remote_code=bool(verl_config.data.get("trust_remote_code", False)),
@@ -1550,6 +1572,7 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
             data_proto_factory=DataProto.from_dict,
             ray_module=ray,
             owns_ray=owns_ray,
+            program_sampling_evidence=sampling_evidence,
             total_epochs=total_epochs,
             total_training_steps=total_training_steps,
             rollout_mode=str(verl_config.actor_rollout_ref.rollout.mode),
