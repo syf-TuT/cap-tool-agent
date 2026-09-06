@@ -86,56 +86,87 @@ LIFT_CONFIG_TEMPLATE = (
 LIFT_SOURCE_TASKS = LIFT_CONFIG_TEMPLATE.with_name(
     "cube_lift_capsule_source_tasks.jsonl"
 )
-CUBE_LIFT_SOURCE_PROMPT_LINES = (
+CUBE_LIFT_OLD_COMPACT_SOURCE_PROMPT = "\n".join(
     (
-        "Your task is to pick up the red cube and lift it. "
-        "Only the five high-level functions below are available:"
-    ),
-    (
-        "- `get_object_pose(object_name, return_bbox_extent=False)` returns the object's XYZ "
-        "position, WXYZ quaternion, and optional bounding-box extent."
-    ),
-    (
-        "- `sample_grasp_pose(object_name)` returns a grasp XYZ position and WXYZ quaternion."
-    ),
-    (
-        "- `goto_pose(position, quaternion_wxyz, z_approach=0.0)` moves the gripper to a pose "
-        "and can approach along its local Z axis."
-    ),
-    "- `open_gripper()` opens the gripper.",
-    "- `close_gripper()` closes the gripper.",
-    (
-        "All quaternion values use WXYZ order. Do not access a raw environment object. "
-        "Do not use low-level joint control. Return one complete executable Python program "
-        "as code only, without Markdown code fences."
-    ),
+        (
+            "Your task is to pick up the red cube and lift it. "
+            "Only the five high-level functions below are available:"
+        ),
+        (
+            "- `get_object_pose(object_name, return_bbox_extent=False)` returns the object's "
+            "XYZ position, WXYZ quaternion, and optional bounding-box extent."
+        ),
+        (
+            "- `sample_grasp_pose(object_name)` returns a grasp XYZ position and WXYZ "
+            "quaternion."
+        ),
+        (
+            "- `goto_pose(position, quaternion_wxyz, z_approach=0.0)` moves the gripper to a "
+            "pose and can approach along its local Z axis."
+        ),
+        "- `open_gripper()` opens the gripper.",
+        "- `close_gripper()` closes the gripper.",
+        (
+            "All quaternion values use WXYZ order. Do not access a raw environment object. "
+            "Do not use low-level joint control. Return one complete executable Python program "
+            "as code only, without Markdown code fences."
+        ),
+    )
+)
+CUBE_LIFT_REQUIRED_SOURCE_SNIPPETS = (
+    "You are controlling a Franka Emika robot with API described below.",
+    "Goal: pick up the red cube and lift it.",
+    "ONLY write the executable Python code and do not write it in code fences.",
+    "The functions (APIs) below are already imported to the environment.",
+    "APIs:",
+    "The quaternion from get_object_pose may be unreliable",
+    "position: (3,) XYZ in meters.",
+    "quaternion_wxyz: (4,) WXYZ unit quaternion.",
+    "bbox_extent: (3,) object extent in meters",
+    "If return_bbox_extent is False, returns None.",
+    "There is no need to call a second goto_pose with the same position",
 )
 CUBE_LIFT_SOURCE_CALLABLE_SIGNATURES = (
-    "get_object_pose(object_name, return_bbox_extent=False)",
-    "sample_grasp_pose(object_name)",
-    "goto_pose(position, quaternion_wxyz, z_approach=0.0)",
-    "open_gripper()",
-    "close_gripper()",
+    (
+        "get_object_pose(object_name: str, return_bbox_extent: bool = False) -> "
+        "tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray | None]"
+    ),
+    "sample_grasp_pose(object_name: str) -> tuple[numpy.ndarray, numpy.ndarray]",
+    (
+        "goto_pose(position: numpy.ndarray, quaternion_wxyz: numpy.ndarray, "
+        "z_approach: float = 0.0) -> None"
+    ),
+    "open_gripper() -> None",
+    "close_gripper() -> None",
 )
 
 
 def _assert_cube_lift_source_prompt_contract(prompt: str) -> None:
-    assert tuple(prompt.splitlines()) == CUBE_LIFT_SOURCE_PROMPT_LINES
+    assert prompt != CUBE_LIFT_OLD_COMPACT_SOURCE_PROMPT
+    assert prompt.startswith("\nYou are controlling a Franka Emika robot")
+    assert "\nAPIs:\n\nget_object_pose" in prompt
 
     callable_signatures = tuple(
-        re.findall(r"`([a-z][a-z0-9_]*\([^`\n]*\))`", prompt)
+        re.findall(
+            r"^([a-z][a-z0-9_]*\([^`\n]*\)(?: -> [^\n]+)?)$",
+            prompt,
+            flags=re.MULTILINE,
+        )
     )
     assert callable_signatures == CUBE_LIFT_SOURCE_CALLABLE_SIGNATURES
-    assert "pick up the red cube and lift it" in prompt
-    assert "Only the five high-level functions below are available" in prompt
-    assert "WXYZ" in prompt
-    assert "one complete executable Python program" in prompt
-    assert "as code only" in prompt
-    assert "without Markdown code fences" in prompt
-    assert "Do not access a raw environment object" in prompt
-    assert "Do not use low-level joint control" in prompt
-    for unavailable_token in ("home_pose", "pick_and_lift"):
+    for snippet in CUBE_LIFT_REQUIRED_SOURCE_SNIPPETS:
+        assert snippet in prompt
+    assert "Only the five high-level functions below are available" not in prompt
+    assert "optional bounding-box extent" not in prompt
+    for unavailable_token in ("get_observation", "pick_and_lift", "quaternion_xyzw"):
         assert re.search(rf"\b{unavailable_token}\b", prompt) is None
+    for success_hint in (
+        "do not release",
+        "don't release",
+        "keep the gripper closed",
+        "keep gripper closed",
+    ):
+        assert success_hint not in prompt.lower()
     for unavailable_function in ("grasp", "lift"):
         assert re.search(rf"\b{unavailable_function}\s*\(", prompt) is None
     assert re.search(r"\benv\s*\.", prompt) is None
@@ -343,11 +374,16 @@ def test_cube_lift_source_task_exposes_only_existing_high_level_functions() -> N
     _assert_cube_lift_source_prompt_contract(prompt)
 
 
+def test_cube_lift_source_prompt_contract_rejects_old_compact_prompt() -> None:
+    with pytest.raises(AssertionError):
+        _assert_cube_lift_source_prompt_contract(CUBE_LIFT_OLD_COMPACT_SOURCE_PROMPT)
+
+
 @pytest.mark.parametrize(
     "extra_declaration",
     (
         "- `goto_pose(position, quaternion_xyzw, z_approach=0.0)` uses XYZW order.",
-        "- `home_pose` moves the robot to its home configuration.",
+        "- `get_observation()` returns the raw low-level environment observation.",
     ),
 )
 def test_cube_lift_source_prompt_contract_rejects_adversarial_api_drift(
