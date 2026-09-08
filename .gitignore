@@ -21,6 +21,8 @@ env/
 .codex-downloads/
 .codex-results/
 .codex-upload/
+# Local Codex run artifacts and handoff archives.
+/.codex_*
 /.codex_runs/
 /codecap-x.codex-model-cache*
 /.codex_sync_*.bundle
@@ -79,6 +81,7 @@ core.*
 wandb/
 .webui_secret_key
 .worktrees/
+/tmp/
 
 # Local third-party dependency checkouts. Keep tracked vendored snippets above,
 # but do not treat initialized external repositories as ordinary source files.

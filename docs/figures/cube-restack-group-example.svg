@@ -1,0 +1,217 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2600" height="1770" viewBox="0 0 2600 1770" role="img" aria-labelledby="title desc">
+<title id="title">Capsule: source-local groups in one Cube Restack execution</title>
+<desc id="desc">A pastel architecture example showing task and API inputs, initial code generation, a source overview, five ordered groups with exact supplied code excerpts, and source-bound feedback. All API calls return success and all five steps remain incomplete. Only steps one through five of a 22-step execution are shown.</desc>
+<defs>
+  <filter id="shadow" x="-10%" y="-15%" width="120%" height="140%"><feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#233449" flood-opacity="0.07"/></filter>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 1L9 5L0 9Z" fill="#8492A5"/></marker>
+</defs>
+<g font-family="Arial, Helvetica, sans-serif">
+<rect x="0" y="0" width="2600" height="1770" rx="0" fill="#FFFFFF" stroke="none" />
+<text x="60" y="65" font-size="42" fill="#101F35" font-weight="700" >Capsule on Cube Restack</text>
+<text x="60" y="102" font-size="25" fill="#53627A" font-weight="400" >From a generated program to source-local execution groups</text>
+<rect x="2110" y="49" width="430" height="30" rx="15" fill="#F2F5F9" stroke="none" />
+<text x="2325" y="70" font-size="20" fill="#53627A" font-weight="600" text-anchor="middle">INITIAL PROGRAM · STEPS 1–5 / 22</text>
+<rect x="60" y="143" width="640" height="61" rx="21" fill="#FBE5F1" stroke="none" filter="url(#shadow)"/>
+<text x="380" y="183" font-size="28" fill="#101F35" font-weight="700" text-anchor="middle">TASK DESCRIPTION</text>
+<rect x="60" y="220" width="640" height="132" rx="18" fill="#FFFFFF" stroke="#DB3A85" stroke-width="3"/>
+<text x="87" y="256" font-size="25" fill="#101F35" font-weight="400" >Place the red cube on top of the green cube,</text>
+<text x="87" y="291" font-size="25" fill="#101F35" font-weight="400" >then open the gripper.</text>
+<text x="87" y="331" font-size="20" fill="#53627A" font-weight="400" >Cube Restack · one recorded execution</text>
+<rect x="740" y="143" width="975" height="61" rx="21" fill="#E8F8F5" stroke="none" filter="url(#shadow)"/>
+<text x="1227.5" y="183" font-size="28" fill="#101F35" font-weight="700" text-anchor="middle">API DOCUMENTATION</text>
+<text x="765" y="245" font-family="Consolas, monospace" font-size="22" fill="#18314D" xml:space="preserve"><tspan fill="#286C95">home_pose</tspan><tspan>()   </tspan><tspan fill="#286C95">get_object_pose</tspan><tspan>(...)</tspan></text>
+<text x="765" y="278" font-family="Consolas, monospace" font-size="22" fill="#18314D" xml:space="preserve"><tspan fill="#286C95">sample_grasp_pose</tspan><tspan>(</tspan><tspan fill="#9B4470">&quot;red cube&quot;</tspan><tspan>)</tspan></text>
+<text x="765" y="311" font-family="Consolas, monospace" font-size="22" fill="#18314D" xml:space="preserve"><tspan fill="#286C95">goto_pose</tspan><tspan>(...)   </tspan><tspan fill="#286C95">open_gripper</tspan><tspan>()   </tspan><tspan fill="#286C95">close_gripper</tspan><tspan>()</tspan></text>
+<rect x="1825" y="139" width="715" height="213" rx="28" fill="#FFFFFF" stroke="#4F95F3" stroke-width="3.5" stroke-dasharray="15 12"/>
+<rect x="1854" y="159" width="657" height="61" rx="21" fill="#FFF0F5" stroke="none" filter="url(#shadow)"/>
+<text x="2182.5" y="199" font-size="30" fill="#101F35" font-weight="700" text-anchor="middle">Initial Code Generation</text>
+<rect x="1885" y="247" width="99" height="63" rx="18" fill="#F5F7FC" stroke="#CBD6E4" stroke-width="1.5"/>
+<text x="1935" y="288" font-size="24" fill="#101F35" font-weight="700" text-anchor="middle">LLM</text>
+<text x="2010" y="266" font-size="24" fill="#101F35" font-weight="500" >Task description + available APIs</text>
+<text x="2010" y="301" font-size="23" fill="#53627A" font-weight="400" >One complete Python program</text>
+<path d="M1718 259H1806" fill="none" stroke="#8492A5" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M700 175H722V123H1787V205H1806" fill="none" stroke="#B0BCCB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M2184 354V386H250V418" fill="none" stroke="#8492A5" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="1115" y="379" font-size="19" fill="#53627A" font-weight="400" text-anchor="middle">generated source</text>
+<rect x="60" y="433" width="390" height="61" rx="21" fill="#FBEAF2" stroke="none" filter="url(#shadow)"/>
+<text x="255" y="473" font-size="27" fill="#101F35" font-weight="700" text-anchor="middle">Generated Program</text>
+<text x="255" y="530" font-size="21" fill="#53627A" font-weight="400" text-anchor="middle">Original source spans</text>
+<text x="255" y="558" font-size="19" fill="#53627A" font-weight="400" text-anchor="middle">Abbreviated overview</text>
+<rect x="530" y="418" width="1270" height="1200" rx="27" fill="#FFFFFF" stroke="#AE92D7" stroke-width="3" stroke-dasharray="15 11"/>
+<rect x="552" y="433" width="1226" height="61" rx="21" fill="#F2EBFC" stroke="none" filter="url(#shadow)"/>
+<text x="1165" y="473" font-size="31" fill="#101F35" font-weight="700" text-anchor="middle">Effect-aware Code Grouping</text>
+<text x="594" y="1597" font-size="20" fill="#53627A" font-weight="400" >AST structure   ·   variable dependencies   ·   API-declared effects</text>
+<rect x="1880" y="433" width="660" height="61" rx="21" fill="#EAF7F3" stroke="none" filter="url(#shadow)"/>
+<text x="2210" y="473" font-size="29" fill="#101F35" font-weight="700" text-anchor="middle">Source-bound Feedback</text>
+<rect x="60" y="577" width="390" height="930" rx="18" fill="#FFFFFF" stroke="#D6DEEA" stroke-width="2"/>
+<rect x="68" y="583" width="374" height="139" rx="12" fill="#EDF5FF" stroke="none" />
+<rect x="68" y="583" width="6" height="139" rx="0" fill="#428DDD" stroke="none" />
+<text x="91" y="613" font-size="22" fill="#428DDD" font-weight="700" >G1</text>
+<text x="416" y="613" font-size="20" fill="#53627A" font-weight="400" text-anchor="end">L1–6</text>
+<text x="91" y="649" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">import numpy as np</text>
+<text x="91" y="676" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">home_pose()</text>
+<path d="M452 652.5C493 652.5,493 576,567 576" fill="none" stroke="#428DDD" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" />
+<path d="M560 571L569 576L560 581" fill="none" stroke="#428DDD" stroke-width="2.3"/>
+<rect x="68" y="722" width="374" height="247" rx="0" fill="#F3EEFC" stroke="none" />
+<rect x="68" y="722" width="6" height="247" rx="0" fill="#8D6CCC" stroke="none" />
+<text x="91" y="752" font-size="22" fill="#8D6CCC" font-weight="700" >G2</text>
+<text x="416" y="752" font-size="20" fill="#53627A" font-weight="400" text-anchor="end">L7–18</text>
+<text x="91" y="788" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">red_pos, ... = ...</text>
+<text x="91" y="815" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">green_pos, ... = ...</text>
+<text x="91" y="842" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">grasp_pos, ... = ...</text>
+<text x="91" y="869" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">goto_pose(...)</text>
+<text x="91" y="896" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">close_gripper()</text>
+<path d="M452 845.5C493 845.5,493 794.5,567 794.5" fill="none" stroke="#8D6CCC" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" />
+<path d="M560 789.5L569 794.5L560 799.5" fill="none" stroke="#8D6CCC" stroke-width="2.3"/>
+<rect x="68" y="969" width="374" height="163" rx="0" fill="#FFF6E8" stroke="none" />
+<rect x="68" y="969" width="6" height="163" rx="0" fill="#CC9642" stroke="none" />
+<text x="91" y="999" font-size="22" fill="#CC9642" font-weight="700" >G3</text>
+<text x="416" y="999" font-size="20" fill="#53627A" font-weight="400" text-anchor="end">L19–25</text>
+<text x="91" y="1035" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">lift_pos = ...</text>
+<text x="91" y="1062" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">lift_pos[2] += 0.15</text>
+<text x="91" y="1089" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">goto_pose(...)</text>
+<path d="M452 1050.5C493 1050.5,493 1028,567 1028" fill="none" stroke="#CC9642" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" />
+<path d="M560 1023L569 1028L560 1033" fill="none" stroke="#CC9642" stroke-width="2.3"/>
+<rect x="68" y="1132" width="374" height="194" rx="0" fill="#EAF8F4" stroke="none" />
+<rect x="68" y="1132" width="6" height="194" rx="0" fill="#4D9B8C" stroke="none" />
+<text x="91" y="1162" font-size="22" fill="#4D9B8C" font-weight="700" >G4</text>
+<text x="416" y="1162" font-size="20" fill="#53627A" font-weight="400" text-anchor="end">L26–36</text>
+<text x="91" y="1198" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">place_z = ...</text>
+<text x="91" y="1225" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">place_pos = ...</text>
+<text x="91" y="1252" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">goto_pose(...)</text>
+<text x="91" y="1279" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">open_gripper()</text>
+<path d="M452 1229C493 1229,493 1235,567 1235" fill="none" stroke="#4D9B8C" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" />
+<path d="M560 1230L569 1235L560 1240" fill="none" stroke="#4D9B8C" stroke-width="2.3"/>
+<rect x="68" y="1326" width="374" height="174" rx="12" fill="#FDEFF5" stroke="none" />
+<rect x="68" y="1326" width="6" height="174" rx="0" fill="#CC7199" stroke="none" />
+<text x="91" y="1356" font-size="22" fill="#CC7199" font-weight="700" >G5</text>
+<text x="416" y="1356" font-size="20" fill="#53627A" font-weight="400" text-anchor="end">L37–42</text>
+<text x="91" y="1392" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">lift_place = ...</text>
+<text x="91" y="1419" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">lift_place[2] += 0.2</text>
+<text x="91" y="1446" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">goto_pose(...)</text>
+<text x="91" y="1473" font-size="18.5" fill="#344862" font-weight="400" font-family="Consolas, monospace">home_pose()</text>
+<path d="M452 1413C493 1413,493 1456.5,567 1456.5" fill="none" stroke="#CC7199" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" />
+<path d="M560 1451.5L569 1456.5L560 1461.5" fill="none" stroke="#CC7199" stroke-width="2.3"/>
+<text x="78" y="1541" font-size="23" fill="#101F35" font-weight="600" >Same source. Same order.</text>
+<text x="78" y="1573" font-size="21" fill="#53627A" font-weight="400" >Grouping changes metadata.</text>
+<rect x="576" y="512" width="1178" height="128" rx="18" fill="#EDF5FF" stroke="#428DDD" stroke-width="1.6"/>
+<rect x="576" y="512" width="7" height="128" rx="3" fill="#428DDD" stroke="none" />
+<rect x="596" y="528" width="116" height="30" rx="15" fill="#FFFFFF" stroke="none" />
+<text x="654" y="549" font-size="19" fill="#428DDD" font-weight="600" text-anchor="middle">GROUP 1</text>
+<text x="727" y="551" font-size="23" fill="#101F35" font-weight="600" >Home</text>
+<text x="1730" y="551" font-size="20" fill="#53627A" font-weight="400" text-anchor="end">Original L1–6  ·  Step 1/22</text>
+<text x="602" y="590" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan fill="#7055A8">import</tspan><tspan> numpy </tspan><tspan fill="#7055A8">as</tspan><tspan> np</tspan></text>
+<text x="602" y="619" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan fill="#286C95">home_pose</tspan><tspan>()</tspan></text>
+<path d="M1756 576H1860" fill="none" stroke="#428DDD" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+<path d="M1852 571L1861 576L1852 581" fill="none" stroke="#428DDD" stroke-width="2.4"/>
+<text x="1808" y="563" font-size="17" fill="#428DDD" font-weight="500" text-anchor="middle">run G1</text>
+<rect x="1880" y="512" width="660" height="128" rx="18" fill="#FFFFFF" stroke="#D8E2EC" stroke-width="1.5"/>
+<rect x="1900" y="526" width="167" height="30" rx="15" fill="#E8F7EF" stroke="none" />
+<text x="1983.5" y="547" font-size="17" fill="#327857" font-weight="600" text-anchor="middle">API SUCCESS</text>
+<rect x="2078" y="526" width="220" height="30" rx="15" fill="#FCEEF2" stroke="none" />
+<text x="2188" y="547" font-size="17" fill="#A2546D" font-weight="600" text-anchor="middle">COMPLETION: FALSE</text>
+<text x="1900" y="588" font-size="26" fill="#101F35" font-weight="500" font-family="Consolas, monospace">0.004661  →  0.003850</text>
+<text x="1900" y="621" font-size="22" fill="#53627A" font-weight="400" >Home reached; no local task progress.</text>
+<rect x="576" y="660" width="1178" height="269" rx="18" fill="#F3EEFC" stroke="#8D6CCC" stroke-width="1.6"/>
+<rect x="576" y="660" width="7" height="269" rx="3" fill="#8D6CCC" stroke="none" />
+<rect x="596" y="676" width="116" height="30" rx="15" fill="#FFFFFF" stroke="none" />
+<text x="654" y="697" font-size="19" fill="#8D6CCC" font-weight="600" text-anchor="middle">GROUP 2</text>
+<text x="727" y="699" font-size="23" fill="#101F35" font-weight="600" >Observe + approach + grasp</text>
+<text x="1730" y="699" font-size="20" fill="#53627A" font-weight="400" text-anchor="end">Original L7–18  ·  Step 2/22</text>
+<text x="602" y="738" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan>red_pos, red_quat, red_extent = </tspan><tspan fill="#286C95">get_object_pose</tspan><tspan>(</tspan></text>
+<text x="602" y="767" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan>    </tspan><tspan fill="#9B4470">&quot;red cube&quot;</tspan><tspan>, return_bbox_extent=</tspan><tspan fill="#7055A8">True</tspan><tspan>)</tspan></text>
+<text x="602" y="796" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan>green_pos, green_quat, green_extent = </tspan><tspan fill="#286C95">get_object_pose</tspan><tspan>(</tspan></text>
+<text x="602" y="825" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan>    </tspan><tspan fill="#9B4470">&quot;green cube&quot;</tspan><tspan>, return_bbox_extent=</tspan><tspan fill="#7055A8">True</tspan><tspan>)</tspan></text>
+<text x="602" y="854" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan>grasp_pos, grasp_quat = </tspan><tspan fill="#286C95">sample_grasp_pose</tspan><tspan>(</tspan><tspan fill="#9B4470">&quot;red cube&quot;</tspan><tspan>)</tspan></text>
+<text x="602" y="883" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan fill="#286C95">goto_pose</tspan><tspan>(grasp_pos, grasp_quat, z_approach=</tspan><tspan fill="#9A651E">0.15</tspan><tspan>)</tspan></text>
+<text x="602" y="912" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan fill="#286C95">close_gripper</tspan><tspan>()</tspan></text>
+<path d="M1756 794.5H1860" fill="none" stroke="#8D6CCC" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+<path d="M1852 789.5L1861 794.5L1852 799.5" fill="none" stroke="#8D6CCC" stroke-width="2.4"/>
+<text x="1808" y="781.5" font-size="17" fill="#8D6CCC" font-weight="500" text-anchor="middle">run G2</text>
+<rect x="1880" y="660" width="660" height="269" rx="18" fill="#FFFFFF" stroke="#D8E2EC" stroke-width="1.5"/>
+<rect x="1900" y="674" width="167" height="30" rx="15" fill="#E8F7EF" stroke="none" />
+<text x="1983.5" y="695" font-size="17" fill="#327857" font-weight="600" text-anchor="middle">API SUCCESS</text>
+<rect x="2078" y="674" width="220" height="30" rx="15" fill="#FCEEF2" stroke="none" />
+<text x="2188" y="695" font-size="17" fill="#A2546D" font-weight="600" text-anchor="middle">COMPLETION: FALSE</text>
+<text x="1900" y="736" font-size="26" fill="#101F35" font-weight="500" font-family="Consolas, monospace">0.003850  →  0.058334</text>
+<text x="1900" y="769" font-size="22" fill="#53627A" font-weight="400" >Gripper closes; completion is false.</text>
+<text x="1900" y="798" font-size="22" fill="#53627A" font-weight="400" >Pose and extent are sampled once.</text>
+<text x="1900" y="827" font-size="22" fill="#53627A" font-weight="400" >The sampled orientation is reused later.</text>
+<text x="1900" y="884" font-size="22" fill="#6A5494" font-weight="500" >Reward improves, but the task is unfinished.</text>
+<rect x="576" y="949" width="1178" height="158" rx="18" fill="#FFF6E8" stroke="#CC9642" stroke-width="1.6"/>
+<rect x="576" y="949" width="7" height="158" rx="3" fill="#CC9642" stroke="none" />
+<rect x="596" y="965" width="116" height="30" rx="15" fill="#FFFFFF" stroke="none" />
+<text x="654" y="986" font-size="19" fill="#CC9642" font-weight="600" text-anchor="middle">GROUP 3</text>
+<text x="727" y="988" font-size="23" fill="#101F35" font-weight="600" >Lift command</text>
+<text x="1730" y="988" font-size="20" fill="#53627A" font-weight="400" text-anchor="end">Original L19–25  ·  Step 3/22</text>
+<text x="602" y="1027" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan>lift_pos = grasp_pos.</tspan><tspan fill="#286C95">copy</tspan><tspan>()</tspan></text>
+<text x="602" y="1056" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan>lift_pos[</tspan><tspan fill="#9A651E">2</tspan><tspan>] += </tspan><tspan fill="#9A651E">0.15</tspan></text>
+<text x="602" y="1085" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan fill="#286C95">goto_pose</tspan><tspan>(lift_pos, grasp_quat)</tspan></text>
+<path d="M1756 1028H1860" fill="none" stroke="#CC9642" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+<path d="M1852 1023L1861 1028L1852 1033" fill="none" stroke="#CC9642" stroke-width="2.4"/>
+<text x="1808" y="1015" font-size="17" fill="#CC9642" font-weight="500" text-anchor="middle">run G3</text>
+<rect x="1880" y="949" width="660" height="158" rx="18" fill="#FFFFFF" stroke="#D8E2EC" stroke-width="1.5"/>
+<rect x="1900" y="963" width="167" height="30" rx="15" fill="#E8F7EF" stroke="none" />
+<text x="1983.5" y="984" font-size="17" fill="#327857" font-weight="600" text-anchor="middle">API SUCCESS</text>
+<rect x="2078" y="963" width="220" height="30" rx="15" fill="#FCEEF2" stroke="none" />
+<text x="2188" y="984" font-size="17" fill="#A2546D" font-weight="600" text-anchor="middle">COMPLETION: FALSE</text>
+<text x="1900" y="1025" font-size="26" fill="#101F35" font-weight="500" font-family="Consolas, monospace">0.058334  →  0.009581</text>
+<text x="1900" y="1058" font-size="22" fill="#53627A" font-weight="400" >The 0.15 m lift command returns success.</text>
+<text x="1900" y="1087" font-size="22" fill="#53627A" font-weight="400" >The intended lift is not established.</text>
+<rect x="576" y="1127" width="1178" height="216" rx="18" fill="#EAF8F4" stroke="#4D9B8C" stroke-width="1.6"/>
+<rect x="576" y="1127" width="7" height="216" rx="3" fill="#4D9B8C" stroke="none" />
+<rect x="596" y="1143" width="116" height="30" rx="15" fill="#FFFFFF" stroke="none" />
+<text x="654" y="1164" font-size="19" fill="#4D9B8C" font-weight="600" text-anchor="middle">GROUP 4</text>
+<text x="727" y="1166" font-size="23" fill="#101F35" font-weight="600" >Place + release</text>
+<text x="1730" y="1166" font-size="20" fill="#53627A" font-weight="400" text-anchor="end">Original L26–36  ·  Step 4/22</text>
+<text x="602" y="1205" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan>place_z = (green_pos[</tspan><tspan fill="#9A651E">2</tspan><tspan>] + green_extent[</tspan><tspan fill="#9A651E">2</tspan><tspan>] / </tspan><tspan fill="#9A651E">2.0</tspan></text>
+<text x="602" y="1234" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan>           - red_extent[</tspan><tspan fill="#9A651E">2</tspan><tspan>] / </tspan><tspan fill="#9A651E">2.0</tspan><tspan>)</tspan></text>
+<text x="602" y="1263" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan>place_pos = np.</tspan><tspan fill="#286C95">array</tspan><tspan>([green_pos[</tspan><tspan fill="#9A651E">0</tspan><tspan>], green_pos[</tspan><tspan fill="#9A651E">1</tspan><tspan>], place_z])</tspan></text>
+<text x="602" y="1292" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan fill="#286C95">goto_pose</tspan><tspan>(place_pos, grasp_quat, z_approach=</tspan><tspan fill="#9A651E">0.15</tspan><tspan>)</tspan></text>
+<text x="602" y="1321" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan fill="#286C95">open_gripper</tspan><tspan>()</tspan></text>
+<path d="M1756 1235H1860" fill="none" stroke="#4D9B8C" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+<path d="M1852 1230L1861 1235L1852 1240" fill="none" stroke="#4D9B8C" stroke-width="2.4"/>
+<text x="1808" y="1222" font-size="17" fill="#4D9B8C" font-weight="500" text-anchor="middle">run G4</text>
+<rect x="1880" y="1127" width="660" height="216" rx="18" fill="#FFFFFF" stroke="#D8E2EC" stroke-width="1.5"/>
+<rect x="1900" y="1141" width="167" height="30" rx="15" fill="#E8F7EF" stroke="none" />
+<text x="1983.5" y="1162" font-size="17" fill="#327857" font-weight="600" text-anchor="middle">API SUCCESS</text>
+<rect x="2078" y="1141" width="220" height="30" rx="15" fill="#FCEEF2" stroke="none" />
+<text x="2188" y="1162" font-size="17" fill="#A2546D" font-weight="600" text-anchor="middle">COMPLETION: FALSE</text>
+<text x="1900" y="1203" font-size="26" fill="#101F35" font-weight="500" font-family="Consolas, monospace">0.009581  →  0.030978</text>
+<text x="1900" y="1236" font-size="22" fill="#53627A" font-weight="400" >Gripper opens; completion is false.</text>
+<text x="1900" y="1265" font-size="22" fill="#53627A" font-weight="400" >Placement uses the Step 2 geometry</text>
+<text x="1900" y="1294" font-size="22" fill="#53627A" font-weight="400" >and the sampled grasp orientation.</text>
+<text x="1900" y="1321" font-size="20" fill="#4C8077" font-weight="500" >Geometry is reused from an earlier observation.</text>
+<rect x="576" y="1363" width="1178" height="187" rx="18" fill="#FDEFF5" stroke="#CC7199" stroke-width="1.6"/>
+<rect x="576" y="1363" width="7" height="187" rx="3" fill="#CC7199" stroke="none" />
+<rect x="596" y="1379" width="116" height="30" rx="15" fill="#FFFFFF" stroke="none" />
+<text x="654" y="1400" font-size="19" fill="#CC7199" font-weight="600" text-anchor="middle">GROUP 5</text>
+<text x="727" y="1402" font-size="23" fill="#101F35" font-weight="600" >Retreat + return home</text>
+<text x="1730" y="1402" font-size="20" fill="#53627A" font-weight="400" text-anchor="end">Original L37–42  ·  Step 5/22</text>
+<text x="602" y="1441" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan>lift_place = place_pos.</tspan><tspan fill="#286C95">copy</tspan><tspan>()</tspan></text>
+<text x="602" y="1470" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan>lift_place[</tspan><tspan fill="#9A651E">2</tspan><tspan>] += </tspan><tspan fill="#9A651E">0.2</tspan></text>
+<text x="602" y="1499" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan fill="#286C95">goto_pose</tspan><tspan>(lift_place, grasp_quat)</tspan></text>
+<text x="602" y="1528" font-family="Consolas, monospace" font-size="23.5" fill="#18314D" xml:space="preserve"><tspan fill="#286C95">home_pose</tspan><tspan>()</tspan></text>
+<path d="M1756 1456.5H1860" fill="none" stroke="#CC7199" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+<path d="M1852 1451.5L1861 1456.5L1852 1461.5" fill="none" stroke="#CC7199" stroke-width="2.4"/>
+<text x="1808" y="1443.5" font-size="17" fill="#CC7199" font-weight="500" text-anchor="middle">run G5</text>
+<rect x="1880" y="1363" width="660" height="187" rx="18" fill="#FFFFFF" stroke="#D8E2EC" stroke-width="1.5"/>
+<rect x="1900" y="1377" width="167" height="30" rx="15" fill="#E8F7EF" stroke="none" />
+<text x="1983.5" y="1398" font-size="17" fill="#327857" font-weight="600" text-anchor="middle">API SUCCESS</text>
+<rect x="2078" y="1377" width="220" height="30" rx="15" fill="#FCEEF2" stroke="none" />
+<text x="2188" y="1398" font-size="17" fill="#A2546D" font-weight="600" text-anchor="middle">COMPLETION: FALSE</text>
+<text x="1900" y="1439" font-size="26" fill="#101F35" font-weight="500" font-family="Consolas, monospace">0.030978  →  0.004386</text>
+<text x="1900" y="1472" font-size="22" fill="#53627A" font-weight="400" >Initial stack has toppled.</text>
+<text x="1900" y="1501" font-size="22" fill="#53627A" font-weight="400" >The cubes are separated.</text>
+<rect x="2385" y="1469" width="44" height="44" rx="6" fill="#EB6578" stroke="#C04A60" stroke-width="1.5"/>
+<rect x="2464" y="1477" width="44" height="44" rx="6" fill="#76BE9A" stroke="#4F9572" stroke-width="1.5"/>
+<path d="M2371 1523H2520" fill="none" stroke="#D2DBE5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+<rect x="60" y="1631" width="2480" height="92" rx="20" fill="#FFF2F6" stroke="#F0CEDC" stroke-width="1.4"/>
+<text x="87" y="1668" font-size="28" fill="#A2446B" font-weight="700" >API success ≠ task completion</text>
+<text x="87" y="1703" font-size="22" fill="#101F35" font-weight="500" >After G5, the initial program is exhausted and the world has changed.</text>
+<path d="M1075 1648V1707" fill="none" stroke="#E8BCCD" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+<text x="1108" y="1668" font-size="25" fill="#101F35" font-weight="700" >Effectful history is retained</text>
+<text x="1108" y="1703" font-size="22" fill="#53627A" font-weight="400" >No rollback / replay of these groups; recovery proceeds from fresh observation.</text>
+<text x="60" y="1750" font-size="18" fill="#53627A" font-weight="400" >Code excerpts and rewards follow the supplied trace. Source spans refer to the original program; stage names are explanatory labels.</text>
+<text x="2540" y="1750" font-size="18" fill="#53627A" font-weight="400" text-anchor="end">G4 subtraction is preserved as pasted. Later steps are not shown.</text>
+</g></svg>
