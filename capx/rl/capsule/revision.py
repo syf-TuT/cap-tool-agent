@@ -8,6 +8,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
+from capx.utils.program_source import normalize_program_source
+
 from .repair import RepairInvariantError
 from .schema import RepairTraceV1, TaskInstanceV1
 
@@ -133,9 +135,12 @@ def validate_complete_program(
     response_token_limit: int = 2048,
     finish_reason: str | None = None,
     truncated: bool = False,
+    allow_python_fence: bool = False,
 ) -> str:
-    """Return valid complete source byte-for-byte; reject rather than clean or truncate it."""
+    """Validate executable content while preserving the original response and token identity."""
 
+    if not isinstance(allow_python_fence, bool):
+        raise TypeError("allow_python_fence must be a boolean")
     if not isinstance(source, str):
         raise RevisionRejection(
             RevisionRejectionReason.INCOMPLETE_PROGRAM,
@@ -165,13 +170,23 @@ def validate_complete_program(
             RevisionRejectionReason.INCOMPLETE_PROGRAM,
             "revision response is empty",
         )
+    executable_source = source
     if "```" in source:
-        raise RevisionRejection(
-            RevisionRejectionReason.MARKDOWN_FENCE,
-            "revision response contains a Markdown code fence",
-        )
+        wrapped = source.strip()
+        if (
+            not allow_python_fence
+            or not wrapped.startswith("```python\n")
+            or not wrapped.endswith("\n```")
+            or wrapped.count("```") != 2
+        ):
+            raise RevisionRejection(
+                RevisionRejectionReason.MARKDOWN_FENCE,
+                "revision response contains an unsupported Markdown code fence",
+            )
+        # Match clean replay's execution boundary; keep the raw response for training.
+        executable_source = normalize_program_source(source)
     try:
-        module = ast.parse(source, mode="exec")
+        module = ast.parse(executable_source, mode="exec")
     except (SyntaxError, ValueError) as error:
         raise RevisionRejection(
             RevisionRejectionReason.SYNTAX_ERROR,
@@ -183,7 +198,7 @@ def validate_complete_program(
             "revision response has no executable Python statements",
         )
     try:
-        compile(source, "<capsule-revision>", "exec")
+        compile(executable_source, "<capsule-revision>", "exec")
     except (SyntaxError, TypeError, ValueError) as error:
         raise RevisionRejection(
             RevisionRejectionReason.SYNTAX_ERROR,

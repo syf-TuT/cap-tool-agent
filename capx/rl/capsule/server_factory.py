@@ -1724,6 +1724,7 @@ class CapsuleServerRuntime:
                 revision_response_token_counter=generator.count_raw_response_tokens,
                 revision_input_token_limit=int(capsule["revision_input_max_tokens"]),
                 revision_response_token_limit=int(capsule["revision_response_max_tokens"]),
+                allow_fenced_revisions=capsule.get("allow_fenced_revisions", False),
             )
             batch_encoder = VeRLGroupEncoder(
                 tokenizer=workers.tokenizer,

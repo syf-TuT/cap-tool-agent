@@ -1,0 +1,196 @@
+"""Prepare and train privileged high-level Cube Stack with the Cube Lift Capsule recipe.
+
+Run preparation on the simulator host. Task prompts and initial-state hashes come from real
+resets; the model, decoder, group assembler, loss, and LoRA recipe are shared with Cube Lift.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import yaml
+
+from scripts.capsule_rl.common import atomic_write_json, load_and_validate_server_config
+
+
+def prepare(root: Path, model: Path, verl: Path, seeds: tuple[int, ...]) -> None:
+    from capx.rl.capsule.server_factory import YamlEnvironmentFactory, load_task_instances
+
+    if not seeds or min(seeds) < 0 or len(set(seeds)) != len(seeds):
+        raise ValueError("training seeds must be distinct non-negative integers")
+    project = Path(__file__).resolve().parents[2]
+    config_dir = project / "env_configs/cube_stack/capsule_rl"
+    config = yaml.safe_load(
+        (config_dir / "franka_robosuite_cube_stack_capsule_critique_grpo.yaml").read_text()
+    )
+    lift = yaml.safe_load(
+        (
+            project
+            / ("env_configs/cube_lifting/capsule_rl/franka_robosuite_cube_lift_capsule_smoke.yaml")
+        ).read_text()
+    )
+    root.mkdir(parents=True, exist_ok=False)
+    config["runtime"].update(
+        {
+            "run_id": root.name,
+            "project_root": str(project),
+            "verl_source_path": str(verl.resolve()),
+            "verl_resolved_config_path": str(root / "verl.yaml"),
+            "dataset_path": str(root / "dataset.seed_resolved.jsonl"),
+            "program_model_path": str(model.resolve()),
+            "output_dir": str(root / "training"),
+        }
+    )
+    config["task"]["profile"] = "robosuite_cube_stack_privileged"
+    # Stack repairs replace longer functions: observed complete traces exceed Lift's 8K limit.
+    # The worker factory propagates this capacity without truncating the committed history.
+    config["capsule"]["revision_input_max_tokens"] = 24576
+    config["capsule"]["allow_fenced_revisions"] = True
+    config["program_service"] = dict(lift["program_service"])
+    config["program_service"]["model"] = str(model.resolve())
+    environment = YamlEnvironmentFactory(str(project / config["task"]["config_path"]))(None)
+    rows = []
+    expected_prompt = None
+    try:
+        for seed in seeds:
+            observation, info = environment.reset(
+                seed=seed, options={"capsule_task_state_resolution": True}
+            )
+            messages = observation["full_prompt"]
+            system = messages[0]["content"]
+            prompt = messages[1]["content"][0]["text"]
+            if system != config["program_service"]["system_prompt"]:
+                raise RuntimeError("environment system prompt differs from the Cube Lift recipe")
+            if expected_prompt is not None and prompt != expected_prompt:
+                raise RuntimeError("task prompt unexpectedly varies across training seeds")
+            expected_prompt = prompt
+            rows.append(
+                {
+                    "task_id": "cube-stack-red-on-green",
+                    "prompt": prompt,
+                    "environment_seed": seed,
+                    "initial_state_sha256": info["initial_state_sha256"],
+                }
+            )
+    finally:
+        environment.close()
+    config["program_service"]["prompt_sha256"] = hashlib.sha256(prompt.encode()).hexdigest()
+    (root / "dataset.seed_resolved.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8"
+    )
+    worker_config = yaml.safe_load(
+        (config_dir / "franka_robosuite_cube_stack_capsule_single_a800_verl.yaml").read_text()
+    )
+    worker_config["trainer"]["total_epochs"] = 1
+    worker_config["trainer"]["experiment_name"] = root.name
+    (root / "verl.yaml").write_text(yaml.safe_dump(worker_config, sort_keys=False))
+    config_path = root / "runtime.yaml"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    validated = load_and_validate_server_config(config_path, check_runtime_paths=True)
+    tasks = load_task_instances(validated)
+    atomic_write_json(
+        root / "protocol.json",
+        {
+            "mode": "privileged_highlevel_cube_stack_capsule_rl",
+            "project_commit": subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=project, text=True
+            ).strip(),
+            "training_seeds": list(seeds),
+            "group_count": len(tasks),
+            "group_size": config["capsule"]["group_size"],
+            "repair_trigger": "all seven initial ordinary Program samples failed clean replay",
+            "program_service": config["program_service"],
+            "controller_service": config["controller_service"],
+            "capsule": config["capsule"],
+            "task": config["task"],
+            "input_sha256": {
+                name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+                for name in ("runtime.yaml", "verl.yaml", "dataset.seed_resolved.jsonl")
+            },
+        },
+    )
+    print(json.dumps({"config": str(config_path), "groups": len(tasks)}), flush=True)
+
+
+def summarize(root: Path, result: dict) -> dict:
+    groups = []
+    for path in sorted((root / "training/groups").glob("*.json")):
+        artifact = json.loads(path.read_text())
+        assembly = artifact["assembly"]
+        group = assembly["group"]
+        groups.append(
+            {
+                "artifact": str(path),
+                "seed": group["environment_seed"],
+                "rewards": artifact["sequence_rewards"],
+                "base_successes": sum(r["outcome"] == "success" for r in assembly["base_results"]),
+                "repair_triggered": group["metadata"]["repair_triggered"],
+                "guided_success": group["metadata"]["guided_member_selected"],
+                "controller_successes": sum(
+                    r.get("pt_result") is not None and r["pt_result"]["outcome"] == "success"
+                    for r in assembly["repair_attempts"]
+                ),
+                "repair_statuses": [r["status"] for r in assembly["repair_attempts"]],
+                "repair_rejection_reasons": [
+                    r["rejection_reason"]
+                    for r in assembly["repair_attempts"]
+                    if r.get("rejection_reason")
+                ],
+                "skipped_actor_update": artifact["skipped_actor_update"],
+            }
+        )
+    if len(groups) != result["completed_group_count"]:
+        raise RuntimeError("saved group count disagrees with the completed training run")
+    return {
+        "training": result,
+        "all_initial_base_failed_groups": sum(g["repair_triggered"] for g in groups),
+        "controller_successful_repairs": sum(g["controller_successes"] for g in groups),
+        "capsule_repaired_groups": sum(g["guided_success"] for g in groups),
+        "groups": groups,
+    }
+
+
+def train(root: Path) -> None:
+    from capx.rl.capsule.server_factory import create_trainer
+
+    config = load_and_validate_server_config(root / "runtime.yaml", check_runtime_paths=True)
+    if not os.environ.get(config["controller_service"]["api_key_env"]):
+        raise RuntimeError("set the Controller API key before starting Capsule training")
+    protocol = json.loads((root / "protocol.json").read_text())
+    for name, expected in protocol["input_sha256"].items():
+        if hashlib.sha256((root / name).read_bytes()).hexdigest() != expected:
+            raise RuntimeError(f"prepared training input changed: {name}")
+    result = create_trainer(config).fit()
+    atomic_write_json(root / "training_result.json", result)
+    summary = summarize(root, result)
+    atomic_write_json(root / "summary.json", summary)
+    print(json.dumps(summary), flush=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("phase", choices=("prepare", "train", "summarize"))
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--model", type=Path)
+    parser.add_argument("--verl", type=Path)
+    parser.add_argument("--seeds", default=",".join(map(str, range(5, 21))))
+    args = parser.parse_args()
+    root = args.root.resolve()
+    if args.phase == "prepare":
+        if args.model is None or args.verl is None:
+            parser.error("prepare requires --model and --verl")
+        prepare(root, args.model, args.verl, tuple(int(s) for s in args.seeds.split(",")))
+    elif args.phase == "train":
+        train(root)
+    else:
+        result = json.loads((root / "training_result.json").read_text())
+        atomic_write_json(root / "summary.json", summarize(root, result))
+
+
+if __name__ == "__main__":
+    main()

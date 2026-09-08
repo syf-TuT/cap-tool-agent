@@ -414,7 +414,6 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
         ("capsule.p0_count", 2, "repair ranks exactly two P0 programs"),
         ("capsule.repair_trajectories_per_p0", 2, "each P0 receives two trajectories"),
         ("capsule.max_controller_turns", 12, "each repair trajectory has a 12-turn cap"),
-        ("capsule.revision_input_max_tokens", 8192, "revision prompts are never truncated"),
         ("capsule.revision_response_max_tokens", 2048, "revision responses are never truncated"),
         ("capsule.gamma", 0.1, "guided shaping uses gamma=0.1"),
         ("actor_rollout_ref.rollout.n", 8, "rollout n=8 must match the learning group"),
@@ -474,7 +473,17 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
     )
     for path, expected, reason in exact_values:
         _require_exact(config, path, expected, reason, errors)
+    revision_input_limit = _get(config, "capsule.revision_input_max_tokens")
+    if (
+        isinstance(revision_input_limit, bool)
+        or not isinstance(revision_input_limit, int)
+        or revision_input_limit < 8192
+    ):
+        errors.append("capsule.revision_input_max_tokens must be an integer >= 8192")
     errors.extend(collect_task_profile_errors(config))
+    allow_fenced_revisions = _get(config, "capsule.allow_fenced_revisions")
+    if allow_fenced_revisions is not _MISSING and not isinstance(allow_fenced_revisions, bool):
+        errors.append("capsule.allow_fenced_revisions must be a boolean")
 
     for path in (
         "runtime.verl_source_path",

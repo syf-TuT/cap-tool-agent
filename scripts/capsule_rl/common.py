@@ -1038,7 +1038,6 @@ def load_and_validate_server_config_bytes(
         "p0_count": 2,
         "repair_trajectories_per_p0": 2,
         "max_controller_turns": 12,
-        "revision_input_max_tokens": 8192,
         "revision_response_max_tokens": 2048,
     }
     for field_name, expected in expected_capsule.items():

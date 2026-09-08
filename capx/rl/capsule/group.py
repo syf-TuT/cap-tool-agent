@@ -352,9 +352,12 @@ class CapsuleGroupAssembler:
         revision_response_token_counter: TokenCounter | None = None,
         revision_input_token_limit: int = 8192,
         revision_response_token_limit: int = 2048,
+        allow_fenced_revisions: bool = False,
     ) -> None:
         if revision_input_token_limit < 1 or revision_response_token_limit < 1:
             raise ValueError("revision token limits must be positive")
+        if not isinstance(allow_fenced_revisions, bool):
+            raise TypeError("allow_fenced_revisions must be a boolean")
         if token_counter is not None and (
             revision_prompt_token_counter is not None
             or revision_response_token_counter is not None
@@ -377,6 +380,7 @@ class CapsuleGroupAssembler:
         )
         self.revision_input_token_limit = revision_input_token_limit
         self.revision_response_token_limit = revision_response_token_limit
+        self.allow_fenced_revisions = allow_fenced_revisions
 
     def _count_revision_response_tokens_with_eos(self, source: str) -> int:
         raw_count = self.revision_response_token_counter(source)
@@ -756,6 +760,7 @@ class CapsuleGroupAssembler:
                 response_token_limit=self.revision_response_token_limit,
                 finish_reason=revision.finish_reason,
                 truncated=revision.truncated,
+                allow_python_fence=self.allow_fenced_revisions,
             )
         except RevisionRejection as error:
             return (
