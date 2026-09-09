@@ -445,6 +445,7 @@ class VeRLProgramGenerator:
         self.prompt_token_limit = prompt_token_limit
         self.response_token_limit = response_token_limit
         self.system_prompt = system_prompt
+        self.usage = {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0}
 
     def count_prompt_tokens(self, text: str) -> int:
         return len(_apply_chat_template(self.tokenizer, text, self.system_prompt))
@@ -513,6 +514,13 @@ class VeRLProgramGenerator:
             meta_info={"do_sample": True, "validate": False},
         )
         output = self.actor_rollout_wg.generate_sequences(request)
+        self.usage["requests"] += 1
+        self.usage["prompt_tokens"] += len(prompt_ids)
+        output_batch = getattr(output, "batch", output)
+        response_width = output_batch["responses"].shape[1]
+        self.usage["completion_tokens"] += int(
+            output_batch["attention_mask"][0, -response_width:].sum().item()
+        )
         source, finish_reason, truncated = self._decode(output)
         return ProgramCandidate(
             program_sample_id=program_sample_id,
@@ -1701,20 +1709,24 @@ class CapsuleServerRuntime:
                 response_token_limit=program_response_token_limit(self.config),
                 system_prompt=system_prompt,
             )
-            controller_config = FrozenControllerConfig(
-                endpoint=str(controller_service["endpoint"]),
-                model=str(controller_service["model"]),
-                api_key_env=str(controller_service["api_key_env"]),
-                frozen=True,
-                max_turns=int(capsule["max_controller_turns"]),
-                request_timeout_s=float(controller_service["request_timeout_s"]),
-                max_output_tokens=int(controller_service.get("max_output_tokens", 512)),
-                temperature=float(controller_service["temperature"]),
-            )
-            repair_collector = ControllerRepairCollector(
-                transport=OpenAICompatibleControllerTransport(controller_config),
-                max_turns=controller_config.max_turns,
-            )
+            repair_trigger = capsule.get("repair_trigger", "all_failed")
+            controller_transport = None
+            if repair_trigger != "never":
+                controller_config = FrozenControllerConfig(
+                    endpoint=str(controller_service["endpoint"]),
+                    model=str(controller_service["model"]),
+                    api_key_env=str(controller_service["api_key_env"]),
+                    frozen=True,
+                    max_turns=int(capsule["max_controller_turns"]),
+                    request_timeout_s=float(controller_service["request_timeout_s"]),
+                    max_output_tokens=int(controller_service.get("max_output_tokens", 512)),
+                    temperature=float(controller_service["temperature"]),
+                )
+                controller_transport = OpenAICompatibleControllerTransport(controller_config)
+                repair_collector = ControllerRepairCollector(
+                    transport=controller_transport,
+                    max_turns=controller_config.max_turns,
+                )
             assembler = CapsuleGroupAssembler(
                 base_sampler=ActorBaseSampler(generator),
                 repair_collector=repair_collector,
@@ -1725,6 +1737,7 @@ class CapsuleServerRuntime:
                 revision_input_token_limit=int(capsule["revision_input_max_tokens"]),
                 revision_response_token_limit=int(capsule["revision_response_max_tokens"]),
                 allow_fenced_revisions=capsule.get("allow_fenced_revisions", False),
+                repair_trigger=repair_trigger,
             )
             batch_encoder = VeRLGroupEncoder(
                 tokenizer=workers.tokenizer,
@@ -1745,7 +1758,12 @@ class CapsuleServerRuntime:
                 config=self.config,
                 max_group_attempts=capsule["max_group_attempts"],
             )
-            claim_root = output_dir / "checkpoints" / safe_run_id
+            checkpoint_root = output_dir / "checkpoints"
+            if runtime.get("checkpoint_root"):
+                checkpoint_root = _resolve_project_path(
+                    runtime["checkpoint_root"], project_root, "runtime.checkpoint_root"
+                )
+            claim_root = checkpoint_root / safe_run_id
             checkpoint = claim_root / "final" / "actor"
             with AtomicCheckpointClaim(checkpoint, claim_root=claim_root) as checkpoint_claim:
                 verl_provenance_before = workers.verl_provenance()
@@ -1801,6 +1819,10 @@ class CapsuleServerRuntime:
             )
             return {
                 "status": run_status,
+                "program_usage": generator.usage,
+                "controller_usage": controller_transport.usage if controller_transport else {
+                    "requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "missing_usage": 0,
+                },
                 "task_count": len(tasks),
                 "scheduled_group_count": len(scheduled_tasks),
                 "step_count": len(results),

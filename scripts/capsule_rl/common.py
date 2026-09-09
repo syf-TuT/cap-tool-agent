@@ -1040,6 +1040,8 @@ def load_and_validate_server_config_bytes(
         "max_controller_turns": 12,
         "revision_response_max_tokens": 2048,
     }
+    if capsule.get("repair_trigger", "all_failed") not in {"never", "any_failed", "all_failed"}:
+        raise ConfigValidationError("capsule.repair_trigger must be never, any_failed, or all_failed")
     for field_name, expected in expected_capsule.items():
         if capsule.get(field_name) != expected:
             raise ConfigValidationError(f"capsule.{field_name} must be {expected}")

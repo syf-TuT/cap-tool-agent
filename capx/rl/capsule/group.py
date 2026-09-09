@@ -37,6 +37,17 @@ REPAIR_TRIGGER_BASE_COUNT = 7
 TRAJECTORIES_PER_P0 = 2
 _UNKNOWN_REPLAY_OUTCOMES = {ReplayOutcome.INFRA_ERROR, ReplayOutcome.EVALUATOR_ERROR}
 _REGEX_TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+REPAIR_TRIGGERS = ("never", "any_failed", "all_failed")
+
+
+def should_trigger_repair(repair_trigger: str, failure_count: int) -> bool:
+    if repair_trigger not in REPAIR_TRIGGERS:
+        raise ValueError(f"repair_trigger must be one of {REPAIR_TRIGGERS}")
+    if repair_trigger == "never":
+        return False
+    if repair_trigger == "any_failed":
+        return failure_count > 0
+    return failure_count == REPAIR_TRIGGER_BASE_COUNT
 
 
 @dataclass(frozen=True)
@@ -344,7 +355,7 @@ class CapsuleGroupAssembler:
         self,
         *,
         base_sampler: BaseSampler,
-        repair_collector: RepairCollector,
+        repair_collector: RepairCollector | None,
         revision_generator: RevisionGenerator,
         clean_evaluator: CleanEvaluator,
         token_counter: TokenCounter | None = None,
@@ -353,7 +364,12 @@ class CapsuleGroupAssembler:
         revision_input_token_limit: int = 8192,
         revision_response_token_limit: int = 2048,
         allow_fenced_revisions: bool = False,
+        repair_trigger: str = "all_failed",
     ) -> None:
+        should_trigger_repair(repair_trigger, 0)
+        if repair_collector is None and repair_trigger != "never":
+            raise ValueError("repair_collector is required when repair is enabled")
+        self.repair_trigger = repair_trigger
         if revision_input_token_limit < 1 or revision_response_token_limit < 1:
             raise ValueError("revision token limits must be positive")
         if not isinstance(allow_fenced_revisions, bool):
@@ -477,13 +493,21 @@ class CapsuleGroupAssembler:
     def _select_p0_indices(
         candidates: list[ProgramCandidate],
         results: list[ProgramReplayResultV1],
-    ) -> tuple[int, int]:
+    ) -> tuple[int, ...]:
         def reward_key(index: int) -> tuple[float, int]:
             raw_reward = results[index].raw_reward
             return (float("-inf") if raw_reward is None else float(raw_reward), -index)
 
-        first = max(range(REPAIR_TRIGGER_BASE_COUNT), key=reward_key)
-        alternatives = [index for index in range(REPAIR_TRIGGER_BASE_COUNT) if index != first]
+        failed = [
+            index for index, result in enumerate(results[:REPAIR_TRIGGER_BASE_COUNT])
+            if result.binary_reward == 0.0
+        ]
+        if not failed:
+            return ()
+        first = max(failed, key=reward_key)
+        alternatives = [index for index in failed if index != first]
+        if not alternatives:
+            return (first,)
         second = max(
             alternatives,
             key=lambda index: (
@@ -566,6 +590,8 @@ class CapsuleGroupAssembler:
         group_uid: str,
         seen_sample_ids: set[str],
     ) -> tuple[RepairAttempt, ProgramCandidate | None]:
+        if self.repair_collector is None:
+            raise RuntimeError("repair is disabled")
         trajectory_id = f"{group_uid}:p0-{p0_rank}:trajectory-{trajectory_index}"
         try:
             trace = self.repair_collector(
@@ -844,10 +870,11 @@ class CapsuleGroupAssembler:
         repair_attempts: list[RepairAttempt] = []
         guided_candidate: ProgramCandidate | None = None
         selected_attempt_index: int | None = None
-        any_base_success = any(
-            result.outcome is ReplayOutcome.SUCCESS for result in base_results
+        repair_triggered = should_trigger_repair(
+            self.repair_trigger,
+            sum(result.binary_reward == 0.0 for result in base_results),
         )
-        if not any_base_success:
+        if repair_triggered:
             p0_indices = self._select_p0_indices(candidates, base_results)
             successful_revisions: list[tuple[int, ProgramCandidate]] = []
             for p0_rank, p0_index in enumerate(p0_indices):
@@ -881,7 +908,7 @@ class CapsuleGroupAssembler:
                     repair_attempts[selected_attempt_index], selected=True
                 )
 
-        if any_base_success or guided_candidate is None:
+        if guided_candidate is None:
             candidate, result = self._sample_and_evaluate_base(
                 task, REPAIR_TRIGGER_BASE_COUNT, seen_sample_ids
             )
@@ -934,7 +961,8 @@ class CapsuleGroupAssembler:
             members=tuple(members),
             skip_actor_update=len(rewards) == 1,
             metadata={
-                "repair_triggered": not any_base_success,
+                "repair_trigger": self.repair_trigger,
+                "repair_triggered": repair_triggered,
                 "guided_member_selected": guided_candidate is not None,
                 "base_member_count": len(base_results),
             },

@@ -22,10 +22,11 @@ from .group import (
     GroupDiscarded,
     RepairAttempt,
     deterministic_group_uid,
+    should_trigger_repair,
     token_levenshtein_distance,
 )
-from .telemetry import summarize_replay_results
 from .schema import ProgramReplayResultV1, ReplayOutcome, TaskInstanceV1
+from .telemetry import summarize_replay_results
 
 _CONFIG_MISSING = object()
 GUIDED_TOKEN_MASK_FIELD = "guided_token_mask"
@@ -446,8 +447,15 @@ class CapsuleCritiqueRayTrainer:
         return tuple(record.reason for record in self._discarded_groups)
 
     @staticmethod
-    def _validate_group(task: TaskInstanceV1, assembly: GroupAssemblyResult) -> None:
+    def _validate_group(
+        task: TaskInstanceV1, assembly: GroupAssemblyResult,
+        repair_trigger: str | None = None,
+    ) -> None:
         group = assembly.group
+        recorded_trigger = group.metadata.get("repair_trigger", "all_failed")
+        if repair_trigger is not None and recorded_trigger != repair_trigger:
+            raise ValueError("group repair_trigger differs from the training configuration")
+        repair_trigger = recorded_trigger
         if len(group.members) != BASE_GROUP_SIZE:
             raise ValueError("Capsule trainer requires exactly eight final members")
         if (
@@ -482,8 +490,6 @@ class CapsuleCritiqueRayTrainer:
                 raise ValueError("the guided member must have binary reward 1")
             if not guided.repair_trajectory_id:
                 raise ValueError("the guided member must retain its repair trajectory id")
-            if any(member.reward != 0.0 for member in group.members[:-1]):
-                raise ValueError("a guided 7+1 group requires seven failed base members")
 
         expected_base_count = BASE_GROUP_SIZE - len(guided_indices)
         if len(assembly.base_results) != expected_base_count:
@@ -518,8 +524,11 @@ class CapsuleCritiqueRayTrainer:
             if (replay.outcome is ReplayOutcome.SUCCESS) != (member.reward == 1.0):
                 raise ValueError(f"base_results[{index}] outcome does not match its member")
 
-        repair_triggered = all(member.reward == 0.0 for member in group.members[:7])
-        expected_attempt_count = 4 if repair_triggered else 0
+        failed_indices = [i for i, member in enumerate(group.members[:7]) if member.reward == 0.0]
+        repair_triggered = should_trigger_repair(repair_trigger, len(failed_indices))
+        if group.metadata.get("repair_triggered", repair_triggered) != repair_triggered:
+            raise ValueError("repair_triggered metadata disagrees with base replay results")
+        expected_attempt_count = 2 * min(2, len(failed_indices)) if repair_triggered else 0
         if len(assembly.repair_attempts) != expected_attempt_count:
             raise ValueError(
                 f"repair_attempts must contain exactly {expected_attempt_count} attempts"
@@ -693,22 +702,23 @@ class CapsuleCritiqueRayTrainer:
                     -index,
                 )
 
-            first_p0_index = max(range(7), key=reward_key)
-            second_p0_index = max(
-                (index for index in range(7) if index != first_p0_index),
-                key=lambda index: (
-                    token_levenshtein_distance(
-                        group.members[first_p0_index].response,
-                        group.members[index].response,
+            first_p0_index = max(failed_indices, key=reward_key)
+            expected_p0_indices = [first_p0_index]
+            alternatives = [index for index in failed_indices if index != first_p0_index]
+            if alternatives:
+                second_p0_index = max(
+                    alternatives,
+                    key=lambda index: (
+                        token_levenshtein_distance(
+                            group.members[first_p0_index].response,
+                            group.members[index].response,
+                        ),
+                        -index,
                     ),
-                    -index,
-                ),
-            )
-            expected_p0_ids = (
-                group.members[first_p0_index].program_sample_id,
-                group.members[second_p0_index].program_sample_id,
-            )
-            actual_p0_ids = (p0_ids_by_rank.get(0), p0_ids_by_rank.get(1))
+                )
+                expected_p0_indices.append(second_p0_index)
+            expected_p0_ids = tuple(group.members[i].program_sample_id for i in expected_p0_indices)
+            actual_p0_ids = tuple(p0_ids_by_rank.get(i) for i in range(len(expected_p0_ids)))
             if actual_p0_ids != expected_p0_ids:
                 raise ValueError("repair_attempts do not match deterministic P0 selection")
         if guided_indices:
@@ -898,7 +908,10 @@ class CapsuleCritiqueRayTrainer:
     def run_step(self, task: TaskInstanceV1) -> TrainingStepResult:
         execution_trace: list[str] = []
         assembly = self.assembler.assemble(task)
-        validate_group_provenance(task, assembly)
+        validate_group_provenance(
+            task, assembly,
+            _nested_config_value(self.config, ("capsule", "repair_trigger"), "all_failed"),
+        )
         batch = self._inject_group(task, assembly)
 
         if not assembly.group.skip_actor_update:

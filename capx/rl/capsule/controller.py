@@ -104,6 +104,7 @@ class OpenAICompatibleControllerTransport:
         self.config = config
         self._client_factory = client_factory
         self._client: Any | None = None
+        self.usage = {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "missing_usage": 0}
 
     def _make_client(self) -> Any:
         api_key = os.environ.get(self.config.api_key_env)
@@ -125,6 +126,7 @@ class OpenAICompatibleControllerTransport:
     def complete(self, messages: tuple[dict[str, str], ...]) -> str:
         if self._client is None:
             self._client = self._make_client()
+        self.usage["requests"] += 1
         response = self._client.chat.completions.create(
             model=self.config.model,
             messages=list(messages),
@@ -134,6 +136,12 @@ class OpenAICompatibleControllerTransport:
             extra_body={"enable_thinking": self.config.enable_thinking},
             response_format={"type": "json_object"},
         )
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            self.usage["missing_usage"] += 1
+        else:
+            for name in ("prompt_tokens", "completion_tokens"):
+                self.usage[name] += int(getattr(usage, name, 0) or 0)
         choices = getattr(response, "choices", None)
         if not isinstance(choices, (list, tuple)) or len(choices) != 1:
             raise ControllerProtocolError("Controller completion must contain exactly one choice")

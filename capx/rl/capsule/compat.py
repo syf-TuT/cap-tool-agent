@@ -410,8 +410,8 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
             3,
             "each scheduled seed permits exactly three group collection attempts",
         ),
-        ("capsule.base_samples_before_repair", 7, "repair triggers only after seven failures"),
-        ("capsule.p0_count", 2, "repair ranks exactly two P0 programs"),
+        ("capsule.base_samples_before_repair", 7, "repair decisions use the first seven samples"),
+        ("capsule.p0_count", 2, "repair ranks at most two failed P0 programs"),
         ("capsule.repair_trajectories_per_p0", 2, "each P0 receives two trajectories"),
         ("capsule.max_controller_turns", 12, "each repair trajectory has a 12-turn cap"),
         ("capsule.revision_response_max_tokens", 2048, "revision responses are never truncated"),
@@ -473,6 +473,9 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
     )
     for path, expected, reason in exact_values:
         _require_exact(config, path, expected, reason, errors)
+    repair_trigger = _get(config, "capsule.repair_trigger")
+    if repair_trigger is not _MISSING and repair_trigger not in ("never", "any_failed", "all_failed"):
+        errors.append("capsule.repair_trigger must be never, any_failed, or all_failed")
     revision_input_limit = _get(config, "capsule.revision_input_max_tokens")
     if (
         isinstance(revision_input_limit, bool)

@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import yaml
@@ -21,7 +22,8 @@ from scripts.capsule_rl.common import atomic_write_json, load_and_validate_serve
 def prepare(
     root: Path, model: Path, verl: Path, seeds: tuple[int, ...],
     resume_from: Path | None = None,
-    *, task: str = "cube_stack",
+    *, task: str = "cube_stack", repair_trigger: str = "all_failed",
+    checkpoint_root: Path | None = None,
 ) -> None:
     from capx.rl.capsule.server_factory import YamlEnvironmentFactory, load_task_instances
 
@@ -62,6 +64,9 @@ def prepare(
     config = yaml.safe_load(
         (config_dir / "franka_robosuite_cube_stack_capsule_critique_grpo.yaml").read_text()
     )
+    config["capsule"]["repair_trigger"] = repair_trigger
+    if parent is not None and parent_protocol["capsule"].get("repair_trigger", "all_failed") != repair_trigger:
+        raise ValueError("continuation must retain the parent's repair trigger")
     lift = yaml.safe_load(
         (
             project
@@ -81,6 +86,8 @@ def prepare(
         }
     )
     config["task"]["profile"] = "robosuite_cube_stack_privileged"
+    if checkpoint_root is not None:
+        config["runtime"]["checkpoint_root"] = str(checkpoint_root.resolve())
     if task == "cube_restack":
         config["task"].update({
             "profile": "robosuite_cube_restack_privileged_highlevel",
@@ -149,7 +156,7 @@ def prepare(
             "cumulative_group_count": prior_groups + len(tasks),
             "resume_from": parent,
             "group_size": config["capsule"]["group_size"],
-            "repair_trigger": "all seven initial ordinary Program samples failed clean replay",
+            "repair_trigger": repair_trigger,
             "program_service": config["program_service"],
             "controller_service": config["controller_service"],
             "capsule": config["capsule"],
@@ -175,6 +182,9 @@ def summarize(root: Path, result: dict) -> dict:
                 "seed": group["environment_seed"],
                 "rewards": artifact["sequence_rewards"],
                 "base_successes": sum(r["outcome"] == "success" for r in assembly["base_results"]),
+                "initial_base_successes": sum(
+                    r["outcome"] == "success" for r in assembly["base_results"][:7]
+                ),
                 "repair_triggered": group["metadata"]["repair_triggered"],
                 "guided_success": group["metadata"]["guided_member_selected"],
                 "controller_successes": sum(
@@ -194,7 +204,9 @@ def summarize(root: Path, result: dict) -> dict:
         raise RuntimeError("saved group count disagrees with the completed training run")
     return {
         "training": result,
-        "all_initial_base_failed_groups": sum(g["repair_triggered"] for g in groups),
+        "all_initial_base_failed_groups": sum(g["initial_base_successes"] == 0 for g in groups),
+        "repair_triggered_groups": sum(g["repair_triggered"] for g in groups),
+        "initial_base_success_rate": sum(g["initial_base_successes"] for g in groups) / (7 * len(groups)),
         "controller_successful_repairs": sum(g["controller_successes"] for g in groups),
         "capsule_repaired_groups": sum(g["guided_success"] for g in groups),
         "groups": groups,
@@ -206,7 +218,7 @@ def train(root: Path) -> None:
     from capx.rl.capsule.server_factory import create_trainer
 
     config = load_and_validate_server_config(root / "runtime.yaml", check_runtime_paths=True)
-    if not os.environ.get(config["controller_service"]["api_key_env"]):
+    if config["capsule"].get("repair_trigger", "all_failed") != "never" and not os.environ.get(config["controller_service"]["api_key_env"]):
         raise RuntimeError("set the Controller API key before starting Capsule training")
     protocol = json.loads((root / "protocol.json").read_text())
     for name, expected in protocol["input_sha256"].items():
@@ -244,7 +256,9 @@ def train(root: Path) -> None:
                 raise
 
         runtime.worker_starter = restored_starter
+    started = time.monotonic()
     result = runtime.fit()
+    result["training_wall_seconds"] = time.monotonic() - started
     result["cumulative_group_count"] = protocol.get("cumulative_group_count", protocol["group_count"])
     atomic_write_json(root / "training_result.json", result)
     summary = summarize(root, result)
@@ -259,6 +273,8 @@ def main(task: str = "cube_stack") -> None:
     parser.add_argument("--model", type=Path)
     parser.add_argument("--verl", type=Path)
     parser.add_argument("--resume-from", type=Path)
+    parser.add_argument("--checkpoint-root", type=Path)
+    parser.add_argument("--repair-trigger", choices=("never", "any_failed", "all_failed"), default="all_failed")
     parser.add_argument("--seeds", default=",".join(map(str, range(5, 21))))
     args = parser.parse_args()
     root = args.root.resolve()
@@ -266,7 +282,8 @@ def main(task: str = "cube_stack") -> None:
         if args.model is None or args.verl is None:
             parser.error("prepare requires --model and --verl")
         prepare(root, args.model, args.verl, tuple(int(s) for s in args.seeds.split(",")),
-                args.resume_from, task=task)
+                args.resume_from, task=task, repair_trigger=args.repair_trigger,
+                checkpoint_root=args.checkpoint_root)
     elif args.phase == "train":
         train(root)
     else:
