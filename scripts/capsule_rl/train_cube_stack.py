@@ -21,9 +21,12 @@ from scripts.capsule_rl.common import atomic_write_json, load_and_validate_serve
 def prepare(
     root: Path, model: Path, verl: Path, seeds: tuple[int, ...],
     resume_from: Path | None = None,
+    *, task: str = "cube_stack",
 ) -> None:
     from capx.rl.capsule.server_factory import YamlEnvironmentFactory, load_task_instances
 
+    if task not in ("cube_stack", "cube_restack"):
+        raise ValueError(f"unsupported training task: {task}")
     if not seeds or min(seeds) < 0 or len(set(seeds)) != len(seeds):
         raise ValueError("training seeds must be distinct non-negative integers")
     parent = None
@@ -39,6 +42,7 @@ def prepare(
             parent_result["status"] != "completed"
             or parent_result["completed_group_count"] != parent_protocol["group_count"]
             or parent_protocol["program_service"]["model"] != str(model.resolve())
+            or parent_protocol["task"]["environment"] != f"robosuite_{task}"
         ):
             raise ValueError("parent must be a completed run of the same base model")
         ancestry_seeds = parent_protocol["training_seeds"]
@@ -77,6 +81,13 @@ def prepare(
         }
     )
     config["task"]["profile"] = "robosuite_cube_stack_privileged"
+    if task == "cube_restack":
+        config["task"].update({
+            "profile": "robosuite_cube_restack_privileged_highlevel",
+            "environment": "robosuite_cube_restack",
+            "config_path": "env_configs/cube_restack/capsule_rl/"
+            "franka_robosuite_cube_restack_privileged_clean_replay.yaml",
+        })
     # Stack repairs replace longer functions: observed complete traces exceed Lift's 8K limit.
     # The worker factory propagates this capacity without truncating the committed history.
     config["capsule"]["revision_input_max_tokens"] = 24576
@@ -101,7 +112,7 @@ def prepare(
             expected_prompt = prompt
             rows.append(
                 {
-                    "task_id": "cube-stack-red-on-green",
+                    "task_id": f"{task.replace('_', '-')}-red-on-green",
                     "prompt": prompt,
                     "environment_seed": seed,
                     "initial_state_sha256": info["initial_state_sha256"],
@@ -128,7 +139,7 @@ def prepare(
     atomic_write_json(
         root / "protocol.json",
         {
-            "mode": "privileged_highlevel_cube_stack_capsule_rl",
+            "mode": f"privileged_highlevel_{task}_capsule_rl",
             "project_commit": subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=project, text=True
             ).strip(),
@@ -241,7 +252,7 @@ def train(root: Path) -> None:
     print(json.dumps(summary), flush=True)
 
 
-def main() -> None:
+def main(task: str = "cube_stack") -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("phase", choices=("prepare", "train", "summarize"))
     parser.add_argument("--root", type=Path, required=True)
@@ -254,7 +265,8 @@ def main() -> None:
     if args.phase == "prepare":
         if args.model is None or args.verl is None:
             parser.error("prepare requires --model and --verl")
-        prepare(root, args.model, args.verl, tuple(int(s) for s in args.seeds.split(",")), args.resume_from)
+        prepare(root, args.model, args.verl, tuple(int(s) for s in args.seeds.split(",")),
+                args.resume_from, task=task)
     elif args.phase == "train":
         train(root)
     else:

@@ -7,7 +7,7 @@ loading YAML, Hydra, Robosuite, or simulator modules.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
@@ -60,12 +60,21 @@ ROBOSUITE_CUBE_LIFT_PRIVILEGED_HIGHLEVEL = CapsuleTaskProfile(
     required_server_targets=("capx.serving.launch_pyroki_server.main",),
 )
 
+ROBOSUITE_CUBE_RESTACK_PRIVILEGED_HIGHLEVEL = replace(
+    ROBOSUITE_CUBE_STACK_PRIVILEGED,
+    name="robosuite_cube_restack_privileged_highlevel",
+    environment="robosuite_cube_restack",
+    env_target="capx.envs.tasks.franka.franka_cube_restack.FrankaRestackCodeEnv",
+    low_level="franka_robosuite_cubes_restack_low_level",
+)
+
 CAPSULE_TASK_PROFILES: Mapping[str, CapsuleTaskProfile] = MappingProxyType(
     {
         profile.name: profile
         for profile in (
             ROBOSUITE_CUBE_STACK_PRIVILEGED,
             ROBOSUITE_CUBE_LIFT_PRIVILEGED_HIGHLEVEL,
+            ROBOSUITE_CUBE_RESTACK_PRIVILEGED_HIGHLEVEL,
         )
     }
 )
@@ -286,6 +295,7 @@ __all__ = [
     "CAPSULE_TASK_PROFILES",
     "ROBOSUITE_CUBE_LIFT_PRIVILEGED_HIGHLEVEL",
     "ROBOSUITE_CUBE_STACK_PRIVILEGED",
+    "ROBOSUITE_CUBE_RESTACK_PRIVILEGED_HIGHLEVEL",
     "CapsuleTaskProfile",
     "CapsuleTaskProfileError",
     "collect_environment_profile_errors",
