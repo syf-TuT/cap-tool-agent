@@ -146,7 +146,7 @@ def generate(root: Path, policy: str, training_root: Path | None = None) -> None
                 "adapter": str(adapter),
                 "adapter_config_sha256": sha256(adapter / "adapter_config.json"),
                 "adapter_model_sha256": sha256(adapter / "adapter_model.safetensors"),
-                "optimizer_steps": result["optimizer_step_delta"],
+                "optimizer_steps": result["optimizer_step_after"],
                 "training_root": str(training_root),
                 "training_protocol_sha256": sha256(training_protocol_path),
                 "training_result_sha256": sha256(training_root / "training_result.json"),

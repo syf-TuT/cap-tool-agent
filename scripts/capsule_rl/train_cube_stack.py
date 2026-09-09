@@ -18,11 +18,41 @@ import yaml
 from scripts.capsule_rl.common import atomic_write_json, load_and_validate_server_config
 
 
-def prepare(root: Path, model: Path, verl: Path, seeds: tuple[int, ...]) -> None:
+def prepare(
+    root: Path, model: Path, verl: Path, seeds: tuple[int, ...],
+    resume_from: Path | None = None,
+) -> None:
     from capx.rl.capsule.server_factory import YamlEnvironmentFactory, load_task_instances
 
     if not seeds or min(seeds) < 0 or len(set(seeds)) != len(seeds):
         raise ValueError("training seeds must be distinct non-negative integers")
+    parent = None
+    ancestry_seeds = []
+    prior_groups = 0
+    if resume_from is not None:
+        resume_from = resume_from.resolve()
+        parent_protocol_path = resume_from / "protocol.json"
+        parent_result_path = resume_from / "training_result.json"
+        parent_protocol = json.loads(parent_protocol_path.read_text())
+        parent_result = json.loads(parent_result_path.read_text())
+        if (
+            parent_result["status"] != "completed"
+            or parent_result["completed_group_count"] != parent_protocol["group_count"]
+            or parent_protocol["program_service"]["model"] != str(model.resolve())
+        ):
+            raise ValueError("parent must be a completed run of the same base model")
+        ancestry_seeds = parent_protocol["training_seeds"]
+        if set(seeds) & set(ancestry_seeds):
+            raise ValueError("new training scenes must not overlap ancestor training scenes")
+        prior_groups = parent_protocol.get("cumulative_group_count", parent_protocol["group_count"])
+        parent = {
+            "training_root": str(resume_from),
+            "protocol_sha256": hashlib.sha256(parent_protocol_path.read_bytes()).hexdigest(),
+            "result_sha256": hashlib.sha256(parent_result_path.read_bytes()).hexdigest(),
+            "checkpoint": parent_result["checkpoint"],
+            "checkpoint_sha256": parent_result["checkpoint_sha256"],
+            "optimizer_step": parent_result["optimizer_step_after"],
+        }
     project = Path(__file__).resolve().parents[2]
     config_dir = project / "env_configs/cube_stack/capsule_rl"
     config = yaml.safe_load(
@@ -80,6 +110,8 @@ def prepare(root: Path, model: Path, verl: Path, seeds: tuple[int, ...]) -> None
     finally:
         environment.close()
     config["program_service"]["prompt_sha256"] = hashlib.sha256(prompt.encode()).hexdigest()
+    if parent is not None and config["program_service"] != parent_protocol["program_service"]:
+        raise ValueError("continuation must retain the parent's Program prompt and sampling recipe")
     (root / "dataset.seed_resolved.jsonl").write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8"
     )
@@ -100,8 +132,11 @@ def prepare(root: Path, model: Path, verl: Path, seeds: tuple[int, ...]) -> None
             "project_commit": subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=project, text=True
             ).strip(),
-            "training_seeds": list(seeds),
+            "training_seeds": ancestry_seeds + list(seeds),
+            "new_training_seeds": list(seeds),
             "group_count": len(tasks),
+            "cumulative_group_count": prior_groups + len(tasks),
+            "resume_from": parent,
             "group_size": config["capsule"]["group_size"],
             "repair_trigger": "all seven initial ordinary Program samples failed clean replay",
             "program_service": config["program_service"],
@@ -156,6 +191,7 @@ def summarize(root: Path, result: dict) -> dict:
 
 
 def train(root: Path) -> None:
+    from capx.rl.capsule.checkpoint import checkpoint_tree_sha256
     from capx.rl.capsule.server_factory import create_trainer
 
     config = load_and_validate_server_config(root / "runtime.yaml", check_runtime_paths=True)
@@ -165,7 +201,40 @@ def train(root: Path) -> None:
     for name, expected in protocol["input_sha256"].items():
         if hashlib.sha256((root / name).read_bytes()).hexdigest() != expected:
             raise RuntimeError(f"prepared training input changed: {name}")
-    result = create_trainer(config).fit()
+    runtime = create_trainer(config)
+    parent = protocol.get("resume_from")
+    if parent is not None:
+        parent_root = Path(parent["training_root"])
+        for filename, key in (("protocol.json", "protocol_sha256"), ("training_result.json", "result_sha256")):
+            if hashlib.sha256((parent_root / filename).read_bytes()).hexdigest() != parent[key]:
+                raise RuntimeError(f"parent training artifact changed: {filename}")
+        if checkpoint_tree_sha256(parent["checkpoint"]) != parent["checkpoint_sha256"]:
+            raise RuntimeError("parent checkpoint changed before continuation")
+        original_starter = runtime.worker_starter
+
+        def restored_starter(config):
+            workers = original_starter(config)
+            try:
+                workers.actor_rollout_wg.load_checkpoint(
+                    parent["checkpoint"], del_local_after_load=False
+                )
+                restored_step = workers.optimizer_step()
+                if restored_step != parent["optimizer_step"]:
+                    raise RuntimeError("restored optimizer step does not match parent")
+                atomic_write_json(root / "restore_evidence.json", {
+                    **parent,
+                    "restored_optimizer_step": restored_step,
+                    "load_contents": ["model", "optimizer", "extra"],
+                })
+                print(f"Restored parent checkpoint at optimizer step {restored_step}", flush=True)
+                return workers
+            except BaseException:
+                workers.close()
+                raise
+
+        runtime.worker_starter = restored_starter
+    result = runtime.fit()
+    result["cumulative_group_count"] = protocol.get("cumulative_group_count", protocol["group_count"])
     atomic_write_json(root / "training_result.json", result)
     summary = summarize(root, result)
     atomic_write_json(root / "summary.json", summary)
@@ -178,13 +247,14 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--verl", type=Path)
+    parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--seeds", default=",".join(map(str, range(5, 21))))
     args = parser.parse_args()
     root = args.root.resolve()
     if args.phase == "prepare":
         if args.model is None or args.verl is None:
             parser.error("prepare requires --model and --verl")
-        prepare(root, args.model, args.verl, tuple(int(s) for s in args.seeds.split(",")))
+        prepare(root, args.model, args.verl, tuple(int(s) for s in args.seeds.split(",")), args.resume_from)
     elif args.phase == "train":
         train(root)
     else:
