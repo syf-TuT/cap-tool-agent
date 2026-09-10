@@ -24,6 +24,7 @@ def prepare(
     resume_from: Path | None = None,
     *, task: str = "cube_stack", repair_trigger: str = "all_failed",
     checkpoint_root: Path | None = None,
+    controller_model: str | None = None,
 ) -> None:
     from capx.rl.capsule.server_factory import YamlEnvironmentFactory, load_task_instances
 
@@ -65,6 +66,8 @@ def prepare(
         (config_dir / "franka_robosuite_cube_stack_capsule_critique_grpo.yaml").read_text()
     )
     config["capsule"]["repair_trigger"] = repair_trigger
+    if controller_model is not None:
+        config["controller_service"]["model"] = controller_model
     if parent is not None and parent_protocol["capsule"].get("repair_trigger", "all_failed") != repair_trigger:
         raise ValueError("continuation must retain the parent's repair trigger")
     lift = yaml.safe_load(
@@ -284,6 +287,7 @@ def main(task: str = "cube_stack") -> None:
     parser.add_argument("--verl", type=Path)
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--checkpoint-root", type=Path)
+    parser.add_argument("--controller-model")
     parser.add_argument("--repair-trigger", choices=("never", "any_failed", "all_failed"), default="all_failed")
     parser.add_argument("--seeds", default=",".join(map(str, range(5, 21))))
     args = parser.parse_args()
@@ -293,7 +297,7 @@ def main(task: str = "cube_stack") -> None:
             parser.error("prepare requires --model and --verl")
         prepare(root, args.model, args.verl, tuple(int(s) for s in args.seeds.split(",")),
                 args.resume_from, task=args.task, repair_trigger=args.repair_trigger,
-                checkpoint_root=args.checkpoint_root)
+                checkpoint_root=args.checkpoint_root, controller_model=args.controller_model)
     elif args.phase == "train":
         train(root)
     else:

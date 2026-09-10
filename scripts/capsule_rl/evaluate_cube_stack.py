@@ -129,7 +129,25 @@ def generate(root: Path, policy: str, training_root: Path | None = None) -> None
         "policy": policy,
         "protocol_sha256": sha256(root / "protocol.json"),
     }
-    if policy == "trained_lora":
+    if policy == "sft_lora":
+        from peft import PeftModel
+
+        sft_root = Path(protocol["training_root"])
+        sft = read(sft_root / "sft_result.json")
+        collection = read(sft_root / "collection_protocol.json")
+        adapter = sft_root / "lora_adapter"
+        if set(collection["training_seeds"]) & set(protocol["seeds"]):
+            raise RuntimeError("SFT and evaluation seeds overlap")
+        if sha256(sft_root / "sft.jsonl") != sft["dataset_sha256"]:
+            raise RuntimeError("SFT dataset changed")
+        if Path(sft["base_model"]).resolve() != Path(model_path).resolve():
+            raise RuntimeError("SFT base model mismatch")
+        model = PeftModel.from_pretrained(model, str(adapter), is_trainable=False)
+        identity.update({"adapter": str(adapter),
+                         "adapter_model_sha256": sha256(adapter / "adapter_model.safetensors"),
+                         "adapter_config_sha256": sha256(adapter / "adapter_config.json"),
+                         "sft_result_sha256": sha256(sft_root / "sft_result.json")})
+    elif policy == "trained_lora":
         from peft import PeftModel
 
         training_root = (training_root or Path(protocol["training_root"])).resolve()

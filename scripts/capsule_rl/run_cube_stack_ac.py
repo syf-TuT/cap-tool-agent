@@ -1,4 +1,4 @@
-"""Paired ordinary GRPO versus any-failure critique, at 16 and 32 Stack or Lift groups."""
+"""Paired ordinary GRPO versus any-failure critique for privileged cube tasks."""
 
 from __future__ import annotations
 
@@ -35,8 +35,12 @@ def audit_training(root: Path, trigger: str, total: int) -> dict:
 
     protocol = read(root / "protocol.json")
     result = read(root / "training_result.json")
-    if result["status"] != "completed" or result["cumulative_group_count"] != total:
+    if result["status"] not in ("completed", "completed_no_updates_all_constant") or result["cumulative_group_count"] != total:
         raise RuntimeError("training did not complete the requested cumulative groups")
+    if result["status"] == "completed_no_updates_all_constant" and (
+        result["actor_updates"] != 0 or result["skipped_actor_updates"] != result["completed_group_count"]
+    ):
+        raise RuntimeError("zero-update completion disagrees with update counters")
     if protocol["capsule"]["repair_trigger"] != trigger:
         raise RuntimeError("wrong training arm")
     if set(protocol["training_seeds"]) & set(range(201, 221)):
@@ -76,6 +80,7 @@ def audit_training(root: Path, trigger: str, total: int) -> dict:
     summary = read(root / "summary.json")
     return {
         "training_root": str(root), "checkpoint": result["checkpoint"],
+        "training_status": result["status"],
         "checkpoint_sha256": result["checkpoint_sha256"],
         "actor_updates": result["actor_updates"],
         "skipped_actor_updates": result["skipped_actor_updates"],
@@ -84,6 +89,9 @@ def audit_training(root: Path, trigger: str, total: int) -> dict:
         "repair_triggered_groups": summary["repair_triggered_groups"],
         "guided_groups": summary["capsule_repaired_groups"],
         "initial_base_success_rate": summary["initial_base_success_rate"],
+        "positive_final_members": sum(sum(r == 1.0 for r in g["rewards"]) for g in summary["groups"]),
+        "all_zero_final_groups": sum(not any(g["rewards"]) for g in summary["groups"]),
+        "controller_successful_repairs": summary["controller_successful_repairs"],
         "accepted_group_replay_attempts": replay_attempts,
         "program_usage": result["program_usage"],
         "controller_usage": result["controller_usage"],
@@ -91,9 +99,9 @@ def audit_training(root: Path, trigger: str, total: int) -> dict:
     }
 
 
-def compare_evaluations(roots: dict[str, Path]) -> dict:
+def compare_evaluations(roots: dict[str, Path], totals: tuple[int, ...] = (16, 32)) -> dict:
     comparisons = {}
-    for total in (16, 32):
+    for total in totals:
         records = {
             arm: [verify_replay(roots[f"{arm}{total}"], "trained_lora", i) for i in range(80)]
             for arm in ("A", "C")
@@ -126,14 +134,19 @@ def compare_evaluations(roots: dict[str, Path]) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", choices=("cube_stack", "cube_lift"), default="cube_stack")
+    parser.add_argument("--task", choices=("cube_stack", "cube_lift", "cube_restack"), default="cube_stack")
+    parser.add_argument("--groups", type=int, choices=(16, 32), default=32)
+    parser.add_argument("--training-only", action="store_true")
+    parser.add_argument("--controller-model")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--verl", type=Path, required=True)
     parser.add_argument("--staging-checkpoint-root", type=Path)
     args = parser.parse_args()
-    if not args.run_id or Path(args.run_id).name != args.run_id:
+    if not args.run_id or Path(args.run_id).name != args.run_id or args.run_id in (".", ".."):
         parser.error("run-id must be a directory name")
+    if args.task == "cube_restack" and not args.training_only:
+        parser.error("Restack requires --training-only; the existing evaluator targets Stack")
     if not os.environ.get("CAPX_CONTROLLER_API_KEY"):
         parser.error("CAPX_CONTROLLER_API_KEY is required for arm C")
     project = Path(__file__).resolve().parents[2]
@@ -155,8 +168,10 @@ def main() -> None:
     manifest = {
         "run_id": args.run_id, "task": args.task,
         "model": str(args.model.resolve()), "verl": str(args.verl.resolve()),
-        "training_seeds": list(range(5, 37)), "evaluation_seeds": list(range(201, 221)),
-        "samples_per_scene": 4, "primary_comparison_groups": 32,
+        "training_seeds": list(range(5, 5 + args.groups)),
+        "evaluation_seeds": [] if args.training_only else list(range(201, 221)),
+        "samples_per_scene": 4, "primary_comparison_groups": args.groups,
+        "training_only": args.training_only, "controller_model": args.controller_model,
         "source_sha256": {str(p.relative_to(project)): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths},
     }
     manifest_path = root / "experiment.json"
@@ -187,7 +202,8 @@ def main() -> None:
     services = []
     try:
         training_roots = {}
-        for total in (16, 32):
+        totals = (16,) if args.groups == 16 else (16, 32)
+        for total in totals:
             for arm, trigger in (("A", "never"), ("C", "any_failed")):
                 label = f"{arm}{total}"
                 training_root = root / label
@@ -199,8 +215,10 @@ def main() -> None:
                                  "--seeds", ",".join(map(str, range(5, 21) if total == 16 else range(21, 37)))]
                     if total == 32:
                         arguments += ["--resume-from", str(training_roots[f"{arm}16"])]
+                    if args.controller_model:
+                        arguments += ["--controller-model", args.controller_model]
                     # Keep one full checkpoint on disk and three in explicit temporary storage.
-                    if args.staging_checkpoint_root and label != "A32":
+                    if args.staging_checkpoint_root and label != f"A{args.groups}":
                         arguments += ["--checkpoint-root", str(args.staging_checkpoint_root / args.run_id / label)]
                     run("scripts.capsule_rl.train_cube_stack", arguments, f"{label}_prepare", arm=arm)
                 if not (training_root / "training_result.json").exists():
@@ -212,6 +230,10 @@ def main() -> None:
                     run("scripts.capsule_rl.train_cube_stack", ["train", "--root", str(training_root)], f"{label}_train", arm=arm)
                 status["training"][label] = audit_training(training_root, trigger, total)
                 write_status(root / "status.json", status)
+
+        if args.training_only:
+            status.update({"status": "completed", "active_phase": None})
+            return
 
         evaluation_roots = {}
         # Generate before loading the perception services to keep GPU use bounded.
@@ -239,7 +261,7 @@ def main() -> None:
                 "--policy", "trained_lora"], f"{label}_evaluate")
             records = [verify_replay(evaluation, "trained_lora", i) for i in range(80)]
             status["evaluation"][label] = {"successes": sum(r["outcome"] == "success" for r in records), "total": 80}
-        comparison = compare_evaluations(evaluation_roots)
+        comparison = compare_evaluations(evaluation_roots, totals)
         atomic_write_json(root / "comparison.json", comparison)
         status.update({"status": "completed", "active_phase": None, "comparison": comparison})
     except BaseException as error:
