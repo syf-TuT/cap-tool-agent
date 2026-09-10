@@ -1,4 +1,4 @@
-"""Paired initial/LoRA evaluation on held-out non-privileged high-level Cube Stack.
+"""Paired initial/LoRA evaluation on held-out non-privileged high-level cube tasks.
 
 Separate generation and replay phases let the actor release GPU memory before perception.
 Each program executes once, without Controller assistance. Partial phases can be resumed.
@@ -62,9 +62,15 @@ def prepare(root: Path, training_root: Path, seeds: tuple[int, ...], samples: in
     if set(seeds) & set(training["training_seeds"]):
         raise ValueError("evaluation seeds must be held out from training")
     project = Path(__file__).resolve().parents[2]
-    config = yaml.safe_load(
-        (project / ("env_configs/cube_stack/franka_robosuite_cube_stack.yaml")).read_text()
-    )
+    environment_name = training["task"]["environment"]
+    evaluation_configs = {
+        "robosuite_cube_stack": "env_configs/cube_stack/franka_robosuite_cube_stack.yaml",
+        "robosuite_cube_lift": "env_configs/cube_lifting/franka_robosuite_cube_lifting.yaml",
+    }
+    if environment_name not in evaluation_configs:
+        raise ValueError(f"unsupported evaluation environment: {environment_name}")
+    task = environment_name.removeprefix("robosuite_")
+    config = yaml.safe_load((project / evaluation_configs[environment_name]).read_text())
     config["record_video"] = False
     config["num_workers"] = 1
     config["env"]["cfg"].update({"enable_render": False, "viser_debug": False})
@@ -83,7 +89,7 @@ def prepare(root: Path, training_root: Path, seeds: tuple[int, ...], samples: in
     atomic_write_json(
         root / "protocol.json",
         {
-            "mode": "initial_vs_trained_nonprivileged_highlevel_cube_stack",
+            "mode": f"initial_vs_trained_nonprivileged_highlevel_{task}",
             "training_root": str(training_root),
             "training_protocol_sha256": sha256(training_root / "protocol.json"),
             "seeds": list(seeds),
@@ -137,8 +143,12 @@ def generate(root: Path, policy: str, training_root: Path | None = None) -> None
             raise RuntimeError("checkpoint training does not match the frozen evaluation protocol")
         result = read(training_root / "training_result.json")
         adapters = list(Path(result["checkpoint"]).rglob("adapter_config.json"))
-        if len(adapters) != 1 or result["optimizer_step_delta"] < 1:
-            raise RuntimeError("training must produce exactly one updated LoRA adapter")
+        if (
+            result["status"] != "completed"
+            or result["completed_group_count"] != training["group_count"]
+            or len(adapters) != 1
+        ):
+            raise RuntimeError("completed training must produce exactly one LoRA adapter")
         adapter = adapters[0].parent
         model = PeftModel.from_pretrained(model, str(adapter), is_trainable=False)
         identity.update(

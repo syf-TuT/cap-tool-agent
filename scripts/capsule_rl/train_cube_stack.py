@@ -1,4 +1,4 @@
-"""Prepare and train privileged high-level Cube Stack with the Cube Lift Capsule recipe.
+"""Prepare and train privileged high-level cube tasks with the Cube Lift Capsule recipe.
 
 Run preparation on the simulator host. Task prompts and initial-state hashes come from real
 resets; the model, decoder, group assembler, loss, and LoRA recipe are shared with Cube Lift.
@@ -27,7 +27,7 @@ def prepare(
 ) -> None:
     from capx.rl.capsule.server_factory import YamlEnvironmentFactory, load_task_instances
 
-    if task not in ("cube_stack", "cube_restack"):
+    if task not in ("cube_stack", "cube_restack", "cube_lift"):
         raise ValueError(f"unsupported training task: {task}")
     if not seeds or min(seeds) < 0 or len(set(seeds)) != len(seeds):
         raise ValueError("training seeds must be distinct non-negative integers")
@@ -95,6 +95,8 @@ def prepare(
             "config_path": "env_configs/cube_restack/capsule_rl/"
             "franka_robosuite_cube_restack_privileged_clean_replay.yaml",
         })
+    elif task == "cube_lift":
+        config["task"] = dict(lift["task"])
     # Stack repairs replace longer functions: observed complete traces exceed Lift's 8K limit.
     # The worker factory propagates this capacity without truncating the committed history.
     config["capsule"]["revision_input_max_tokens"] = 24576
@@ -102,6 +104,7 @@ def prepare(
     config["program_service"] = dict(lift["program_service"])
     config["program_service"]["model"] = str(model.resolve())
     environment = YamlEnvironmentFactory(str(project / config["task"]["config_path"]))(None)
+    task_id = "cube-lift" if task == "cube_lift" else f"{task.replace('_', '-')}-red-on-green"
     rows = []
     expected_prompt = None
     try:
@@ -119,7 +122,7 @@ def prepare(
             expected_prompt = prompt
             rows.append(
                 {
-                    "task_id": f"{task.replace('_', '-')}-red-on-green",
+                    "task_id": task_id,
                     "prompt": prompt,
                     "environment_seed": seed,
                     "initial_state_sha256": info["initial_state_sha256"],
@@ -268,6 +271,7 @@ def train(root: Path) -> None:
 
 def main(task: str = "cube_stack") -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--task", choices=("cube_stack", "cube_restack", "cube_lift"), default=task)
     parser.add_argument("phase", choices=("prepare", "train", "summarize"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--model", type=Path)
@@ -282,7 +286,7 @@ def main(task: str = "cube_stack") -> None:
         if args.model is None or args.verl is None:
             parser.error("prepare requires --model and --verl")
         prepare(root, args.model, args.verl, tuple(int(s) for s in args.seeds.split(",")),
-                args.resume_from, task=task, repair_trigger=args.repair_trigger,
+                args.resume_from, task=args.task, repair_trigger=args.repair_trigger,
                 checkpoint_root=args.checkpoint_root)
     elif args.phase == "train":
         train(root)

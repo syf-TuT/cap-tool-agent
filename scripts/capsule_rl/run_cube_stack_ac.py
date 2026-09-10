@@ -1,4 +1,4 @@
-"""Paired ordinary GRPO versus any-failure critique, at 16 and 32 Cube Stack groups."""
+"""Paired ordinary GRPO versus any-failure critique, at 16 and 32 Stack or Lift groups."""
 
 from __future__ import annotations
 
@@ -126,6 +126,7 @@ def compare_evaluations(roots: dict[str, Path]) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--task", choices=("cube_stack", "cube_lift"), default="cube_stack")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--verl", type=Path, required=True)
@@ -152,7 +153,8 @@ def main() -> None:
                     project / "capx/rl/capsule/controller.py", project / "scripts/capsule_rl/common.py",
                     project / "scripts/capsule_rl/train_cube_stack.py", project / "scripts/capsule_rl/evaluate_cube_stack.py"]
     manifest = {
-        "run_id": args.run_id, "model": str(args.model.resolve()), "verl": str(args.verl.resolve()),
+        "run_id": args.run_id, "task": args.task,
+        "model": str(args.model.resolve()), "verl": str(args.verl.resolve()),
         "training_seeds": list(range(5, 37)), "evaluation_seeds": list(range(201, 221)),
         "samples_per_scene": 4, "primary_comparison_groups": 32,
         "source_sha256": {str(p.relative_to(project)): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths},
@@ -191,7 +193,8 @@ def main() -> None:
                 training_root = root / label
                 training_roots[label] = training_root
                 if not (training_root / "protocol.json").exists():
-                    arguments = ["prepare", "--root", str(training_root), "--model", str(args.model),
+                    arguments = ["prepare", "--task", args.task,
+                                 "--root", str(training_root), "--model", str(args.model),
                                  "--verl", str(args.verl), "--repair-trigger", trigger,
                                  "--seeds", ",".join(map(str, range(5, 21) if total == 16 else range(21, 37)))]
                     if total == 32:
