@@ -77,12 +77,15 @@ def capsule_critique_policy_loss(
     clip_ratio_high: float | None = None,
     clip_ratio_c: float = 3.0,
     capsule_gamma: float = 0.1,
+    guided_objective: str = "probability_shaping",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Mix pinned VeRL dual-clipped PPO base tokens with guided probability shaping.
 
     Base-token math is byte-for-byte equivalent in operation order to the pinned VeRL vanilla
     objective.  Guided tokens use ``-A * sigmoid(log(p) - log(gamma))`` and never consult their
-    old log-probability.  The combined loss is a mean over non-padding response tokens.
+    old log-probability. ``log_probability`` instead uses ``-A * log(p)`` so guided
+    tokens retain the full advantage coefficient. The combined loss is a mean over
+    non-padding response tokens.
     """
 
     _require_tensor_shape_and_dtype(
@@ -92,6 +95,8 @@ def capsule_critique_policy_loss(
         response_mask,
         guided_token_mask,
     )
+    if guided_objective not in ("probability_shaping", "log_probability"):
+        raise ValueError(f"unsupported guided_objective: {guided_objective!r}")
     numeric_parameters = {
         "clip_ratio": clip_ratio,
         "clip_ratio_c": clip_ratio_c,
@@ -141,8 +146,11 @@ def capsule_critique_policy_loss(
     base_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
     # sigmoid is numerically stable even for very small/large current probabilities.
-    guided_probability_weight = torch.sigmoid(log_prob - math.log(float(capsule_gamma)))
-    guided_losses = -advantages * guided_probability_weight
+    if guided_objective == "log_probability":
+        guided_losses = -advantages * log_prob
+    else:
+        guided_probability_weight = torch.sigmoid(log_prob - math.log(float(capsule_gamma)))
+        guided_losses = -advantages * guided_probability_weight
     losses = torch.where(guided_token_mask, guided_losses, base_losses)
     pg_loss = _masked_mean(losses, response_mask)
 
@@ -231,6 +239,9 @@ def verl_capsule_critique_policy_loss(
         clip_ratio_high=_config_get(config, "clip_ratio_high", None),
         clip_ratio_c=_config_get(config, "clip_ratio_c", 3.0),
         capsule_gamma=_policy_loss_config_get(config, "capsule_gamma", 0.1),
+        guided_objective=_policy_loss_config_get(
+            config, "guided_objective", "probability_shaping"
+        ),
     )
     return pg_loss, {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),

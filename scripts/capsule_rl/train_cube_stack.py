@@ -141,6 +141,12 @@ def prepare(
     )
     worker_config["trainer"]["total_epochs"] = 1
     worker_config["trainer"]["experiment_name"] = root.name
+    if task == "cube_lift":
+        # Equal reward-baseline weight and full guided log-probability coefficient.
+        for training_config in (config, worker_config):
+            training_config["actor_rollout_ref"]["actor"]["policy_loss"][
+                "guided_objective"
+            ] = "log_probability"
     (root / "verl.yaml").write_text(yaml.safe_dump(worker_config, sort_keys=False))
     config_path = root / "runtime.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))

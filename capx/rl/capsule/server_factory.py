@@ -1363,6 +1363,9 @@ def _load_resolved_verl_config(config: Mapping[str, Any], project_root: Path) ->
         verl_config.actor_rollout_ref.actor.ulysses_sequence_parallel_size = 1
         verl_config.actor_rollout_ref.actor.policy_loss.loss_mode = "capsule_critique"
         verl_config.actor_rollout_ref.actor.policy_loss.capsule_gamma = 0.1
+        verl_config.actor_rollout_ref.actor.policy_loss.guided_objective = (
+            capsule_actor["policy_loss"].get("guided_objective", "probability_shaping")
+        )
         verl_config.algorithm.norm_adv_by_std_in_grpo = False
         verl_config.algorithm.rollout_is = False
         verl_config.algorithm.rollout_is_threshold = None
