@@ -134,10 +134,11 @@ def compare_evaluations(roots: dict[str, Path], totals: tuple[int, ...] = (16, 3
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", choices=("cube_stack", "cube_lift", "cube_restack"), default="cube_stack")
+    parser.add_argument("--task", choices=("cube_stack", "cube_lift", "cube_restack", "spill_wipe"), default="cube_stack")
     parser.add_argument("--groups", type=int, choices=(16, 32), default=32)
     parser.add_argument("--training-only", action="store_true")
     parser.add_argument("--controller-model")
+    parser.add_argument("--controller-endpoint")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--verl", type=Path, required=True)
@@ -165,6 +166,16 @@ def main() -> None:
                     project / "capx/rl/capsule/trainer.py", project / "capx/rl/capsule/server_factory.py",
                     project / "capx/rl/capsule/controller.py", project / "scripts/capsule_rl/common.py",
                     project / "scripts/capsule_rl/train_cube_stack.py", project / "scripts/capsule_rl/evaluate_cube_stack.py"]
+    if args.task == "spill_wipe":
+        source_paths.extend(project / name for name in (
+            "capx/rl/capsule/task_profiles.py",
+            "capx/envs/simulators/robosuite_spill_wipe.py",
+            "capx/envs/tasks/franka/franka_spill_wipe.py",
+            "capx/integrations/franka/spill_wipe.py",
+            "capx/integrations/franka/spill_wipe_privileged.py",
+            "env_configs/spill_wipe/franka_robosuite_spill_wipe.yaml",
+            "env_configs/spill_wipe/capsule_rl/franka_robosuite_spill_wipe_privileged_clean_replay.yaml",
+        ))
     manifest = {
         "run_id": args.run_id, "task": args.task,
         "model": str(args.model.resolve()), "verl": str(args.verl.resolve()),
@@ -172,6 +183,7 @@ def main() -> None:
         "evaluation_seeds": [] if args.training_only else list(range(201, 221)),
         "samples_per_scene": 4, "primary_comparison_groups": args.groups,
         "training_only": args.training_only, "controller_model": args.controller_model,
+        "controller_endpoint": args.controller_endpoint,
         "source_sha256": {str(p.relative_to(project)): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths},
     }
     manifest_path = root / "experiment.json"
@@ -217,6 +229,8 @@ def main() -> None:
                         arguments += ["--resume-from", str(training_roots[f"{arm}16"])]
                     if args.controller_model:
                         arguments += ["--controller-model", args.controller_model]
+                    if args.controller_endpoint:
+                        arguments += ["--controller-endpoint", args.controller_endpoint]
                     # Keep one full checkpoint on disk and three in explicit temporary storage.
                     if args.staging_checkpoint_root and label != f"A{args.groups}":
                         arguments += ["--checkpoint-root", str(args.staging_checkpoint_root / args.run_id / label)]
@@ -246,7 +260,8 @@ def main() -> None:
                     "--samples-per-seed", "4"], f"{label}_eval_prepare")
             run("scripts.capsule_rl.evaluate_cube_stack", ["generate", "--root", str(evaluation),
                 "--policy", "trained_lora"], f"{label}_generate")
-        for service, port in (("sam3", 8114), ("contact_graspnet", 8115), ("pyroki", 8116)):
+        grasp_services = () if args.task == "spill_wipe" else (("contact_graspnet", 8115),)
+        for service, port in (("sam3", 8114), *grasp_services, ("pyroki", 8116)):
             if not ready(port):
                 with (logs / f"{service}.log").open("a") as log:
                     services.append(subprocess.Popen([sys.executable, "-m", f"capx.serving.launch_{service}_server"],

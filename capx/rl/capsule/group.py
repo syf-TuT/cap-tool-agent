@@ -58,6 +58,7 @@ class ProgramCandidate:
     source: str
     finish_reason: str | None = None
     truncated: bool = False
+    response_token_ids: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.program_sample_id, str) or not self.program_sample_id:
@@ -68,6 +69,11 @@ class ProgramCandidate:
             raise TypeError("finish_reason must be a string or null")
         if not isinstance(self.truncated, bool):
             raise TypeError("truncated must be a boolean")
+        if self.response_token_ids is not None:
+            ids = tuple(self.response_token_ids)
+            if not ids or any(type(value) is not int or value < 0 for value in ids):
+                raise ValueError("response_token_ids must contain non-negative token IDs")
+            object.__setattr__(self, "response_token_ids", ids)
 
 
 class BaseSampler(Protocol):
@@ -484,6 +490,8 @@ class CapsuleGroupAssembler:
             reward=float(result.binary_reward),
             metadata={
                 "base_index": base_index,
+                **({"response_token_ids": candidate.response_token_ids}
+                   if candidate.response_token_ids is not None else {}),
                 "replay_outcome": result.outcome.value,
                 "raw_reward": result.raw_reward,
             },
@@ -935,6 +943,8 @@ class CapsuleGroupAssembler:
                     reward=1.0,
                     metadata={
                         "p0_program_sample_id": selected_attempt.p0_program_sample_id,
+                        **({"response_token_ids": guided_candidate.response_token_ids}
+                           if guided_candidate.response_token_ids is not None else {}),
                         "p0_rank": selected_attempt.p0_rank,
                         "trajectory_index": selected_attempt.trajectory_index,
                         "pt_source_sha256": selected_attempt.trace.final_source_sha256

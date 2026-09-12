@@ -798,7 +798,11 @@ class CapsuleCritiqueRayTrainer:
         group = assembly.group
         prompts = (task.prompt,) * BASE_GROUP_SIZE
         responses = tuple(member.response for member in group.members)
-        batch = self.batch_encoder.encode(prompts, responses)
+        sampled_ids = tuple(member.metadata.get("response_token_ids") for member in group.members)
+        if any(ids is not None for ids in sampled_ids):
+            batch = self.batch_encoder.encode(prompts, responses, response_token_ids=sampled_ids)
+        else:
+            batch = self.batch_encoder.encode(prompts, responses)
         tensors = _tensor_batch(batch)
         self._validate_encoded_tensors(tensors)
         response_mask = tensors["response_mask"]

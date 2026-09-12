@@ -485,14 +485,11 @@ class VeRLProgramGenerator:
                 "VeRL rollout returned active tokens after EOS; action identity is untrusted"
             )
         raw_response_ids = active[:eos_index]
-        source = self.tokenizer.decode(raw_response_ids, skip_special_tokens=True)
+        source = self.tokenizer.decode(
+            raw_response_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+        )
         if not isinstance(source, str) or not source:
             raise CandidateCollectionError("VeRL rollout returned an empty Program response")
-        retokenized = _encode_raw_response(self.tokenizer, source)
-        if retokenized != raw_response_ids:
-            raise CandidateCollectionError(
-                "VeRL rollout response failed the decode/retokenize token round-trip"
-            )
         return source, "stop", False
 
     def generate(self, prompt: str, program_sample_id: str) -> ProgramCandidate:
@@ -522,11 +519,14 @@ class VeRLProgramGenerator:
             output_batch["attention_mask"][0, -response_width:].sum().item()
         )
         source, finish_reason, truncated = self._decode(output)
+        sampled_ids = output_batch["responses"][0].detach().cpu().tolist()
+        sampled_ids = sampled_ids[:sampled_ids.index(self.tokenizer.eos_token_id)]
         return ProgramCandidate(
             program_sample_id=program_sample_id,
             source=source,
             finish_reason=finish_reason,
             truncated=truncated,
+            response_token_ids=tuple(sampled_ids),
         )
 
 
@@ -556,9 +556,14 @@ class VeRLGroupEncoder:
             if isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0:
                 raise ServerFactoryError(f"tokenizer.{name} must be a non-negative integer")
 
-    def encode(self, prompts: tuple[str, ...], responses: tuple[str, ...]) -> Any:
+    def encode(
+        self, prompts: tuple[str, ...], responses: tuple[str, ...],
+        *, response_token_ids: tuple[tuple[int, ...] | None, ...] | None = None,
+    ) -> Any:
         if not prompts or len(prompts) != len(responses):
             raise ServerFactoryError("training prompts/responses must have equal non-zero size")
+        if response_token_ids is not None and len(response_token_ids) != len(responses):
+            raise ServerFactoryError("sampled token rows must match training responses")
         prompt_rows: list[list[int]] = []
         response_rows: list[list[int]] = []
         prompt_lengths: list[int] = []
@@ -567,7 +572,17 @@ class VeRLGroupEncoder:
             zip(prompts, responses, strict=True)
         ):
             prompt_ids = _apply_chat_template(self.tokenizer, prompt, self.system_prompt)
-            response_ids = _encode_raw_response(self.tokenizer, response)
+            sampled = response_token_ids[row_index] if response_token_ids is not None else None
+            if sampled is None:
+                response_ids = _encode_raw_response(self.tokenizer, response)
+            else:
+                response_ids = list(sampled)
+                if any(type(value) is not int or value < 0 for value in response_ids):
+                    raise ServerFactoryError("sampled response contains invalid token IDs")
+                if self.eos_token_id in response_ids or self.tokenizer.decode(
+                    response_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+                ) != response:
+                    raise ServerFactoryError("sampled tokens do not match the executed response")
             if not response_ids:
                 raise ServerFactoryError(f"training response {row_index} has invalid token IDs")
             response_ids.append(self.eos_token_id)

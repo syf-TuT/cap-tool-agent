@@ -68,6 +68,16 @@ ROBOSUITE_CUBE_RESTACK_PRIVILEGED_HIGHLEVEL = replace(
     low_level="franka_robosuite_cubes_restack_low_level",
 )
 
+ROBOSUITE_SPILL_WIPE_PRIVILEGED = replace(
+    ROBOSUITE_CUBE_STACK_PRIVILEGED,
+    name="robosuite_spill_wipe_privileged",
+    environment="robosuite_spill_wipe",
+    api="franka_spill_wipe_privileged",
+    env_target="capx.envs.tasks.franka.franka_spill_wipe.FrankaSpillWipeCodeEnv",
+    low_level="franka_robosuite_spill_wipe_low_level",
+    api_classes=("FrankaControlSpillWipePrivilegedApi",),
+)
+
 CAPSULE_TASK_PROFILES: Mapping[str, CapsuleTaskProfile] = MappingProxyType(
     {
         profile.name: profile
@@ -75,6 +85,7 @@ CAPSULE_TASK_PROFILES: Mapping[str, CapsuleTaskProfile] = MappingProxyType(
             ROBOSUITE_CUBE_STACK_PRIVILEGED,
             ROBOSUITE_CUBE_LIFT_PRIVILEGED_HIGHLEVEL,
             ROBOSUITE_CUBE_RESTACK_PRIVILEGED_HIGHLEVEL,
+            ROBOSUITE_SPILL_WIPE_PRIVILEGED,
         )
     }
 )
@@ -296,6 +307,7 @@ __all__ = [
     "ROBOSUITE_CUBE_LIFT_PRIVILEGED_HIGHLEVEL",
     "ROBOSUITE_CUBE_STACK_PRIVILEGED",
     "ROBOSUITE_CUBE_RESTACK_PRIVILEGED_HIGHLEVEL",
+    "ROBOSUITE_SPILL_WIPE_PRIVILEGED",
     "CapsuleTaskProfile",
     "CapsuleTaskProfileError",
     "collect_environment_profile_errors",

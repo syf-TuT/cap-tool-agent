@@ -25,10 +25,11 @@ def prepare(
     *, task: str = "cube_stack", repair_trigger: str = "all_failed",
     checkpoint_root: Path | None = None,
     controller_model: str | None = None,
+    controller_endpoint: str | None = None,
 ) -> None:
     from capx.rl.capsule.server_factory import YamlEnvironmentFactory, load_task_instances
 
-    if task not in ("cube_stack", "cube_restack", "cube_lift"):
+    if task not in ("cube_stack", "cube_restack", "cube_lift", "spill_wipe"):
         raise ValueError(f"unsupported training task: {task}")
     if not seeds or min(seeds) < 0 or len(set(seeds)) != len(seeds):
         raise ValueError("training seeds must be distinct non-negative integers")
@@ -42,7 +43,10 @@ def prepare(
         parent_protocol = json.loads(parent_protocol_path.read_text())
         parent_result = json.loads(parent_result_path.read_text())
         if (
-            parent_result["status"] != "completed"
+            parent_result["status"] not in (
+                ("completed", "completed_no_updates_all_constant")
+                if task == "spill_wipe" else ("completed",)
+            )
             or parent_result["completed_group_count"] != parent_protocol["group_count"]
             or parent_protocol["program_service"]["model"] != str(model.resolve())
             or parent_protocol["task"]["environment"] != f"robosuite_{task}"
@@ -68,6 +72,8 @@ def prepare(
     config["capsule"]["repair_trigger"] = repair_trigger
     if controller_model is not None:
         config["controller_service"]["model"] = controller_model
+    if controller_endpoint is not None:
+        config["controller_service"]["endpoint"] = controller_endpoint
     if parent is not None and parent_protocol["capsule"].get("repair_trigger", "all_failed") != repair_trigger:
         raise ValueError("continuation must retain the parent's repair trigger")
     lift = yaml.safe_load(
@@ -100,6 +106,14 @@ def prepare(
         })
     elif task == "cube_lift":
         config["task"] = dict(lift["task"])
+    elif task == "spill_wipe":
+        config["task"].update({
+            "profile": "robosuite_spill_wipe_privileged",
+            "environment": "robosuite_spill_wipe",
+            "api": "franka_spill_wipe_privileged",
+            "config_path": "env_configs/spill_wipe/capsule_rl/"
+            "franka_robosuite_spill_wipe_privileged_clean_replay.yaml",
+        })
     # Stack repairs replace longer functions: observed complete traces exceed Lift's 8K limit.
     # The worker factory propagates this capacity without truncating the committed history.
     config["capsule"]["revision_input_max_tokens"] = 24576
@@ -108,6 +122,8 @@ def prepare(
     config["program_service"]["model"] = str(model.resolve())
     environment = YamlEnvironmentFactory(str(project / config["task"]["config_path"]))(None)
     task_id = "cube-lift" if task == "cube_lift" else f"{task.replace('_', '-')}-red-on-green"
+    if task == "spill_wipe":
+        task_id = "spill-wipe-brown-spill"
     rows = []
     expected_prompt = None
     try:
@@ -280,7 +296,7 @@ def train(root: Path) -> None:
 
 def main(task: str = "cube_stack") -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", choices=("cube_stack", "cube_restack", "cube_lift"), default=task)
+    parser.add_argument("--task", choices=("cube_stack", "cube_restack", "cube_lift", "spill_wipe"), default=task)
     parser.add_argument("phase", choices=("prepare", "train", "summarize"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--model", type=Path)
@@ -288,6 +304,7 @@ def main(task: str = "cube_stack") -> None:
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--checkpoint-root", type=Path)
     parser.add_argument("--controller-model")
+    parser.add_argument("--controller-endpoint")
     parser.add_argument("--repair-trigger", choices=("never", "any_failed", "all_failed"), default="all_failed")
     parser.add_argument("--seeds", default=",".join(map(str, range(5, 21))))
     args = parser.parse_args()
@@ -297,7 +314,8 @@ def main(task: str = "cube_stack") -> None:
             parser.error("prepare requires --model and --verl")
         prepare(root, args.model, args.verl, tuple(int(s) for s in args.seeds.split(",")),
                 args.resume_from, task=args.task, repair_trigger=args.repair_trigger,
-                checkpoint_root=args.checkpoint_root, controller_model=args.controller_model)
+                checkpoint_root=args.checkpoint_root, controller_model=args.controller_model,
+                controller_endpoint=args.controller_endpoint)
     elif args.phase == "train":
         train(root)
     else:

@@ -7,6 +7,7 @@ hot-swappable for code execution environments.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import numpy as np
@@ -16,6 +17,7 @@ from robosuite.controllers.composite.composite_controller_factory import (
     load_composite_controller_config,
 )
 
+from capx.envs.robosuite_seed import reseed_robosuite_owner
 from capx.envs.simulators.robosuite_base import RobosuiteBaseEnv
 
 
@@ -107,7 +109,7 @@ class FrankaRobosuiteSpillWipeLowLevel(RobosuiteBaseEnv):
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if seed is not None:
-            self._rng = np.random.default_rng(seed)
+            reseed_robosuite_owner(self, seed)
 
         self.robosuite_env.reset()
         # Adjust initial orientation
@@ -132,8 +134,16 @@ class FrankaRobosuiteSpillWipeLowLevel(RobosuiteBaseEnv):
         )
 
         info = {
-            "task_prompt": "Place the primary cube on top of the secondary cube. Quaternions are WXYZ."
+            "task_prompt": "Wipe up the brown spill. Quaternions are WXYZ."
         }
+        # Wipe markers are static model bodies, so qpos alone does not identify the spill.
+        sim = self.robosuite_env.sim
+        marker_positions = np.concatenate([
+            sim.data.body_xpos[sim.model.body_name2id(marker.root_body)]
+            for marker in self.robosuite_env.model.mujoco_arena.markers
+        ])
+        state = np.round(np.concatenate((sim.data.qpos, sim.data.qvel, marker_positions)), 10)
+        info["initial_state_sha256"] = hashlib.sha256(state.astype("<f8").tobytes()).hexdigest()
         return obs, info
 
     def step(self, action: Any) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:

@@ -64,6 +64,7 @@ def prepare(root: Path, training_root: Path, seeds: tuple[int, ...], samples: in
     project = Path(__file__).resolve().parents[2]
     environment_name = training["task"]["environment"]
     evaluation_configs = {
+        "robosuite_spill_wipe": "env_configs/spill_wipe/franka_robosuite_spill_wipe.yaml",
         "robosuite_cube_stack": "env_configs/cube_stack/franka_robosuite_cube_stack.yaml",
         "robosuite_cube_lift": "env_configs/cube_lifting/franka_robosuite_cube_lifting.yaml",
     }
@@ -74,7 +75,8 @@ def prepare(root: Path, training_root: Path, seeds: tuple[int, ...], samples: in
     config["record_video"] = False
     config["num_workers"] = 1
     config["env"]["cfg"].update({"enable_render": False, "viser_debug": False})
-    if config["env"]["cfg"]["privileged"] or config["env"]["cfg"]["apis"] != ["FrankaControlApi"]:
+    expected_api = "FrankaControlSpillWipeApi" if task == "spill_wipe" else "FrankaControlApi"
+    if config["env"]["cfg"]["privileged"] or config["env"]["cfg"]["apis"] != [expected_api]:
         raise RuntimeError("evaluation must use the non-privileged high-level API")
     root.mkdir(parents=True, exist_ok=False)
     config["output_dir"] = str(root / "environment_outputs")
@@ -82,8 +84,14 @@ def prepare(root: Path, training_root: Path, seeds: tuple[int, ...], samples: in
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     environment = YamlEnvironmentFactory(str(config_path))(None)
     try:
-        observation, _ = environment.reset(seed=seeds[0])
+        observation, reset_info = environment.reset(seed=seeds[0])
         messages = observation["full_prompt"]
+        initial_states = {}
+        if task == "spill_wipe":
+            initial_states[str(seeds[0])] = reset_info["initial_state_sha256"]
+            for seed in seeds[1:]:
+                _, info = environment.reset(seed=seed)
+                initial_states[str(seed)] = info["initial_state_sha256"]
     finally:
         environment.close()
     atomic_write_json(
@@ -104,6 +112,7 @@ def prepare(root: Path, training_root: Path, seeds: tuple[int, ...], samples: in
             "user_prompt": messages[1]["content"][0]["text"],
             "success_rule": "no program error, task_completed, terminal reward >= 1",
             "controller_enabled": False,
+            **({"initial_states": initial_states} if task == "spill_wipe" else {}),
         },
     )
 
@@ -162,7 +171,11 @@ def generate(root: Path, policy: str, training_root: Path | None = None) -> None
         result = read(training_root / "training_result.json")
         adapters = list(Path(result["checkpoint"]).rglob("adapter_config.json"))
         if (
-            result["status"] != "completed"
+            result["status"] not in (
+                ("completed", "completed_no_updates_all_constant")
+                if training["task"]["environment"] == "robosuite_spill_wipe"
+                else ("completed",)
+            )
             or result["completed_group_count"] != training["group_count"]
             or len(adapters) != 1
         ):
@@ -252,13 +265,17 @@ def evaluate(root: Path, policy: str) -> None:
                 continue
             record, generation_path = verify_generation(root, policy, ordinal)
             source = normalize_program_source(record["source"])
-            observation, _ = environment.reset(seed=record["environment_seed"])
+            observation, reset_info = environment.reset(seed=record["environment_seed"])
             if observation["full_prompt"][1]["content"][0]["text"] != protocol["user_prompt"]:
                 raise RuntimeError("evaluation prompt changed")
             # Audit the physical reset without exposing privileged state to the policy.
             sim_data = environment.low_level_env.robosuite_env.sim.data
             initial_state = np.round(np.concatenate((sim_data.qpos, sim_data.qvel)), 10)
             initial_hash = hashlib.sha256(initial_state.astype("<f8").tobytes()).hexdigest()
+            if "initial_states" in protocol:
+                initial_hash = reset_info["initial_state_sha256"]
+                if initial_hash != protocol["initial_states"][str(record["environment_seed"])]:
+                    raise RuntimeError("evaluation physical reset differs from prepared scene")
             _, reward, terminated, truncated, info = environment.step(source)
             error = info.get("error_type")
             diagnostics = "\n".join(
