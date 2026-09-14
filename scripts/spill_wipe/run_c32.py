@@ -1,4 +1,4 @@
-"""Continue Spill Wipe critique training by 16 groups and evaluate paired scenes."""
+"""Continue Spill Wipe GRPO or critique training by 16 groups and evaluate paired scenes."""
 
 from __future__ import annotations
 
@@ -24,10 +24,12 @@ def main() -> None:
     parser.add_argument("--baseline-evaluation", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--groups", type=int, choices=(32, 48), default=32)
+    parser.add_argument("--arm", choices=("A", "C"), default="C")
     args = parser.parse_args()
     total = args.groups
     parent_total = total - 16
-    parent_label, label = f"C{parent_total}", f"C{total}"
+    trigger = "never" if args.arm == "A" else "any_failed"
+    parent_label, label = f"{args.arm}{parent_total}", f"{args.arm}{total}"
     new_seeds = list(range(5 + parent_total, 5 + total))
     project = Path(__file__).resolve().parents[2]
     os.chdir(project)
@@ -38,14 +40,14 @@ def main() -> None:
     frozen = read(baseline / "protocol.json")
     if (previous["cumulative_group_count"] != parent_total
             or previous["task"]["environment"] != "robosuite_spill_wipe"
-            or previous["capsule"]["repair_trigger"] != "any_failed"
+            or previous["capsule"]["repair_trigger"] != trigger
             or previous["training_seeds"] != list(range(5, 5 + parent_total))):
         raise ValueError(f"parent must be Spill Wipe {parent_label} with contiguous seeds from 5")
     if (Path(frozen["training_root"]).resolve() != parent
             or frozen["seeds"] != list(range(201, 221))
             or frozen["total_samples_per_policy"] != 80):
         raise ValueError("baseline must be the parent run's frozen 80-sample evaluation")
-    audit_training(parent, "any_failed", parent_total)
+    audit_training(parent, trigger, parent_total)
     root = project / "artifacts" / args.run_id
     logs = project / "outputs" / args.run_id
     root.mkdir(parents=True, exist_ok=True)
@@ -91,7 +93,7 @@ def main() -> None:
         if not ready(8116):
             raise RuntimeError("start Pyroki on port 8116 before continuation")
         if not (training / "training_result.json").exists():
-            if not os.environ.get("CAPX_CONTROLLER_API_KEY"):
+            if trigger != "never" and not os.environ.get("CAPX_CONTROLLER_API_KEY"):
                 raise RuntimeError("CAPX_CONTROLLER_API_KEY is required for critique training")
             parent_checkpoint = Path(read(parent / "training_result.json")["checkpoint"])
             checkpoint_bytes = sum(p.stat().st_size for p in parent_checkpoint.rglob("*") if p.is_file())
@@ -102,12 +104,12 @@ def main() -> None:
                 run("scripts.capsule_rl.train_cube_stack", ["prepare", "--task", "spill_wipe",
                     "--root", str(training), "--resume-from", str(parent),
                     "--model", previous["program_service"]["model"],
-                    "--verl", runtime["verl_source_path"], "--repair-trigger", "any_failed",
+                    "--verl", runtime["verl_source_path"], "--repair-trigger", trigger,
                     "--controller-model", previous["controller_service"]["model"],
                     "--controller-endpoint", previous["controller_service"]["endpoint"],
                     "--seeds", ",".join(map(str, new_seeds))], f"prepare_{label}")
             run("scripts.capsule_rl.train_cube_stack", ["train", "--root", str(training)], f"train_{label}")
-        status["training"] = audit_training(training, "any_failed", total)
+        status["training"] = audit_training(training, trigger, total)
         restored = read(training / "restore_evidence.json")
         if restored["restored_optimizer_step"] != read(parent / "training_result.json")["optimizer_step_after"]:
             raise RuntimeError("continuation optimizer state differs from parent")
