@@ -161,6 +161,7 @@ def main() -> None:
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false", "OMP_NUM_THREADS": "4",
         "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
         "HF_HUB_DISABLE_TELEMETRY": "1",
+        "CAPX_FORCE_STREAMING_CHAT_COMPLETIONS": "0",
     })
     source_paths = [Path(__file__), project / "capx/rl/capsule/group.py",
                     project / "capx/rl/capsule/trainer.py", project / "capx/rl/capsule/server_factory.py",
