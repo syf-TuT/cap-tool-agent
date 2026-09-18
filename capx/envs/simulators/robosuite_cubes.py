@@ -18,6 +18,7 @@ from robosuite.controllers.composite.composite_controller_factory import (
 from robosuite.utils.placement_samplers import UniformRandomSampler
 
 from capx.envs.simulators.robosuite_base import RobosuiteBaseEnv
+from capx.rl.capsule.initial_state import cube_initial_state_sha256_from_observation
 
 
 class FrankaRobosuiteCubesLowLevel(RobosuiteBaseEnv):
@@ -67,6 +68,7 @@ class FrankaRobosuiteCubesLowLevel(RobosuiteBaseEnv):
                         controller=self.controller_cfg
                     ),
                     horizon=max_steps,
+                    seed=seed,
                 )
             else:
                 self.robosuite_env = suite.environments.manipulation.stack.Stack(
@@ -84,6 +86,7 @@ class FrankaRobosuiteCubesLowLevel(RobosuiteBaseEnv):
                     ),
                     horizon=max_steps,
                     reward_shaping=True,
+                    seed=seed,
                 )
         else:
             self.robosuite_env = suite.environments.manipulation.stack.Stack(
@@ -100,6 +103,7 @@ class FrankaRobosuiteCubesLowLevel(RobosuiteBaseEnv):
                 controller_configs=load_composite_controller_config(controller=self.controller_cfg),
                 horizon=max_steps,
                 reward_shaping=True,
+                seed=seed,
             )
         cubes = [self.robosuite_env.cubeA, self.robosuite_env.cubeB]
 
@@ -123,7 +127,7 @@ class FrankaRobosuiteCubesLowLevel(RobosuiteBaseEnv):
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if seed is not None:
-            self._rng = np.random.default_rng(seed)
+            self._reseed_robosuite(seed)
 
         self.robosuite_env.reset()
         # Adjust initial orientation
@@ -154,6 +158,11 @@ class FrankaRobosuiteCubesLowLevel(RobosuiteBaseEnv):
         info = {
             "task_prompt": "Place the primary cube on top of the secondary cube. Quaternions are WXYZ."
         }
+        initial_state_sha256 = cube_initial_state_sha256_from_observation(
+            obs, self._current_joints
+        )
+        if initial_state_sha256 is not None:
+            info["initial_state_sha256"] = initial_state_sha256
         return obs, info
 
     def _cube_pose_dict(self, robosuite_obs: dict[str, Any]) -> dict[str, list[float]]:

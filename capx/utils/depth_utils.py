@@ -1,6 +1,6 @@
 import numpy as np
 import numpy.typing as npt
-from matplotlib import cm
+from matplotlib import colormaps
 
 
 def deproject_pixel_to_camera(
@@ -240,7 +240,7 @@ def depth_to_rgb(
         norm = 1.0 - norm
 
     # Apply colormap (returns RGBA in [0,1])
-    cmap = cm.get_cmap(cmap_name)
+    cmap = colormaps.get_cmap(cmap_name)
     rgba = cmap(norm)  # (H, W, 4)
     rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
 

@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +31,37 @@ def _args_for_config(path):
         visual_differencing_model_server_url="http://127.0.0.1:8110/chat/completions",
         visual_differencing_model_api_key=None,
     )
+
+
+@pytest.mark.parametrize(
+    "source_config",
+    [
+        "cube_lifting/franka_robosuite_cube_lifting.yaml",
+        "cube_stack/franka_robosuite_cube_stack.yaml",
+        "cube_restack/franka_robosuite_cube_restack.yaml",
+        "spill_wipe/franka_robosuite_spill_wipe.yaml",
+        "two_arm_lift/franka_robosuite_two_arm_lift.yaml",
+        "two_arm_handover/two_arm_handover.yaml",
+    ],
+)
+def test_capsule_benchmark_generated_config_loads(source_config, tmp_path):
+    script = Path(
+        "scripts/benchmarks/run_qwen7b_capsule20_six_tasks_s01_20.sh"
+    ).read_text()
+    generator = script.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    output = tmp_path / "capsule.yaml"
+    subprocess.run(
+        [sys.executable, "-c", generator, f"env_configs/{source_config}", str(output)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    _, config, _ = _load_config(_args_for_config(output))
+
+    assert config["agent_mode"] == "capsule"
+    assert config["max_capsule_steps"] == 20
+    assert config["capsule_require_task_success_for_finish"] is True
 
 
 def test_load_config_reads_libero_capsule_capabilities(tmp_path):

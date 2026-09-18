@@ -23,6 +23,7 @@ from robosuite.utils.placement_samplers import ObjectPositionSampler
 from robosuite.utils.transform_utils import quat_multiply
 
 from capx.envs.simulators.robosuite_base import RobosuiteBaseEnv
+from capx.rl.capsule.initial_state import cube_initial_state_sha256_from_observation
 
 
 class StackedObjectRandomSampler(ObjectPositionSampler):
@@ -370,10 +371,15 @@ class FrankaRobosuiteCubesRestackLowLevel(RobosuiteBaseEnv):
         self._step_count = 0
         self._sim_step_count = 0
 
-        robosuite_obs = self.robosuite_env._get_observations()
+        # Observe and hash the settled state that the first program actually receives.
+        for _ in range(50):
+            self.robosuite_env.sim.forward()
+            self.robosuite_env.sim.step()
+            self._set_gripper(1.0)
+
+        self.robosuite_env.sim.forward()
+        robosuite_obs = self.robosuite_env._get_observations(force_update=True)
         self._current_joints = np.array(robosuite_obs["robot0_joint_pos"], dtype=np.float64)
-        # We do this because for some reason modifying qpos does not update robot0_joint_pos
-        self._current_joints[6] -= np.pi
 
         obs = self.get_observation()
         self.gripper_link_wxyz_xyz = np.concatenate(
@@ -393,15 +399,14 @@ class FrankaRobosuiteCubesRestackLowLevel(RobosuiteBaseEnv):
             rgba=[0, 1, 0, 1],
         )
 
-        # Settle the environment
-        for _ in range(50):
-            self.robosuite_env.sim.forward()
-            self.robosuite_env.sim.step()
-            self._set_gripper(1.0)
-
         info = {
             "task_prompt": "Place the primary cube on top of the secondary cube. Quaternions are WXYZ."
         }
+        initial_state_sha256 = cube_initial_state_sha256_from_observation(
+            obs, self._current_joints
+        )
+        if initial_state_sha256 is not None:
+            info["initial_state_sha256"] = initial_state_sha256
         return obs, info
 
     def _cube_pose_dict(self, robosuite_obs: dict[str, Any]) -> dict[str, list[float]]:

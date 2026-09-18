@@ -19,6 +19,9 @@ from capx.integrations.franka import nut_assembly_visual
 from capx.integrations.franka.control import FrankaControlApi
 from capx.integrations.franka.handover import FrankaHandoverApi
 from capx.integrations.franka.nut_assembly_visual import FrankaControlNutAssemblyVisualApi
+from capx.rl.capsule.initial_state import (
+    cube_lift_initial_state_sha256_from_observation,
+)
 
 
 class ConstructorCaptured(Exception):
@@ -251,6 +254,130 @@ class FakeSim:
 
     def forward(self) -> None:
         pass
+
+
+class CubeLiftResetSim:
+    def __init__(self) -> None:
+        self.data = SimpleNamespace(
+            qpos=np.zeros(7, dtype=np.float64),
+            xquat=np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (2, 1)),
+            xpos=np.zeros((2, 3), dtype=np.float64),
+        )
+        self.forward_count = 0
+        self.step_count = 0
+
+    def forward(self) -> None:
+        self.forward_count += 1
+
+    def step(self) -> None:
+        self.step_count += 1
+
+
+class CubeLiftResetRobosuiteEnv:
+    def __init__(self) -> None:
+        self.seed = None
+        self.rng = np.random.default_rng(1)
+        self.placement_initializer = FakeSampler()
+        self.sim = CubeLiftResetSim()
+        self.reset_seed: int | None = None
+        self.reset_rng: np.random.Generator | None = None
+        self.reset_sampler_rng: np.random.Generator | None = None
+
+    def reset(self) -> None:
+        self.reset_seed = self.seed
+        self.reset_rng = self.rng
+        self.reset_sampler_rng = self.placement_initializer.rng
+
+    def _get_observations(self) -> dict[str, Any]:
+        return {
+            "cube_pos": np.array([0.1, 0.2, 0.3], dtype=np.float64),
+            "cube_quat": np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+            "robot0_joint_pos": np.zeros(7, dtype=np.float64),
+            "robot0_gripper_qpos": np.array([0.04], dtype=np.float64),
+        }
+
+
+def _make_cube_lift_reset_wrapper(
+    *, privileged: bool
+) -> robosuite_cube_lift.FrankaRobosuiteCubeLiftLowLevel:
+    env = object.__new__(robosuite_cube_lift.FrankaRobosuiteCubeLiftLowLevel)
+    env._rng = np.random.default_rng(2)
+    env.privileged = privileged
+    env.robosuite_env = CubeLiftResetRobosuiteEnv()
+    env.base_link_idx = 0
+    env.gripper_link_idx = 1
+    env._process_camera_observations = lambda _: None
+    env._compute_gripper_obs = lambda _: None
+    return env
+
+
+def test_cube_lift_seeded_reset_synchronizes_environment_and_sampler_rng() -> None:
+    env = _make_cube_lift_reset_wrapper(privileged=False)
+
+    env.reset(seed=5)
+
+    assert env.robosuite_env.reset_seed == 5
+    assert env.robosuite_env.reset_rng is env._rng
+    assert env.robosuite_env.reset_sampler_rng is env._rng
+    expected_rng = np.random.default_rng(5)
+    np.testing.assert_array_equal(env._rng.integers(0, 100, 5), expected_rng.integers(0, 100, 5))
+
+
+def test_privileged_cube_lift_reset_reports_initial_state_hash() -> None:
+    env = _make_cube_lift_reset_wrapper(privileged=True)
+
+    observation, info = env.reset(seed=5)
+
+    initial_state_sha256 = info["initial_state_sha256"]
+    assert len(initial_state_sha256) == 64
+    assert initial_state_sha256 == initial_state_sha256.lower()
+    assert set(initial_state_sha256) <= set("0123456789abcdef")
+    assert initial_state_sha256 == cube_lift_initial_state_sha256_from_observation(
+        observation, env._current_joints
+    )
+
+
+def test_non_privileged_cube_lift_reset_omits_initial_state_hash() -> None:
+    env = _make_cube_lift_reset_wrapper(privileged=False)
+
+    observation, info = env.reset(seed=5)
+
+    assert "cube_poses" not in observation
+    assert "initial_state_sha256" not in info
+
+
+def test_cube_lift_reset_fallback_prompt_describes_lifting_red_cube() -> None:
+    env = _make_cube_lift_reset_wrapper(privileged=False)
+
+    _observation, info = env.reset(seed=5)
+
+    task_prompt = info["task_prompt"].lower()
+    assert "red cube" in task_prompt
+    assert "lift" in task_prompt
+    assert "secondary" not in task_prompt
+    assert "stack" not in task_prompt
+
+
+def test_cube_lift_pose_converts_robosuite_xyzw_quaternion_to_wxyz() -> None:
+    env = object.__new__(robosuite_cube_lift.FrankaRobosuiteCubeLiftLowLevel)
+    env.base_link_idx = 0
+    env.robosuite_env = SimpleNamespace(
+        sim=SimpleNamespace(
+            data=SimpleNamespace(
+                xquat=np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float64),
+                xpos=np.zeros((1, 3), dtype=np.float64),
+            )
+        )
+    )
+
+    poses = env._cube_pose_dict(
+        {
+            "cube_pos": np.array([0.1, 0.2, 0.3], dtype=np.float64),
+            "cube_quat": np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+        }
+    )
+
+    np.testing.assert_allclose(poses["primary"], [0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0])
 
 
 CUBE_OBSERVATION_CASES = (

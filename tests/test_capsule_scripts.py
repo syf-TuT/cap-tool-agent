@@ -1,0 +1,5890 @@
+from __future__ import annotations
+
+import builtins
+import hashlib
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import yaml
+
+from capx.rl.capsule import main_ppo
+from capx.rl.capsule.actor_identity import actor_binding_sha256, build_actor_identity
+from capx.rl.capsule.controller import python_base_unit_spans
+from capx.rl.capsule.group import RepairAttempt, deterministic_group_uid
+from capx.rl.capsule.repair import BaseUnitSpan, RepairDraft
+from capx.rl.capsule.schema import (
+    LearningGroupV1,
+    LearningMemberV1,
+    ProgramReplayResultV1,
+    ReplayOutcome,
+    TaskInstanceV1,
+)
+from capx.utils.program_source import normalize_program_source
+from scripts.capsule_rl import (
+    adapter_reload_smoke,
+    analyze_artifacts,
+    build_verified_group,
+    check_seed_determinism,
+    common,
+    controller_collector_smoke,
+    cube_lift_privileged_replay_smoke,
+    launch_owned_services,
+    one_step_trainer_smoke,
+    oracle_clean_replay,
+    materialize_resolved_dataset,
+    prepare_dataset_config,
+    server_adapter,
+    server_preflight,
+)
+from test_capsule_final_audit_contract import valid_final_runtime_audit
+
+
+ENTRYPOINTS = (
+    "prepare_dataset_config.py",
+    "materialize_resolved_dataset.py",
+    "server_preflight.py",
+    "check_seed_determinism.py",
+    "oracle_clean_replay.py",
+    "controller_collector_smoke.py",
+    "cube_lift_privileged_replay_smoke.py",
+    "build_verified_group.py",
+    "one_step_trainer_smoke.py",
+    "server_adapter.py",
+    "adapter_reload_smoke.py",
+    "analyze_artifacts.py",
+)
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+CONFIG_TEMPLATE = (
+    REPOSITORY_ROOT
+    / "env_configs"
+    / "cube_stack"
+    / "capsule_rl"
+    / "franka_robosuite_cube_stack_capsule_critique_grpo.yaml"
+)
+CLEAN_REPLAY_CONFIG = (
+    REPOSITORY_ROOT
+    / "env_configs"
+    / "cube_stack"
+    / "capsule_rl"
+    / "franka_robosuite_cube_stack_privileged_clean_replay.yaml"
+)
+LIFT_CONFIG_TEMPLATE = (
+    REPOSITORY_ROOT
+    / "env_configs"
+    / "cube_lifting"
+    / "capsule_rl"
+    / "franka_robosuite_cube_lift_capsule_smoke.yaml"
+)
+LIFT_SOURCE_TASKS = LIFT_CONFIG_TEMPLATE.with_name(
+    "cube_lift_capsule_source_tasks.jsonl"
+)
+CUBE_LIFT_OLD_COMPACT_SOURCE_PROMPT = "\n".join(
+    (
+        (
+            "Your task is to pick up the red cube and lift it. "
+            "Only the five high-level functions below are available:"
+        ),
+        (
+            "- `get_object_pose(object_name, return_bbox_extent=False)` returns the object's "
+            "XYZ position, WXYZ quaternion, and optional bounding-box extent."
+        ),
+        (
+            "- `sample_grasp_pose(object_name)` returns a grasp XYZ position and WXYZ "
+            "quaternion."
+        ),
+        (
+            "- `goto_pose(position, quaternion_wxyz, z_approach=0.0)` moves the gripper to a "
+            "pose and can approach along its local Z axis."
+        ),
+        "- `open_gripper()` opens the gripper.",
+        "- `close_gripper()` closes the gripper.",
+        (
+            "All quaternion values use WXYZ order. Do not access a raw environment object. "
+            "Do not use low-level joint control. Return one complete executable Python program "
+            "as code only, without Markdown code fences."
+        ),
+    )
+)
+CUBE_LIFT_REQUIRED_SOURCE_SNIPPETS = (
+    "You are controlling a Franka Emika robot with API described below.",
+    "Goal: pick up the red cube and lift it.",
+    "ONLY write the executable Python code and do not write it in code fences.",
+    "The functions (APIs) below are already imported to the environment.",
+    "APIs:",
+    "The quaternion from get_object_pose may be unreliable",
+    "position: (3,) XYZ in meters.",
+    "quaternion_wxyz: (4,) WXYZ unit quaternion.",
+    "bbox_extent: (3,) object extent in meters",
+    "If return_bbox_extent is False, returns None.",
+    "There is no need to call a second goto_pose with the same position",
+)
+CUBE_LIFT_SOURCE_CALLABLE_SIGNATURES = (
+    (
+        "get_object_pose(object_name: str, return_bbox_extent: bool = False) -> "
+        "tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray | None]"
+    ),
+    "sample_grasp_pose(object_name: str) -> tuple[numpy.ndarray, numpy.ndarray]",
+    (
+        "goto_pose(position: numpy.ndarray, quaternion_wxyz: numpy.ndarray, "
+        "z_approach: float = 0.0) -> None"
+    ),
+    "open_gripper() -> None",
+    "close_gripper() -> None",
+)
+
+
+def _assert_cube_lift_source_prompt_contract(prompt: str) -> None:
+    assert prompt != CUBE_LIFT_OLD_COMPACT_SOURCE_PROMPT
+    assert prompt.startswith("\nYou are controlling a Franka Emika robot")
+    assert "\nAPIs:\n\nget_object_pose" in prompt
+
+    callable_signatures = tuple(
+        re.findall(
+            r"^([a-z][a-z0-9_]*\([^`\n]*\)(?: -> [^\n]+)?)$",
+            prompt,
+            flags=re.MULTILINE,
+        )
+    )
+    assert callable_signatures == CUBE_LIFT_SOURCE_CALLABLE_SIGNATURES
+    for snippet in CUBE_LIFT_REQUIRED_SOURCE_SNIPPETS:
+        assert snippet in prompt
+    assert "Only the five high-level functions below are available" not in prompt
+    assert "optional bounding-box extent" not in prompt
+    for unavailable_token in ("get_observation", "pick_and_lift", "quaternion_xyzw"):
+        assert re.search(rf"\b{unavailable_token}\b", prompt) is None
+    for success_hint in (
+        "do not release",
+        "don't release",
+        "keep the gripper closed",
+        "keep gripper closed",
+    ):
+        assert success_hint not in prompt.lower()
+    for unavailable_function in ("grasp", "lift"):
+        assert re.search(rf"\b{unavailable_function}\s*\(", prompt) is None
+    assert re.search(r"\benv\s*\.", prompt) is None
+    assert re.search(r"\bAPIS\s*\[", prompt, flags=re.IGNORECASE) is None
+
+
+@pytest.fixture(autouse=True)
+def _stub_materializer_final_audit_reproduction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep materializer unit fixtures synthetic; dedicated tests exercise reproduction."""
+
+    monkeypatch.setattr(
+        materialize_resolved_dataset,
+        "_recompute_final_runtime_audit",
+        lambda audit: dict(audit.payload),
+    )
+
+
+def _minimal_resolved_verl_config() -> dict[str, object]:
+    return {
+        "actor_rollout_ref": {
+            "model": {
+                "lora_rank": 16,
+                "lora_alpha": 32,
+                "target_modules": "all-linear",
+            },
+            "rollout": {},
+            "actor": {
+                "strategy": "fsdp",
+                "optim": {},
+                "policy_loss": {},
+            },
+        },
+        "algorithm": {},
+        "reward_model": {},
+        "trainer": {
+            "total_epochs": 1,
+            "n_gpus_per_node": 1,
+            "nnodes": 1,
+            "device": "cuda",
+        },
+        "ray_kwargs": {"ray_init": {}},
+        "data": {},
+    }
+
+
+def _server_config(tmp_path: Path) -> Path:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    verl = project_root / "verl"
+    verl.mkdir()
+    model = project_root / "program-model"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type":"qwen2"}\n', encoding="utf-8")
+    dataset = project_root / "dataset.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "task_id": "cube-stack",
+                "task_instance_id": "cube-stack:seed-5",
+                "environment_seed": 5,
+                "prompt": "stack",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    resolved_verl_config = project_root / "resolved_verl_ppo.yaml"
+    resolved_verl_config.write_text(
+        yaml.safe_dump(_minimal_resolved_verl_config(), sort_keys=False),
+        encoding="utf-8",
+    )
+    output = project_root / "outputs" / "capsule"
+    config = yaml.safe_load(CONFIG_TEMPLATE.read_text(encoding="utf-8"))
+    config["runtime"].update(
+        {
+            "project_root": str(project_root),
+            "python_executable": sys.executable,
+            "verl_source_path": str(verl),
+            "output_dir": str(output),
+            "dataset_path": str(dataset),
+            "program_model_path": str(model),
+            "verl_resolved_config_path": str(resolved_verl_config),
+        }
+    )
+    config["task"]["config_path"] = str(CLEAN_REPLAY_CONFIG)
+    config["program_service"].update(
+        {
+            "mode": "actor_identity",
+            "endpoint": "http://127.0.0.1:8000/v1",
+            "model": "program-actor",
+            "api_key_env": "PROGRAM_API_KEY",
+        }
+    )
+    config["controller_service"].update(
+        {
+            "endpoint": "http://127.0.0.1:8001/v1",
+            "model": "frozen-controller",
+            "api_key_env": "CONTROLLER_API_KEY",
+        }
+    )
+    path = tmp_path / "capsule.yaml"
+    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    return path
+
+
+def _matching_lift_environment_payload() -> dict[str, object]:
+    return {
+        "env": {
+            "_target_": "capx.envs.tasks.franka.franka_lift.FrankaLiftCodeEnv",
+            "cfg": {
+                "_target_": "capx.envs.tasks.base.CodeExecEnvConfig",
+                "low_level": "franka_robosuite_cube_lift_low_level",
+                "privileged": True,
+                "enable_render": False,
+                "viser_debug": False,
+                "apis": ["FrankaControlPrivilegedApi"],
+            },
+        },
+        "api_servers": [
+            {
+                "_target_": "capx.serving.launch_pyroki_server.main",
+                "host": "127.0.0.1",
+                "port": 8116,
+                "robot": "panda_description",
+                "target_link": "panda_hand",
+            }
+        ],
+        "record_video": False,
+        "num_workers": 1,
+    }
+
+
+def _lift_server_config(tmp_path: Path) -> tuple[Path, Path]:
+    config_path = _server_config(tmp_path)
+    environment_path = tmp_path / "staged" / "renamed-lift-environment.yaml"
+    environment_path.parent.mkdir()
+    environment_path.write_text(
+        yaml.safe_dump(_matching_lift_environment_payload(), sort_keys=False),
+        encoding="utf-8",
+    )
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["task"].update(
+        {
+            "profile": "robosuite_cube_lift_privileged_highlevel",
+            "environment": "robosuite_cube_lift",
+            "api": "franka_control_privileged",
+            "privilege": "privileged",
+            "render": False,
+            "record_video": False,
+            "config_path": str(environment_path),
+        }
+    )
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    return config_path, environment_path
+
+
+def _replace_nested_value(
+    payload: dict[str, object], path: tuple[str | int, ...], value: object
+) -> None:
+    current: object = payload
+    for part in path[:-1]:
+        current = current[part]  # type: ignore[index]
+    current[path[-1]] = value  # type: ignore[index]
+
+
+def test_all_server_entrypoints_exist_and_advertise_safe_validation_mode() -> None:
+    root = Path(__file__).resolve().parents[1]
+    scripts_dir = root / "scripts" / "capsule_rl"
+
+    for filename in ENTRYPOINTS:
+        source = (scripts_dir / filename).read_text(encoding="utf-8")
+        assert "--validate-only" in source or "--dry-run" in source
+        assert "if __name__ == \"__main__\"" in source
+
+
+def test_cube_lift_repository_template_loads_without_runtime_path_checks() -> None:
+    loaded = common.load_and_validate_server_config(
+        LIFT_CONFIG_TEMPLATE,
+        check_runtime_paths=False,
+    )
+
+    assert loaded["task"]["profile"] == "robosuite_cube_lift_privileged_highlevel"
+    assert loaded["capsule"]["group_size"] == 8
+    assert loaded["capsule"]["base_samples_before_repair"] == 7
+    assert loaded["algorithm"]["adv_estimator"] == "grpo"
+    assert loaded["controller_service"]["frozen"] is True
+
+
+def test_cube_lift_source_task_exposes_only_existing_high_level_functions() -> None:
+    source_lines = [
+        line
+        for line in LIFT_SOURCE_TASKS.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert len(source_lines) == 1
+    record = json.loads(source_lines[0])
+    assert set(record) == {"task_id", "prompt"}
+    assert record["task_id"] == "cube-lift-red-cube"
+
+    prompt = record["prompt"]
+    _assert_cube_lift_source_prompt_contract(prompt)
+
+
+def test_cube_lift_source_prompt_contract_rejects_old_compact_prompt() -> None:
+    with pytest.raises(AssertionError):
+        _assert_cube_lift_source_prompt_contract(CUBE_LIFT_OLD_COMPACT_SOURCE_PROMPT)
+
+
+@pytest.mark.parametrize(
+    "extra_declaration",
+    (
+        "- `goto_pose(position, quaternion_xyzw, z_approach=0.0)` uses XYZW order.",
+        "- `get_observation()` returns the raw low-level environment observation.",
+    ),
+)
+def test_cube_lift_source_prompt_contract_rejects_adversarial_api_drift(
+    extra_declaration: str,
+) -> None:
+    source_line = LIFT_SOURCE_TASKS.read_text(encoding="utf-8").strip()
+    canonical_prompt = json.loads(source_line)["prompt"]
+    adversarial_prompt = f"{canonical_prompt}\n{extra_declaration}"
+
+    with pytest.raises(AssertionError):
+        _assert_cube_lift_source_prompt_contract(adversarial_prompt)
+
+
+def test_server_config_validation_checks_algorithm_and_runtime_invariants(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+
+    loaded = common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+    assert loaded["capsule"]["group_size"] == 8
+    assert loaded["controller_service"]["frozen"] is True
+
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["task"]["render"] = True
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    with pytest.raises(common.ConfigValidationError, match="render"):
+        common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+
+def test_server_config_accepts_matching_staged_lift_environment_yaml(
+    tmp_path: Path,
+) -> None:
+    config_path, environment_path = _lift_server_config(tmp_path)
+
+    loaded = common.load_and_validate_server_config(
+        config_path, check_runtime_paths=True
+    )
+
+    assert loaded["task"]["profile"] == "robosuite_cube_lift_privileged_highlevel"
+    assert loaded["task"]["config_path"] == str(environment_path)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "bad_value", "message"),
+    [
+        (
+            ("env", "_target_"),
+            "capx.envs.tasks.franka.franka_pick_place.FrankaPickPlaceCodeEnv",
+            r"env\._target_",
+        ),
+        (
+            ("env", "cfg", "_target_"),
+            "example.WrongConfig",
+            r"env\.cfg\._target_",
+        ),
+        (
+            ("env", "cfg", "low_level"),
+            "franka_robosuite_cubes_low_level",
+            r"low_level",
+        ),
+        (("env", "cfg", "privileged"), False, r"privileged"),
+        (("env", "cfg", "enable_render"), True, r"enable_render"),
+        (("env", "cfg", "viser_debug"), True, r"viser_debug"),
+        (("env", "cfg", "apis"), ["FrankaControlApi"], r"apis"),
+        (("env", "cfg", "prompt"), "override prompt", r"env\.cfg.*exact keys.*prompt"),
+        (
+            ("env", "cfg", "oracle_code"),
+            "raise RuntimeError('override')",
+            r"env\.cfg.*exact keys.*oracle_code",
+        ),
+        (
+            ("env", "cfg", "task_only_prompt"),
+            "override task-only prompt",
+            r"env\.cfg.*exact keys.*task_only_prompt",
+        ),
+        (
+            ("env", "cfg", "multi_turn_prompt"),
+            "override multi-turn prompt",
+            r"env\.cfg.*exact keys.*multi_turn_prompt",
+        ),
+        (("record_video",), True, r"record_video"),
+        (("num_workers",), 2, r"num_workers"),
+        (
+            ("api_servers", 0, "_target_"),
+            "example.wrong_server",
+            r"api_servers\[0\]\._target_",
+        ),
+        (("api_servers", 0, "host"), "0.0.0.0", r"host"),
+        (("api_servers", 0, "port"), 8117, r"port"),
+        (("api_servers", 0, "robot"), "ur5e", r"robot"),
+        (("api_servers", 0, "target_link"), "panda_link8", r"target_link"),
+        (("api_servers",), [], r"exactly 1"),
+        (
+            ("api_servers",),
+            [
+                {
+                    "_target_": "capx.serving.launch_pyroki_server.main",
+                    "host": "127.0.0.1",
+                    "port": 8116,
+                    "robot": "panda_description",
+                    "target_link": "panda_hand",
+                },
+                {
+                    "_target_": "capx.serving.launch_pyroki_server.main",
+                    "host": "127.0.0.1",
+                    "port": 8116,
+                    "robot": "panda_description",
+                    "target_link": "panda_hand",
+                },
+            ],
+            r"exactly 1",
+        ),
+        (
+            ("api_servers",),
+            [
+                {
+                    "_target_": "capx.serving.launch_pyroki_server.main",
+                    "host": "127.0.0.1",
+                    "port": 8116,
+                    "robot": "panda_description",
+                    "target_link": "panda_hand",
+                    "unexpected": True,
+                }
+            ],
+            r"exact keys",
+        ),
+    ],
+)
+def test_server_config_rejects_lift_environment_profile_drift(
+    field_path: tuple[str | int, ...],
+    bad_value: object,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    config_path, environment_path = _lift_server_config(tmp_path)
+    environment = yaml.safe_load(environment_path.read_text(encoding="utf-8"))
+    _replace_nested_value(environment, field_path, bad_value)
+    environment_path.write_text(
+        yaml.safe_dump(environment, sort_keys=False), encoding="utf-8"
+    )
+
+    with pytest.raises(common.ConfigValidationError, match=message):
+        common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+
+@pytest.mark.parametrize(
+    ("environment_bytes", "message"),
+    [
+        (b"\xff", "UTF-8"),
+        (b"env: [", "YAML"),
+        (b"- not-a-mapping\n", "mapping"),
+    ],
+)
+def test_server_config_reports_typed_environment_yaml_errors(
+    environment_bytes: bytes,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    config_path, environment_path = _lift_server_config(tmp_path)
+    environment_path.write_bytes(environment_bytes)
+
+    with pytest.raises(common.ConfigValidationError, match=message):
+        common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+
+def test_server_config_without_runtime_path_checks_does_not_open_environment_yaml(
+    tmp_path: Path,
+) -> None:
+    config_path, environment_path = _lift_server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    missing_path = environment_path.parent / "does-not-exist.yaml"
+    config["task"]["config_path"] = str(missing_path)
+
+    loaded = common.load_and_validate_server_config_bytes(
+        yaml.safe_dump(config, sort_keys=False).encode("utf-8"),
+        check_runtime_paths=False,
+    )
+
+    assert loaded["task"]["config_path"] == str(missing_path)
+    assert not missing_path.exists()
+
+
+def test_server_config_bytes_loader_validates_the_supplied_snapshot(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+    original_bytes = config_path.read_bytes()
+    config_path.write_bytes(b"schema_version: 999\n")
+
+    loaded = common.load_and_validate_server_config_bytes(
+        original_bytes,
+        check_runtime_paths=True,
+    )
+
+    assert loaded["schema_version"] == 1
+    assert hashlib.sha256(original_bytes).hexdigest() != common.artifact_file_sha256(
+        config_path
+    )
+
+
+def test_server_config_requires_existing_resolved_verl_config(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["runtime"].pop("verl_resolved_config_path")
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(common.ConfigValidationError, match="verl_resolved_config_path"):
+        common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+
+def test_server_config_rejects_plaintext_service_endpoint_off_loopback(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["program_service"]["endpoint"] = "http://example.com/v1"
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(common.ConfigValidationError, match="https.*loopback"):
+        common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+
+@pytest.mark.parametrize(
+    "missing_path",
+    [
+        ("actor_rollout_ref",),
+        ("actor_rollout_ref", "model"),
+        ("actor_rollout_ref", "rollout"),
+        ("actor_rollout_ref", "actor"),
+        ("actor_rollout_ref", "actor", "optim"),
+        ("actor_rollout_ref", "actor", "policy_loss"),
+        ("algorithm",),
+        ("reward_model",),
+        ("trainer",),
+        ("ray_kwargs",),
+        ("data",),
+    ],
+)
+def test_server_config_rejects_resolved_verl_missing_required_tree(
+    missing_path: tuple[str, ...], tmp_path: Path
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    resolved_path = Path(config["runtime"]["verl_resolved_config_path"])
+    resolved = yaml.safe_load(resolved_path.read_text(encoding="utf-8"))
+    parent = resolved
+    for key in missing_path[:-1]:
+        parent = parent[key]
+    parent.pop(missing_path[-1])
+    resolved_path.write_text(yaml.safe_dump(resolved, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(common.ConfigValidationError, match="\\.".join(missing_path)):
+        common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "bad_value", "message"),
+    [
+        (("actor_rollout_ref", "model"), [], "mapping"),
+        (("actor_rollout_ref", "rollout"), None, "mapping"),
+        (("actor_rollout_ref", "actor", "optim"), 1, "mapping"),
+        (("actor_rollout_ref", "actor", "policy_loss"), "loss", "mapping"),
+        (("actor_rollout_ref", "actor", "strategy"), "megatron", "FSDP"),
+        (("algorithm",), [], "mapping"),
+        (("reward_model",), None, "mapping"),
+        (("trainer",), [], "mapping"),
+        (("trainer", "total_epochs"), 0, "positive integer"),
+        (("trainer", "n_gpus_per_node"), True, "positive integer"),
+        (("trainer", "nnodes"), -1, "positive integer"),
+        (("trainer", "device"), "", "non-empty string"),
+        (("trainer", "n_gpus_per_node"), 3, "divisible"),
+        (("ray_kwargs",), [], "mapping"),
+        (("ray_kwargs", "ray_init"), [], "mapping"),
+        (("data",), [], "mapping"),
+    ],
+)
+def test_server_config_rejects_invalid_resolved_verl_scalars_and_shapes(
+    field_path: tuple[str, ...],
+    bad_value: object,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    resolved_path = Path(config["runtime"]["verl_resolved_config_path"])
+    resolved = yaml.safe_load(resolved_path.read_text(encoding="utf-8"))
+    parent = resolved
+    for key in field_path[:-1]:
+        parent = parent[key]
+    parent[field_path[-1]] = bad_value
+    resolved_path.write_text(yaml.safe_dump(resolved, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(common.ConfigValidationError, match=message):
+        common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+
+def test_server_config_validates_resolved_verl_without_torch_or_omegaconf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    real_import = builtins.__import__
+
+    def guarded_import(name: str, *args: object, **kwargs: object):
+        if name == "torch" or name.startswith("torch."):
+            raise AssertionError("static VeRL config validation must not import torch")
+        if name == "omegaconf" or name.startswith("omegaconf."):
+            raise AssertionError("static VeRL config validation must not import OmegaConf")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+
+def test_preflight_hashes_resolved_verl_config_without_overwriting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    project_root = Path(config["runtime"]["project_root"])
+    (project_root / "uv.lock").write_text("lock", encoding="utf-8")
+    monkeypatch.setenv("MUJOCO_GL", "egl")
+    monkeypatch.setenv("PROGRAM_API_KEY", "present")
+    monkeypatch.setenv("CONTROLLER_API_KEY", "present")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True)),
+    )
+    monkeypatch.setattr(server_preflight, "_endpoint_open", lambda _endpoint: True)
+    monkeypatch.setattr(
+        server_preflight,
+        "_fetch_actor_identity",
+        lambda _endpoint, _token: build_actor_identity(config),
+    )
+
+    def fake_git_sha(path: Path) -> str:
+        if path == Path(config["runtime"]["verl_source_path"]):
+            return config["runtime"]["verl_pinned_sha"]
+        return "d" * 40
+
+    monkeypatch.setattr(server_preflight, "_git_sha", fake_git_sha)
+    artifact = tmp_path / "gate01_preflight.json"
+
+    payload = server_preflight.run_preflight(
+        config_path, artifact, run_id="capsule-smoke-001"
+    )
+
+    assert payload["checks"]["verl_resolved_config_sha256"] == common.artifact_file_sha256(
+        config["runtime"]["verl_resolved_config_path"]
+    )
+    assert payload["verl_resolved_config_sha256"] == payload["checks"][
+        "verl_resolved_config_sha256"
+    ]
+    assert payload["resolved_environment_sha256"] == payload["checks"][
+        "resolved_environment_sha256"
+    ]
+    assert payload["program_model_sha256"] == payload["checks"][
+        "program_model_sha256"
+    ]
+    assert payload["actor_binding_sha256"] == payload["checks"][
+        "actor_binding_sha256"
+    ]
+    assert payload["checks"]["program_actor_identity_verified"] is True
+    dataset_path = Path(config["runtime"]["dataset_path"])
+    assert payload["dataset_sha256"] == common.artifact_file_sha256(dataset_path)
+    assert payload["checks"]["dataset_sha256"] == payload["dataset_sha256"]
+    assert payload["checks"]["dataset_path"] == str(dataset_path.resolve())
+    assert payload["checks"]["dataset_task_count"] == 1
+    assert payload["checks"]["dataset_task_identities"] == [
+        {"task_id": "cube-stack", "environment_seed": 5}
+    ]
+    assert payload["execution_mode"] == common.CANONICAL_EXECUTION_MODE
+    common.verify_preflight_gate_artifact(payload)
+    with pytest.raises(FileExistsError, match="artifact already exists"):
+        server_preflight.run_preflight(config_path, artifact, run_id="capsule-smoke-001")
+
+
+def test_preflight_failure_is_published_separately_without_claiming_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
+    )
+    monkeypatch.setattr(server_preflight, "_endpoint_open", lambda _endpoint: True)
+    monkeypatch.setattr(
+        server_preflight,
+        "_fetch_actor_identity",
+        lambda _endpoint, _token: build_actor_identity(config),
+    )
+    monkeypatch.setattr(
+        server_preflight,
+        "_git_sha",
+        lambda path: (
+            config["runtime"]["verl_pinned_sha"]
+            if path == Path(config["runtime"]["verl_source_path"])
+            else "d" * 40
+        ),
+    )
+    artifact = tmp_path / "gate01_preflight.json"
+
+    with pytest.raises(common.GateArtifactError, match="preflight failed"):
+        server_preflight.run_preflight(
+            config_path, artifact, run_id="capsule-smoke-001"
+        )
+
+    assert not artifact.exists()
+    failure_path = common.gate_failure_artifact_path(artifact)
+    failure = json.loads(failure_path.read_text(encoding="utf-8"))
+    assert failure["gate"] == "preflight"
+    assert failure["passed"] is False
+    assert failure["exception"]["stage"] == "required_checks"
+    assert failure["config_sha256"] == common.artifact_file_sha256(config_path)
+    assert failure["dataset_sha256"] == common.artifact_file_sha256(
+        config["runtime"]["dataset_path"]
+    )
+    original = failure_path.read_bytes()
+    with pytest.raises(FileExistsError, match="failure artifact already exists"):
+        server_preflight.run_preflight(
+            config_path, artifact, run_id="capsule-smoke-001"
+        )
+    assert failure_path.read_bytes() == original
+
+
+def test_preflight_rejects_program_actor_identity_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = _prepare_successful_preflight(config_path, monkeypatch)
+    monkeypatch.setattr(
+        server_preflight,
+        "_git_sha",
+        lambda path: (
+            str(config["runtime"]["verl_pinned_sha"])
+            if path.resolve() == Path(config["runtime"]["verl_source_path"]).resolve()
+            else "d" * 40
+        ),
+    )
+    drifted = build_actor_identity(config)
+    drifted["program_model_sha256"] = "b" * 64
+    monkeypatch.setattr(
+        server_preflight,
+        "_fetch_actor_identity",
+        lambda _endpoint, _token: drifted,
+    )
+    artifact = tmp_path / "gate01_identity_drift.json"
+
+    with pytest.raises(common.GateArtifactError, match="program_model_sha256"):
+        server_preflight.run_preflight(
+            config_path, artifact, run_id="capsule-smoke-identity-drift"
+        )
+
+    failure = json.loads(
+        common.gate_failure_artifact_path(artifact).read_text(encoding="utf-8")
+    )
+    assert failure["exception"]["stage"] == "runtime_checks"
+
+
+def test_preflight_typed_verification_precedes_success_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    project_root = Path(config["runtime"]["project_root"])
+    (project_root / "uv.lock").write_text("lock", encoding="utf-8")
+    monkeypatch.setenv("MUJOCO_GL", "egl")
+    monkeypatch.setenv("PROGRAM_API_KEY", "present")
+    monkeypatch.setenv("CONTROLLER_API_KEY", "present")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True)),
+    )
+    monkeypatch.setattr(server_preflight, "_endpoint_open", lambda _endpoint: True)
+    monkeypatch.setattr(
+        server_preflight,
+        "_fetch_actor_identity",
+        lambda _endpoint, _token: build_actor_identity(config),
+    )
+    monkeypatch.setattr(
+        server_preflight,
+        "_git_sha",
+        lambda path: (
+            config["runtime"]["verl_pinned_sha"]
+            if path == Path(config["runtime"]["verl_source_path"])
+            else "d" * 40
+        ),
+    )
+    def reject_typed_evidence(_payload: object) -> None:
+        raise common.GateArtifactError("typed evidence rejected")
+
+    monkeypatch.setattr(
+        server_preflight,
+        "verify_preflight_gate_artifact",
+        reject_typed_evidence,
+    )
+    artifact = tmp_path / "gate01_preflight.json"
+
+    with pytest.raises(common.GateArtifactError, match="typed evidence rejected"):
+        server_preflight.run_preflight(
+            config_path, artifact, run_id="capsule-smoke-001"
+        )
+
+    assert not artifact.exists()
+    failure = json.loads(
+        common.gate_failure_artifact_path(artifact).read_text(encoding="utf-8")
+    )
+    assert failure["exception"]["stage"] == "artifact_verification"
+
+
+def _prepare_successful_preflight(
+    config_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    project_root = Path(config["runtime"]["project_root"])
+    (project_root / "uv.lock").write_text("lock", encoding="utf-8")
+    monkeypatch.setenv("MUJOCO_GL", "egl")
+    monkeypatch.setenv("PROGRAM_API_KEY", "present")
+    monkeypatch.setenv("CONTROLLER_API_KEY", "present")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True)),
+    )
+    monkeypatch.setattr(server_preflight, "_endpoint_open", lambda _endpoint: True)
+    monkeypatch.setattr(
+        server_preflight,
+        "_fetch_actor_identity",
+        lambda _endpoint, _token: build_actor_identity(config),
+    )
+    return config
+
+
+@pytest.mark.parametrize(
+    ("repository", "mutation", "expected_stage"),
+    [
+        ("project", "sha", "post_project_git"),
+        ("project", "dirty", "post_project_git"),
+        ("verl", "sha", "post_verl_git"),
+        ("verl", "dirty", "post_verl_git"),
+    ],
+)
+def test_preflight_rechecks_git_sha_and_cleanliness_before_publication(
+    repository: str,
+    mutation: str,
+    expected_stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = _prepare_successful_preflight(config_path, monkeypatch)
+    project_root = Path(config["runtime"]["project_root"]).resolve()
+    verl_root = Path(config["runtime"]["verl_source_path"]).resolve()
+    calls = {"project": 0, "verl": 0}
+
+    def changing_git_sha(path: Path) -> str:
+        resolved = path.resolve()
+        name = "verl" if resolved == verl_root else "project"
+        assert resolved in {project_root, verl_root}
+        calls[name] += 1
+        baseline = (
+            str(config["runtime"]["verl_pinned_sha"])
+            if name == "verl"
+            else "d" * 40
+        )
+        if name == repository and calls[name] == 2:
+            if mutation == "dirty":
+                raise common.GateArtifactError(f"Git checkout became dirty: {path}")
+            return "e" * 40
+        return baseline
+
+    monkeypatch.setattr(server_preflight, "_git_sha", changing_git_sha)
+    artifact = tmp_path / f"gate01_{repository}_{mutation}.json"
+
+    with pytest.raises(common.GateArtifactError, match="Git"):
+        server_preflight.run_preflight(config_path, artifact, run_id="capsule-smoke-001")
+
+    assert not artifact.exists()
+    failure = json.loads(
+        common.gate_failure_artifact_path(artifact).read_text(encoding="utf-8")
+    )
+    assert failure["exception"]["stage"] == expected_stage
+    assert calls[repository] == 2
+
+
+@pytest.mark.parametrize(
+    ("mutable_input", "expected_stage", "message"),
+    [
+        ("config", "post_config", "config"),
+        ("dataset", "post_dataset", "dataset"),
+        ("environment", "post_runtime_dependencies", "environment"),
+        ("verl_config", "post_runtime_dependencies", "VeRL"),
+    ],
+)
+def test_preflight_rechecks_mutable_inputs_after_typed_verification(
+    mutable_input: str,
+    expected_stage: str,
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    environment_path = tmp_path / "environment.yaml"
+    environment_path.write_bytes(CLEAN_REPLAY_CONFIG.read_bytes())
+    config["task"]["config_path"] = str(environment_path)
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    config = _prepare_successful_preflight(config_path, monkeypatch)
+    project_root = Path(config["runtime"]["project_root"]).resolve()
+    verl_root = Path(config["runtime"]["verl_source_path"]).resolve()
+    monkeypatch.setattr(
+        server_preflight,
+        "_git_sha",
+        lambda path: (
+            str(config["runtime"]["verl_pinned_sha"])
+            if path.resolve() == verl_root
+            else "d" * 40
+        ),
+    )
+    assert project_root != verl_root
+    targets = {
+        "config": config_path,
+        "dataset": Path(config["runtime"]["dataset_path"]),
+        "environment": environment_path,
+        "verl_config": Path(config["runtime"]["verl_resolved_config_path"]),
+    }
+    real_verifier = server_preflight.verify_preflight_gate_artifact
+
+    def mutate_after_verification(payload: object) -> None:
+        real_verifier(payload)
+        with targets[mutable_input].open("ab") as stream:
+            stream.write(b"\n# changed after typed verification\n")
+
+    monkeypatch.setattr(
+        server_preflight,
+        "verify_preflight_gate_artifact",
+        mutate_after_verification,
+    )
+    artifact = tmp_path / f"gate01_{mutable_input}.json"
+
+    with pytest.raises(common.GateArtifactError, match=message):
+        server_preflight.run_preflight(config_path, artifact, run_id="capsule-smoke-001")
+
+    assert not artifact.exists()
+    failure = json.loads(
+        common.gate_failure_artifact_path(artifact).read_text(encoding="utf-8")
+    )
+    assert failure["exception"]["stage"] == expected_stage
+
+
+def test_preflight_hashes_the_exact_bytes_given_to_the_config_loader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = _prepare_successful_preflight(config_path, monkeypatch)
+    initial_bytes = config_path.read_bytes()
+    observed: dict[str, bytes] = {}
+    real_loader = common.load_and_validate_server_config_bytes
+
+    def recording_loader(raw: bytes, *, check_runtime_paths: bool) -> dict[str, object]:
+        observed["raw"] = raw
+        return real_loader(raw, check_runtime_paths=check_runtime_paths)
+
+    monkeypatch.setattr(
+        server_preflight,
+        "load_and_validate_server_config_bytes",
+        recording_loader,
+    )
+    monkeypatch.setattr(
+        server_preflight,
+        "_git_sha",
+        lambda path: (
+            str(config["runtime"]["verl_pinned_sha"])
+            if path.resolve() == Path(config["runtime"]["verl_source_path"]).resolve()
+            else "d" * 40
+        ),
+    )
+
+    payload = server_preflight.run_preflight(
+        config_path,
+        tmp_path / "gate01_snapshot.json",
+        run_id="capsule-smoke-001",
+    )
+
+    assert observed["raw"] == initial_bytes
+    assert payload["config_sha256"] == hashlib.sha256(observed["raw"]).hexdigest()
+
+
+def test_preflight_validate_only_rejects_blank_run_id(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+
+    with pytest.raises(ValueError, match="run_id must be non-empty"):
+        server_preflight.main(
+            [
+                "--config",
+                str(config_path),
+                "--artifact",
+                str(tmp_path / "preflight.json"),
+                "--run-id",
+                "   ",
+                "--validate-only",
+            ]
+        )
+
+
+def test_preflight_execute_config_failure_still_publishes_failure_evidence(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["runtime"].pop("dataset_path")
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    artifact = tmp_path / "gate01_preflight.json"
+
+    with pytest.raises(common.ConfigValidationError, match="dataset_path"):
+        server_preflight.main(
+            [
+                "--config",
+                str(config_path),
+                "--artifact",
+                str(artifact),
+                "--run-id",
+                "capsule-smoke-001",
+            ]
+        )
+
+    assert not artifact.exists()
+    failure = json.loads(
+        common.gate_failure_artifact_path(artifact).read_text(encoding="utf-8")
+    )
+    assert failure["exception"]["stage"] == "config_load"
+    assert failure["dataset_sha256"] is None
+
+
+def test_external_gate_validate_only_expands_placeholders_without_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _server_config(tmp_path)
+    artifact = tmp_path / "seed_gate.json"
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("validate-only must not execute a subprocess")
+
+    monkeypatch.setattr(common.subprocess, "run", forbidden_run)
+    plan = common.ExternalGatePlan(
+        gate_name="seed_determinism",
+        config_path=config_path,
+        artifact_path=artifact,
+        runner_command=(
+            f"{sys.executable} fake_runner.py --config {{config}} "
+            "--seeds {seed_sequence} --output {artifact}"
+        ),
+        placeholders={"seed_sequence": "5,6,5"},
+        required_placeholders=frozenset({"config", "seed_sequence", "artifact"}),
+    )
+
+    argv = common.run_external_gate(plan, validate_only=True)
+
+    assert "5,6,5" in argv
+    assert str(config_path.resolve()) in argv
+    assert str(artifact.resolve()) in argv
+    assert "VALIDATION ONLY" in capsys.readouterr().out
+    assert not artifact.exists()
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "artifact_name", "subcommand", "expected_tail"),
+    [
+        (
+            check_seed_determinism.main,
+            "gate02_seed.json",
+            "seed",
+            ("--seeds", "5,6,5"),
+        ),
+        (
+            oracle_clean_replay.main,
+            "gate03_oracle.json",
+            "oracle",
+            ("--seed", "5", "--replays", "2"),
+        ),
+        (
+            controller_collector_smoke.main,
+            "gate04_collector.json",
+            "collector",
+            (
+                "--p0-count",
+                "2",
+                "--trajectories",
+                "2",
+                "--max-turns",
+                "12",
+            ),
+        ),
+        (
+            build_verified_group.main,
+            "gate05_guided_group.json",
+            "guided",
+            (
+                "--group-size",
+                "8",
+                "--base-count",
+                "7",
+                "--guided-count",
+                "1",
+                "--max-group-attempts",
+                "20",
+            ),
+        ),
+        (
+            one_step_trainer_smoke.main,
+            "gate06_trainer.json",
+            "trainer",
+            (
+                "--optimizer-steps",
+                "1",
+                "--group-rewards",
+                "0,0,0,0,0,0,0,1",
+                "--guided-artifact",
+                "{guided_artifact}",
+            ),
+        ),
+    ],
+)
+def test_gate_wrapper_validate_only_expands_repository_server_adapter(
+    entrypoint,
+    artifact_name: str,
+    subcommand: str,
+    expected_tail: tuple[str, ...],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = _server_config(tmp_path)
+    run_dir = tmp_path / "capsule-smoke-001"
+    run_dir.mkdir()
+    artifact = run_dir / artifact_name
+    if entrypoint is one_step_trainer_smoke.main:
+        guided_payload = _guided_gate_payload()
+        guided_payload["run_id"] = run_dir.name
+        guided_payload["config_sha256"] = common.artifact_file_sha256(config_path)
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        project_root = Path(config["runtime"]["project_root"]).resolve()
+
+        def clean_git_sha(root: Path) -> str:
+            assert root == project_root
+            return str(guided_payload["git_sha"])
+
+        monkeypatch.setattr(
+            server_adapter,
+            "_git_sha",
+            clean_git_sha,
+        )
+        (run_dir / "gate05_guided_group.json").write_text(
+            json.dumps(guided_payload), encoding="utf-8"
+        )
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("wrapper validate-only must not execute the server adapter")
+
+    monkeypatch.setattr(common.subprocess, "run", forbidden_run)
+
+    assert (
+        entrypoint(
+            [
+                "--config",
+                str(config_path),
+                "--artifact",
+                str(artifact),
+                "--validate-only",
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    argv = payload["argv"]
+    assert argv[:3] == [sys.executable, "-m", "scripts.capsule_rl.server_adapter"]
+    assert argv[3:9] == [
+        "--config",
+        str(config_path.resolve()),
+        "--artifact",
+        str(artifact.resolve()),
+        "--run-id",
+        run_dir.name,
+    ]
+    subcommand_index = argv.index(subcommand)
+    actual_tail = argv[subcommand_index + 1 :]
+    resolved_expected_tail = [
+        str(run_dir / "gate05_guided_group.json")
+        if value == "{guided_artifact}"
+        else value
+        for value in expected_tail
+    ]
+    assert actual_tail == resolved_expected_tail
+    assert not artifact.exists()
+
+
+def test_trainer_wrapper_validate_only_rejects_missing_guided_dependency(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    run_dir = tmp_path / "capsule-smoke-missing-guided"
+    run_dir.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="guided artifact"):
+        one_step_trainer_smoke.main(
+            [
+                "--config",
+                str(config_path),
+                "--artifact",
+                str(run_dir / "gate06_trainer.json"),
+                "--validate-only",
+            ]
+        )
+
+
+def test_external_gate_rejects_missing_placeholder_and_shell_operators(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+    base = dict(
+        gate_name="collector",
+        config_path=config_path,
+        artifact_path=tmp_path / "collector.json",
+        placeholders={},
+        required_placeholders=frozenset({"config", "artifact"}),
+    )
+    with pytest.raises(common.CommandValidationError, match="placeholder"):
+        common.run_external_gate(
+            common.ExternalGatePlan(runner_command=f"{sys.executable} runner.py", **base),
+            validate_only=True,
+        )
+    with pytest.raises(common.CommandValidationError, match="shell operator"):
+        common.run_external_gate(
+            common.ExternalGatePlan(
+                runner_command=(
+                    f"{sys.executable} runner.py --config {{config}} "
+                    "--output {artifact} && echo unsafe"
+                ),
+                **base,
+            ),
+            validate_only=True,
+        )
+
+
+def test_gate_artifact_verifiers_enforce_seed_oracle_group_and_trainer_gates(
+    tmp_path: Path,
+) -> None:
+    common.verify_seed_gate_artifact(
+        {
+            **_gate_envelope("seed"),
+            "seeds": [5, 6, 5],
+            "initial_state_sha256": ["a" * 64, "b" * 64, "a" * 64],
+        }
+    )
+    oracle_result = _replay_result(
+        program_sample_id="oracle-0", source="oracle = True\n", success=True
+    )
+    common.verify_oracle_gate_artifact(
+        {
+            **_gate_envelope("oracle_replay"),
+            "direct_replay": True,
+            "controller_used": False,
+            "replays": [
+                {
+                    "result": oracle_result.to_dict(),
+                    "worker_id": "worker-1",
+                    "reset_seed": 5,
+                    "namespace_fresh": True,
+                    "api_state_cleared": True,
+                    "watchdog_active": True,
+                },
+                {
+                    "result": oracle_result.to_dict(),
+                    "worker_id": "worker-1",
+                    "reset_seed": 5,
+                    "namespace_fresh": True,
+                    "api_state_cleared": True,
+                    "watchdog_active": True,
+                },
+            ],
+            "replay_event_count": 2,
+            "attempt_event_count": 2,
+            "retry_count": 0,
+            "infra_failures": 0,
+            "evaluator_failures": 0,
+            "worker_replacements": 0,
+        }
+    )
+    repair_records = []
+    collector_selected_results = [
+        _replay_result(
+            program_sample_id=f"base-{index}",
+            source=f"failed_{index} = True\n",
+            success=False,
+        )
+        for index in range(7)
+    ]
+    collector_base_results = [result.to_dict() for result in collector_selected_results[:2]]
+    for p0_rank in range(2):
+        source = f"failed_{p0_rank} = True\n"
+        for trajectory_index in range(2):
+            draft = RepairDraft(
+                task_id="cube-stack-5",
+                environment_seed=5,
+                program_sample_id=f"base-{p0_rank}",
+                repair_trajectory_id=f"repair-{p0_rank}-{trajectory_index}",
+                base_source=source,
+                base_units=[BaseUnitSpan("whole", 0, len(source), source)],
+            )
+            draft.submit({"action": "finish", "rationale": "complete"})
+            repair_records.append(
+                {
+                    "p0_rank": p0_rank,
+                    "trajectory_index": trajectory_index,
+                    "trace": draft.to_trace().to_dict(),
+                }
+            )
+    common.verify_collector_gate_artifact(
+        {
+            **_gate_envelope("collector"),
+            "controller_frozen": True,
+            "intermediate_replay_count": 0,
+            "p0_count": 2,
+            "repair_trajectories_per_p0": 2,
+            "base_results": collector_base_results,
+            "selected_batch_index": 0,
+            "selected_batch_results": [
+                result.to_dict() for result in collector_selected_results
+            ],
+            "discarded_batches": [],
+            "replay_events": [
+                {
+                    "batch_index": 0,
+                    "base_index": index,
+                    "selected_batch": True,
+                    "result": result.to_dict(),
+                }
+                for index, result in enumerate(collector_selected_results)
+            ],
+            "replay_event_count": 7,
+            "attempt_event_count": 7,
+            "retry_count": 0,
+            "infra_failures": 0,
+            "evaluator_failures": 0,
+            "worker_replacements": 0,
+            "repair_traces": repair_records,
+        }
+    )
+    group = _verified_group()
+    guided_provenance = _guided_provenance(group)
+    common.verify_guided_gate_artifact(
+        {
+            **_gate_envelope("guided"),
+            "task_instance": _verified_task().to_dict(),
+            "original_prompt": "stack the cubes",
+            "training_input_contains_critique": False,
+            "learning_group": group.to_dict(),
+            **guided_provenance,
+        }
+    )
+    checkpoint = tmp_path / "gate06" / "run" / "global_step_1" / "actor"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "state.bin").write_bytes(b"checkpoint")
+    _write_test_lora_adapter(checkpoint)
+    adapter_evidence = common.direct_lora_adapter_evidence(checkpoint)
+    checkpoint_contract = _checkpoint_contract(checkpoint)
+    common.verify_trainer_gate_artifact(
+        {
+            **_gate_envelope("trainer"),
+            "learning_group": group.to_dict(),
+            "actor_update_rpcs": 1,
+            "optimizer_steps": 1,
+            "optimizer_step_before": 0,
+            "optimizer_step_after": 1,
+            "gradient_norm": 0.25,
+            "checkpoint": str(checkpoint),
+            "group_rewards": [0, 0, 0, 0, 0, 0, 0, 1],
+            "guided_token_mask_present": True,
+            "guided_token_count": 4,
+            "guided_mask_response_only": True,
+            "guided_token_mask_shape": [8, 4],
+            "guided_row_indices": [7],
+            "rollout_mask_matches_guided": True,
+            "old_log_probs_finite": True,
+            "reference_log_probs_finite": True,
+            "reference_log_prob_shape": [8, 4],
+            "reference_log_prob_response_token_counts": [4] * 8,
+            "training_call_trace": [
+                "old_logprob",
+                "reference_logprob",
+                "update",
+            ],
+            "rollout_is": False,
+            "norm_adv_by_std_in_grpo": False,
+            "loss_mode": "capsule_critique",
+            "capsule_gamma": 0.1,
+            "reference_kl_enabled": True,
+            "reference_kl_coef": 0.001,
+            "reference_policy_mode": "actor_base_adapter_disabled",
+            "rollout_mode": "sync",
+            "ppo_epochs": 1,
+            "ppo_mini_batch_size": 8,
+            "data_parallel_world_size": 1,
+            "sequence_parallel_size": 1,
+            "verl_provenance_before": _verl_provenance(),
+            "verl_provenance_after": _verl_provenance(),
+            "lora_runtime_before": _lora_runtime_evidence(),
+            "lora_runtime_after": _lora_runtime_evidence(),
+            "cuda_peak_reserved_bytes": 60 * 1024**3,
+            "host_memory": {
+                "sample_count": 8,
+                "minimum_mem_available_bytes": 80 * 1024**3,
+                "poll_interval_s": 0.25,
+                "monitor_scope": "before_worker_start_through_after_ray_shutdown",
+            },
+            "ray_release": {
+                "worker_close_calls": 1,
+                "ray_shutdown_calls": 1,
+                "ray_shutdown_complete": True,
+            },
+            **adapter_evidence,
+            "actor_update_skipped": False,
+            "metrics": {"actor/pg_loss": 0.5},
+            **checkpoint_contract,
+            "guided_artifact_sha256": "e" * 64,
+        }
+    )
+
+    with pytest.raises(common.GateArtifactError):
+        common.verify_seed_gate_artifact(
+            {
+                **_gate_envelope("seed"),
+                "seeds": [5, 6, 5],
+                "initial_state_sha256": ["a" * 64] * 3,
+            }
+        )
+    with pytest.raises(common.GateArtifactError):
+        invalid_group = group.to_dict()
+        invalid_group["group_uid"] = "invalid"
+        common.verify_guided_gate_artifact(
+            {
+                **_gate_envelope("guided"),
+                "learning_group": invalid_group,
+            }
+        )
+
+
+def test_collector_verifier_rejects_empty_trace_records() -> None:
+    with pytest.raises(common.GateArtifactError, match="trace"):
+        common.verify_collector_gate_artifact(
+            {
+                **_gate_envelope("collector"),
+                "controller_frozen": True,
+                "intermediate_replay_count": 0,
+                "p0_count": 2,
+                "repair_trajectories_per_p0": 2,
+                "base_results": [
+                    _replay_result(
+                        program_sample_id=f"base-{rank}",
+                        source=f"failed_{rank} = True\n",
+                        success=False,
+                    ).to_dict()
+                    for rank in range(2)
+                ],
+                "repair_traces": [
+                    {"p0_rank": rank, "trajectory_index": trajectory}
+                    for rank in range(2)
+                    for trajectory in range(2)
+                ],
+            }
+        )
+
+
+def test_prepare_validate_only_does_not_write_dataset_or_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _server_config(tmp_path)
+    source = tmp_path / "source.jsonl"
+    source.write_text('{"task_id":"cube-stack","prompt":"stack cubes"}\n', encoding="utf-8")
+    destination = tmp_path / "prepared"
+
+    result = prepare_dataset_config.prepare(
+        config_path=config_path,
+        source_dataset=source,
+        output_dir=destination,
+        seeds=(5, 6),
+        validate_only=True,
+    )
+
+    assert result.record_count == 2
+    assert not destination.exists()
+    assert "VALIDATION ONLY" in capsys.readouterr().out
+
+
+def test_prepare_rejects_negative_seed_without_writing(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+    source = tmp_path / "negative-seed-source.jsonl"
+    source.write_text('{"task_id":"cube-stack","prompt":"stack cubes"}\n', encoding="utf-8")
+    destination = tmp_path / "negative-seed-output"
+
+    with pytest.raises(common.ConfigValidationError, match="non-negative"):
+        prepare_dataset_config.prepare(
+            config_path=config_path,
+            source_dataset=source,
+            output_dir=destination,
+            seeds=(-1,),
+            validate_only=True,
+        )
+
+    assert not destination.exists()
+
+
+def test_prepare_rejects_duplicate_seeds_without_writing(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+    source = tmp_path / "duplicate-seed-source.jsonl"
+    source.write_text('{"task_id":"cube-stack","prompt":"stack cubes"}\n', encoding="utf-8")
+    destination = tmp_path / "duplicate-seed-output"
+
+    with pytest.raises(common.ConfigValidationError, match="duplicate"):
+        prepare_dataset_config.prepare(
+            config_path=config_path,
+            source_dataset=source,
+            output_dir=destination,
+            seeds=(5, 5),
+            validate_only=True,
+        )
+
+    assert not destination.exists()
+
+
+def test_prepare_strips_untrusted_source_initial_state_hash(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+    source = tmp_path / "source-with-fake-hash.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "task_id": "cube-stack",
+                "prompt": "stack cubes",
+                "initial_state_sha256": "f" * 64,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "prepared-no-untrusted-hash"
+
+    result = prepare_dataset_config.prepare(
+        config_path=config_path,
+        source_dataset=source,
+        output_dir=destination,
+        seeds=(5,),
+        validate_only=False,
+    )
+
+    record = json.loads(result.dataset_path.read_text(encoding="utf-8"))
+    assert "initial_state_sha256" not in record
+
+
+def test_prepare_failure_never_publishes_a_partial_two_file_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    source = tmp_path / "atomic-source.jsonl"
+    source.write_text('{"task_id":"cube-stack","prompt":"stack cubes"}\n', encoding="utf-8")
+    destination = tmp_path / "atomic-prepared"
+    original_write_text = Path.write_text
+
+    def interrupt_resolved_config(self: Path, *args: object, **kwargs: object) -> int:
+        if self.name == "capsule_rl.resolved.yaml":
+            raise KeyboardInterrupt("interrupted between bundle writes")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", interrupt_resolved_config)
+
+    with pytest.raises(KeyboardInterrupt, match="between bundle writes"):
+        prepare_dataset_config.prepare(
+            config_path=config_path,
+            source_dataset=source,
+            output_dir=destination,
+            seeds=(5,),
+            validate_only=False,
+        )
+
+    assert not destination.exists()
+    assert list(tmp_path.glob(".atomic-prepared.staging-*")) == []
+
+
+def _resolved_task() -> TaskInstanceV1:
+    return TaskInstanceV1(
+        task_id="cube-stack",
+        environment_seed=5,
+        prompt="stack",
+        environment="robosuite_cube_stack",
+        api="franka_control_privileged",
+        privilege="privileged",
+        initial_state_sha256="a" * 64,
+    )
+
+
+def _resolved_task_variant(**changes: object) -> TaskInstanceV1:
+    payload = _resolved_task().to_dict()
+    payload.update(changes)
+    return TaskInstanceV1.from_dict(payload)
+
+
+def _materialization_gate7_audit(
+    config_path: Path, *, initial_state_sha256: str = "a" * 64
+) -> Path:
+    config = common.load_and_validate_server_config(
+        config_path, check_runtime_paths=True
+    )
+    dependencies = common.runtime_dependency_hashes(config)
+    actor_identity = build_actor_identity(config)
+    audit_path = config_path.parent / f"{config_path.stem}.gate07_audit.json"
+    gate7_resolved_profile = audit_path.parent / "resolved" / "verl.yaml"
+    gate7_resolved_profile.parent.mkdir(exist_ok=True)
+    gate7_resolved_profile.write_bytes(
+        Path(str(actor_identity["verl_resolved_config_path"])).read_bytes()
+    )
+    for filename in (
+        "gate07_audit.candidate.json",
+        "launcher_continuous_memory.json",
+        "launcher_controller_attestation.json",
+        "launcher_owned_cleanup.json",
+        "launcher_initial_audit.json",
+        "launcher_memory_00_post-controller.json",
+        *analyze_artifacts.REQUIRED_GATE_FILES.values(),
+    ):
+        (audit_path.parent / filename).write_text("{}\n", encoding="utf-8")
+    audit_path.write_text(
+        json.dumps(
+            valid_final_runtime_audit(
+                run_directory=audit_path.parent,
+                config_sha256=common.artifact_file_sha256(config_path),
+                dataset_sha256=common.artifact_file_sha256(
+                    common.runtime_dataset_path(config)
+                ),
+                resolved_environment_sha256=dependencies[
+                    "resolved_environment_sha256"
+                ],
+                verl_resolved_config_sha256=dependencies[
+                    "verl_resolved_config_sha256"
+                ],
+                program_model_sha256=actor_identity["program_model_sha256"],
+                actor_binding_sha256=actor_identity["actor_binding_sha256"],
+                typed_task_identities=[
+                    {
+                        "task_id": "cube-stack",
+                        "environment_seed": 5,
+                        "initial_state_sha256": initial_state_sha256,
+                    }
+                ],
+            ),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return audit_path
+
+
+def test_materialize_rejects_config_replacement_during_snapshot_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    audit_path = _materialization_gate7_audit(config_path)
+    replacement = tmp_path / "replacement-config.yaml"
+    replacement.write_bytes(config_path.read_bytes())
+    target_identity = (config_path.stat().st_dev, config_path.stat().st_ino)
+    original_read = os.read
+    replaced = False
+
+    def racing_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        chunk = original_read(descriptor, size)
+        opened = os.fstat(descriptor)
+        if chunk and not replaced and (opened.st_dev, opened.st_ino) == target_identity:
+            replaced = True
+            os.replace(replacement, config_path)
+        return chunk
+
+    monkeypatch.setattr(os, "read", racing_read)
+
+    with pytest.raises(common.ConfigValidationError, match="changed|replaced"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=audit_path,
+            output_dir=tmp_path / "config-race-output",
+            validate_only=True,
+        )
+
+    assert replaced is True
+
+
+def test_materialize_rejects_gate7_replacement_during_snapshot_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    audit_path = _materialization_gate7_audit(config_path)
+    replacement = tmp_path / "replacement-audit.json"
+    replacement.write_bytes(audit_path.read_bytes())
+    target_identity = (audit_path.stat().st_dev, audit_path.stat().st_ino)
+    original_read = os.read
+    replaced = False
+
+    def racing_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        chunk = original_read(descriptor, size)
+        opened = os.fstat(descriptor)
+        if chunk and not replaced and (opened.st_dev, opened.st_ino) == target_identity:
+            replaced = True
+            os.replace(replacement, audit_path)
+        return chunk
+
+    monkeypatch.setattr(os, "read", racing_read)
+
+    with pytest.raises(common.ConfigValidationError, match="changed|replaced"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=audit_path,
+            output_dir=tmp_path / "audit-race-output",
+            validate_only=True,
+        )
+
+    assert replaced is True
+
+
+def test_materialize_validate_only_parses_the_hashed_dataset_a_to_b_to_a_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    audit_path = _materialization_gate7_audit(config_path)
+    config = common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+    dataset_path = common.runtime_dataset_path(config)
+    trusted = dataset_path.read_bytes()
+    replacement_payload = json.loads(trusted)
+    replacement_payload["prompt"] = "attacker prompt"
+    replacement = (json.dumps(replacement_payload, sort_keys=True) + "\n").encode()
+    original_hash = materialize_resolved_dataset.artifact_file_sha256
+    original_snapshot = materialize_resolved_dataset.read_stable_regular_file
+    original_source_rows = materialize_resolved_dataset._source_rows
+    observed_prompts: list[str] = []
+
+    def hash_then_swap(candidate: str | Path) -> str:
+        digest = original_hash(candidate)
+        if Path(candidate).resolve() == dataset_path.resolve():
+            dataset_path.write_bytes(replacement)
+        return digest
+
+    def snapshot_then_swap(candidate: str | Path, *, label: str):
+        snapshot = original_snapshot(candidate, label=label)
+        if label == "source dataset":
+            dataset_path.write_bytes(replacement)
+        return snapshot
+
+    def capture_then_restore(source):
+        rows = original_source_rows(source)
+        observed_prompts.append(str(rows[0][1]["prompt"]))
+        dataset_path.write_bytes(trusted)
+        return rows
+
+    monkeypatch.setattr(materialize_resolved_dataset, "artifact_file_sha256", hash_then_swap)
+    monkeypatch.setattr(
+        materialize_resolved_dataset, "read_stable_regular_file", snapshot_then_swap
+    )
+    monkeypatch.setattr(materialize_resolved_dataset, "_source_rows", capture_then_restore)
+
+    materialize_resolved_dataset.materialize(
+        config_path=config_path,
+        gate7_audit_path=audit_path,
+        output_dir=tmp_path / "dataset-snapshot-validation",
+        validate_only=True,
+    )
+
+    assert dataset_path.read_bytes() == trusted
+    assert observed_prompts == ["stack"]
+
+
+@pytest.mark.parametrize("dependency_kind", ["environment", "resolved_verl"])
+def test_materialize_resolver_consumes_staged_dependency_a_during_a_to_b_to_a(
+    dependency_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _server_config(tmp_path)
+    config_payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if dependency_kind == "environment":
+        dependency_path = tmp_path / "environment.yaml"
+        dependency_path.write_bytes(CLEAN_REPLAY_CONFIG.read_bytes())
+        config_payload["task"]["config_path"] = str(dependency_path)
+        replacement = b"task: AttackerTask\n"
+        resolver_field = ("task", "config_path")
+    else:
+        dependency_path = Path(config_payload["runtime"]["verl_resolved_config_path"])
+        replacement = dependency_path.read_bytes() + b"# attacker\n"
+        resolver_field = ("runtime", "verl_resolved_config_path")
+    config_path.write_text(yaml.safe_dump(config_payload, sort_keys=False), encoding="utf-8")
+    audit_path = _materialization_gate7_audit(config_path)
+    trusted = dependency_path.read_bytes()
+    original_snapshot = materialize_resolved_dataset.read_stable_regular_file
+    observed: list[bytes] = []
+    swapped = False
+
+    def snapshot_then_swap(candidate: str | Path, *, label: str):
+        nonlocal swapped
+        snapshot = original_snapshot(candidate, label=label)
+        if not swapped and Path(candidate).resolve() == dependency_path.resolve():
+            swapped = True
+            dependency_path.write_bytes(replacement)
+        return snapshot
+
+    def resolver(resolver_config):
+        section, field = resolver_field
+        consumed = Path(resolver_config[section][field])
+        observed.append(consumed.read_bytes())
+        dependency_path.write_bytes(trusted)
+        return (_resolved_task(),)
+
+    monkeypatch.setattr(
+        materialize_resolved_dataset,
+        "read_stable_regular_file",
+        snapshot_then_swap,
+    )
+
+    materialize_resolved_dataset.materialize(
+        config_path=config_path,
+        gate7_audit_path=audit_path,
+        output_dir=tmp_path / f"staged-{dependency_kind}",
+        validate_only=False,
+        task_resolver=resolver,
+    )
+
+    assert observed == [trusted]
+    assert dependency_path.read_bytes() == trusted
+
+
+def test_materialize_validate_only_never_calls_state_resolver_or_writes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _server_config(tmp_path)
+    destination = tmp_path / "seed-resolved"
+
+    def forbidden_resolver(_config):
+        raise AssertionError("validate-only must not resolve task state")
+
+    result = materialize_resolved_dataset.materialize(
+        config_path=config_path,
+        gate7_audit_path=_materialization_gate7_audit(config_path),
+        output_dir=destination,
+        validate_only=True,
+        task_resolver=forbidden_resolver,
+    )
+
+    assert result.dataset_path == destination / "capsule_rl.seed_resolved.dataset.jsonl"
+    assert result.config_path == destination / "capsule_rl.seed_resolved.yaml"
+    assert not destination.exists()
+    assert "VALIDATION ONLY" in capsys.readouterr().out
+
+
+def _overwrite_config_dataset(config_path: Path, rows: list[object]) -> None:
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    dataset_path = Path(config["runtime"]["dataset_path"])
+    dataset_path.write_text(
+        "".join(f"{json.dumps(row)}\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def _unresolved_task_row(*, task_id: str = "cube-stack", seed: int = 5) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "task_id": task_id,
+        "task_instance_id": f"{task_id}:seed-{seed}",
+        "environment_seed": seed,
+        "prompt": "stack",
+    }
+
+
+def test_materialize_validate_only_rejects_malformed_json_without_resolving(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    Path(config["runtime"]["dataset_path"]).write_text("{not-json\n", encoding="utf-8")
+    destination = tmp_path / "malformed-json-output"
+
+    def forbidden_resolver(_config):
+        raise AssertionError("invalid validate-only input must not resolve task state")
+
+    with pytest.raises(common.ConfigValidationError, match="line 1.*invalid JSON"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=destination,
+            validate_only=True,
+            task_resolver=forbidden_resolver,
+        )
+
+    assert not destination.exists()
+
+
+def test_materialize_validate_only_rejects_malformed_task_row_without_resolving(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    row = _unresolved_task_row()
+    row["prompt"] = 123
+    _overwrite_config_dataset(config_path, [row])
+    destination = tmp_path / "malformed-task-output"
+
+    def forbidden_resolver(_config):
+        raise AssertionError("invalid validate-only input must not resolve task state")
+
+    with pytest.raises(common.ConfigValidationError, match="line 1.*TaskInstanceV1"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=destination,
+            validate_only=True,
+            task_resolver=forbidden_resolver,
+        )
+
+    assert not destination.exists()
+
+
+def test_materialize_validate_only_rejects_negative_seed_without_resolving(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    _overwrite_config_dataset(config_path, [_unresolved_task_row(seed=-1)])
+    destination = tmp_path / "negative-materialize-seed-output"
+
+    def forbidden_resolver(_config):
+        raise AssertionError("invalid validate-only input must not resolve task state")
+
+    with pytest.raises(
+        common.ConfigValidationError, match="environment_seed must be non-negative"
+    ):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=destination,
+            validate_only=True,
+            task_resolver=forbidden_resolver,
+        )
+
+    assert not destination.exists()
+
+
+def test_materialize_validate_only_rejects_duplicate_task_identity_without_resolving(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    _overwrite_config_dataset(config_path, [_unresolved_task_row(), _unresolved_task_row()])
+    destination = tmp_path / "duplicate-materialize-identity-output"
+
+    def forbidden_resolver(_config):
+        raise AssertionError("invalid validate-only input must not resolve task state")
+
+    with pytest.raises(common.ConfigValidationError, match="duplicate task identity"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=destination,
+            validate_only=True,
+            task_resolver=forbidden_resolver,
+        )
+
+    assert not destination.exists()
+
+
+def test_materialize_publishes_typed_dataset_and_updated_config(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+    destination = tmp_path / "seed-resolved"
+
+    result = materialize_resolved_dataset.materialize(
+        config_path=config_path,
+        gate7_audit_path=_materialization_gate7_audit(config_path),
+        output_dir=destination,
+        validate_only=False,
+        task_resolver=lambda _config: (_resolved_task(),),
+    )
+
+    records = [
+        TaskInstanceV1.from_json(line)
+        for line in result.dataset_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert records == [_resolved_task()]
+    resolved_config = yaml.safe_load(result.config_path.read_text(encoding="utf-8"))
+    assert resolved_config["runtime"]["dataset_path"] == str(result.dataset_path)
+    assert resolved_config["runtime"]["bundle_manifest_path"] == str(
+        result.manifest_path
+    )
+    assert resolved_config["runtime"]["gate7_audit_path"] == str(
+        destination / "gate07_audit.json"
+    )
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 1
+    assert manifest["record_count"] == 1
+    assert manifest["dataset_sha256"] == common.artifact_file_sha256(result.dataset_path)
+    assert manifest["source_config_sha256"] == common.artifact_file_sha256(config_path)
+    source_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert manifest["source_dataset_sha256"] == common.artifact_file_sha256(
+        source_config["runtime"]["dataset_path"]
+    )
+    assert manifest["gate7_run_id"] == "capsule-smoke-001"
+    identity = build_actor_identity(source_config)
+    assert manifest["program_model_sha256"] == identity["program_model_sha256"]
+    assert manifest["actor_binding_sha256"] == identity["actor_binding_sha256"]
+    assert manifest["gate7_audit_sha256"] == common.artifact_file_sha256(
+        manifest["gate7_audit_path"]
+    )
+    assert manifest["gate7_typed_task_identities"] == [
+        {
+            "task_id": "cube-stack",
+            "environment_seed": 5,
+            "initial_state_sha256": "a" * 64,
+        }
+    ]
+    assert manifest["output_dataset_sha256"] == common.artifact_file_sha256(
+        result.dataset_path
+    )
+    assert manifest["output_config_sha256"] == common.artifact_file_sha256(
+        result.config_path
+    )
+    formal_config, formal_config_path = main_ppo.load_and_validate_config(result.config_path)
+    verified_bundle = main_ppo.verify_bundle_provenance(formal_config, formal_config_path)
+    assert verified_bundle["gate7_run_id"] == "capsule-smoke-001"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "changed_value"),
+    [
+        ("task_id", "replacement-task"),
+        ("environment_seed", 6),
+        ("prompt", "replacement prompt"),
+        ("environment", "replacement_environment"),
+        ("api", "replacement_api"),
+        ("privilege", "replacement_privilege"),
+        ("metadata", {"split": "replacement"}),
+    ],
+)
+def test_materialize_rejects_same_count_resolver_immutable_field_substitution(
+    field_name: str, changed_value: object, tmp_path: Path
+) -> None:
+    config_path = _server_config(tmp_path)
+
+    with pytest.raises(
+        common.ConfigValidationError,
+        match=rf"resolved task 0.*immutable source field {field_name}",
+    ):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=tmp_path / f"substituted-{field_name}",
+            validate_only=False,
+            task_resolver=lambda _config: (
+                _resolved_task_variant(**{field_name: changed_value}),
+            ),
+        )
+
+
+def test_materialize_rejects_same_count_resolver_row_reordering(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+    _overwrite_config_dataset(
+        config_path,
+        [
+            _unresolved_task_row(task_id="cube-stack", seed=5),
+            {
+                **_unresolved_task_row(task_id="cube-stack-second", seed=6),
+                "prompt": "stack second",
+                "metadata": {"split": "second"},
+            },
+        ],
+    )
+    first = _resolved_task()
+    second = _resolved_task_variant(
+        task_id="cube-stack-second",
+        environment_seed=6,
+        prompt="stack second",
+        initial_state_sha256="b" * 64,
+        metadata={"split": "second"},
+    )
+
+    with pytest.raises(
+        common.ConfigValidationError, match="resolved task 0.*immutable source field"
+    ):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=tmp_path / "reordered-rows",
+            validate_only=False,
+            task_resolver=lambda _config: (second, first),
+        )
+
+
+def test_materialize_preserves_source_row_order_and_immutable_fields(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+    _overwrite_config_dataset(
+        config_path,
+        [
+            {**_unresolved_task_row(), "metadata": {"split": "first"}},
+            {
+                **_unresolved_task_row(task_id="cube-stack-second", seed=6),
+                "prompt": "stack second",
+                "metadata": {"split": "second"},
+            },
+        ],
+    )
+    first = _resolved_task_variant(metadata={"split": "first"})
+    second = _resolved_task_variant(
+        task_id="cube-stack-second",
+        environment_seed=6,
+        prompt="stack second",
+        initial_state_sha256="b" * 64,
+        metadata={"split": "second"},
+    )
+
+    result = materialize_resolved_dataset.materialize(
+        config_path=config_path,
+        gate7_audit_path=_materialization_gate7_audit(config_path),
+        output_dir=tmp_path / "ordered-rows",
+        validate_only=False,
+        task_resolver=lambda _config: (first, second),
+    )
+
+    assert [
+        TaskInstanceV1.from_json(line)
+        for line in result.dataset_path.read_text(encoding="utf-8").splitlines()
+    ] == [first, second]
+
+
+def test_materialize_rejects_change_to_source_real_initial_state_hash(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    source_row = _unresolved_task_row()
+    source_row["initial_state_sha256"] = "c" * 64
+    _overwrite_config_dataset(config_path, [source_row])
+
+    with pytest.raises(
+        common.ConfigValidationError, match="initial_state_sha256.*immutable source"
+    ):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(
+                config_path, initial_state_sha256="c" * 64
+            ),
+            output_dir=tmp_path / "changed-real-state",
+            validate_only=False,
+            task_resolver=lambda _config: (_resolved_task(),),
+        )
+
+
+def test_materialize_accepts_unchanged_source_real_initial_state_hash(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    source_row = _unresolved_task_row()
+    source_row["initial_state_sha256"] = "c" * 64
+    _overwrite_config_dataset(config_path, [source_row])
+
+    result = materialize_resolved_dataset.materialize(
+        config_path=config_path,
+        gate7_audit_path=_materialization_gate7_audit(
+            config_path, initial_state_sha256="c" * 64
+        ),
+        output_dir=tmp_path / "preserved-real-state",
+        validate_only=False,
+        task_resolver=lambda _config: (
+            _resolved_task_variant(initial_state_sha256="c" * 64),
+        ),
+    )
+
+    assert TaskInstanceV1.from_json(
+        result.dataset_path.read_text(encoding="utf-8").strip()
+    ).initial_state_sha256 == "c" * 64
+
+
+def test_materialize_allows_explicit_initial_state_placeholder_to_resolve(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    source_row = _unresolved_task_row()
+    source_row["initial_state_sha256"] = "0" * 64
+    _overwrite_config_dataset(config_path, [source_row])
+
+    result = materialize_resolved_dataset.materialize(
+        config_path=config_path,
+        gate7_audit_path=_materialization_gate7_audit(config_path),
+        output_dir=tmp_path / "resolved-explicit-placeholder",
+        validate_only=False,
+        task_resolver=lambda _config: (_resolved_task(),),
+    )
+
+    assert TaskInstanceV1.from_json(
+        result.dataset_path.read_text(encoding="utf-8").strip()
+    ).initial_state_sha256 == "a" * 64
+
+
+def test_materialize_rejects_unresolved_initial_state_placeholder(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+
+    with pytest.raises(
+        common.ConfigValidationError, match="did not replace.*initial-state placeholder"
+    ):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=tmp_path / "unresolved-placeholder",
+            validate_only=False,
+            task_resolver=lambda _config: (
+                _resolved_task_variant(initial_state_sha256="0" * 64),
+            ),
+        )
+
+
+def test_materialize_refuses_overwrite_before_resolving(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+    destination = tmp_path / "seed-resolved"
+    destination.mkdir()
+
+    def forbidden_resolver(_config):
+        raise AssertionError("existing output must fail before state resolution")
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=destination,
+            validate_only=False,
+            task_resolver=forbidden_resolver,
+        )
+
+
+def test_materialize_resolver_failure_leaves_no_bundle(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+    destination = tmp_path / "seed-resolved"
+
+    def failed_resolver(_config):
+        raise RuntimeError("reset failed")
+
+    with pytest.raises(RuntimeError, match="reset failed"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=destination,
+            validate_only=False,
+            task_resolver=failed_resolver,
+        )
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".seed-resolved.*.tmp"))
+
+
+def test_materialize_rejects_actor_identity_changed_during_resolution(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    model_config = Path(config["runtime"]["program_model_path"]) / "config.json"
+    destination = tmp_path / "changed-actor-identity"
+
+    def mutate_model(_config):
+        model_config.write_text('{"model_type":"changed"}\n', encoding="utf-8")
+        return (_resolved_task(),)
+
+    with pytest.raises(common.ConfigValidationError, match="actor identity changed"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=destination,
+            validate_only=False,
+            task_resolver=mutate_model,
+        )
+
+    assert not destination.exists()
+
+
+def test_materialize_rejects_gate7_audit_dataset_mismatch_before_resolving(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    audit_path = _materialization_gate7_audit(config_path)
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit["dataset_sha256"] = "0" * 64
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+
+    def forbidden_resolver(_config):
+        raise AssertionError("mismatched Gate7 audit must fail before resolution")
+
+    with pytest.raises(common.ConfigValidationError, match="Gate7.*dataset SHA"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=audit_path,
+            output_dir=tmp_path / "mismatched-audit",
+            validate_only=False,
+            task_resolver=forbidden_resolver,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "message"),
+    [
+        ("program_model_sha256", "Program model SHA"),
+        ("actor_binding_sha256", "actor binding SHA"),
+    ],
+)
+def test_materialize_rejects_gate7_actor_identity_mismatch_before_resolving(
+    field_name: str,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    audit_path = _materialization_gate7_audit(config_path)
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit[field_name] = "0" * 64
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+
+    def forbidden_resolver(_config):
+        raise AssertionError("mismatched actor identity must fail before resolution")
+
+    with pytest.raises(common.ConfigValidationError, match=message):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=audit_path,
+            output_dir=tmp_path / f"mismatched-{field_name}",
+            validate_only=False,
+            task_resolver=forbidden_resolver,
+        )
+
+
+def test_materialize_base_exception_removes_only_owned_partial_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    destination = tmp_path / "interrupted-resolved"
+    real_replace = materialize_resolved_dataset.os.replace
+    replace_count = 0
+
+    def interrupt_second_publish(source: object, target: object) -> None:
+        nonlocal replace_count
+        replace_count += 1
+        if replace_count == 2:
+            raise KeyboardInterrupt("interrupted during bundle publication")
+        real_replace(source, target)
+
+    monkeypatch.setattr(
+        materialize_resolved_dataset.os, "replace", interrupt_second_publish
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="bundle publication"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=destination,
+            validate_only=False,
+            task_resolver=lambda _config: (_resolved_task(),),
+        )
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".interrupted-resolved.*.tmp"))
+
+
+def test_materialize_cleanup_refuses_concurrently_replaced_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    destination = tmp_path / "replaced-resolved"
+    displaced_owner = tmp_path / "displaced-owned-directory"
+
+    def replace_destination_then_interrupt(source: object, target: object) -> None:
+        del source, target
+        destination.rename(displaced_owner)
+        destination.mkdir()
+        (destination / "concurrent-owner.txt").write_text(
+            "must survive", encoding="utf-8"
+        )
+        raise KeyboardInterrupt("destination replaced concurrently")
+
+    monkeypatch.setattr(
+        materialize_resolved_dataset.os,
+        "replace",
+        replace_destination_then_interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="replaced concurrently"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=destination,
+            validate_only=False,
+            task_resolver=lambda _config: (_resolved_task(),),
+        )
+
+    assert (destination / "concurrent-owner.txt").read_text(encoding="utf-8") == (
+        "must survive"
+    )
+    assert displaced_owner.is_dir()
+    assert not list(tmp_path.glob(".replaced-resolved.*.tmp"))
+
+
+def test_materialize_partial_publish_cleanup_preserves_concurrent_insert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    destination = tmp_path / "inserted-during-publish"
+    foreign = destination / "concurrent-owner.txt"
+    real_replace = materialize_resolved_dataset.os.replace
+    replace_count = 0
+
+    def insert_then_interrupt(source: object, target: object) -> None:
+        nonlocal replace_count
+        replace_count += 1
+        if replace_count == 2:
+            foreign.write_bytes(b"foreign concurrent data\n")
+            raise KeyboardInterrupt("interrupted after concurrent insert")
+        real_replace(source, target)
+
+    monkeypatch.setattr(
+        materialize_resolved_dataset.os,
+        "replace",
+        insert_then_interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="concurrent insert"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=destination,
+            validate_only=False,
+            task_resolver=lambda _config: (_resolved_task(),),
+        )
+
+    assert foreign.read_bytes() == b"foreign concurrent data\n"
+    assert sorted(path.name for path in destination.iterdir()) == [foreign.name]
+
+
+def test_materialize_publish_rejects_same_bytes_replacement_before_ownership_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    destination = tmp_path / "same-bytes-replacement"
+    dataset = destination / "capsule_rl.seed_resolved.dataset.jsonl"
+    real_replace = materialize_resolved_dataset.os.replace
+    replaced_identity: tuple[int, int] | None = None
+    replace_count = 0
+
+    def replace_published_inode(source: object, target: object) -> None:
+        nonlocal replace_count, replaced_identity
+        replace_count += 1
+        real_replace(source, target)
+        if replace_count == 1:
+            target_path = Path(target)
+            same_bytes = target_path.read_bytes()
+            foreign_staging = target_path.with_name("foreign-dataset.tmp")
+            foreign_staging.write_bytes(same_bytes)
+            target_path.unlink()
+            real_replace(foreign_staging, target_path)
+            replaced = target_path.stat(follow_symlinks=False)
+            replaced_identity = (replaced.st_dev, replaced.st_ino)
+
+    monkeypatch.setattr(
+        materialize_resolved_dataset.os,
+        "replace",
+        replace_published_inode,
+    )
+
+    with pytest.raises(common.ConfigValidationError, match="ownership was recorded"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=destination,
+            validate_only=False,
+            task_resolver=lambda _config: (_resolved_task(),),
+        )
+
+    current = dataset.stat(follow_symlinks=False)
+    assert (current.st_dev, current.st_ino) == replaced_identity
+
+
+def test_materialize_evidence_failure_cleanup_preserves_replaced_owned_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    destination = tmp_path / "replaced-after-publish"
+    replaced_dataset = destination / "capsule_rl.seed_resolved.dataset.jsonl"
+    foreign_bytes = b"foreign replacement data\n"
+
+    class _FailAfterPublication:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *_args: object) -> None:
+            replaced_dataset.unlink()
+            replaced_dataset.write_bytes(foreign_bytes)
+            raise common.ConfigValidationError(
+                "Gate7 evidence changed after bundle publication"
+            )
+
+    monkeypatch.setattr(
+        materialize_resolved_dataset,
+        "_verified_gate7_evidence",
+        lambda _audit: _FailAfterPublication(),
+    )
+
+    with pytest.raises(common.ConfigValidationError, match="changed after bundle"):
+        materialize_resolved_dataset.materialize(
+            config_path=config_path,
+            gate7_audit_path=_materialization_gate7_audit(config_path),
+            output_dir=destination,
+            validate_only=False,
+            task_resolver=lambda _config: (_resolved_task(),),
+        )
+
+    assert replaced_dataset.read_bytes() == foreign_bytes
+    assert sorted(path.name for path in destination.iterdir()) == [
+        replaced_dataset.name
+    ]
+
+
+def test_materialize_completed_publication_survives_temp_cleanup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    destination = tmp_path / "cleanup-warning-resolved"
+    real_rmtree = materialize_resolved_dataset.shutil.rmtree
+
+    def fail_only_staging_cleanup(path: object, *args: object, **kwargs: object) -> None:
+        if Path(path).name.startswith(".cleanup-warning-resolved."):
+            raise OSError("temporary cleanup failed after publication")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        materialize_resolved_dataset.shutil, "rmtree", fail_only_staging_cleanup
+    )
+
+    result = materialize_resolved_dataset.materialize(
+        config_path=config_path,
+        gate7_audit_path=_materialization_gate7_audit(config_path),
+        output_dir=destination,
+        validate_only=False,
+        task_resolver=lambda _config: (_resolved_task(),),
+    )
+
+    assert result.manifest_path.is_file()
+    assert result.dataset_path.is_file()
+    assert result.config_path.is_file()
+
+
+def test_artifact_analyzer_summarizes_without_importing_runtime(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "group.json").write_text(
+        json.dumps(
+            {
+                "artifact_type": "learning_group",
+                "members": [
+                    *[{"member_type": "base", "reward": 0.0} for _ in range(7)],
+                    {"member_type": "critique_guided_revision", "reward": 1.0},
+                ],
+                "repair_attempts": [
+                    {"pt_outcome": "success", "p_hat_outcome": "task_failure"},
+                    {"pt_outcome": "success", "p_hat_outcome": "success"},
+                ],
+                "retry_count": 2,
+                "infra_failures": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = analyze_artifacts.analyze_directory(artifacts)
+
+    assert summary["learning_groups"] == 1
+    assert summary["base_members"] == 7
+    assert summary["guided_members"] == 1
+    assert summary["pt_successes"] == 2
+    assert summary["p_hat_successes"] == 1
+    assert summary["retry_count"] == 2
+    assert summary["infra_failures"] == 1
+
+
+def test_artifact_analyzer_counts_the_same_typed_group_only_once(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    learning_group = {
+        "group_uid": "cube-stack-5:group-0",
+        "members": [
+            {"member_type": "base", "reward": 0.0},
+            {"member_type": "critique_guided_revision", "reward": 1.0},
+        ],
+    }
+    for name in ("gate05_guided_group.json", "gate06_trainer.json"):
+        (artifacts / name).write_text(
+            json.dumps({"learning_group": learning_group}),
+            encoding="utf-8",
+        )
+
+    summary = analyze_artifacts.analyze_directory(artifacts)
+
+    assert summary["learning_groups"] == 1
+    assert summary["base_members"] == 1
+    assert summary["guided_members"] == 1
+
+
+def test_artifact_tree_rejects_a_symlink_used_as_the_root(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "state.bin").write_bytes(b"checkpoint")
+    checkpoint_link = tmp_path / "checkpoint-link"
+    checkpoint_link.symlink_to(checkpoint, target_is_directory=True)
+
+    with pytest.raises(common.GateArtifactError, match="artifact path must not be a symlink"):
+        common.artifact_tree_sha256(checkpoint_link)
+
+
+def test_documentation_records_all_gates_and_runtime_not_verified_boundary() -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "docs" / "capsule_rl.md").read_text(encoding="utf-8")
+
+    for gate in (
+        "Preflight",
+        "Seed gate",
+        "Oracle replay gate",
+        "Collector gate",
+        "Guided gate",
+        "Trainer gate",
+        "Result audit",
+    ):
+        assert gate in text
+    for requirement in (
+        "CONTROLLER_API_KEY",
+        "Controller endpoint",
+        "verl_resolved_config_path",
+        "PyRoKi",
+        "MUJOCO_GL=egl",
+        "ProgramReplayResultV1",
+        "LearningGroupV1",
+        "config_sha256",
+        "--run-id",
+        "runtime_verified",
+        "outputs/",
+        "artifacts/",
+        "runtime verified",
+    ):
+        assert requirement in text
+
+
+def _synthetic_actor_identity() -> dict[str, object]:
+    identity: dict[str, object] = {
+        "schema_version": 1,
+        "service_role": "program_actor_identity",
+        "serves_generation": False,
+        "model": "Qwen/Qwen2.5-Coder-7B-Instruct",
+        "program_model_path": "/models/Qwen2.5-Coder-7B-Instruct",
+        "program_model_file_count": 2,
+        "program_model_sha256": "1" * 64,
+        "lora_rank": 16,
+        "lora_alpha": 32,
+        "lora_target_modules": ["all-linear"],
+        "verl_source_path": "/pinned/verl-source",
+        "verl_pinned_sha": "c" * 40,
+        "verl_resolved_config_path": "/resolved/verl.yaml",
+        "verl_resolved_config_sha256": "f" * 64,
+    }
+    identity["actor_binding_sha256"] = actor_binding_sha256(identity)
+    return identity
+
+
+def _gate_envelope(gate: str) -> dict[str, object]:
+    actor_identity = _synthetic_actor_identity()
+    return {
+        "schema_version": 1,
+        "gate": gate,
+        "passed": True,
+        "execution_mode": common.CANONICAL_EXECUTION_MODE,
+        "run_id": "capsule-smoke-001",
+        "config_sha256": "c" * 64,
+        "git_sha": "d" * 40,
+        "dataset_sha256": "9" * 64,
+        "resolved_environment_sha256": "e" * 64,
+        "verl_resolved_config_sha256": "f" * 64,
+        "program_model_sha256": actor_identity["program_model_sha256"],
+        "actor_binding_sha256": actor_identity["actor_binding_sha256"],
+    }
+
+
+def test_gate_envelope_requires_dataset_sha256() -> None:
+    payload = {
+        **_gate_envelope("seed"),
+        "seeds": [5, 6, 5],
+        "initial_state_sha256": ["a" * 64, "b" * 64, "a" * 64],
+    }
+    del payload["dataset_sha256"]
+
+    with pytest.raises(common.GateArtifactError, match="dataset_sha256"):
+        common.verify_seed_gate_artifact(payload)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "resolved_environment_sha256",
+        "verl_resolved_config_sha256",
+        "program_model_sha256",
+        "actor_binding_sha256",
+    ],
+)
+def test_gate_envelope_requires_runtime_dependency_sha256(field_name: str) -> None:
+    payload = {
+        **_gate_envelope("seed"),
+        "seeds": [5, 6, 5],
+        "initial_state_sha256": ["a" * 64, "b" * 64, "a" * 64],
+    }
+    del payload[field_name]
+
+    with pytest.raises(common.GateArtifactError, match=field_name):
+        common.verify_seed_gate_artifact(payload)
+
+
+@pytest.mark.parametrize("invalid_version", [True, 1.0])
+def test_gate_envelope_requires_exact_integer_schema_version(
+    invalid_version: object,
+) -> None:
+    payload = {
+        **_gate_envelope("seed"),
+        "schema_version": invalid_version,
+        "seeds": [5, 6, 5],
+        "initial_state_sha256": ["a" * 64, "b" * 64, "a" * 64],
+    }
+
+    with pytest.raises(common.GateArtifactError, match="schema_version"):
+        common.verify_seed_gate_artifact(payload)
+
+
+def _replay_result(
+    *,
+    program_sample_id: str,
+    source: str,
+    success: bool,
+    initial_state_sha256: str = "a" * 64,
+) -> ProgramReplayResultV1:
+    return ProgramReplayResultV1(
+        task_id="cube-stack-5",
+        environment_seed=5,
+        program_sample_id=program_sample_id,
+        source=source,
+        initial_state_sha256=initial_state_sha256,
+        outcome=ReplayOutcome.SUCCESS if success else ReplayOutcome.TASK_FAILURE,
+        raw_reward=1.0 if success else 0.25,
+        binary_reward=1.0 if success else 0.0,
+        task_completed=success,
+        diagnostics={
+            "evaluator_attempt_history": [
+                {
+                    "attempt": 1,
+                    "outcome": "success" if success else "task_failure",
+                    "worker_replaced": False,
+                    "retry_scheduled": False,
+                    "error_type": None,
+                    "error_message": None,
+                }
+            ],
+            "reset_info": {
+                "capsule_reset_evidence": {
+                    "namespace_fresh": True,
+                    "api_state_cleared": True,
+                    "api_reset_count": 1,
+                    "api_reset_confirmed_count": 1,
+                }
+            }
+        },
+    )
+
+
+def test_replay_telemetry_is_derived_from_typed_results_and_rejects_forged_counts() -> None:
+    recovered = ProgramReplayResultV1(
+        task_id="cube-stack-5",
+        environment_seed=5,
+        program_sample_id="recovered",
+        source="pass\n",
+        initial_state_sha256="a" * 64,
+        outcome=ReplayOutcome.TASK_FAILURE,
+        raw_reward=0.2,
+        binary_reward=0.0,
+        task_completed=False,
+        attempts=2,
+        diagnostics={
+            "evaluator_attempt_history": [
+                {
+                    "attempt": 1,
+                    "outcome": "evaluator_error",
+                    "worker_replaced": True,
+                    "retry_scheduled": True,
+                    "error_type": "MalformedPayloadError",
+                    "error_message": "bad payload",
+                },
+                {
+                    "attempt": 2,
+                    "outcome": "task_failure",
+                    "worker_replaced": False,
+                    "retry_scheduled": False,
+                    "error_type": None,
+                    "error_message": None,
+                },
+            ]
+        },
+    )
+    exhausted = ProgramReplayResultV1(
+        task_id="cube-stack-5",
+        environment_seed=5,
+        program_sample_id="exhausted",
+        source="pass\n",
+        initial_state_sha256="a" * 64,
+        outcome=ReplayOutcome.INFRA_ERROR,
+        raw_reward=None,
+        binary_reward=None,
+        task_completed=False,
+        attempts=3,
+        error_type="WorkerCrashedError",
+        error_message="worker remained poisoned",
+        diagnostics={
+            "evaluator_attempt_history": [
+                {
+                    "attempt": attempt,
+                    "outcome": "infra_error",
+                    "worker_replaced": True,
+                    "retry_scheduled": attempt < 3,
+                    "error_type": "WorkerCrashedError",
+                    "error_message": "worker remained poisoned",
+                }
+                for attempt in range(1, 4)
+            ]
+        },
+    )
+    payload = {
+        "replay_event_count": 2,
+        "attempt_event_count": 5,
+        "retry_count": 3,
+        "infra_failures": 3,
+        "evaluator_failures": 1,
+        "worker_replacements": 4,
+    }
+
+    common.verify_replay_telemetry(payload, (recovered, exhausted))
+
+    payload["infra_failures"] = 0
+    with pytest.raises(common.GateArtifactError, match="telemetry"):
+        common.verify_replay_telemetry(payload, (recovered, exhausted))
+
+
+def test_guided_artifact_verifier_does_not_import_torch_or_numpy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _guided_gate_payload()
+    import capx.rl.capsule as capsule_package
+
+    original_module = sys.modules.get("capx.rl.capsule.trainer")
+    original_attribute = getattr(capsule_package, "trainer", None)
+    sys.modules.pop("capx.rl.capsule.trainer", None)
+    real_import = builtins.__import__
+
+    def guarded_import(name: str, *args: object, **kwargs: object):
+        if name.split(".", 1)[0] in {"torch", "numpy"}:
+            raise AssertionError(f"static artifact verification imported {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    try:
+        common.verify_guided_gate_artifact(payload)
+    finally:
+        if original_module is None:
+            sys.modules.pop("capx.rl.capsule.trainer", None)
+        else:
+            sys.modules["capx.rl.capsule.trainer"] = original_module
+        if original_attribute is not None:
+            setattr(capsule_package, "trainer", original_attribute)
+
+
+def _verified_task() -> TaskInstanceV1:
+    return TaskInstanceV1(
+        task_id="cube-stack-5",
+        environment_seed=5,
+        prompt="stack the cubes",
+        environment="robosuite_cube_stack",
+        api="franka_control_privileged",
+        privilege="privileged",
+        initial_state_sha256="a" * 64,
+    )
+
+
+def _verified_group() -> LearningGroupV1:
+    task = _verified_task()
+    prompt = task.prompt
+    group_uid = deterministic_group_uid(task)
+    members = tuple(
+        [
+            LearningMemberV1(
+                member_type="base",
+                program_sample_id=f"base-{index}",
+                prompt=prompt,
+                response=f"failed_{index} = True\n",
+                reward=0.0,
+            )
+            for index in range(7)
+        ]
+        + [
+            LearningMemberV1(
+                member_type="critique_guided_revision",
+                program_sample_id="guided-0",
+                repair_trajectory_id=f"{group_uid}:p0-0:trajectory-0",
+                prompt=prompt,
+                response="success = True\n",
+                reward=1.0,
+            )
+        ]
+    )
+    return LearningGroupV1(
+        task_id=task.task_id,
+        environment_seed=task.environment_seed,
+        group_uid=group_uid,
+        initial_state_sha256=task.initial_state_sha256,
+        members=members,
+    )
+
+
+def _guided_provenance(group: LearningGroupV1) -> dict[str, object]:
+    base_results = [
+        _replay_result(
+            program_sample_id=member.program_sample_id,
+            source=member.response,
+            success=False,
+        )
+        for member in group.members[:7]
+    ]
+    selected_trajectory_id = str(group.members[-1].repair_trajectory_id)
+    draft = RepairDraft(
+        task_id=group.task_id,
+        environment_seed=group.environment_seed,
+        program_sample_id=base_results[0].program_sample_id,
+        repair_trajectory_id=selected_trajectory_id,
+        base_source=base_results[0].source,
+        base_units=[
+            BaseUnitSpan(
+                "whole",
+                0,
+                len(base_results[0].source),
+                base_results[0].source,
+            )
+        ],
+    )
+    draft.submit(
+        {
+            "action": "append",
+            "generation_id": "recovery-1",
+            "unit_id": "whole",
+            "source": "recovered = True\n",
+            "rationale": "repair",
+        }
+    )
+    draft.submit({"action": "finish", "rationale": "complete"})
+    trace = draft.to_trace()
+    pt_result = _replay_result(
+        program_sample_id=f"{selected_trajectory_id}:pt",
+        source=trace.final_source,
+        success=True,
+    )
+    p_hat_result = _replay_result(
+        program_sample_id=group.members[-1].program_sample_id,
+        source=group.members[-1].response,
+        success=True,
+    )
+    selected_replay_results = [*base_results, pt_result, p_hat_result]
+    attempts: list[RepairAttempt] = []
+    for p0_rank, p0_sample_id in enumerate(
+        (base_results[0].program_sample_id, base_results[1].program_sample_id)
+    ):
+        for trajectory_index in range(2):
+            trajectory_id = (
+                f"{group.group_uid}:p0-{p0_rank}:trajectory-{trajectory_index}"
+            )
+            if (p0_rank, trajectory_index) == (0, 0):
+                attempts.append(
+                    RepairAttempt(
+                        p0_rank=p0_rank,
+                        trajectory_index=trajectory_index,
+                        p0_program_sample_id=p0_sample_id,
+                        repair_trajectory_id=trajectory_id,
+                        status="guided_success",
+                        trace=trace,
+                        pt_result=pt_result,
+                        revision_program_sample_id=p_hat_result.program_sample_id,
+                        revision_source=p_hat_result.source,
+                        revision_result=p_hat_result,
+                        selected=True,
+                    )
+                )
+            else:
+                attempts.append(
+                    RepairAttempt(
+                        p0_rank=p0_rank,
+                        trajectory_index=trajectory_index,
+                        p0_program_sample_id=p0_sample_id,
+                        repair_trajectory_id=trajectory_id,
+                        status="rejected",
+                        rejection_reason="collector_error",
+                        rejection_message="mocked rejection",
+                    )
+                )
+    return {
+        "base_results": [result.to_dict() for result in base_results],
+        "repair_attempts": [attempt.to_dict() for attempt in attempts],
+        "selected_repair": {
+            "p0_rank": 0,
+            "trajectory_index": 0,
+            "trace": trace.to_dict(),
+            "p0_result": base_results[0].to_dict(),
+            "pt_result": pt_result.to_dict(),
+            "p_hat_result": p_hat_result.to_dict(),
+        },
+        "selected_group_attempt_index": 0,
+        "discarded_group_attempts": [],
+        "replay_events": [
+            {
+                "group_attempt_index": 0,
+                "result_index": index,
+                "selected_group": True,
+                "result": result.to_dict(),
+            }
+            for index, result in enumerate(selected_replay_results)
+        ],
+        "replay_event_count": len(selected_replay_results),
+        "attempt_event_count": len(selected_replay_results),
+        "retry_count": 0,
+        "infra_failures": 0,
+        "evaluator_failures": 0,
+        "worker_replacements": 0,
+    }
+
+
+def _guided_gate_payload() -> dict[str, object]:
+    group = _verified_group()
+    return {
+        **_gate_envelope("guided"),
+        "task_instance": _verified_task().to_dict(),
+        "original_prompt": "stack the cubes",
+        "training_input_contains_critique": False,
+        "learning_group": group.to_dict(),
+        **_guided_provenance(group),
+    }
+
+
+def test_external_gate_execute_rejects_existing_artifact_before_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    artifact = tmp_path / "seed_gate.json"
+    artifact.write_text('{"old":true}\n', encoding="utf-8")
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("an existing artifact must fail before the runner starts")
+
+    monkeypatch.setattr(common.subprocess, "run", forbidden_run)
+    plan = common.ExternalGatePlan(
+        gate_name="seed",
+        config_path=config_path,
+        artifact_path=artifact,
+        runner_command=(
+            f"{sys.executable} fake_runner.py --config {{config}} "
+            "--seeds {seed_sequence} --output {artifact}"
+        ),
+        placeholders={"seed_sequence": "5,6,5"},
+        required_placeholders=frozenset({"config", "seed_sequence", "artifact"}),
+    )
+
+    with pytest.raises(FileExistsError, match="artifact already exists"):
+        common.run_external_gate(plan, validate_only=False)
+
+    assert artifact.read_text(encoding="utf-8") == '{"old":true}\n'
+
+
+def test_oracle_verifier_requires_typed_clean_replay_results() -> None:
+    payload = {
+        **_gate_envelope("oracle_replay"),
+        "direct_replay": True,
+        "controller_used": False,
+        "replays": [
+            {
+                "outcome": "success",
+                "raw_reward": 0.0,
+                "truncated": True,
+                "worker_id": "worker-1",
+                "reset_seed": 5,
+                "namespace_fresh": True,
+                "api_state_cleared": True,
+                "watchdog_active": True,
+            }
+        ]
+        * 2,
+    }
+
+    with pytest.raises(common.GateArtifactError, match="ProgramReplayResultV1"):
+        common.verify_oracle_gate_artifact(payload)
+
+
+def test_oracle_verifier_rejects_top_level_reset_evidence_spoof() -> None:
+    result = _replay_result(
+        program_sample_id="oracle-0", source="oracle = True\n", success=True
+    ).to_dict()
+    result["diagnostics"] = {}
+    payload = {
+        **_gate_envelope("oracle_replay"),
+        "direct_replay": True,
+        "controller_used": False,
+        "replays": [
+            {
+                "result": result,
+                "worker_id": "worker-1",
+                "reset_seed": 5,
+                "namespace_fresh": True,
+                "api_state_cleared": True,
+                "watchdog_active": True,
+            }
+        ]
+        * 2,
+    }
+
+    with pytest.raises(common.GateArtifactError, match="capsule_reset_evidence"):
+        common.verify_oracle_gate_artifact(payload)
+
+
+def test_guided_verifier_rejects_unlinked_string_only_success() -> None:
+    group = _verified_group()
+    payload = {
+        **_gate_envelope("guided"),
+        "task_instance": _verified_task().to_dict(),
+        "learning_group": group.to_dict(),
+        "original_prompt": "stack the cubes",
+        "training_input_contains_critique": False,
+        "base_results": [
+            _replay_result(
+                program_sample_id=member.program_sample_id,
+                source=member.response,
+                success=False,
+            ).to_dict()
+            for member in group.members[:7]
+        ],
+        "selected_repair": {"pt_outcome": "success", "p_hat_outcome": "success"},
+    }
+
+    with pytest.raises(common.GateArtifactError, match="repair_attempts|selected repair"):
+        common.verify_guided_gate_artifact(payload)
+
+
+def test_guided_verifier_requires_complete_fixed_2x2_repair_attempts() -> None:
+    payload = _guided_gate_payload()
+    payload["repair_attempts"] = payload["repair_attempts"][:-1]
+
+    with pytest.raises(common.GateArtifactError, match="exactly 4 attempts"):
+        common.verify_guided_gate_artifact(payload)
+
+
+def test_guided_verifier_selects_first_success_in_fixed_attempt_order() -> None:
+    payload = _guided_gate_payload()
+    attempts = payload["repair_attempts"]
+    first = attempts[0]
+    first["selected"] = False
+    second = deepcopy(first)
+    second_trajectory_id = (
+        f"{payload['learning_group']['group_uid']}:p0-0:trajectory-1"
+    )
+    second.update(
+        {
+            "trajectory_index": 1,
+            "repair_trajectory_id": second_trajectory_id,
+            "selected": True,
+        }
+    )
+    second["trace"]["repair_trajectory_id"] = second_trajectory_id
+    for event in [*second["trace"]["edits"], *second["trace"]["audits"]]:
+        event["repair_trajectory_id"] = second_trajectory_id
+    second["pt_result"]["program_sample_id"] = f"{second_trajectory_id}:pt"
+    attempts[1] = second
+    payload["learning_group"]["members"][-1][
+        "repair_trajectory_id"
+    ] = second_trajectory_id
+    payload["selected_repair"] = {
+        "p0_rank": 0,
+        "trajectory_index": 1,
+        "trace": deepcopy(second["trace"]),
+        "p0_result": deepcopy(payload["base_results"][0]),
+        "pt_result": deepcopy(second["pt_result"]),
+        "p_hat_result": deepcopy(second["revision_result"]),
+    }
+
+    with pytest.raises(common.GateArtifactError, match="first successful"):
+        common.verify_guided_gate_artifact(payload)
+
+
+def test_guided_verifier_enforces_deterministic_p0_selection() -> None:
+    payload = _guided_gate_payload()
+    for attempt in payload["repair_attempts"][2:]:
+        attempt["p0_program_sample_id"] = "base-2"
+
+    with pytest.raises(common.GateArtifactError, match="deterministic P0 selection"):
+        common.verify_guided_gate_artifact(payload)
+
+
+def test_guided_verifier_accepts_discarded_fallback_in_evaluation_order() -> None:
+    payload = _guided_gate_payload()
+    selected_events = payload["replay_events"]
+    for event in selected_events:
+        event["group_attempt_index"] = 1
+
+    fallback_member = LearningMemberV1(
+        member_type="base",
+        program_sample_id="base-7",
+        prompt="stack the cubes",
+        response="failed_7 = True\n",
+        reward=0.0,
+    )
+    selected_group = LearningGroupV1.from_dict(payload["learning_group"])
+    fallback_group = LearningGroupV1(
+        task_id=selected_group.task_id,
+        environment_seed=selected_group.environment_seed,
+        group_uid=selected_group.group_uid,
+        initial_state_sha256=selected_group.initial_state_sha256,
+        members=(*selected_group.members[:7], fallback_member),
+        skip_actor_update=True,
+        metadata={"guided_member_selected": False},
+    )
+    fallback_result = _replay_result(
+        program_sample_id=fallback_member.program_sample_id,
+        source=fallback_member.response,
+        success=False,
+    )
+    fallback_attempts = deepcopy(payload["repair_attempts"])
+    first_attempt = fallback_attempts[0]
+    first_attempt["status"] = "revision_failed"
+    first_attempt["selected"] = False
+    first_attempt["revision_result"].update(
+        {
+            "outcome": "task_failure",
+            "raw_reward": 0.25,
+            "binary_reward": 0.0,
+            "task_completed": False,
+        }
+    )
+    first_attempt["revision_result"]["diagnostics"]["evaluator_attempt_history"][0][
+        "outcome"
+    ] = "task_failure"
+    fallback_base_results = [
+        ProgramReplayResultV1.from_dict(result) for result in payload["base_results"]
+    ] + [fallback_result]
+    fallback_replays = [
+        *fallback_base_results[:7],
+        ProgramReplayResultV1.from_dict(first_attempt["pt_result"]),
+        ProgramReplayResultV1.from_dict(first_attempt["revision_result"]),
+        fallback_base_results[7],
+    ]
+    discarded_events = [
+        {
+            "group_attempt_index": 0,
+            "result_index": index,
+            "selected_group": False,
+            "result": result.to_dict(),
+        }
+        for index, result in enumerate(fallback_replays)
+    ]
+    payload.update(
+        {
+            "selected_group_attempt_index": 1,
+            "discarded_group_attempts": [
+                {
+                    "group_attempt_index": 0,
+                    "reason": "no_guided_member",
+                    "message": "assembled fallback group had no PT/P_hat double-success",
+                    "replay_results": [result.to_dict() for result in fallback_replays],
+                    "partial_repair_attempts": [],
+                    "assembly": {
+                        "group": fallback_group.to_dict(),
+                        "base_results": [result.to_dict() for result in fallback_base_results],
+                        "repair_attempts": fallback_attempts,
+                    },
+                }
+            ],
+            "replay_events": [*discarded_events, *selected_events],
+        }
+    )
+    payload.update(
+        common.summarize_replay_results(
+            tuple(
+                ProgramReplayResultV1.from_dict(event["result"])
+                for event in payload["replay_events"]
+            ),
+            require_attempt_history=True,
+        )
+    )
+
+    common.verify_guided_gate_artifact(payload)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "message"),
+    [
+        ("loss_mode", "vanilla", "capsule_critique"),
+        ("capsule_gamma", 0.2, "capsule_gamma"),
+        ("reference_kl_enabled", False, "reference KL"),
+        ("reference_kl_coef", 0.0, "reference_kl_coef"),
+        ("rollout_mode", "async", "synchronous"),
+        ("ppo_epochs", 2, "ppo_epochs"),
+        ("ppo_mini_batch_size", 4, "ppo_mini_batch_size"),
+        ("data_parallel_world_size", 3, "data_parallel_world_size"),
+        ("sequence_parallel_size", 2, "sequence_parallel_size"),
+        ("actor_update_rpcs", 2, "actor update RPC"),
+        ("optimizer_step_after", 2, "step delta"),
+    ],
+)
+def test_trainer_verifier_requires_capsule_loss_contract(
+    field_name: str,
+    invalid_value: object,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payload = _complete_gate_payloads(checkpoint)["trainer"]
+    payload[field_name] = invalid_value
+
+    with pytest.raises(common.GateArtifactError, match=message):
+        common.verify_trainer_gate_artifact(payload)
+
+
+@pytest.mark.parametrize(
+    ("mutator", "message"),
+    [
+        (
+            lambda payload: payload["lora_runtime_after"].update(
+                {"non_lora_trainable_parameter_count": 1}
+            ),
+            "only LoRA",
+        ),
+        (
+            lambda payload: payload.update(
+                {"cuda_peak_reserved_bytes": 70 * 1024**3 + 1}
+            ),
+            "70 GiB",
+        ),
+        (
+            lambda payload: payload["host_memory"].update(
+                {"minimum_mem_available_bytes": 12 * 1024**3 - 1}
+            ),
+            "12 GiB",
+        ),
+        (
+            lambda payload: payload["ray_release"].update({"ray_shutdown_calls": 2}),
+            "exactly once",
+        ),
+        (
+            lambda payload: payload.update({"reference_policy_mode": "standalone"}),
+            "actor_base_adapter_disabled",
+        ),
+        (
+            lambda payload: payload.pop("reference_policy_mode"),
+            "actor_base_adapter_disabled",
+        ),
+        (
+            lambda payload: payload.update({"adapter_model_sha256": "0" * 64}),
+            "adapter",
+        ),
+    ],
+)
+def test_trainer_verifier_rejects_invalid_lora_memory_shutdown_or_adapter_evidence(
+    tmp_path: Path,
+    mutator,
+    message: str,
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payload = _complete_gate_payloads(checkpoint)["trainer"]
+    mutator(payload)
+
+    with pytest.raises(common.GateArtifactError, match=message):
+        common.verify_trainer_gate_artifact(payload)
+
+
+def test_server_config_validator_reuses_canonical_training_contract(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["controller_service"]["endpoint"] = payload["program_service"]["endpoint"]
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(common.ConfigValidationError, match="separate endpoints"):
+        common.load_and_validate_server_config(config_path, check_runtime_paths=True)
+
+
+def test_main_validate_import_path_does_not_import_torch() -> None:
+    code = """
+import builtins
+real_import = builtins.__import__
+def guarded_import(name, *args, **kwargs):
+    if name == 'torch' or name.startswith('torch.'):
+        raise RuntimeError('torch import is forbidden on validate-only import path')
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+import capx.rl.capsule.main_ppo
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_gate7_requires_all_six_verified_artifacts(tmp_path: Path) -> None:
+    assert hasattr(analyze_artifacts, "audit_gate_directory")
+    with pytest.raises(common.GateArtifactError, match="missing gate artifact"):
+        analyze_artifacts.audit_gate_directory(tmp_path)
+
+
+def test_gate7_validate_only_audits_inputs_without_writing(tmp_path: Path) -> None:
+    with pytest.raises(common.GateArtifactError, match="missing gate artifact"):
+        analyze_artifacts.main(
+            [
+                "--input-dir",
+                str(tmp_path),
+                "--output-json",
+                str(tmp_path / "summary.json"),
+                "--output-report",
+                str(tmp_path / "report.md"),
+                "--validate-only",
+            ]
+        )
+
+    assert not (tmp_path / "summary.json").exists()
+    assert not (tmp_path / "report.md").exists()
+
+
+def _checkpoint_contract(checkpoint: Path) -> dict[str, object]:
+    file_count = common.artifact_tree_file_count(checkpoint)
+    sha256 = common.artifact_tree_sha256(checkpoint)
+    manifest = checkpoint.parent / "checkpoint_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "checkpoint": str(checkpoint.resolve()),
+                "checkpoint_file_count": file_count,
+                "checkpoint_sha256": sha256,
+                "optimizer_step_before": 0,
+                "optimizer_step_after": 1,
+                "optimizer_step_delta": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "checkpoint_file_count": file_count,
+        "checkpoint_sha256": sha256,
+        "checkpoint_manifest": str(manifest.resolve()),
+    }
+
+
+def _verl_provenance() -> dict[str, object]:
+    return {
+        "source_path": "/pinned/verl-source",
+        "expected_sha": "c" * 40,
+        "actual_sha": "c" * 40,
+        "clean": True,
+        "worker_count": 1,
+        "worker_ranks": [0],
+        "worker_module_paths": ["/pinned/verl-source/verl/__init__.py"],
+    }
+
+
+def _lora_runtime_evidence() -> dict[str, object]:
+    return {
+        "lora_rank": 16,
+        "lora_alpha": 32,
+        "lora_target_modules": ["all-linear"],
+        "worker_count": 1,
+        "worker_ranks": [0],
+        "trainable_parameter_name_sha256s": ["a" * 64],
+        "total_parameter_count": 7_000_000_000,
+        "trainable_parameter_count": 40_000_000,
+        "non_lora_trainable_parameter_count": 0,
+        "only_lora_trainable": True,
+        "lora_layer_count": 28,
+        "lora_projection_suffixes": [
+            "down_proj",
+            "gate_proj",
+            "k_proj",
+            "o_proj",
+            "q_proj",
+            "up_proj",
+            "v_proj",
+        ],
+        "lora_tensor_count_per_worker": 392,
+        "cuda_peak_reserved_bytes": 60 * 1024**3,
+        "host_mem_available_min_bytes": 90 * 1024**3,
+        "workers": [
+            {
+                "rank": 0,
+                "total_parameter_count": 7_000_000_000,
+                "trainable_parameter_count": 40_000_000,
+                "trainable_tensor_count": 392,
+                "lora_layer_count": 28,
+                "lora_projection_suffixes": [
+                    "down_proj",
+                    "gate_proj",
+                    "k_proj",
+                    "o_proj",
+                    "q_proj",
+                    "up_proj",
+                    "v_proj",
+                ],
+                "non_lora_trainable_parameter_count": 0,
+                "only_lora_trainable": True,
+                "trainable_parameter_names_sha256": "a" * 64,
+                "cuda_peak_reserved_bytes": 60 * 1024**3,
+                "host_mem_available_bytes": 90 * 1024**3,
+            }
+        ],
+    }
+
+
+def _complete_gate_payloads(checkpoint: Path) -> dict[str, dict[str, object]]:
+    if checkpoint.is_dir() and not any(checkpoint.iterdir()):
+        (checkpoint / "state.bin").write_bytes(b"checkpoint")
+    _write_test_lora_adapter(checkpoint)
+    adapter_evidence = common.direct_lora_adapter_evidence(checkpoint)
+    checkpoint_contract = _checkpoint_contract(checkpoint)
+    oracle_result = _replay_result(
+        program_sample_id="oracle-0", source="oracle = True\n", success=True
+    )
+    oracle_records = [
+        {
+            "result": oracle_result.to_dict(),
+            "worker_id": "worker-1",
+            "reset_seed": 5,
+            "namespace_fresh": True,
+            "api_state_cleared": True,
+            "watchdog_active": True,
+        }
+        for _ in range(2)
+    ]
+
+    collector_selected_batch_results = [
+        _replay_result(
+            program_sample_id=f"collector-base-{rank}",
+            source=f"collector_failed_{rank} = True\n",
+            success=False,
+        )
+        for rank in range(7)
+    ]
+    collector_base_results = collector_selected_batch_results[:2]
+    collector_records = []
+    for rank, result in enumerate(collector_base_results):
+        for trajectory_index in range(2):
+            draft = RepairDraft(
+                task_id=result.task_id,
+                environment_seed=result.environment_seed,
+                program_sample_id=result.program_sample_id,
+                repair_trajectory_id=f"collector-repair-{rank}-{trajectory_index}",
+                base_source=result.source,
+                base_units=[BaseUnitSpan("whole", 0, len(result.source), result.source)],
+            )
+            draft.submit({"action": "finish", "rationale": "complete"})
+            collector_records.append(
+                {
+                    "p0_rank": rank,
+                    "trajectory_index": trajectory_index,
+                    "trace": draft.to_trace().to_dict(),
+                }
+            )
+
+    group = _verified_group()
+    guided_provenance = _guided_provenance(group)
+
+    actor_identity = _synthetic_actor_identity()
+    return {
+        "preflight": {
+            **_gate_envelope("preflight"),
+            "failed_checks": [],
+            "checks": {
+                "git_sha": "d" * 40,
+                "verl_source_path": "/pinned/verl-source",
+                "verl_expected_sha": "c" * 40,
+                "verl_actual_sha": "c" * 40,
+                "verl_sha_matches": True,
+                "dependency_lock_present": True,
+                "cuda_available": True,
+                "egl_configured": True,
+                "program_model_exists": True,
+                "program_model_file_count": actor_identity["program_model_file_count"],
+                "program_model_sha256": actor_identity["program_model_sha256"],
+                "actor_binding_sha256": actor_identity["actor_binding_sha256"],
+                "program_actor_identity": actor_identity,
+                "program_actor_identity_verified": True,
+                "program_api_key_present": True,
+                "controller_api_key_present": True,
+                "program_endpoint_ready": True,
+                "controller_endpoint_ready": True,
+                "pyroki_endpoint_ready": True,
+                "resolved_environment_sha256": "e" * 64,
+                "verl_resolved_config_sha256": "f" * 64,
+                "dataset_path": str((checkpoint.parent / "dataset.jsonl").resolve()),
+                "dataset_sha256": "9" * 64,
+                "dataset_task_count": 1,
+                "dataset_task_identities": [
+                    {"task_id": "cube-stack-5", "environment_seed": 5}
+                ],
+            },
+        },
+        "seed": {
+            **_gate_envelope("seed"),
+            "seeds": [5, 6, 5],
+            "initial_state_sha256": ["a" * 64, "b" * 64, "a" * 64],
+        },
+        "oracle_replay": {
+            **_gate_envelope("oracle_replay"),
+            "direct_replay": True,
+            "controller_used": False,
+            "replays": oracle_records,
+            "replay_event_count": 2,
+            "attempt_event_count": 2,
+            "retry_count": 0,
+            "infra_failures": 0,
+            "evaluator_failures": 0,
+            "worker_replacements": 0,
+        },
+        "collector": {
+            **_gate_envelope("collector"),
+            "controller_frozen": True,
+            "intermediate_replay_count": 0,
+            "p0_count": 2,
+            "repair_trajectories_per_p0": 2,
+            "base_results": [result.to_dict() for result in collector_base_results],
+            "selected_batch_index": 0,
+            "selected_batch_results": [
+                result.to_dict() for result in collector_selected_batch_results
+            ],
+            "discarded_batches": [],
+            "replay_events": [
+                {
+                    "batch_index": 0,
+                    "base_index": index,
+                    "selected_batch": True,
+                    "result": result.to_dict(),
+                }
+                for index, result in enumerate(collector_selected_batch_results)
+            ],
+            "replay_event_count": 7,
+            "attempt_event_count": 7,
+            "retry_count": 0,
+            "infra_failures": 0,
+            "evaluator_failures": 0,
+            "worker_replacements": 0,
+            "repair_traces": collector_records,
+        },
+        "guided": {
+            **_gate_envelope("guided"),
+            "task_instance": _verified_task().to_dict(),
+            "original_prompt": "stack the cubes",
+            "training_input_contains_critique": False,
+            "learning_group": group.to_dict(),
+            **guided_provenance,
+        },
+        "trainer": {
+            **_gate_envelope("trainer"),
+            "learning_group": group.to_dict(),
+            "actor_update_rpcs": 1,
+            "optimizer_steps": 1,
+            "optimizer_step_before": 0,
+            "optimizer_step_after": 1,
+            "gradient_norm": 0.25,
+            "checkpoint": str(checkpoint),
+            "group_rewards": [0, 0, 0, 0, 0, 0, 0, 1],
+            "guided_token_mask_present": True,
+            "guided_token_count": 4,
+            "guided_mask_response_only": True,
+            "guided_token_mask_shape": [8, 4],
+            "guided_row_indices": [7],
+            "rollout_mask_matches_guided": True,
+            "old_log_probs_finite": True,
+            "reference_log_probs_finite": True,
+            "reference_log_prob_shape": [8, 4],
+            "reference_log_prob_response_token_counts": [4] * 8,
+            "training_call_trace": [
+                "old_logprob",
+                "reference_logprob",
+                "update",
+            ],
+            "rollout_is": False,
+            "norm_adv_by_std_in_grpo": False,
+            "loss_mode": "capsule_critique",
+            "capsule_gamma": 0.1,
+            "reference_kl_enabled": True,
+            "reference_kl_coef": 0.001,
+            "reference_policy_mode": "actor_base_adapter_disabled",
+            "rollout_mode": "sync",
+            "ppo_epochs": 1,
+            "ppo_mini_batch_size": 8,
+            "data_parallel_world_size": 1,
+            "sequence_parallel_size": 1,
+            "verl_provenance_before": _verl_provenance(),
+            "verl_provenance_after": _verl_provenance(),
+            "lora_runtime_before": _lora_runtime_evidence(),
+            "lora_runtime_after": _lora_runtime_evidence(),
+            "cuda_peak_reserved_bytes": 60 * 1024**3,
+            "host_memory": {
+                "sample_count": 8,
+                "minimum_mem_available_bytes": 80 * 1024**3,
+                "poll_interval_s": 0.25,
+                "monitor_scope": "before_worker_start_through_after_ray_shutdown",
+            },
+            "ray_release": {
+                "worker_close_calls": 1,
+                "ray_shutdown_calls": 1,
+                "ray_shutdown_complete": True,
+            },
+            **adapter_evidence,
+            "actor_update_skipped": False,
+            "metrics": {"actor/pg_loss": 0.5, "capsule/guided_loss": -0.1},
+            **checkpoint_contract,
+            "guided_artifact_sha256": "f" * 64,
+        },
+    }
+
+
+def _collector_payload_with_fenced_p0(
+    tmp_path: Path, *, explicit_protocol_edits: bool
+) -> dict[str, object]:
+    checkpoint = tmp_path / "fenced-checkpoint"
+    checkpoint.mkdir()
+    payload = _complete_gate_payloads(checkpoint)["collector"]
+    fenced_source = "```python\nprint('ok')\n```\nExplanation.\n"
+    selected_results: list[ProgramReplayResultV1] = []
+    for index in range(7):
+        is_fenced = index == 0
+        source = fenced_source if is_fenced else f"collector_failed_{index} = True\n"
+        executed_source = normalize_program_source(source)
+        selected_results.append(
+            ProgramReplayResultV1(
+                task_id="cube-stack-5",
+                environment_seed=5,
+                program_sample_id=f"collector-base-{index}",
+                source=source,
+                initial_state_sha256="a" * 64,
+                outcome=ReplayOutcome.TASK_FAILURE,
+                raw_reward=0.25,
+                binary_reward=0.0,
+                task_completed=False,
+                error_type=None,
+                error_message=None,
+                diagnostics={
+                    "raw_source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                    "executed_source_sha256": hashlib.sha256(
+                        executed_source.encode("utf-8")
+                    ).hexdigest(),
+                    "source_normalized": executed_source != source,
+                    "evaluator_attempt_history": [
+                        {
+                            "attempt": 1,
+                            "outcome": "task_failure",
+                            "worker_replaced": False,
+                            "retry_scheduled": False,
+                            "error_type": None,
+                            "error_message": None,
+                        }
+                    ],
+                    "reset_info": {
+                        "capsule_reset_evidence": {
+                            "namespace_fresh": True,
+                            "api_state_cleared": True,
+                            "api_reset_count": 1,
+                            "api_reset_confirmed_count": 1,
+                        }
+                    },
+                },
+            )
+        )
+
+    records: list[dict[str, object]] = []
+    for rank, result in enumerate(selected_results[:2]):
+        for trajectory_index in range(2):
+            base_units = (
+                python_base_unit_spans(result.source)
+                if rank != 0 or explicit_protocol_edits
+                else (BaseUnitSpan("program", 0, len(result.source), result.source),)
+            )
+            draft = RepairDraft(
+                task_id=result.task_id,
+                environment_seed=result.environment_seed,
+                program_sample_id=result.program_sample_id,
+                repair_trajectory_id=f"fenced-repair-{rank}-{trajectory_index}",
+                base_source=result.source,
+                base_units=base_units,
+            )
+            if rank == 0:
+                if explicit_protocol_edits:
+                    for target in (
+                        "base:fence_open",
+                        "base:fence_close",
+                        "base:protocol_suffix",
+                    ):
+                        draft.submit({"action": "replace", "target": target, "source": ""})
+                else:
+                    draft.submit(
+                        {
+                            "action": "replace",
+                            "target": "base:program",
+                            "source": "print('ok')\n",
+                        }
+                    )
+            draft.submit({"action": "finish", "rationale": "complete"})
+            records.append(
+                {
+                    "p0_rank": rank,
+                    "trajectory_index": trajectory_index,
+                    "trace": draft.to_trace().to_dict(),
+                }
+            )
+
+    payload["base_results"] = [result.to_dict() for result in selected_results[:2]]
+    payload["selected_batch_results"] = [result.to_dict() for result in selected_results]
+    payload["replay_events"] = [
+        {
+            "batch_index": 0,
+            "base_index": index,
+            "selected_batch": True,
+            "result": result.to_dict(),
+        }
+        for index, result in enumerate(selected_results)
+    ]
+    payload["repair_traces"] = records
+    return payload
+
+
+def test_collector_verifier_rejects_whole_program_cleanup_of_fenced_p0(
+    tmp_path: Path,
+) -> None:
+    payload = _collector_payload_with_fenced_p0(
+        tmp_path, explicit_protocol_edits=False
+    )
+
+    with pytest.raises(common.GateArtifactError, match="explicit protocol"):
+        common.verify_collector_gate_artifact(payload)
+
+
+def test_collector_verifier_accepts_explicit_fence_and_suffix_deletions(
+    tmp_path: Path,
+) -> None:
+    payload = _collector_payload_with_fenced_p0(
+        tmp_path, explicit_protocol_edits=True
+    )
+
+    common.verify_collector_gate_artifact(payload)
+
+
+def _set_fenced_p0_diagnostic(
+    payload: dict[str, object], field_name: str, value: object
+) -> None:
+    base_result = payload["base_results"][0]
+    selected_result = payload["selected_batch_results"][0]
+    replay_result = payload["replay_events"][0]["result"]
+    for result in (base_result, selected_result, replay_result):
+        diagnostics = result["diagnostics"]
+        if value is None:
+            diagnostics.pop(field_name, None)
+        else:
+            diagnostics[field_name] = value
+
+
+def test_collector_verifier_rejects_missing_fenced_source_normalization(
+    tmp_path: Path,
+) -> None:
+    payload = _collector_payload_with_fenced_p0(
+        tmp_path, explicit_protocol_edits=True
+    )
+    _set_fenced_p0_diagnostic(payload, "source_normalized", None)
+
+    with pytest.raises(common.GateArtifactError, match="prove source normalization"):
+        common.verify_collector_gate_artifact(payload)
+
+
+def test_collector_verifier_rejects_mismatched_fenced_executed_source_hash(
+    tmp_path: Path,
+) -> None:
+    payload = _collector_payload_with_fenced_p0(
+        tmp_path, explicit_protocol_edits=True
+    )
+    _set_fenced_p0_diagnostic(payload, "executed_source_sha256", "f" * 64)
+
+    with pytest.raises(common.GateArtifactError, match="executed source hash is invalid"):
+        common.verify_collector_gate_artifact(payload)
+
+
+def _write_test_lora_adapter(
+    checkpoint: Path,
+    *,
+    omitted_tensor: tuple[int, str, str] | None = None,
+    target_modules: list[str] | None = None,
+    shape_override: tuple[int, str, str, list[int]] | None = None,
+) -> Path:
+    adapter = checkpoint / "lora_adapter"
+    adapter.mkdir(parents=True, exist_ok=True)
+    projections = {
+        "q_proj": "self_attn",
+        "k_proj": "self_attn",
+        "v_proj": "self_attn",
+        "o_proj": "self_attn",
+        "gate_proj": "mlp",
+        "up_proj": "mlp",
+        "down_proj": "mlp",
+    }
+    dimensions = {
+        "q_proj": (3584, 3584),
+        "k_proj": (3584, 512),
+        "v_proj": (3584, 512),
+        "o_proj": (3584, 3584),
+        "gate_proj": (3584, 18944),
+        "up_proj": (3584, 18944),
+        "down_proj": (18944, 3584),
+    }
+    tensor_header: dict[str, object] = {}
+    offset = 0
+    for layer in range(28):
+        for projection, block in projections.items():
+            input_dimension, output_dimension = dimensions[projection]
+            for side, shape in (
+                ("A", [16, input_dimension]),
+                ("B", [output_dimension, 16]),
+            ):
+                if omitted_tensor == (layer, projection, side):
+                    continue
+                if (
+                    shape_override is not None
+                    and shape_override[:3] == (layer, projection, side)
+                ):
+                    shape = shape_override[3]
+                byte_length = math.prod(shape) * 2
+                tensor_header[
+                    f"base_model.model.model.layers.{layer}.{block}.{projection}."
+                    f"lora_{side}.default.weight"
+                ] = {
+                    "dtype": "F16",
+                    "shape": shape,
+                    "data_offsets": [offset, offset + byte_length],
+                }
+                offset += byte_length
+    header = json.dumps(tensor_header, separators=(",", ":")).encode("utf-8")
+    with (adapter / "adapter_model.safetensors").open("wb") as stream:
+        stream.write(len(header).to_bytes(8, "little") + header)
+        stream.truncate(8 + len(header) + offset)
+    (adapter / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "peft_type": "LORA",
+                "r": 16,
+                "lora_alpha": 32,
+                "bias": "none",
+                "task_type": "CAUSAL_LM",
+                "target_modules": target_modules or list(projections),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return adapter
+
+
+def test_direct_lora_adapter_contract_requires_real_safetensors_and_exact_config(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    adapter = _write_test_lora_adapter(checkpoint)
+
+    evidence = common.direct_lora_adapter_evidence(checkpoint)
+
+    assert evidence["adapter_path"] == str(adapter.resolve())
+    assert evidence["adapter_model_path"].endswith("adapter_model.safetensors")
+    assert evidence["adapter_config_path"].endswith("adapter_config.json")
+    assert evidence["adapter_config"]["r"] == 16
+    assert evidence["adapter_config"]["lora_alpha"] == 32
+    assert evidence["adapter_config"]["bias"] == "none"
+    assert evidence["adapter_config"]["task_type"] == "CAUSAL_LM"
+    assert evidence["adapter_tensor_count"] == 28 * 7 * 2
+    assert len(evidence["adapter_model_sha256"]) == 64
+    assert len(evidence["adapter_config_sha256"]) == 64
+
+    config_path = adapter / "adapter_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["r"] = 8
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(common.GateArtifactError, match="rank=16"):
+        common.direct_lora_adapter_evidence(checkpoint)
+
+    config["r"] = 16
+    config["bias"] = "all"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(common.GateArtifactError, match="bias=none"):
+        common.direct_lora_adapter_evidence(checkpoint)
+
+    config["bias"] = "none"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    (adapter / "adapter_model.safetensors").write_bytes(b"not-safetensors")
+    with pytest.raises(common.GateArtifactError, match="safetensors"):
+        common.direct_lora_adapter_evidence(checkpoint)
+
+
+def test_direct_lora_adapter_rejects_incomplete_all_linear_config_and_tensor_pairs(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    _write_test_lora_adapter(checkpoint, target_modules=["q_proj", "k_proj"])
+
+    with pytest.raises(common.GateArtifactError, match="seven Qwen all-linear"):
+        common.direct_lora_adapter_evidence(checkpoint)
+
+    checkpoint = tmp_path / "missing-pair-checkpoint"
+    _write_test_lora_adapter(
+        checkpoint,
+        omitted_tensor=(27, "down_proj", "B"),
+    )
+
+    with pytest.raises(common.GateArtifactError, match="tensor coverage"):
+        common.direct_lora_adapter_evidence(checkpoint)
+
+
+def test_direct_lora_adapter_rejects_duplicate_targets_and_wrong_qwen_dimensions(
+    tmp_path: Path,
+) -> None:
+    duplicate_checkpoint = tmp_path / "duplicate-target-checkpoint"
+    targets = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "q_proj",
+    ]
+    _write_test_lora_adapter(duplicate_checkpoint, target_modules=targets)
+    with pytest.raises(common.GateArtifactError, match="duplicates"):
+        common.direct_lora_adapter_evidence(duplicate_checkpoint)
+
+    shape_checkpoint = tmp_path / "wrong-shape-checkpoint"
+    _write_test_lora_adapter(
+        shape_checkpoint,
+        shape_override=(0, "k_proj", "B", [3584, 16]),
+    )
+    with pytest.raises(common.GateArtifactError, match="Qwen2.5-Coder-7B dimensions"):
+        common.direct_lora_adapter_evidence(shape_checkpoint)
+
+
+def _adapter_reload_payload(gate6_path: Path, gate6: dict[str, object]) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "gate": "adapter_reload",
+        "passed": True,
+        "execution_mode": common.CANONICAL_EXECUTION_MODE,
+        "run_id": gate6["run_id"],
+        "config_sha256": gate6["config_sha256"],
+        "git_sha": gate6["git_sha"],
+        "dataset_sha256": gate6["dataset_sha256"],
+        "resolved_environment_sha256": gate6["resolved_environment_sha256"],
+        "verl_resolved_config_sha256": gate6["verl_resolved_config_sha256"],
+        "program_model_sha256": gate6["program_model_sha256"],
+        "actor_binding_sha256": gate6["actor_binding_sha256"],
+        "gate06_artifact": str(gate6_path.resolve()),
+        "gate06_artifact_sha256": common.artifact_file_sha256(gate6_path),
+        "ray_release": dict(gate6["ray_release"]),
+        "adapter_path": gate6["adapter_path"],
+        "adapter_model_sha256": gate6["adapter_model_sha256"],
+        "adapter_config_sha256": gate6["adapter_config_sha256"],
+        "base_model_path": "/models/Qwen2.5-Coder-7B-Instruct",
+        "base_model_dtype": "float32",
+        "device": "cuda:0",
+        "prompt_sha256": hashlib.sha256(
+            adapter_reload_smoke.RELOAD_PROMPT.encode("utf-8")
+        ).hexdigest(),
+        "input_token_count": 8,
+        "adapter_disabled_logits_finite": True,
+        "adapter_enabled_logits_finite": True,
+        "max_abs_logit_diff": 1e-4,
+        "cuda_peak_reserved_bytes": 35 * 1024**3,
+        "host_mem_available_before_bytes": 80 * 1024**3,
+        "host_mem_available_after_bytes": 75 * 1024**3,
+        "host_mem_available_min_bytes": 75 * 1024**3,
+        "host_memory": {
+            "sample_count": 6,
+            "minimum_mem_available_bytes": 75 * 1024**3,
+            "poll_interval_s": 0.25,
+            "monitor_scope": "adapter_reload_model_load_through_cuda_release",
+        },
+    }
+
+
+def test_adapter_reload_verifier_binds_gate6_and_requires_changed_finite_logits(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    gate6 = _complete_gate_payloads(checkpoint)["trainer"]
+    gate6_path = tmp_path / "gate06_trainer.json"
+    gate6_path.write_text(json.dumps(gate6), encoding="utf-8")
+    payload = _adapter_reload_payload(gate6_path, gate6)
+
+    common.verify_adapter_reload_artifact(payload)
+
+    payload["max_abs_logit_diff"] = 0.0
+    with pytest.raises(common.GateArtifactError, match="change logits"):
+        common.verify_adapter_reload_artifact(payload)
+
+    payload["max_abs_logit_diff"] = 1e-4
+    payload["prompt_sha256"] = "a" * 64
+    with pytest.raises(common.GateArtifactError, match="fixed prompt"):
+        common.verify_adapter_reload_artifact(payload)
+
+    payload["prompt_sha256"] = hashlib.sha256(
+        adapter_reload_smoke.RELOAD_PROMPT.encode("utf-8")
+    ).hexdigest()
+    payload["ray_release"] = {**payload["ray_release"], "ray_shutdown_calls": 2}
+    with pytest.raises(common.GateArtifactError, match="Ray"):
+        common.verify_adapter_reload_artifact(payload)
+
+
+def test_fp32_adapter_reload_stops_host_monitor_when_model_load_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, int] = {}
+
+    class _Monitor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self):
+            observed["starts"] = observed.get("starts", 0) + 1
+            return self
+
+        def __exit__(self, *_args: object) -> bool:
+            observed["stops"] = observed.get("stops", 0) + 1
+            return False
+
+        def sample(self) -> int:
+            observed["samples"] = observed.get("samples", 0) + 1
+            return 80 * 1024**3
+
+    class _Tokenizer:
+        @staticmethod
+        def from_pretrained(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("tokenizer load failed")
+
+    def current_device() -> int:
+        observed["cuda_device_checks"] = observed.get("cuda_device_checks", 0) + 1
+        return 0
+
+    def reset_peak_memory_stats(_device: int) -> None:
+        if observed.get("cuda_device_checks") != 1:
+            raise RuntimeError("CUDA allocator was not initialized")
+
+    fake_cuda = SimpleNamespace(
+        is_available=lambda: True,
+        device_count=lambda: 1,
+        current_device=current_device,
+        manual_seed_all=lambda _seed: None,
+        empty_cache=lambda: None,
+        reset_peak_memory_stats=reset_peak_memory_stats,
+    )
+    fake_torch = SimpleNamespace(
+        cuda=fake_cuda,
+        manual_seed=lambda _seed: None,
+    )
+    monkeypatch.setattr(server_adapter, "_HostMemoryMonitor", _Monitor)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "peft", SimpleNamespace(PeftModel=object()))
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoModelForCausalLM=object(), AutoTokenizer=_Tokenizer),
+    )
+
+    with pytest.raises(RuntimeError, match="tokenizer load failed"):
+        adapter_reload_smoke.run_fp32_adapter_reload(
+            base_model_path=tmp_path / "base",
+            adapter_path=tmp_path / "adapter",
+        )
+
+    assert observed == {
+        "cuda_device_checks": 1,
+        "starts": 1,
+        "samples": 2,
+        "stops": 1,
+    }
+
+
+def test_adapter_reload_cli_runs_after_gate6_and_writes_immutable_bound_artifact(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    gate6 = _complete_gate_payloads(checkpoint)["trainer"]
+    actor_identity = build_actor_identity(config)
+    gate6["config_sha256"] = common.artifact_file_sha256(config_path)
+    gate6["program_model_sha256"] = actor_identity["program_model_sha256"]
+    gate6["actor_binding_sha256"] = actor_identity["actor_binding_sha256"]
+    gate6["verl_resolved_config_sha256"] = actor_identity[
+        "verl_resolved_config_sha256"
+    ]
+    gate6_path = tmp_path / "gate06_trainer.json"
+    gate6_path.write_text(json.dumps(gate6), encoding="utf-8")
+    artifact = tmp_path / "adapter_reload_smoke.json"
+    calls: list[tuple[Path, Path]] = []
+
+    def fake_smoke(*, base_model_path: Path, adapter_path: Path):
+        calls.append((base_model_path, adapter_path))
+        return {
+            "base_model_path": str(base_model_path),
+            "base_model_dtype": "float32",
+            "device": "cuda:0",
+            "prompt_sha256": hashlib.sha256(
+                adapter_reload_smoke.RELOAD_PROMPT.encode("utf-8")
+            ).hexdigest(),
+            "input_token_count": 8,
+            "adapter_disabled_logits_finite": True,
+            "adapter_enabled_logits_finite": True,
+            "max_abs_logit_diff": 1e-4,
+            "cuda_peak_reserved_bytes": 35 * 1024**3,
+            "host_mem_available_before_bytes": 80 * 1024**3,
+            "host_mem_available_after_bytes": 75 * 1024**3,
+            "host_mem_available_min_bytes": 75 * 1024**3,
+            "host_memory": {
+                "sample_count": 6,
+                "minimum_mem_available_bytes": 75 * 1024**3,
+                "poll_interval_s": 0.25,
+                "monitor_scope": "adapter_reload_model_load_through_cuda_release",
+            },
+        }
+
+    assert (
+        adapter_reload_smoke.main(
+            [
+                "--config",
+                str(config_path),
+                "--gate6-artifact",
+                str(gate6_path),
+                "--artifact",
+                str(artifact),
+                "--run-id",
+                str(gate6["run_id"]),
+            ],
+            smoke_runner=fake_smoke,
+        )
+        == 0
+    )
+
+    assert calls == [
+        (
+            Path(config["runtime"]["program_model_path"]).resolve(),
+            Path(gate6["adapter_path"]),
+        )
+    ]
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    common.verify_adapter_reload_artifact(payload)
+    assert payload["gate06_artifact_sha256"] == common.artifact_file_sha256(gate6_path)
+    with pytest.raises(FileExistsError, match="already exists"):
+        adapter_reload_smoke.main(
+            [
+                "--config",
+                str(config_path),
+                "--gate6-artifact",
+                str(gate6_path),
+                "--artifact",
+                str(artifact),
+                "--run-id",
+                str(gate6["run_id"]),
+            ],
+            smoke_runner=fake_smoke,
+        )
+
+
+def test_adapter_reload_cli_rejects_base_model_identity_drift_during_smoke(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    gate6 = _complete_gate_payloads(checkpoint)["trainer"]
+    actor_identity = build_actor_identity(config)
+    gate6.update(
+        {
+            "config_sha256": common.artifact_file_sha256(config_path),
+            "program_model_sha256": actor_identity["program_model_sha256"],
+            "actor_binding_sha256": actor_identity["actor_binding_sha256"],
+            "verl_resolved_config_sha256": actor_identity[
+                "verl_resolved_config_sha256"
+            ],
+        }
+    )
+    gate6_path = tmp_path / "gate06_trainer.json"
+    gate6_path.write_text(json.dumps(gate6), encoding="utf-8")
+    artifact = tmp_path / "adapter_reload_smoke.json"
+
+    def mutate_model(**_kwargs: object):
+        model_config = Path(config["runtime"]["program_model_path"]) / "config.json"
+        model_config.write_text('{"model_type":"tampered"}\n', encoding="utf-8")
+        return {
+            "base_model_path": str(Path(config["runtime"]["program_model_path"])),
+            "base_model_dtype": "float32",
+            "device": "cuda:0",
+            "prompt_sha256": hashlib.sha256(
+                adapter_reload_smoke.RELOAD_PROMPT.encode("utf-8")
+            ).hexdigest(),
+            "input_token_count": 8,
+            "adapter_disabled_logits_finite": True,
+            "adapter_enabled_logits_finite": True,
+            "max_abs_logit_diff": 1e-4,
+            "cuda_peak_reserved_bytes": 35 * 1024**3,
+            "host_mem_available_before_bytes": 80 * 1024**3,
+            "host_mem_available_after_bytes": 75 * 1024**3,
+            "host_mem_available_min_bytes": 75 * 1024**3,
+            "host_memory": {
+                "sample_count": 6,
+                "minimum_mem_available_bytes": 75 * 1024**3,
+                "poll_interval_s": 0.25,
+                "monitor_scope": "adapter_reload_model_load_through_cuda_release",
+            },
+        }
+
+    with pytest.raises(adapter_reload_smoke.AdapterReloadError, match="identity changed"):
+        adapter_reload_smoke.main(
+            [
+                "--config",
+                str(config_path),
+                "--gate6-artifact",
+                str(gate6_path),
+                "--artifact",
+                str(artifact),
+                "--run-id",
+                str(gate6["run_id"]),
+            ],
+            smoke_runner=mutate_model,
+        )
+    assert not artifact.exists()
+
+
+def test_adapter_reload_guard_rejects_base_model_a_to_b_to_a_during_load(
+    tmp_path: Path,
+) -> None:
+    config_path = _server_config(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    gate6 = _complete_gate_payloads(checkpoint)["trainer"]
+    actor_identity = build_actor_identity(config)
+    gate6.update(
+        {
+            "config_sha256": common.artifact_file_sha256(config_path),
+            "program_model_sha256": actor_identity["program_model_sha256"],
+            "actor_binding_sha256": actor_identity["actor_binding_sha256"],
+            "verl_resolved_config_sha256": actor_identity[
+                "verl_resolved_config_sha256"
+            ],
+        }
+    )
+    gate6_path = tmp_path / "gate06_trainer.json"
+    gate6_path.write_text(json.dumps(gate6), encoding="utf-8")
+    artifact = tmp_path / "adapter_reload_smoke.json"
+
+    def swap_and_restore_model(**_kwargs: object):
+        model_config = Path(config["runtime"]["program_model_path"]) / "config.json"
+        trusted = model_config.read_bytes()
+        model_config.write_bytes(b'{"model_type":"transient-attacker"}\n')
+        model_config.write_bytes(trusted)
+        return {
+            "base_model_path": str(Path(config["runtime"]["program_model_path"])),
+            "base_model_dtype": "float32",
+            "device": "cuda:0",
+            "prompt_sha256": hashlib.sha256(
+                adapter_reload_smoke.RELOAD_PROMPT.encode("utf-8")
+            ).hexdigest(),
+            "input_token_count": 8,
+            "adapter_disabled_logits_finite": True,
+            "adapter_enabled_logits_finite": True,
+            "max_abs_logit_diff": 1e-4,
+            "cuda_peak_reserved_bytes": 35 * 1024**3,
+            "host_mem_available_before_bytes": 80 * 1024**3,
+            "host_mem_available_after_bytes": 75 * 1024**3,
+            "host_mem_available_min_bytes": 75 * 1024**3,
+            "host_memory": {
+                "sample_count": 6,
+                "minimum_mem_available_bytes": 75 * 1024**3,
+                "poll_interval_s": 0.25,
+                "monitor_scope": "adapter_reload_model_load_through_cuda_release",
+            },
+        }
+
+    with pytest.raises(adapter_reload_smoke.AdapterReloadError, match="guarded runtime input"):
+        adapter_reload_smoke.main(
+            [
+                "--config",
+                str(config_path),
+                "--gate6-artifact",
+                str(gate6_path),
+                "--artifact",
+                str(artifact),
+                "--run-id",
+                str(gate6["run_id"]),
+            ],
+            smoke_runner=swap_and_restore_model,
+        )
+    assert not artifact.exists()
+
+
+def _write_gate_payloads(
+    directory: Path, payloads: dict[str, dict[str, object]]
+) -> None:
+    for gate, filename in analyze_artifacts.REQUIRED_GATE_FILES.items():
+        if gate == "adapter_reload":
+            gate6_path = directory / analyze_artifacts.REQUIRED_GATE_FILES["trainer"]
+            payloads[gate] = _adapter_reload_payload(gate6_path, payloads["trainer"])
+        if gate == "trainer":
+            guided_path = directory / analyze_artifacts.REQUIRED_GATE_FILES["guided"]
+            payloads["trainer"]["guided_artifact_sha256"] = common.artifact_file_sha256(
+                guided_path
+            )
+        (directory / filename).write_text(
+            json.dumps(payloads[gate], ensure_ascii=False), encoding="utf-8"
+        )
+
+
+def test_gate7_verifies_complete_typed_chain_and_emits_hash_manifest(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    _write_gate_payloads(tmp_path, payloads)
+
+    summary = analyze_artifacts.audit_gate_directory(tmp_path)
+
+    assert summary["runtime_verified"] is False
+    assert summary["runtime_verification_pending"] == [
+        "launcher_continuous_memory",
+        "owned_service_cleanup",
+        "controller_runtime_attestation",
+    ]
+    assert summary["gate_chain"][-1]["gate"] == "adapter_reload"
+    assert summary["adapter_reload_max_abs_logit_diff"] == 1e-4
+    assert len(summary["adapter_reload_artifact_sha256"]) == 64
+    assert summary["adapter_model_sha256"] == payloads["trainer"][
+        "adapter_model_sha256"
+    ]
+    assert summary["dataset_sha256"] == "9" * 64
+    assert summary["resolved_environment_sha256"] == "e" * 64
+    assert summary["verl_resolved_config_sha256"] == "f" * 64
+    assert summary["program_model_sha256"] == "1" * 64
+    assert summary["actor_binding_sha256"] == _synthetic_actor_identity()[
+        "actor_binding_sha256"
+    ]
+    assert summary["typed_task_identities"] == [
+        {
+            "task_id": "cube-stack-5",
+            "environment_seed": 5,
+            "initial_state_sha256": "a" * 64,
+        }
+    ]
+    assert summary["gate_statuses"] == {gate: "passed" for gate in payloads}
+    assert [entry["gate"] for entry in summary["gate_chain"]] == list(payloads)
+    assert summary["gate_chain"][0]["previous_sha256"] is None
+    assert summary["gate_chain"][1]["previous_sha256"] == summary["gate_chain"][0][
+        "sha256"
+    ]
+
+
+def _write_continuous_memory_evidence(path: Path, *, passed: bool = True) -> None:
+    samples = [
+        {"elapsed_ms": 0, "available_mib": 20000},
+        {"elapsed_ms": 1000, "available_mib": 19000 if passed else 12000},
+    ]
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_type": "single_a800_continuous_memory",
+                "interval_s": 1.0,
+                "required_mib": 12288,
+                "sample_count": len(samples),
+                "minimum_available_mib": min(
+                    sample["available_mib"] for sample in samples
+                ),
+                "maximum_sample_gap_ms": 1000,
+                "maximum_allowed_gap_ms": 5000,
+                "passed": passed,
+                "probe_error": None,
+                "samples": samples,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_controller_attestation(
+    path: Path, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "artifact_type": "llama_cpp_b10516_runtime_attestation",
+        "version_tag": "b10516",
+        "archive_path": str((path.parent / "llama-b10516.tar.gz").resolve()),
+        "archive_sha256": analyze_artifacts._LLAMA_ARCHIVE_SHA256,
+        "binary_path": str((path.parent / "llama-server").resolve()),
+        "binary_archive_member": "llama-server",
+        "binary_sha256": "b" * 64,
+        "gguf_path": str((path.parent / "controller.gguf").resolve()),
+        "gguf_sha256": analyze_artifacts._CONTROLLER_GGUF_SHA256,
+        "build_number": 10516,
+        "runtime_tree_sha256": "d" * 64,
+        "regular_file_count": 12,
+        "symlink_count": 3,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        analyze_artifacts,
+        "attest_llama_cpp_runtime",
+        lambda **_kwargs: dict(payload),
+    )
+    return payload
+
+
+def _write_owned_cleanup(path: Path, *, run_id: str) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_type": "single_a800_owned_service_cleanup",
+                "run_id": run_id,
+                "cleanup_completed": True,
+                "services": [
+                    {
+                        "name": name,
+                        "ownership": "owned",
+                        "pid": 4100 + index,
+                        "starttime_ticks": 41000 + index,
+                        "termination_confirmed": True,
+                    }
+                    for index, name in enumerate(
+                        ("controller", "program", "pyroki"), start=1
+                    )
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_initial_launcher_audit(
+    path: Path,
+    *,
+    run_id: str,
+    git_sha: str,
+    profile_sha256: str,
+    oom_profile: str = common.SINGLE_A800_OOM_PROFILE,
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "artifact_type": "single_a800_initial_audit",
+                "run_id": run_id,
+                "oom_profile": oom_profile,
+                "profile_sha256": profile_sha256,
+                "snapshot": {
+                    "gpu_name": "NVIDIA A800 80GB PCIe",
+                    "gpu_count": 1,
+                    "gpu_total_vram_mib": 81920,
+                    "gpu_free_vram_mib": 80000,
+                    "other_gpu_processes_mib": [128],
+                    "host_memory_mib": 131072,
+                    "mem_available_before_controller_mib": 110000,
+                    "mem_available_after_controller_mib": 110000,
+                    "mem_available_during_run_mib": 110000,
+                    "shm_available_mib": 16384,
+                    "disk_free_mib": 100000,
+                    "cuda_version": "12.8",
+                    "nvidia_driver": "570.00",
+                    "repo_head": git_sha,
+                    "repo_is_dirty": False,
+                    "system_version": "Linux-test",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_resolved_verl_profile(
+    directory: Path, *, oom_profile: str = common.SINGLE_A800_OOM_PROFILE
+) -> tuple[Path, str]:
+    profile_path = directory / "resolved" / "verl.yaml"
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(
+        yaml.safe_dump(
+            {
+                "actor_rollout_ref": {"model": {"lora_rank": 16}},
+                "capsule_runtime": {"oom_profile": oom_profile},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return profile_path, common.artifact_file_sha256(profile_path)
+
+
+def _bind_gate_payloads_to_resolved_profile(
+    payloads: dict[str, dict[str, object]],
+    *,
+    profile_path: Path,
+    profile_sha256: str,
+) -> None:
+    preflight_checks = payloads["preflight"]["checks"]
+    assert isinstance(preflight_checks, dict)
+    actor_identity = preflight_checks["program_actor_identity"]
+    assert isinstance(actor_identity, dict)
+    actor_identity["verl_resolved_config_path"] = str(profile_path.resolve())
+    actor_identity["verl_resolved_config_sha256"] = profile_sha256
+    actor_identity["actor_binding_sha256"] = actor_binding_sha256(actor_identity)
+    preflight_checks["verl_resolved_config_sha256"] = profile_sha256
+    preflight_checks["actor_binding_sha256"] = actor_identity["actor_binding_sha256"]
+    for payload in payloads.values():
+        payload["verl_resolved_config_sha256"] = profile_sha256
+        payload["actor_binding_sha256"] = actor_identity["actor_binding_sha256"]
+
+
+def _write_post_controller_memory(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_type": "single_a800_memory_check",
+                "stage": "post-controller",
+                "available_mib": 100000,
+                "required_mib": 92160,
+                "passed": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _prepare_successful_gate7_finalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    profile_oom_profile: str = common.SINGLE_A800_OOM_PROFILE,
+    initial_oom_profile: str = common.SINGLE_A800_OOM_PROFILE,
+    initial_profile_sha256: str | None = None,
+) -> tuple[list[str], Path, str]:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    profile_path, profile_sha256 = _write_resolved_verl_profile(
+        tmp_path, oom_profile=profile_oom_profile
+    )
+    payloads = _complete_gate_payloads(checkpoint)
+    _bind_gate_payloads_to_resolved_profile(
+        payloads,
+        profile_path=profile_path,
+        profile_sha256=profile_sha256,
+    )
+    _write_gate_payloads(tmp_path, payloads)
+    candidate_json = tmp_path / "gate07_audit.candidate.json"
+    candidate_report = tmp_path / "gate07_audit.candidate.md"
+    analyze_artifacts.main(
+        [
+            "--input-dir",
+            str(tmp_path),
+            "--output-json",
+            str(candidate_json),
+            "--output-report",
+            str(candidate_report),
+        ]
+    )
+    candidate = json.loads(candidate_json.read_text(encoding="utf-8"))
+    memory_path = tmp_path / "launcher_continuous_memory.json"
+    controller_path = tmp_path / "launcher_controller_attestation.json"
+    cleanup_path = tmp_path / "launcher_owned_cleanup.json"
+    _write_continuous_memory_evidence(memory_path)
+    _write_controller_attestation(controller_path, monkeypatch)
+    _write_owned_cleanup(cleanup_path, run_id=candidate["run_id"])
+    _write_initial_launcher_audit(
+        tmp_path / "launcher_initial_audit.json",
+        run_id=candidate["run_id"],
+        git_sha=candidate["git_sha"],
+        profile_sha256=initial_profile_sha256 or profile_sha256,
+        oom_profile=initial_oom_profile,
+    )
+    _write_post_controller_memory(
+        tmp_path / "launcher_memory_00_post-controller.json"
+    )
+    return (
+        [
+            "--input-dir",
+            str(tmp_path),
+            "--output-json",
+            str(tmp_path / "gate07_audit.json"),
+            "--output-report",
+            str(tmp_path / "gate07_audit.md"),
+            "--candidate-artifact",
+            str(candidate_json),
+            "--continuous-memory-artifact",
+            str(memory_path),
+            "--controller-attestation-artifact",
+            str(controller_path),
+            "--owned-cleanup-artifact",
+            str(cleanup_path),
+        ],
+        profile_path,
+        profile_sha256,
+    )
+
+
+def test_owned_cleanup_verifier_rejects_a_still_running_process(tmp_path: Path) -> None:
+    proc_stat = Path(f"/proc/{os.getpid()}/stat")
+    if not proc_stat.is_file():
+        pytest.skip("Linux /proc identity verification is unavailable")
+    stat_text = proc_stat.read_text(encoding="ascii")
+    starttime_ticks = int(stat_text[stat_text.rfind(")") + 2 :].split()[19])
+    cleanup_path = tmp_path / "launcher_owned_cleanup.json"
+    _write_owned_cleanup(cleanup_path, run_id="run-live")
+    cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
+    cleanup["services"][0].update(
+        {"pid": os.getpid(), "starttime_ticks": starttime_ticks}
+    )
+    cleanup_path.write_text(json.dumps(cleanup), encoding="utf-8")
+
+    with pytest.raises(common.GateArtifactError, match="still running"):
+        analyze_artifacts._verify_owned_cleanup_artifact(
+            cleanup_path, expected_run_id="run-live"
+        )
+
+
+def test_external_controller_attestation_and_cleanup_are_verified_without_a_pid(
+    tmp_path: Path,
+) -> None:
+    controller = {
+        "mode": "external",
+        "endpoint": "https://coding.dashscope.aliyuncs.com/v1",
+        "model": "qwen3.7-plus",
+        "api_key_env": "CAPX_CONTROLLER_API_KEY",
+        "request_timeout_s": 300.0,
+        "max_output_tokens": 4096,
+        "stream": False,
+        "enable_thinking": False,
+        "temperature": 0.7,
+    }
+    attestation = launch_owned_services._external_controller_attestation(
+        controller, credential_present=True
+    )
+    attestation_path = tmp_path / "launcher_controller_attestation.json"
+    attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
+
+    verified, _sha256 = analyze_artifacts._verify_controller_attestation_artifact(
+        attestation_path
+    )
+
+    assert verified == attestation
+    assert "controller-secret" not in json.dumps(verified)
+
+    cleanup_path = tmp_path / "launcher_owned_cleanup.json"
+    cleanup_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_type": "single_a800_owned_service_cleanup",
+                "run_id": "external-run",
+                "cleanup_completed": True,
+                "services": [
+                    {
+                        "name": "controller",
+                        "ownership": "external",
+                        "termination_confirmed": None,
+                    },
+                    {
+                        "name": "program",
+                        "ownership": "owned",
+                        "pid": 900001,
+                        "starttime_ticks": 1001,
+                        "termination_confirmed": True,
+                    },
+                    {
+                        "name": "pyroki",
+                        "ownership": "owned",
+                        "pid": 900002,
+                        "starttime_ticks": 1002,
+                        "termination_confirmed": True,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cleanup, _sha256 = analyze_artifacts._verify_owned_cleanup_artifact(
+        cleanup_path, expected_run_id="external-run"
+    )
+
+    assert cleanup["services"][0]["ownership"] == "external"
+
+
+def test_gate7_finalization_binds_candidate_and_continuous_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    profile_path, profile_sha256 = _write_resolved_verl_profile(tmp_path)
+    payloads = _complete_gate_payloads(checkpoint)
+    _bind_gate_payloads_to_resolved_profile(
+        payloads,
+        profile_path=profile_path,
+        profile_sha256=profile_sha256,
+    )
+    _write_gate_payloads(tmp_path, payloads)
+    candidate_json = tmp_path / "gate07_audit.candidate.json"
+    candidate_report = tmp_path / "gate07_audit.candidate.md"
+    memory_path = tmp_path / "launcher_continuous_memory.json"
+    controller_path = tmp_path / "launcher_controller_attestation.json"
+    cleanup_path = tmp_path / "launcher_owned_cleanup.json"
+    initial_audit_path = tmp_path / "launcher_initial_audit.json"
+    post_controller_memory_path = tmp_path / "launcher_memory_00_post-controller.json"
+    final_json = tmp_path / "gate07_audit.json"
+    final_report = tmp_path / "gate07_audit.md"
+
+    assert analyze_artifacts.main(
+        [
+            "--input-dir",
+            str(tmp_path),
+            "--output-json",
+            str(candidate_json),
+            "--output-report",
+            str(candidate_report),
+        ]
+    ) == 0
+    _write_continuous_memory_evidence(memory_path)
+    controller = _write_controller_attestation(controller_path, monkeypatch)
+    candidate = json.loads(candidate_json.read_text(encoding="utf-8"))
+    _write_owned_cleanup(cleanup_path, run_id=candidate["run_id"])
+    _write_initial_launcher_audit(
+        initial_audit_path,
+        run_id=candidate["run_id"],
+        git_sha=candidate["git_sha"],
+        profile_sha256=profile_sha256,
+    )
+    _write_post_controller_memory(post_controller_memory_path)
+
+    assert analyze_artifacts.main(
+        [
+            "--input-dir",
+            str(tmp_path),
+            "--output-json",
+            str(final_json),
+            "--output-report",
+            str(final_report),
+            "--candidate-artifact",
+            str(candidate_json),
+            "--continuous-memory-artifact",
+            str(memory_path),
+            "--controller-attestation-artifact",
+            str(controller_path),
+            "--owned-cleanup-artifact",
+            str(cleanup_path),
+        ]
+    ) == 0
+
+    final = json.loads(final_json.read_text(encoding="utf-8"))
+    common.validate_final_runtime_audit(final)
+    assert final["runtime_verified"] is True
+    assert final["gate07_candidate_sha256"] == common.artifact_file_sha256(
+        candidate_json
+    )
+    assert final["launcher_continuous_memory_sha256"] == common.artifact_file_sha256(
+        memory_path
+    )
+    assert final["minimum_mem_available_mib"] == 19000
+    assert final["controller_mode"] == "local"
+    assert final["controller_binding_sha256"] == controller["runtime_tree_sha256"]
+    assert final["owned_service_cleanup_completed"] is True
+    assert final["owned_service_cleanup_count"] == 3
+    assert final["initial_hardware"]["gpu_name"] == "NVIDIA A800 80GB PCIe"
+    assert final["mem_available_after_controller_mib"] == 100000
+    assert final["resolved_profile_sha256"] == profile_sha256
+    assert final["resolved_profile_sha256"] == final[
+        "verl_resolved_config_sha256"
+    ]
+
+
+def test_gate7_finalization_rejects_failed_memory_or_launcher_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    profile_path, profile_sha256 = _write_resolved_verl_profile(tmp_path)
+    payloads = _complete_gate_payloads(checkpoint)
+    _bind_gate_payloads_to_resolved_profile(
+        payloads,
+        profile_path=profile_path,
+        profile_sha256=profile_sha256,
+    )
+    _write_gate_payloads(tmp_path, payloads)
+    candidate_json = tmp_path / "gate07_audit.candidate.json"
+    candidate_report = tmp_path / "gate07_audit.candidate.md"
+    analyze_artifacts.main(
+        [
+            "--input-dir",
+            str(tmp_path),
+            "--output-json",
+            str(candidate_json),
+            "--output-report",
+            str(candidate_report),
+        ]
+    )
+    memory_path = tmp_path / "launcher_continuous_memory.json"
+    controller_path = tmp_path / "launcher_controller_attestation.json"
+    cleanup_path = tmp_path / "launcher_owned_cleanup.json"
+    initial_audit_path = tmp_path / "launcher_initial_audit.json"
+    post_controller_memory_path = tmp_path / "launcher_memory_00_post-controller.json"
+    _write_continuous_memory_evidence(memory_path, passed=False)
+    controller = _write_controller_attestation(controller_path, monkeypatch)
+    candidate = json.loads(candidate_json.read_text(encoding="utf-8"))
+    _write_owned_cleanup(cleanup_path, run_id=candidate["run_id"])
+    _write_initial_launcher_audit(
+        initial_audit_path,
+        run_id=candidate["run_id"],
+        git_sha=candidate["git_sha"],
+        profile_sha256=profile_sha256,
+    )
+    _write_post_controller_memory(post_controller_memory_path)
+
+    final_args = [
+        "--input-dir",
+        str(tmp_path),
+        "--output-json",
+        str(tmp_path / "gate07_audit.json"),
+        "--output-report",
+        str(tmp_path / "gate07_audit.md"),
+        "--candidate-artifact",
+        str(candidate_json),
+        "--continuous-memory-artifact",
+        str(memory_path),
+        "--controller-attestation-artifact",
+        str(controller_path),
+        "--owned-cleanup-artifact",
+        str(cleanup_path),
+    ]
+    with pytest.raises(common.GateArtifactError, match="continuous memory"):
+        analyze_artifacts.main(final_args)
+    assert not (tmp_path / "gate07_audit.json").exists()
+
+    memory_path.unlink()
+    _write_continuous_memory_evidence(memory_path)
+    (tmp_path / "launcher_failure.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(common.GateArtifactError, match="launcher failure"):
+        analyze_artifacts.main(final_args)
+    assert not (tmp_path / "gate07_audit.json").exists()
+
+    (tmp_path / "launcher_failure.json").unlink()
+    cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
+    cleanup["services"][0]["termination_confirmed"] = False
+    cleanup_path.write_text(json.dumps(cleanup), encoding="utf-8")
+    with pytest.raises(common.GateArtifactError, match="cleanup entry"):
+        analyze_artifacts.main(final_args)
+    assert not (tmp_path / "gate07_audit.json").exists()
+
+    _write_owned_cleanup(cleanup_path, run_id=candidate["run_id"])
+    drifted_controller = {**controller, "binary_sha256": "e" * 64}
+    monkeypatch.setattr(
+        analyze_artifacts,
+        "attest_llama_cpp_runtime",
+        lambda **_kwargs: drifted_controller,
+    )
+    with pytest.raises(common.GateArtifactError, match="changed before final Gate 7"):
+        analyze_artifacts.main(final_args)
+    assert not (tmp_path / "gate07_audit.json").exists()
+
+    monkeypatch.setattr(
+        analyze_artifacts,
+        "attest_llama_cpp_runtime",
+        lambda **_kwargs: dict(controller),
+    )
+    initial_audit = json.loads(initial_audit_path.read_text(encoding="utf-8"))
+    initial_audit["snapshot"]["gpu_free_vram_mib"] = 70000
+    initial_audit_path.write_text(json.dumps(initial_audit), encoding="utf-8")
+    with pytest.raises(common.GateArtifactError, match="below the fixed threshold"):
+        analyze_artifacts.main(final_args)
+
+    _write_initial_launcher_audit(
+        initial_audit_path,
+        run_id=candidate["run_id"],
+        git_sha=candidate["git_sha"],
+        profile_sha256=profile_sha256,
+    )
+    post_memory = json.loads(post_controller_memory_path.read_text(encoding="utf-8"))
+    post_memory["available_mib"] = 90000
+    post_memory["passed"] = False
+    post_controller_memory_path.write_text(json.dumps(post_memory), encoding="utf-8")
+    with pytest.raises(common.GateArtifactError, match="90 GiB"):
+        analyze_artifacts.main(final_args)
+    assert not (tmp_path / "gate07_audit.json").exists()
+
+
+def test_gate7_finalization_rejects_tampered_initial_profile_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_args, _profile_path, _profile_sha256 = (
+        _prepare_successful_gate7_finalization(
+            tmp_path,
+            monkeypatch,
+            initial_profile_sha256="8" * 64,
+        )
+    )
+
+    with pytest.raises(common.GateArtifactError, match="resolved VeRL profile SHA"):
+        analyze_artifacts.main(final_args)
+
+
+def test_initial_audit_rejects_legacy_retry_schema(tmp_path: Path) -> None:
+    audit_path = tmp_path / "launcher_initial_audit.json"
+    _write_initial_launcher_audit(
+        audit_path,
+        run_id="fixed-profile-run",
+        git_sha="a" * 40,
+        profile_sha256="b" * 64,
+    )
+    payload = json.loads(audit_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 1
+    payload["retry_name"] = payload.pop("oom_profile")
+    audit_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(common.GateArtifactError, match="schema"):
+        analyze_artifacts._verify_initial_audit_artifact(
+            audit_path,
+            expected_run_id="fixed-profile-run",
+            expected_git_sha="a" * 40,
+        )
+
+
+def test_gate7_finalization_rejects_oom_profile_different_from_resolved_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_args, _profile_path, _profile_sha256 = (
+        _prepare_successful_gate7_finalization(
+            tmp_path,
+            monkeypatch,
+            profile_oom_profile="removed_profile",
+        )
+    )
+
+    with pytest.raises(common.GateArtifactError, match="oom_profile.*initial audit"):
+        analyze_artifacts.main(final_args)
+
+
+def test_gate7_finalization_rejects_resolved_profile_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_args, profile_path, _profile_sha256 = _prepare_successful_gate7_finalization(
+        tmp_path, monkeypatch
+    )
+    profile_path.write_bytes(profile_path.read_bytes() + b"# drift\n")
+
+    with pytest.raises(common.GateArtifactError, match="resolved VeRL profile SHA"):
+        analyze_artifacts.main(final_args)
+
+
+def test_gate7_finalization_rejects_symlink_resolved_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final_args, profile_path, _profile_sha256 = _prepare_successful_gate7_finalization(
+        tmp_path, monkeypatch
+    )
+    external = tmp_path / "external-verl.yaml"
+    profile_path.replace(external)
+    profile_path.symlink_to(external)
+
+    with pytest.raises(common.GateArtifactError, match="symlink|without following"):
+        analyze_artifacts.main(final_args)
+
+
+def test_gate7_finalization_mutation_guard_watches_resolved_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    profile_path, _profile_sha256 = _write_resolved_verl_profile(tmp_path)
+    _write_gate_payloads(tmp_path, _complete_gate_payloads(checkpoint))
+    captured_watches: list[object] = []
+
+    class FakeGuard:
+        def close(self) -> None:
+            pass
+
+    def capture_watches(watches):
+        captured_watches.extend(watches)
+        return FakeGuard()
+
+    monkeypatch.setattr(analyze_artifacts, "sys_platform_linux", lambda: True)
+    monkeypatch.setattr(
+        analyze_artifacts.PathMutationGuard,
+        "open",
+        staticmethod(capture_watches),
+    )
+
+    guard = analyze_artifacts._gate7_mutation_context(tmp_path, finalizing=True)
+    guard.close()
+
+    assert any(
+        getattr(watch, "path", None) == profile_path
+        and getattr(watch, "recursive", None) is False
+        for watch in captured_watches
+    )
+
+
+def test_gate7_rejects_noncanonical_gate_evidence(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    payloads["collector"]["execution_mode"] = "custom_runner"
+    _write_gate_payloads(tmp_path, payloads)
+
+    with pytest.raises(common.GateArtifactError, match="noncanonical"):
+        analyze_artifacts.audit_gate_directory(tmp_path)
+
+
+def test_gate7_rejects_success_and_failure_evidence_for_same_gate(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    _write_gate_payloads(tmp_path, payloads)
+    seed_path = tmp_path / analyze_artifacts.REQUIRED_GATE_FILES["seed"]
+    common.write_gate_failure_artifact(
+        seed_path,
+        gate="seed",
+        run_id="capsule-smoke-001",
+        config_sha256="c" * 64,
+        git_sha="d" * 40,
+        error=RuntimeError("late failure evidence"),
+        stage="artifact_publish",
+    )
+
+    with pytest.raises(common.GateArtifactError, match="both success and failure"):
+        analyze_artifacts.audit_gate_directory(tmp_path)
+
+
+def test_gate7_rejects_symlink_gate_artifact_in_run_directory(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    _write_gate_payloads(tmp_path, payloads)
+    seed_path = tmp_path / analyze_artifacts.REQUIRED_GATE_FILES["seed"]
+    external = tmp_path / "external-seed.json"
+    seed_path.replace(external)
+    seed_path.symlink_to(external)
+
+    assert common.gate_failure_artifact_path(seed_path) == seed_path.with_name(
+        f"{seed_path.name}.failure.json"
+    )
+    with pytest.raises(common.GateArtifactError, match="symlink"):
+        analyze_artifacts.audit_gate_directory(tmp_path)
+
+
+def test_gate7_rejects_gate_bytes_changed_during_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    _write_gate_payloads(tmp_path, payloads)
+    original_loader = analyze_artifacts._load_gate_artifact_snapshot
+    mutated = False
+
+    def load_then_mutate(path: Path, gate: str):
+        nonlocal mutated
+        snapshot = original_loader(path, gate)
+        if gate == "preflight" and not mutated:
+            path.write_bytes(path.read_bytes() + b"\n")
+            mutated = True
+        return snapshot
+
+    monkeypatch.setattr(
+        analyze_artifacts, "_load_gate_artifact_snapshot", load_then_mutate
+    )
+
+    with pytest.raises(common.GateArtifactError, match="changed during Gate 7 audit"):
+        analyze_artifacts.audit_gate_directory(tmp_path)
+
+
+def test_gate7_publishes_json_and_markdown_as_one_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    _write_gate_payloads(tmp_path, payloads)
+    output_json = tmp_path / "audit.json"
+    output_report = tmp_path / "audit.md"
+    real_link = analyze_artifacts.os.link
+
+    def fail_report_publish(source: object, destination: object) -> None:
+        if Path(destination) == output_report:
+            raise OSError("report publication failed")
+        real_link(source, destination)
+
+    monkeypatch.setattr(analyze_artifacts.os, "link", fail_report_publish)
+
+    with pytest.raises(OSError, match="report publication failed"):
+        analyze_artifacts.main(
+            [
+                "--input-dir",
+                str(tmp_path),
+                "--output-json",
+                str(output_json),
+                "--output-report",
+                str(output_report),
+            ]
+        )
+
+    assert not output_json.exists()
+    assert not output_report.exists()
+    assert not list(tmp_path.glob(".audit.*.tmp"))
+
+
+def test_gate7_rolls_back_pair_when_post_publish_verification_fails(
+    tmp_path: Path,
+) -> None:
+    output_json = tmp_path / "audit.json"
+    output_report = tmp_path / "audit.md"
+
+    def reject_publication() -> None:
+        raise common.GateArtifactError("evidence mutated during publication")
+
+    with pytest.raises(common.GateArtifactError, match="mutated during publication"):
+        analyze_artifacts._publish_audit_outputs(
+            output_json,
+            output_report,
+            {"runtime_verified": True},
+            post_publish_verify=reject_publication,
+        )
+
+    assert not output_json.exists()
+    assert not output_report.exists()
+    assert not list(tmp_path.glob(".audit.*.tmp"))
+
+
+def test_gate7_pair_rollback_never_deletes_replaced_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    _write_gate_payloads(tmp_path, payloads)
+    output_json = tmp_path / "audit.json"
+    output_report = tmp_path / "audit.md"
+    real_link = analyze_artifacts.os.link
+
+    def replace_json_then_fail_report(source: object, destination: object) -> None:
+        destination_path = Path(destination)
+        if destination_path == output_report:
+            output_json.unlink()
+            output_json.write_text("foreign replacement\n", encoding="utf-8")
+            raise OSError("report publication failed after replacement")
+        real_link(source, destination)
+
+    monkeypatch.setattr(analyze_artifacts.os, "link", replace_json_then_fail_report)
+
+    with pytest.raises(OSError, match="after replacement"):
+        analyze_artifacts.main(
+            [
+                "--input-dir",
+                str(tmp_path),
+                "--output-json",
+                str(output_json),
+                "--output-report",
+                str(output_report),
+            ]
+        )
+
+    assert output_json.read_text(encoding="utf-8") == "foreign replacement\n"
+    assert not output_report.exists()
+
+
+def test_gate7_rejects_trainer_group_different_from_guided_group(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    payloads["trainer"]["learning_group"]["group_uid"] = "different-group"
+    _write_gate_payloads(tmp_path, payloads)
+
+    with pytest.raises(common.GateArtifactError, match="exact verified guided group"):
+        analyze_artifacts.audit_gate_directory(tmp_path)
+
+
+def test_gate7_links_seed5_initial_state_across_replay_gates(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    payloads["seed"]["initial_state_sha256"] = ["9" * 64, "b" * 64, "9" * 64]
+    _write_gate_payloads(tmp_path, payloads)
+
+    with pytest.raises(common.GateArtifactError, match="seed-5 initial state"):
+        analyze_artifacts.audit_gate_directory(tmp_path)
+
+
+def test_gate7_rejects_dataset_bytes_changed_between_gates(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    payloads["collector"]["dataset_sha256"] = "8" * 64
+    _write_gate_payloads(tmp_path, payloads)
+
+    with pytest.raises(common.GateArtifactError, match="dataset SHA"):
+        analyze_artifacts.audit_gate_directory(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "message"),
+    [
+        ("resolved_environment_sha256", "resolved environment SHA"),
+        ("verl_resolved_config_sha256", "resolved VeRL config SHA"),
+        ("program_model_sha256", "Program model SHA"),
+        ("actor_binding_sha256", "actor binding SHA"),
+    ],
+)
+def test_gate7_rejects_runtime_dependency_changed_between_gates(
+    field_name: str, message: str, tmp_path: Path
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    payloads["collector"][field_name] = "8" * 64
+    _write_gate_payloads(tmp_path, payloads)
+
+    with pytest.raises(common.GateArtifactError, match=message):
+        analyze_artifacts.audit_gate_directory(tmp_path)
+
+
+def test_gate7_rejects_different_typed_seed5_task_identity(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    for replay in payloads["oracle_replay"]["replays"]:
+        replay["result"]["task_id"] = "different-cube-stack-task"
+    _write_gate_payloads(tmp_path, payloads)
+
+    with pytest.raises(common.GateArtifactError, match="seed-5 task identity"):
+        analyze_artifacts.audit_gate_directory(tmp_path)
+
+
+def test_gate7_requires_seed5_task_identity_to_exist_in_preflight_dataset(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    payloads["preflight"]["checks"]["dataset_task_identities"] = [
+        {"task_id": "another-task", "environment_seed": 5}
+    ]
+    _write_gate_payloads(tmp_path, payloads)
+
+    with pytest.raises(common.GateArtifactError, match="preflight dataset"):
+        analyze_artifacts.audit_gate_directory(tmp_path)
+
+
+def test_gate7_rejects_trainer_dependency_hash_different_from_gate5(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    _write_gate_payloads(tmp_path, payloads)
+    trainer_path = tmp_path / analyze_artifacts.REQUIRED_GATE_FILES["trainer"]
+    trainer_payload = json.loads(trainer_path.read_text(encoding="utf-8"))
+    trainer_payload["guided_artifact_sha256"] = "0" * 64
+    trainer_path.write_text(json.dumps(trainer_payload), encoding="utf-8")
+    reload_path = tmp_path / analyze_artifacts.REQUIRED_GATE_FILES["adapter_reload"]
+    reload_path.write_text(
+        json.dumps(_adapter_reload_payload(trainer_path, trainer_payload)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(common.GateArtifactError, match="Gate 5 artifact"):
+        analyze_artifacts.audit_gate_directory(tmp_path)
+
+
+def test_gate7_rejects_checkpoint_bytes_changed_after_gate6(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    payloads = _complete_gate_payloads(checkpoint)
+    _write_gate_payloads(tmp_path, payloads)
+    (checkpoint / "state.bin").write_bytes(b"tampered")
+
+    with pytest.raises(common.GateArtifactError, match="checkpoint_sha256"):
+        analyze_artifacts.audit_gate_directory(tmp_path)
+
+
+def test_external_gate_publishes_runner_output_from_unique_staging_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    artifact = tmp_path / "seed.json"
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        staging = Path(argv[argv.index("--output") + 1])
+        assert staging != artifact
+        staging.write_text('{"fresh":true}\n', encoding="utf-8")
+        assert _kwargs["capture_output"] is True
+        assert _kwargs["text"] is True
+        return subprocess.CompletedProcess(argv, 0, "runner out\n", "runner err\n")
+
+    monkeypatch.setattr(common.subprocess, "run", fake_run)
+    plan = common.ExternalGatePlan(
+        gate_name="seed",
+        config_path=config_path,
+        artifact_path=artifact,
+        runner_command=(
+            f"{sys.executable} fake_runner.py --config {{config}} --output {{artifact}}"
+        ),
+    )
+
+    common.run_external_gate(plan, validate_only=False)
+
+    assert artifact.read_text(encoding="utf-8") == '{"fresh":true}\n'
+    assert (tmp_path / "seed.json.stdout.log").read_text(encoding="utf-8") == "runner out\n"
+    assert (tmp_path / "seed.json.stderr.log").read_text(encoding="utf-8") == "runner err\n"
+    assert not list(tmp_path.glob(".seed.json.*.tmp"))
+
+
+def test_external_gate_direct_publish_passes_final_artifact_to_locked_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    artifact = tmp_path / "trainer.json"
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        destination = Path(argv[argv.index("--output") + 1])
+        assert destination == artifact
+        destination.write_text('{"fresh":true}\n', encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "trainer out\n", "")
+
+    monkeypatch.setattr(common.subprocess, "run", fake_run)
+    plan = common.ExternalGatePlan(
+        gate_name="trainer",
+        config_path=config_path,
+        artifact_path=artifact,
+        runner_command=(
+            f"{sys.executable} fake_runner.py --config {{config}} --output {{artifact}}"
+        ),
+        direct_artifact_publish=True,
+    )
+
+    common.run_external_gate(plan, validate_only=False)
+
+    assert artifact.read_text(encoding="utf-8") == '{"fresh":true}\n'
+    assert (tmp_path / "trainer.json.stdout.log").read_text(encoding="utf-8") == "trainer out\n"
+    assert (tmp_path / "trainer.json.stderr.log").read_text(encoding="utf-8") == ""
+
+
+def test_one_step_trainer_forbids_runner_override(tmp_path: Path) -> None:
+    config_path = _server_config(tmp_path)
+
+    with pytest.raises(SystemExit):
+        one_step_trainer_smoke.main(
+            [
+                "--config",
+                str(config_path),
+                "--artifact",
+                str(tmp_path / "trainer.json"),
+                "--validate-only",
+                "--runner-command",
+                "python unsafe_override.py",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    (
+        check_seed_determinism.main,
+        oracle_clean_replay.main,
+        controller_collector_smoke.main,
+        build_verified_group.main,
+    ),
+)
+def test_canonical_collection_gate_wrappers_forbid_runner_override(
+    entrypoint: object, tmp_path: Path
+) -> None:
+    config_path = _server_config(tmp_path)
+
+    with pytest.raises(SystemExit):
+        entrypoint(
+            [
+                "--config",
+                str(config_path),
+                "--artifact",
+                str(tmp_path / "gate.json"),
+                "--validate-only",
+                "--runner-command",
+                "python custom_runner.py",
+            ]
+        )
+
+
+def test_external_gate_does_not_publish_invalid_staging_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    artifact = tmp_path / "seed.json"
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        staging = Path(argv[argv.index("--output") + 1])
+        staging.write_text('{"passed":false}\n', encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0)
+
+    def reject(_payload: object) -> None:
+        raise common.GateArtifactError("invalid staged evidence")
+
+    monkeypatch.setattr(common.subprocess, "run", fake_run)
+    plan = common.ExternalGatePlan(
+        gate_name="seed",
+        config_path=config_path,
+        artifact_path=artifact,
+        runner_command=(
+            f"{sys.executable} fake_runner.py --config {{config}} --output {{artifact}}"
+        ),
+    )
+
+    with pytest.raises(common.GateArtifactError, match="invalid staged evidence"):
+        common.run_external_gate(plan, validate_only=False, verifier=reject)
+
+    assert not artifact.exists()
+    failure = json.loads(
+        (tmp_path / "seed.json.failure.json").read_text(encoding="utf-8")
+    )
+    assert failure["passed"] is False
+    assert failure["gate"] == "seed"
+    assert failure["exception"] == {
+        "type": "GateArtifactError",
+        "message": "invalid staged evidence",
+        "stage": "artifact_verification",
+    }
+    assert not list(tmp_path.glob(".seed.json.*.tmp"))
+
+
+def test_external_gate_persists_nonzero_runner_failure_and_captured_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    artifact = tmp_path / "seed.json"
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 17, "partial out\n", "child crashed\n")
+
+    monkeypatch.setattr(common.subprocess, "run", fake_run)
+    monkeypatch.setattr(common, "_available_git_sha", lambda _root: "c" * 40)
+    plan = common.ExternalGatePlan(
+        gate_name="seed_determinism",
+        config_path=config_path,
+        artifact_path=artifact,
+        runner_command=(
+            f"{sys.executable} fake_runner.py --config {{config}} --output {{artifact}}"
+        ),
+    )
+
+    with pytest.raises(common.GateExecutionError, match="status 17"):
+        common.run_external_gate(plan, validate_only=False)
+
+    failure = json.loads(
+        (tmp_path / "seed.json.failure.json").read_text(encoding="utf-8")
+    )
+    assert not artifact.exists()
+    assert failure["schema_version"] == 1
+    assert failure["gate"] == "seed"
+    assert failure["passed"] is False
+    assert failure["run_id"] == tmp_path.name
+    assert failure["config_sha256"] == common.artifact_file_sha256(config_path)
+    assert failure["git_sha"] == "c" * 40
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert failure["dataset_sha256"] == common.artifact_file_sha256(
+        config["runtime"]["dataset_path"]
+    )
+    assert failure["exception"]["stage"] == "runner_exit"
+    assert (tmp_path / "seed.json.stdout.log").read_text(encoding="utf-8") == "partial out\n"
+    assert (tmp_path / "seed.json.stderr.log").read_text(encoding="utf-8") == "child crashed\n"
+
+
+@pytest.mark.parametrize("invalid_version", [True, 1.0])
+def test_failure_artifact_requires_exact_integer_schema_version(
+    invalid_version: object,
+) -> None:
+    payload = {
+        "schema_version": invalid_version,
+        "gate": "seed",
+        "passed": False,
+        "run_id": "run-01",
+        "config_sha256": "c" * 64,
+        "git_sha": "d" * 40,
+        "exception": {
+            "type": "RuntimeError",
+            "message": "failed",
+            "stage": "runtime_dispatch",
+        },
+    }
+
+    with pytest.raises(common.GateArtifactError, match="schema_version"):
+        common._verify_failure_artifact(
+            payload,
+            gate="seed",
+            run_id="run-01",
+            config_sha256="c" * 64,
+        )
+
+
+def test_external_gate_promotes_child_failure_before_cleaning_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    artifact = tmp_path / "seed.json"
+    child_payload: dict[str, object] = {}
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    dataset_sha256 = common.artifact_file_sha256(config["runtime"]["dataset_path"])
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        staging = Path(argv[argv.index("--output") + 1])
+        child_failure = common.write_gate_failure_artifact(
+            staging,
+            gate="seed",
+            run_id=tmp_path.name,
+            config_sha256=common.artifact_file_sha256(config_path),
+            git_sha="a" * 40,
+            dataset_sha256=dataset_sha256,
+            error=RuntimeError("child runtime failed"),
+            stage="runtime_dispatch",
+        )
+        child_payload.update(json.loads(child_failure.read_text(encoding="utf-8")))
+        return subprocess.CompletedProcess(argv, 1, "child plan\n", "traceback\n")
+
+    monkeypatch.setattr(common.subprocess, "run", fake_run)
+    plan = common.ExternalGatePlan(
+        gate_name="seed",
+        config_path=config_path,
+        artifact_path=artifact,
+        runner_command=(
+            f"{sys.executable} fake_runner.py --config {{config}} --output {{artifact}}"
+        ),
+    )
+
+    with pytest.raises(common.GateExecutionError, match="status 1"):
+        common.run_external_gate(plan, validate_only=False)
+
+    final_failure = tmp_path / "seed.json.failure.json"
+    assert json.loads(final_failure.read_text(encoding="utf-8")) == child_payload
+    assert not list(tmp_path.glob(".seed.json.*.tmp.failure.json"))
+    assert (tmp_path / "seed.json.stdout.log").is_file()
+    assert (tmp_path / "seed.json.stderr.log").is_file()
+
+
+def test_external_gate_direct_publish_reuses_child_failure_without_overwrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    artifact = tmp_path / "trainer.json"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    dataset_sha256 = common.artifact_file_sha256(config["runtime"]["dataset_path"])
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        destination = Path(argv[argv.index("--output") + 1])
+        common.write_gate_failure_artifact(
+            destination,
+            gate="trainer",
+            run_id=tmp_path.name,
+            config_sha256=common.artifact_file_sha256(config_path),
+            git_sha="b" * 40,
+            dataset_sha256=dataset_sha256,
+            error=RuntimeError("checkpoint validation failed"),
+            stage="artifact_verification",
+        )
+        return subprocess.CompletedProcess(argv, 2, "", "trainer traceback\n")
+
+    monkeypatch.setattr(common.subprocess, "run", fake_run)
+    plan = common.ExternalGatePlan(
+        gate_name="trainer",
+        config_path=config_path,
+        artifact_path=artifact,
+        runner_command=(
+            f"{sys.executable} fake_runner.py --config {{config}} --output {{artifact}}"
+        ),
+        direct_artifact_publish=True,
+    )
+
+    with pytest.raises(common.GateExecutionError, match="status 2"):
+        common.run_external_gate(plan, validate_only=False)
+
+    failure = json.loads(
+        (tmp_path / "trainer.json.failure.json").read_text(encoding="utf-8")
+    )
+    assert failure["exception"]["message"] == "checkpoint validation failed"
+    assert failure["exception"]["stage"] == "artifact_verification"
+    assert (tmp_path / "trainer.json.stderr.log").read_text(encoding="utf-8") == (
+        "trainer traceback\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "claimed_suffix",
+    (".failure.json", ".stdout.log", ".stderr.log"),
+)
+def test_external_gate_refuses_to_overwrite_existing_failure_or_log(
+    claimed_suffix: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _server_config(tmp_path)
+    artifact = tmp_path / "seed.json"
+    claimed = tmp_path / f"seed.json{claimed_suffix}"
+    claimed.write_bytes(b"original immutable evidence\n")
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("runner must not start when an evidence path is claimed")
+
+    monkeypatch.setattr(common.subprocess, "run", forbidden_run)
+    plan = common.ExternalGatePlan(
+        gate_name="seed",
+        config_path=config_path,
+        artifact_path=artifact,
+        runner_command=(
+            f"{sys.executable} fake_runner.py --config {{config}} --output {{artifact}}"
+        ),
+    )
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        common.run_external_gate(plan, validate_only=False)
+
+    assert claimed.read_bytes() == b"original immutable evidence\n"
+    assert not artifact.exists()
+
+
+def test_external_gate_keeps_staged_child_failure_when_final_publication_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _server_config(tmp_path)
+    artifact = tmp_path / "seed.json"
+    final_failure = tmp_path / "seed.json.failure.json"
+    real_link = common.os.link
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    dataset_sha256 = common.artifact_file_sha256(config["runtime"]["dataset_path"])
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        staging = Path(argv[argv.index("--output") + 1])
+        common.write_gate_failure_artifact(
+            staging,
+            gate="seed",
+            run_id=tmp_path.name,
+            config_sha256=common.artifact_file_sha256(config_path),
+            git_sha="a" * 40,
+            dataset_sha256=dataset_sha256,
+            error=RuntimeError("unique child failure"),
+            stage="runtime_dispatch",
+        )
+
+        def fail_final_failure_link(source: object, destination: object) -> None:
+            if Path(destination) == final_failure:
+                raise OSError("failure publication unavailable")
+            real_link(source, destination)
+
+        monkeypatch.setattr(common.os, "link", fail_final_failure_link)
+        return subprocess.CompletedProcess(argv, 3, "", "child failed\n")
+
+    monkeypatch.setattr(common.subprocess, "run", fake_run)
+    plan = common.ExternalGatePlan(
+        gate_name="seed",
+        config_path=config_path,
+        artifact_path=artifact,
+        runner_command=(
+            f"{sys.executable} fake_runner.py --config {{config}} --output {{artifact}}"
+        ),
+    )
+
+    with pytest.raises(common.GateExecutionError, match="status 3") as caught:
+        common.run_external_gate(plan, validate_only=False)
+
+    staged_failures = list(tmp_path.glob(".seed.json.*.tmp.failure.json"))
+    assert not final_failure.exists()
+    assert len(staged_failures) == 1
+    assert json.loads(staged_failures[0].read_text(encoding="utf-8"))["exception"][
+        "message"
+    ] == "unique child failure"
+    assert caught.value.failure_artifact_recording_errors

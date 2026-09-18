@@ -1,0 +1,461 @@
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from capx.rl.capsule.controller import (
+    ControllerProtocolError,
+    ControllerRepairCollector,
+    FrozenControllerConfig,
+    OpenAICompatibleControllerTransport,
+    python_base_unit_spans,
+)
+from capx.rl.capsule.group import CollectionInfrastructureError, ProgramCandidate
+from capx.rl.capsule.schema import ProgramReplayResultV1, ReplayOutcome, TaskInstanceV1
+
+
+def _task() -> TaskInstanceV1:
+    return TaskInstanceV1(
+        task_id="cube-stack-5",
+        environment_seed=5,
+        prompt="Stack the cubes.",
+        environment="robosuite_cube_stack",
+        api="franka_privileged",
+        privilege="privileged",
+        initial_state_sha256="a" * 64,
+    )
+
+
+def _failure(p0: ProgramCandidate) -> ProgramReplayResultV1:
+    task = _task()
+    return ProgramReplayResultV1(
+        task_id=task.task_id,
+        environment_seed=task.environment_seed,
+        program_sample_id=p0.program_sample_id,
+        source=p0.source,
+        initial_state_sha256=task.initial_state_sha256,
+        outcome=ReplayOutcome.PROGRAM_ERROR,
+        raw_reward=0.0,
+        binary_reward=0.0,
+        task_completed=False,
+        error_type="NameError",
+        error_message="missing helper",
+        diagnostics={"stderr": "NameError: missing helper"},
+    )
+
+
+def _syntax_failure(p0: ProgramCandidate) -> ProgramReplayResultV1:
+    task = _task()
+    return ProgramReplayResultV1(
+        task_id=task.task_id,
+        environment_seed=task.environment_seed,
+        program_sample_id=p0.program_sample_id,
+        source=p0.source,
+        initial_state_sha256=task.initial_state_sha256,
+        outcome=ReplayOutcome.PROGRAM_ERROR,
+        raw_reward=0.0,
+        binary_reward=0.0,
+        task_completed=False,
+        error_type="SyntaxError",
+        error_message="invalid syntax (<actor>, line 1)",
+        diagnostics={"stderr": "SyntaxError: invalid syntax"},
+    )
+
+
+class _ScriptedTransport:
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[dict[str, str], ...]] = []
+
+    def complete(self, messages: tuple[dict[str, str], ...]) -> str:
+        self.calls.append(messages)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        assert isinstance(response, str)
+        return response
+
+
+def _action(action: str, **fields: object) -> str:
+    return json.dumps({"action": action, **fields})
+
+
+def test_python_base_units_are_stable_top_level_statement_spans() -> None:
+    source = "# keep this comment\nx = 1\n\ndef helper():\n    return x\n"
+
+    spans = python_base_unit_spans(source)
+
+    assert [span.unit_id for span in spans] == ["group_0", "group_1"]
+    assert [source[span.start_offset : span.end_offset] for span in spans] == [
+        "x = 1",
+        "def helper():\n    return x",
+    ]
+
+
+def test_python_base_units_expose_fences_without_cleaning_actor_source() -> None:
+    source = "```python\nprint('ok')\n```\n"
+
+    spans = python_base_unit_spans(source)
+
+    assert source == "```python\nprint('ok')\n```\n"
+    assert [
+        (span.unit_id, source[span.start_offset : span.end_offset]) for span in spans
+    ] == [
+        ("fence_open", "```python\n"),
+        ("group_0", "print('ok')"),
+        ("fence_close", "```\n"),
+    ]
+    assert [span.expected_source for span in spans] == [
+        "```python\n",
+        "print('ok')",
+        "```\n",
+    ]
+
+
+def test_python_base_units_expose_trailing_protocol_text_without_cleaning() -> None:
+    source = "```python\nprint('ok')\n```\nHere is the requested program.\n"
+
+    spans = python_base_unit_spans(source)
+
+    assert source == "```python\nprint('ok')\n```\nHere is the requested program.\n"
+    assert [
+        (span.unit_id, source[span.start_offset : span.end_offset]) for span in spans
+    ] == [
+        ("fence_open", "```python\n"),
+        ("group_0", "print('ok')"),
+        ("fence_close", "```\n"),
+        ("protocol_suffix", "Here is the requested program.\n"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "if (",
+        "# comments only\n",
+        "",
+        "```python\nprint('missing close')\n",
+        "prefix\n```python\nprint('not outer')\n```\n",
+        "```python\nif (\n```\n",
+    ],
+)
+def test_python_base_units_fall_back_to_whole_program_for_unparseable_source(source: str) -> None:
+    spans = python_base_unit_spans(source)
+
+    assert len(spans) == 1
+    assert spans[0].unit_id == "program"
+    assert spans[0].start_offset == 0
+    assert spans[0].end_offset == len(source)
+
+
+def test_collector_requires_explicit_fence_edits_after_recorded_p0_failure() -> None:
+    source = "```python\nprint('ok')\n```\n"
+    p0 = ProgramCandidate("base-fenced", source)
+    transport = _ScriptedTransport(
+        [
+            _action(
+                "replace",
+                target="base:fence_open",
+                source="",
+                rationale="remove the Actor protocol fence opener",
+            ),
+            _action(
+                "replace",
+                target="base:fence_close",
+                source="",
+                rationale="remove the Actor protocol fence closer",
+            ),
+            _action("finish", rationale="the fenced P0 is now executable Python"),
+        ]
+    )
+
+    trace = ControllerRepairCollector(transport=transport, max_turns=3)(
+        _task(), p0, _syntax_failure(p0), 0, 0, "repair-fenced"
+    )
+
+    first_state = json.loads(transport.calls[0][1]["content"])
+    assert first_state["current_source"] == source
+    assert first_state["base_failure"]["error_type"] == "SyntaxError"
+    assert first_state["base_failure"]["raw_reward"] == 0.0
+    assert [edit.target for edit in trace.edits] == [
+        "base:fence_open",
+        "base:fence_close",
+    ]
+    assert trace.base_source == source
+    assert trace.final_source == "print('ok')\n"
+    assert trace.reconstruct() == trace.final_source
+
+
+def test_collector_tracks_protocol_repairs_and_rejects_repeated_empty_replace() -> None:
+    source = "```python\nprint('ok')\n```\nExplanation.\n"
+    p0 = ProgramCandidate("base-fenced-suffix", source)
+    transport = _ScriptedTransport(
+        [
+            _action("replace", target="base:fence_open", source=""),
+            _action("replace", target="base:fence_open", source=""),
+            _action("replace", target="base:fence_close", source=""),
+            _action("replace", target="base:protocol_suffix", source=""),
+            _action("finish", rationale="protocol bytes removed explicitly"),
+        ]
+    )
+
+    trace = ControllerRepairCollector(transport=transport, max_turns=5)(
+        _task(), p0, _syntax_failure(p0), 0, 0, "repair-fenced-suffix"
+    )
+
+    assert [edit.target for edit in trace.edits] == [
+        "base:fence_open",
+        "base:fence_close",
+        "base:protocol_suffix",
+    ]
+    assert trace.edits[1].turn_index == 3
+    assert trace.audits[0].turn_index == 2
+    assert trace.audits[0].event_type == "invalid"
+    assert "must change" in trace.audits[0].message
+    second_state = json.loads(transport.calls[1][1]["content"])
+    third_state = json.loads(transport.calls[2][1]["content"])
+    assert second_state["protocol_repairs"] == {
+        "completed_targets": ["base:fence_open"],
+        "remaining_targets": ["base:fence_close", "base:protocol_suffix"],
+        "required_targets": [
+            "base:fence_open",
+            "base:fence_close",
+            "base:protocol_suffix",
+        ],
+    }
+    assert third_state["protocol_repairs"] == second_state["protocol_repairs"]
+    assert trace.final_source == "print('ok')\n"
+    assert trace.reconstruct() == trace.final_source
+
+
+def test_collector_never_cleans_fence_without_a_controller_edit() -> None:
+    source = "```python\nprint('ok')\n```\n"
+    p0 = ProgramCandidate("base-fenced", source)
+    transport = _ScriptedTransport([_action("finish", rationale="no repair")])
+
+    trace = ControllerRepairCollector(transport=transport, max_turns=1)(
+        _task(), p0, _syntax_failure(p0), 0, 0, "repair-unmodified-fence"
+    )
+
+    assert trace.edits == ()
+    assert trace.base_source == source
+    assert trace.final_source == source
+
+
+def test_collector_runs_edit_sequence_without_replay_and_reconstructs_pt() -> None:
+    p0 = ProgramCandidate("base-0", "broken = True\n")
+    transport = _ScriptedTransport(
+        [
+            _action(
+                "append",
+                generation_id="recovery_1",
+                unit_id="body",
+                source="recover = False\n",
+                rationale="add recovery",
+            ),
+            _action(
+                "replace",
+                target="base:group_0",
+                source="broken = False",
+                rationale="fix original",
+            ),
+            _action(
+                "replace",
+                target="recovery:recovery_1:body",
+                source="recover = True\n",
+                rationale="fix appended code",
+            ),
+            _action("finish", rationale="complete"),
+        ]
+    )
+    collector = ControllerRepairCollector(transport=transport, max_turns=12)
+
+    trace = collector(_task(), p0, _failure(p0), 0, 0, "repair-0")
+
+    assert len(transport.calls) == 4
+    assert [edit.target for edit in trace.edits] == [
+        "recovery:recovery_1:body",
+        "base:group_0",
+        "recovery:recovery_1:body",
+    ]
+    assert trace.final_source == "broken = False\n\nrecover = True\n"
+    assert trace.reconstruct() == trace.final_source
+    assert trace.audits[-1].event_type == "finish"
+    joined_prompts = "\n".join(message["content"] for call in transport.calls for message in call)
+    assert "Do not execute" in joined_prompts
+    assert "repair-0" in joined_prompts
+    assert "initial_state_sha256" not in joined_prompts
+    assert "NameError: missing helper" in joined_prompts
+
+
+def test_collector_sends_only_system_and_latest_complete_state_each_turn() -> None:
+    p0 = ProgramCandidate("base-0", "broken = True\n")
+    append_response = _action(
+        "append",
+        generation_id="recovery_1",
+        unit_id="body",
+        source="recover = True\n",
+        rationale="add recovery",
+    )
+    transport = _ScriptedTransport([append_response, _action("finish")])
+    collector = ControllerRepairCollector(transport=transport, max_turns=2)
+
+    collector(_task(), p0, _failure(p0), 0, 0, "repair-0")
+
+    assert [[message["role"] for message in call] for call in transport.calls] == [
+        ["system", "user"],
+        ["system", "user"],
+    ]
+    first_state = json.loads(transport.calls[0][1]["content"])
+    latest_state = json.loads(transport.calls[1][1]["content"])
+    assert first_state["current_revision"] == 0
+    assert first_state["current_source"] == p0.source
+    assert first_state["feedback"] == "start repair"
+    assert latest_state["current_revision"] == 1
+    assert latest_state["current_source"] == "broken = True\n\nrecover = True\n"
+    assert latest_state["feedback"] == "committed revision 1 at recovery:recovery_1:body"
+    assert append_response not in transport.calls[1][1]["content"]
+
+
+def test_invalid_and_inspect_actions_only_enter_audit() -> None:
+    transport = _ScriptedTransport(
+        [
+            "not-json",
+            _action("inspect", message="show current targets"),
+            _action("finish"),
+        ]
+    )
+    collector = ControllerRepairCollector(transport=transport, max_turns=3)
+
+    p0 = ProgramCandidate("base-0", "x = 1\n")
+    trace = collector(_task(), p0, _failure(p0), 0, 0, "repair-0")
+
+    assert trace.edits == ()
+    assert [audit.event_type for audit in trace.audits] == [
+        "parse_failure",
+        "inspect",
+        "finish",
+    ]
+    assert trace.final_source == trace.base_source
+
+
+def test_transport_failure_is_typed_as_collection_infrastructure_error() -> None:
+    collector = ControllerRepairCollector(
+        transport=_ScriptedTransport([TimeoutError("controller timeout")]),
+        max_turns=1,
+    )
+
+    with pytest.raises(CollectionInfrastructureError, match="controller request failed"):
+        p0 = ProgramCandidate("base-0", "x = 1\n")
+        collector(_task(), p0, _failure(p0), 0, 0, "repair-0")
+
+
+def test_non_text_transport_response_is_protocol_error() -> None:
+    class _BadTransport:
+        def complete(self, messages):
+            del messages
+            return {"action": "finish"}
+
+    collector = ControllerRepairCollector(transport=_BadTransport(), max_turns=1)
+
+    with pytest.raises(ControllerProtocolError, match="text"):
+        p0 = ProgramCandidate("base-0", "x = 1\n")
+        collector(_task(), p0, _failure(p0), 0, 0, "repair-0")
+
+
+def test_frozen_controller_config_is_strict() -> None:
+    config = FrozenControllerConfig(
+        endpoint="http://controller.invalid/v1",
+        model="controller-model",
+        api_key_env="CAPX_CONTROLLER_API_KEY",
+    )
+    assert config.frozen is True
+    assert config.request_timeout_s == 300.0
+    assert config.max_output_tokens == 4096
+    assert config.stream is False
+    assert config.enable_thinking is False
+
+    with pytest.raises(ValueError, match="frozen"):
+        FrozenControllerConfig(
+            endpoint="http://controller.invalid/v1",
+            model="controller-model",
+            api_key_env="CAPX_CONTROLLER_API_KEY",
+            frozen=False,
+        )
+    with pytest.raises(ValueError, match="max_turns"):
+        FrozenControllerConfig(
+            endpoint="http://controller.invalid/v1",
+            model="controller-model",
+            api_key_env="CAPX_CONTROLLER_API_KEY",
+            max_turns=13,
+        )
+    for invalid in (True, 0, -1):
+        with pytest.raises((TypeError, ValueError), match="max_output_tokens"):
+            FrozenControllerConfig(
+                endpoint="http://controller.invalid/v1",
+                model="controller-model",
+                api_key_env="CAPX_CONTROLLER_API_KEY",
+                max_output_tokens=invalid,
+            )
+    for field_name in ("stream", "enable_thinking"):
+        for invalid in (True, "false", 0, None):
+            with pytest.raises((TypeError, ValueError), match=field_name):
+                FrozenControllerConfig(
+                    endpoint="http://controller.invalid/v1",
+                    model="controller-model",
+                    api_key_env="CAPX_CONTROLLER_API_KEY",
+                    **{field_name: invalid},
+                )
+
+
+def test_openai_transport_is_lazy_and_uses_dedicated_credentials(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class _Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"action":"finish"}'))]
+            )
+
+    class _Client:
+        chat = SimpleNamespace(completions=_Completions())
+
+    client_construction: list[dict[str, str]] = []
+
+    def factory(**kwargs):
+        client_construction.append(kwargs)
+        return _Client()
+
+    monkeypatch.setenv("CAPX_CONTROLLER_API_KEY", "controller-secret")
+    config = FrozenControllerConfig(
+        endpoint="https://coding.dashscope.aliyuncs.com/v1",
+        model="qwen3.7-plus",
+        api_key_env="CAPX_CONTROLLER_API_KEY",
+    )
+    transport = OpenAICompatibleControllerTransport(config, client_factory=factory)
+    assert client_construction == []
+
+    response = transport.complete(({"role": "user", "content": "repair"},))
+
+    assert response == '{"action":"finish"}'
+    assert client_construction == [
+        {
+            "api_key": "controller-secret",
+            "base_url": "https://coding.dashscope.aliyuncs.com/v1",
+            "timeout": 300.0,
+        }
+    ]
+    assert calls == [
+        {
+            "model": "qwen3.7-plus",
+            "messages": [{"role": "user", "content": "repair"}],
+            "temperature": 0.7,
+            "max_tokens": 4096,
+            "stream": False,
+            "extra_body": {"enable_thinking": False},
+            "response_format": {"type": "json_object"},
+        }
+    ]

@@ -17,6 +17,9 @@ from robosuite.controllers.composite.composite_controller_factory import (
 )
 
 from capx.envs.simulators.robosuite_base import RobosuiteBaseEnv
+from capx.rl.capsule.initial_state import (
+    cube_lift_initial_state_sha256_from_observation,
+)
 
 
 class FrankaRobosuiteCubeLiftLowLevel(RobosuiteBaseEnv):
@@ -61,6 +64,7 @@ class FrankaRobosuiteCubeLiftLowLevel(RobosuiteBaseEnv):
                     ),
                     horizon=max_steps,
                     reward_shaping=True,
+                    seed=seed,
                 )
             else:
                 self.robosuite_env = suite.environments.manipulation.lift.Lift(
@@ -78,6 +82,7 @@ class FrankaRobosuiteCubeLiftLowLevel(RobosuiteBaseEnv):
                     ),
                     horizon=max_steps,
                     reward_shaping=True,
+                    seed=seed,
                 )
         else:
             self.robosuite_env = suite.environments.manipulation.lift.Lift(
@@ -94,6 +99,7 @@ class FrankaRobosuiteCubeLiftLowLevel(RobosuiteBaseEnv):
                 controller_configs=load_composite_controller_config(controller=self.controller_cfg),
                 horizon=max_steps,
                 reward_shaping=True,
+                seed=seed,
             )
 
         self._init_robot_links()
@@ -107,7 +113,7 @@ class FrankaRobosuiteCubeLiftLowLevel(RobosuiteBaseEnv):
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if seed is not None:
-            self._rng = np.random.default_rng(seed)
+            self._reseed_robosuite(seed)
 
         self.robosuite_env.reset()
         # Adjust initial orientation
@@ -136,8 +142,13 @@ class FrankaRobosuiteCubeLiftLowLevel(RobosuiteBaseEnv):
         )
 
         info = {
-            "task_prompt": "Place the primary cube on top of the secondary cube. Quaternions are WXYZ."
+            "task_prompt": "Pick up the red cube (primary) and lift it. Quaternions are WXYZ."
         }
+        initial_state_sha256 = cube_lift_initial_state_sha256_from_observation(
+            obs, self._current_joints
+        )
+        if initial_state_sha256 is not None:
+            info["initial_state_sha256"] = initial_state_sha256
         return obs, info
 
     def _cube_pose_dict(self, robosuite_obs: dict[str, Any]) -> dict[str, list[float]]:
@@ -149,8 +160,10 @@ class FrankaRobosuiteCubeLiftLowLevel(RobosuiteBaseEnv):
             ]
         )
 
+        cube_quat_xyzw = np.asarray(robosuite_obs["cube_quat"])
+        cube_quat_wxyz = cube_quat_xyzw[[3, 0, 1, 2]]
         cubeA_world = vtf.SE3(
-            wxyz_xyz=np.concatenate([robosuite_obs["cube_quat"], robosuite_obs["cube_pos"]])
+            wxyz_xyz=np.concatenate([cube_quat_wxyz, robosuite_obs["cube_pos"]])
         )
 
         base_transform = vtf.SE3(wxyz_xyz=base_link_wxyz_xyz).inverse()

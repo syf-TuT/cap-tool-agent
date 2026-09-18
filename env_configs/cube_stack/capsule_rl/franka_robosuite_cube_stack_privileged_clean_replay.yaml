@@ -1,0 +1,24 @@
+# Server-only Cube Stack privileged environment template for deterministic clean replay.
+# Parsing this file has no side effects. Runtime gates start PyRoKi and construct the environment.
+env:
+  _target_: capx.envs.tasks.franka.franka_pick_place.FrankaPickPlaceCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level: franka_robosuite_cubes_low_level
+    privileged: true
+    enable_render: false
+    viser_debug: false
+    apis:
+      - FrankaControlPrivilegedApi
+
+api_servers:
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+record_video: false
+output_dir: ./outputs/cube_stack_capsule_rl_clean_replay
+trials: 1
+num_workers: 1

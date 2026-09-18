@@ -6,7 +6,6 @@ robosuite_cubes_restack.py, robosuite_spill_wipe.py, and robosuite_nut_assembly.
 
 from __future__ import annotations
 
-import collections.abc
 import os
 from typing import Any
 
@@ -17,6 +16,7 @@ import viser.transforms as vtf
 from robosuite.utils.camera_utils import get_real_depth_map
 
 from capx.envs.base import BaseEnv
+from capx.envs.robosuite_seed import reseed_robosuite_owner
 from capx.utils.camera_utils import obs_get_rgb
 from capx.utils.depth_utils import depth_color_to_pointcloud
 
@@ -76,50 +76,9 @@ class RobosuiteBaseEnv(BaseEnv):
         self._current_joints = np.zeros(7, dtype=np.float64)
         self._gripper_fraction = 1.0  # 1.0 = open, 0.0 = closed
 
-    @staticmethod
-    def _set_placement_sampler_rng(
-        sampler: Any,
-        rng: np.random.Generator,
-        *,
-        seen: set[int] | None = None,
-    ) -> None:
-        """Point a placement sampler and its nested samplers at ``rng``."""
-        if sampler is None:
-            return
-
-        if seen is None:
-            seen = set()
-        sampler_id = id(sampler)
-        if sampler_id in seen:
-            return
-        seen.add(sampler_id)
-
-        if hasattr(sampler, "rng"):
-            sampler.rng = rng
-
-        children = getattr(sampler, "samplers", None)
-        if isinstance(children, collections.abc.Mapping):
-            child_samplers = children.values()
-        elif isinstance(children, collections.abc.Iterable) and not isinstance(
-            children, (str, bytes)
-        ):
-            child_samplers = children
-        else:
-            return
-
-        for child in child_samplers:
-            RobosuiteBaseEnv._set_placement_sampler_rng(child, rng, seen=seen)
-
     def _reseed_robosuite(self, seed: int) -> None:
         """Synchronize the wrapper, Robosuite environment, and placement samplers."""
-        rng = np.random.default_rng(seed)
-        self._rng = rng
-        self.robosuite_env.seed = seed
-        self.robosuite_env.rng = rng
-        self._set_placement_sampler_rng(
-            getattr(self.robosuite_env, "placement_initializer", None),
-            rng,
-        )
+        reseed_robosuite_owner(self, seed)
 
     def _init_robot_links(self) -> None:
         """Initialize robot link indices and base transforms. Call after robosuite_env is created."""

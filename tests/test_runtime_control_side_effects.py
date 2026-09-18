@@ -94,6 +94,14 @@ class _ObservationEnv:
         return self.observation
 
 
+class _MotionEnv:
+    def __init__(self):
+        self.moved_joints = []
+
+    def move_to_joints_blocking(self, joints):
+        self.moved_joints.append(joints)
+
+
 def test_collect_returns_empty_for_no_apis():
     assert collect_side_effect_calls([]) == set()
 
@@ -142,6 +150,18 @@ def test_franka_privileged_api_declares_pose_and_gripper_side_effects():
     api = object.__new__(FrankaControlPrivilegedApi)
 
     assert SINGLE_ARM_CONTROL_SIDE_EFFECTS <= api.side_effect_functions()
+
+
+def test_franka_privileged_api_exposes_home_pose_when_declared_as_side_effect():
+    env = _MotionEnv()
+    api = object.__new__(FrankaControlPrivilegedApi)
+    api._env = env
+
+    functions = api.functions()
+
+    assert "home_pose" in functions
+    functions["home_pose"]()
+    assert len(env.moved_joints) == 1
 
 
 def test_franka_reduced_api_declares_joint_and_gripper_side_effects():
