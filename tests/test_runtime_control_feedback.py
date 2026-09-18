@@ -1,5 +1,20 @@
+import pytest
+
 from capx.runtime_control.feedback import build_runtime_feedback
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, RuntimeAction, RuntimeEvent
+
+
+def _effect_group() -> CodeRegionGroup:
+    return CodeRegionGroup(
+        "group_1",
+        1,
+        1,
+        "goto_pose(target)",
+        region_ids=["region_1"],
+        primitive_calls=["goto_pose"],
+        used_names=["goto_pose", "target"],
+        has_robot_side_effect=True,
+    )
 
 
 def test_feedback_binds_failed_region_to_source_span():
@@ -72,17 +87,7 @@ def test_feedback_allows_non_side_effect_group_without_reward_progress():
 
 
 def test_feedback_warns_for_side_effect_group_without_reward_progress():
-    group = CodeRegionGroup(
-        "group_1",
-        1,
-        2,
-        "joints = solve_ik(target)\nmove_to_joints(joints)",
-        region_ids=["region_1", "region_2"],
-        primitive_calls=["solve_ik", "move_to_joints"],
-        defined_names=["joints"],
-        used_names=["solve_ik", "target", "move_to_joints"],
-        has_robot_side_effect=True,
-    )
+    group = _effect_group()
 
     feedback = build_runtime_feedback(
         step_id=1,
@@ -99,6 +104,101 @@ def test_feedback_warns_for_side_effect_group_without_reward_progress():
     assert any("No rollback is available" in hint for hint in feedback.repair_hints)
     assert any("fresh observation" in hint for hint in feedback.repair_hints)
     assert any("append_recovery" in hint for hint in feedback.repair_hints)
+
+
+def test_feedback_sparse_terminal_keeps_successful_effect_without_terminal_progress():
+    feedback = build_runtime_feedback(
+        step_id=1,
+        action=RuntimeAction("run_group", {"group_id": "group_1"}),
+        event=RuntimeEvent(action="run_group", status="success", region_id="group_1"),
+        region=_effect_group(),
+        trace_events=[{"name": "goto_pose", "status": "success"}],
+        before_state={"reward": 0.0, "task_completed": False},
+        after_state={"reward": 0.0, "task_completed": False},
+        progress_mode="sparse_terminal",
+    )
+
+    assert feedback.status == "success"
+    assert feedback.evidence["progress_mode"] == "sparse_terminal"
+    assert feedback.evidence["terminal_progress_unverified"] is True
+    assert "no local task progress" not in feedback.message
+
+
+def test_feedback_sparse_terminal_warns_without_a_primitive_trace():
+    feedback = build_runtime_feedback(
+        step_id=1,
+        action=RuntimeAction("run_group", {"group_id": "group_1"}),
+        event=RuntimeEvent(action="run_group", status="success", region_id="group_1"),
+        region=_effect_group(),
+        trace_events=[],
+        before_state={"reward": 0.0, "task_completed": False},
+        after_state={"reward": 0.0, "task_completed": False},
+        progress_mode="sparse_terminal",
+    )
+
+    assert feedback.status == "warning"
+    assert "terminal_progress_unverified" not in feedback.evidence
+
+
+def test_feedback_sparse_terminal_warns_when_effect_primitive_failed():
+    feedback = build_runtime_feedback(
+        step_id=1,
+        action=RuntimeAction("run_group", {"group_id": "group_1"}),
+        event=RuntimeEvent(action="run_group", status="success", region_id="group_1"),
+        region=_effect_group(),
+        trace_events=[{"name": "goto_pose", "status": "failed"}],
+        before_state={"reward": 0.0, "task_completed": False},
+        after_state={"reward": 0.0, "task_completed": False},
+        progress_mode="sparse_terminal",
+    )
+
+    assert feedback.status == "warning"
+    assert "terminal_progress_unverified" not in feedback.evidence
+
+
+def test_feedback_sparse_terminal_does_not_treat_observation_as_effect():
+    feedback = build_runtime_feedback(
+        step_id=1,
+        action=RuntimeAction("run_group", {"group_id": "group_1"}),
+        event=RuntimeEvent(action="run_group", status="success", region_id="group_1"),
+        region=_effect_group(),
+        trace_events=[{"name": "get_observation", "status": "success"}],
+        before_state={"reward": 0.0, "task_completed": False},
+        after_state={"reward": 0.0, "task_completed": False},
+        progress_mode="sparse_terminal",
+    )
+
+    assert feedback.status == "warning"
+    assert "terminal_progress_unverified" not in feedback.evidence
+
+
+def test_feedback_sparse_terminal_rejects_unknown_progress_mode():
+    with pytest.raises(ValueError, match="progress_mode"):
+        build_runtime_feedback(
+            step_id=1,
+            action=RuntimeAction("run_group", {"group_id": "group_1"}),
+            event=RuntimeEvent(action="run_group", status="success", region_id="group_1"),
+            region=_effect_group(),
+            trace_events=[],
+            before_state={"reward": 0.0, "task_completed": False},
+            after_state={"reward": 0.0, "task_completed": False},
+            progress_mode="unknown",
+        )
+
+
+def test_feedback_sparse_terminal_dense_default_still_warns_without_progress():
+    feedback = build_runtime_feedback(
+        step_id=1,
+        action=RuntimeAction("run_group", {"group_id": "group_1"}),
+        event=RuntimeEvent(action="run_group", status="success", region_id="group_1"),
+        region=_effect_group(),
+        trace_events=[{"name": "goto_pose", "status": "success"}],
+        before_state={"reward": 0.0, "task_completed": False},
+        after_state={"reward": 0.0, "task_completed": False},
+    )
+
+    assert feedback.status == "warning"
+    assert "no local task progress" in feedback.message
 
 
 def test_feedback_keeps_source_patch_successful_without_reward_progress():

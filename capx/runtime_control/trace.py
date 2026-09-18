@@ -41,8 +41,13 @@ class RuntimeTrace:
         }
 
 
-def wrap_function_for_trace(name: str, fn: Callable[..., Any], trace: RuntimeTrace) -> Callable[..., Any]:
-    @functools.wraps(fn)
+def wrap_function_for_trace(
+    name: str,
+    fn: Callable[..., Any],
+    trace: RuntimeTrace,
+    *,
+    expose_wrapped: bool = True,
+) -> Callable[..., Any]:
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         start = time.perf_counter()
         event: dict[str, Any] = {
@@ -74,6 +79,10 @@ def wrap_function_for_trace(name: str, fn: Callable[..., Any], trace: RuntimeTra
         trace.log(event)
         return result
 
+    if expose_wrapped:
+        return functools.wraps(fn)(wrapped)
+    wrapped.__name__ = name
+    wrapped.__qualname__ = name
     return wrapped
 
 

@@ -56,6 +56,144 @@ python capx/envs/launch.py \
     --total-trials 10
 ```
 
+### Capsule LLM-step for standard LIBERO-Object
+
+The `franka_libero_object_0_capsule_llm_step.yaml` configuration targets standard
+`libero_object` task 0. It uses the non-privileged `FrankaLiberoApi`, not a reduced or
+ground-truth API. The Capsule controller uses a text-only decision model: images are
+not attached to its initial or Capsule Action prompts, and wrist-camera capture is
+disabled. Main-camera recording remains enabled through `record_video`. Prompt-visible
+state is limited to proprioception, while full object state is written only to
+diagnostic artifacts and is never added to the LLM prompt or runtime history.
+
+Because this configuration sets `privileged: false`, every generated Capsule program
+must pass the strict Python-subset preflight. This enforcement is independent of
+`capsule_validate_program_contract`; setting that flag to `false` does not disable the
+strict subset. Use no imports, classes, lambdas, `try`, `while`, or async constructs.
+Dynamic or reflective calls and callable aliases are unavailable. Only zero-argument
+`.copy()` is allowed as an attribute call; all other attribute calls are unavailable. The
+execution globals contain only restricted safe builtins and approved public API
+bindings. Programs may directly call those bindings, safe builtins, or proven-pure
+top-level helpers. They may use only statically bounded `for` loops, and total
+computation must remain within the static budget. Legacy arbitrary-Python Capsule
+programs are not available in non-privileged mode.
+
+Molmo remains an internal perception service used by `FrankaLiberoApi`; it is not the
+Capsule decision model. This configuration requires that external Molmo vLLM service
+on port 8122, and it is not auto-started by the YAML. Use a separate Molmo service
+environment so the Molmo `torch`/vLLM dependencies do not conflict with the dedicated
+LIBERO environment. Do not assume `.venv-libero` already contains vLLM. Create the
+service environment once:
+
+```bash
+uv venv .venv-molmo --python 3.12
+source .venv-molmo/bin/activate
+uv sync --active --extra molmo
+```
+
+Then start Molmo from that environment in a separate server terminal:
+
+```bash
+source .venv-molmo/bin/activate
+python -m capx.serving.vllm_server --model allenai/Molmo2-8B --host 127.0.0.1 --port 8122
+```
+
+From another terminal, confirm `http://127.0.0.1:8122/v1/models` is ready before
+starting the configured launch.
+
+`FrankaLiberoApi` uses SAM3 for text segmentation when possible, with Molmo point
+prompts as a fallback. Its multi-view point-cloud API queries Molmo first to locate the
+object in each camera view before applying SAM3, so the Molmo endpoint must be ready
+even though a SAM3 server is also configured.
+
+For a local source-only check, run the focused configuration test below from the
+prepared WSL project at `/home/capx/code/cap-x`; do not run this command from the Windows
+checkout. It parses the YAML and verifies the non-privileged prompt contract; it does
+not start LIBERO, MuJoCo, model servers, or a robot trial.
+
+```bash
+cd /home/capx/code/cap-x
+uv run --no-sync pytest tests/test_runtime_control_config.py -q \
+  -k libero_object_capsule_llm_step_yaml_uses_approved_capabilities
+```
+
+Run the simulator commands below only on a server or dedicated LIBERO runtime with the
+LIBERO environment and required LLM, PyRoKi, SAM3, and Contact-GraspNet services
+available. They are not local Windows validation commands. Validate task 0 first, then
+expand to all ten tasks.
+
+Task-0 smoke test:
+
+```bash
+source .venv-libero/bin/activate
+MUJOCO_GL=egl TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+uv run --no-sync --active capx/envs/launch.py \
+  --config-path env_configs/libero/franka_libero_object_0_capsule_llm_step.yaml \
+  --total-trials 1 \
+  --num-workers 1
+```
+
+Task 0 over five initial states:
+
+```bash
+source .venv-libero/bin/activate
+MUJOCO_GL=egl TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+uv run --no-sync --active python -m capx.envs.scripts.run_libero_batch \
+  --base-config-path env_configs/libero/franka_libero_object_0_capsule_llm_step.yaml \
+  --suites libero_object \
+  --task-ids 0 \
+  --total-trials 5 \
+  --num-workers 1 \
+  --output-dir ./outputs/libero_object_capsule_llm_step_task0
+```
+
+All ten tasks over five initial states each:
+
+```bash
+source .venv-libero/bin/activate
+MUJOCO_GL=egl TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+uv run --no-sync --active python -m capx.envs.scripts.run_libero_batch \
+  --base-config-path env_configs/libero/franka_libero_object_0_capsule_llm_step.yaml \
+  --suites libero_object \
+  --total-trials 5 \
+  --num-workers 1 \
+  --output-dir ./outputs/libero_object_capsule_llm_step_all
+```
+
+Each run directory contains the generated Capsule program, sanitized initial/step
+prompts, runtime trace JSON, per-step metrics, full-state diagnostic JSONL, and a
+`capsule_visuals_trial_<NN>/` directory with the main/wrist PNG files. Persisted prompt
+artifacts contain image metadata and relative PNG paths rather than inline base64 image
+payloads.
+
+### Privileged Capsule LLM-step for standard LIBERO-Object
+
+The `env_configs/libero/franka_libero_object_0_privileged_capsule_llm_step.yaml`
+configuration also targets standard `libero_object` task 0, but uses ground-truth object
+poses through `FrankaLiberoPrivilegedApi`. It is separate from and does not change the
+non-privileged Capsule baseline above.
+
+With `capsule_prompt_state_level: full`, post-action observations created after a
+`run_group` use full ground-truth object state and are attached to subsequent Capsule
+Action prompts. The initial Action prompt has no post-action snapshot. Diagnostic
+artifacts independently use full state through `capsule_diagnostic_state_level: full`.
+Visual feedback and wrist-camera prompt capture remain disabled, while main-camera video
+recording remains enabled.
+
+Of the API/perception services, only PyRoKi on port 8116 is required and auto-started by
+this configuration. Molmo, SAM3, and Contact-GraspNet are not used; the Capsule run still
+requires its configured LLM endpoint. Run this smoke test only on a server or dedicated
+LIBERO runtime, not from the Windows checkout:
+
+```bash
+source .venv-libero/bin/activate
+MUJOCO_GL=egl TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+uv run --no-sync --active capx/envs/launch.py \
+  --config-path env_configs/libero/franka_libero_object_0_privileged_capsule_llm_step.yaml \
+  --total-trials 1 \
+  --num-workers 1
+```
+
 ## Choosing a Task
 
 Each LIBERO task is specified by a **suite name** and **task index**. The YAML config's `low_level` field follows the pattern:

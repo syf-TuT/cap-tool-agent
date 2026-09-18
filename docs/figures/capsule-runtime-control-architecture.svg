@@ -216,16 +216,15 @@
     <text x="1264" y="128" class="box-title">Capsule Action LLM</text>
     <text x="1264" y="150" class="body">Chooses one runtime-control action</text>
     <rect x="1264" y="164" width="112" height="23" rx="11" class="chip-blue"/>
-    <text x="1277" y="180" class="chip-text">regions + groups</text>
+    <text x="1277" y="180" class="chip-text">groups + evidence</text>
     <rect x="1384" y="164" width="58" height="23" rx="11" class="chip-blue"/>
     <text x="1397" y="180" class="chip-text">history</text>
     <rect x="1449" y="164" width="74" height="23" rx="11" class="chip-blue"/>
     <text x="1462" y="180" class="chip-text">feedback</text>
     <text x="1264" y="210" class="body-small">Allowed actions:</text>
-    <text x="1264" y="229" class="code">run_group, run_region</text>
-    <text x="1264" y="246" class="code">inspect_trace, inspect_variables</text>
-    <text x="1264" y="263" class="code">patch_group, patch_region</text>
-    <text x="1264" y="276" class="code">append_recovery, finish</text>
+    <text x="1264" y="229" class="code">run_group, inspect_variables</text>
+    <text x="1264" y="246" class="code">patch_group, append_recovery</text>
+    <text x="1264" y="263" class="code">finish</text>
   </g>
 
   <path d="M260 180H296" class="arrow-blue" marker-end="url(#arrow-blue)"/>
@@ -248,7 +247,7 @@
     <rect x="615" y="405" width="165" height="58" rx="6" class="purple-module"/>
     <text x="633" y="427" class="box-title">normalizer</text>
     <text x="633" y="447" class="body-small">merge regions into</text>
-    <text x="633" y="460" class="body-small">semantic groups</text>
+    <text x="633" y="460" class="body-small">effect-bounded groups</text>
 
     <rect x="800" y="405" width="165" height="58" rx="6" class="purple-module"/>
     <text x="818" y="427" class="box-title">prompt builder</text>
@@ -273,8 +272,8 @@
 
     <rect x="800" y="486" width="165" height="58" rx="6" class="purple-module"/>
     <text x="818" y="508" class="box-title">executor</text>
-    <text x="818" y="528" class="body-small">execute selected</text>
-    <text x="818" y="541" class="body-small">region or group</text>
+    <text x="818" y="528" class="body-small">execute one selected</text>
+    <text x="818" y="541" class="body-small">effect-bounded group</text>
 
     <rect x="985" y="486" width="165" height="58" rx="6" class="green-light"/>
     <text x="1003" y="508" class="box-title">trace recorder</text>
@@ -294,7 +293,7 @@
   <text x="564" y="298" class="body-small" fill="#2563eb">source enters runtime control</text>
 
   <path d="M965 424C1072 358 1144 308 1240 202" class="arrow-purple" marker-end="url(#arrow-purple)"/>
-  <text x="1048" y="345" class="body-small" fill="#7c3aed">prompt: groups, regions, history, trace</text>
+  <text x="1048" y="345" class="body-small" fill="#7c3aed">prompt: groups + bounded evidence</text>
   <path d="M1242 229C1162 289 1100 328 1068 402" class="arrow-purple" marker-end="url(#arrow-purple)"/>
   <text x="1110" y="292" class="body-small" fill="#7c3aed">JSON action</text>
 
@@ -321,7 +320,8 @@
 
   <g>
     <rect x="420" y="604" width="330" height="34" rx="6" fill="#fff7ed" stroke="#fed7aa"/>
-    <text x="438" y="626" class="body-small" fill="#9a3412">After patch_group, patch_region, or append_recovery: re-segment and regroup source.</text>
+    <text x="438" y="619" class="body-small" fill="#9a3412">After patch_group / append_recovery:</text>
+    <text x="438" y="633" class="body-small" fill="#9a3412">regroup source; do not auto-execute.</text>
     <path d="M707 604C748 585 753 553 696 547C624 540 545 548 513 486" class="arrow-orange dash" marker-end="url(#arrow-orange)"/>
   </g>
 

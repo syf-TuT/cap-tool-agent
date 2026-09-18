@@ -27,6 +27,7 @@ class RunOutcome(str, Enum):
     LLM_FAILED = "llm_failed"
     TRIAL_BUDGET_EXHAUSTED = "trial_budget_exhausted"
     EXECUTION_FAILED = "execution_failed"
+    INFRASTRUCTURE_FAILED = "infrastructure_failed"
     CANCELLED = "cancelled"
     PARENT_GUARD_KILLED = "parent_guard_killed"
 

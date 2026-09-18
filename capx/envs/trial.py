@@ -14,44 +14,74 @@ from __future__ import annotations
 
 import ast
 import base64
+import binascii
 import copy
 import gc
+import hashlib
 import io
 import json
 import os
+import re
 import time
-from typing import Any
+from collections import Counter
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+
+# Use TYPE_CHECKING to avoid circular imports for type hints only
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from PIL import Image
 
 from capx.envs.configs.instantiate import instantiate
+from capx.envs.infrastructure import (
+    InfrastructureFailure,
+    classify_runtime_infrastructure_failure,
+)
 from capx.envs.tasks.base import CodeExecutionEnvBase
+from capx.envs.trial_results import RunOutcome
+from capx.llm.client import (
+    VLM_MODELS,
+    ModelQueryArgs,
+)
+from capx.llm.client import (
+    query_model as _query_model,
+)
+from capx.llm.client import (
+    query_model_ensemble as _query_model_ensemble,
+)
+from capx.llm.client import (
+    query_single_model_ensemble as _query_single_model_ensemble,
+)
+from capx.llm.context import get_trial_llm_context, llm_call_stage
 from capx.runtime_control import (
     CapsuleExecutor,
     CodeRegion,
     CodeRegionGroup,
+    LineageAmbiguityError,
+    PostActionObservation,
+    ProgramContractViolation,
+    RecoveryGeneration,
     RuntimeAction,
     RuntimeEvent,
     RuntimeTrace,
+    SourceRevision,
+    UnitLineage,
+    analyze_capsule_program_contract_details,
+    analyze_capsule_strict_subset,
     build_capsule_prompt,
     build_runtime_feedback,
     parse_runtime_action_response,
+    preflight_capsule_strict_source,
+    reconcile_lineage,
     replace_region_source,
     segment_python_code,
     segment_python_code_groups,
+    validate_progress_mode,
 )
 from capx.runtime_control.segmenter import ROBOT_SIDE_EFFECT_CALLS
 from capx.runtime_control.side_effects import collect_side_effect_calls
-
-from capx.llm.client import (
-    VLM_MODELS,
-    ModelQueryArgs,
-    query_model as _query_model,
-    query_model_ensemble as _query_model_ensemble,
-    query_single_model_ensemble as _query_single_model_ensemble,
-)
-from capx.llm.context import llm_call_stage
 from capx.utils.launch_utils import (
     TrialSummary,
     _build_multi_turn_decision_prompt,
@@ -63,14 +93,13 @@ from capx.utils.launch_utils import (
 )
 from capx.utils.video_utils import _encode_video_base64, _write_video
 
-# Use TYPE_CHECKING to avoid circular imports for type hints only
-from typing import TYPE_CHECKING
-
 if TYPE_CHECKING:
     from capx.envs.launch import LaunchArgs
 
 
 MULTITURN_LIMIT = 10
+CAPSULE_INFRASTRUCTURE_MAX_ATTEMPTS = 3
+CAPSULE_INFRASTRUCTURE_RETRY_BACKOFF_SECONDS = (0.5, 1.0)
 
 # ---------------------------------------------------------------------------
 # Shared formatting helpers
@@ -82,7 +111,7 @@ def _annotate_code_blocks(
 ) -> str:
     """Join code blocks into a single string with ``# Code block N`` headers."""
     annotated = []
-    for i, (block, metadata) in enumerate(zip(code_blocks, code_block_metadata, strict=False)):
+    for i, (block, _metadata) in enumerate(zip(code_blocks, code_block_metadata, strict=False)):
         annotated.append(f"# Code block {i}\n{block}")
     return "\n\n".join(annotated)
 
@@ -228,6 +257,451 @@ def _save_turn_and_combined_videos(
 # ---------------------------------------------------------------------------
 # Visual feedback and image differencing
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CapsuleVisual:
+    """One current camera observation prepared for a Capsule prompt."""
+
+    camera: str
+    data_url: str
+    image: Image.Image
+    width: int
+    height: int
+    sha256: str
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "camera": self.camera,
+            "width": self.width,
+            "height": self.height,
+            "sha256": self.sha256,
+        }
+
+
+def _capsule_capture_error(camera: str, error: str) -> dict[str, str]:
+    return {"camera": camera, "error": error}
+
+
+_CAPSULE_VISUAL_ERROR_CAMERAS = {"main", "wrist", "all", "unknown"}
+_CAPSULE_VISUAL_ERROR_CODES = {
+    "camera_unavailable",
+    "capture_failed",
+    "invalid_camera",
+    "save_failed",
+    "unknown_error",
+}
+
+
+def _normalize_capsule_visual_errors(
+    errors: list[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    """Keep visual audit errors generic and safe to persist."""
+    normalized: list[dict[str, str]] = []
+    for error in errors:
+        camera = str(error.get("camera", "unknown"))
+        if camera not in _CAPSULE_VISUAL_ERROR_CAMERAS:
+            camera = "unknown"
+        error_code = str(error.get("error", "unknown_error"))
+        if error_code not in _CAPSULE_VISUAL_ERROR_CODES:
+            error_code = "unknown_error"
+        item = _capsule_capture_error(
+            camera,
+            error_code,
+        )
+        path = _safe_relative_artifact_path(error.get("path"))
+        if path is not None:
+            item["path"] = path
+        normalized.append(item)
+    return normalized
+
+
+def _capsule_visual_audit_entries(
+    errors: list[Mapping[str, Any]],
+    *,
+    step_id: int,
+    phase: str,
+) -> list[dict[str, Any]]:
+    return [
+        {"step_id": step_id, "phase": phase, **error}
+        for error in _normalize_capsule_visual_errors(errors)
+    ]
+
+
+def _visual_payloads(value: Any) -> list[Any]:
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def _decode_image_data_url(data_url: str) -> tuple[str, bytes]:
+    if not isinstance(data_url, str) or "," not in data_url:
+        raise ValueError("visual payload is not a base64 data URL")
+    header, encoded = data_url.split(",", 1)
+    header_parts = header.split(";")
+    if not header_parts or header_parts[0].casefold() != "data:image/png":
+        raise ValueError("visual payload must use the PNG media type")
+    parameters = [parameter.casefold() for parameter in header_parts[1:]]
+    if not parameters or parameters[-1] != "base64" or parameters.count("base64") != 1:
+        raise ValueError("visual payload must use a standalone base64 parameter")
+    compact_payload = re.sub(r"\s+", "", encoded)
+    try:
+        png_bytes = base64.b64decode(compact_payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("visual payload contains invalid base64") from exc
+    return "image/png", png_bytes
+
+
+def _capsule_visual_from_payload(
+    camera: str,
+    data_url: Any,
+    image: Any,
+) -> CapsuleVisual:
+    if not isinstance(data_url, str) or not isinstance(image, Image.Image):
+        raise ValueError("visual capture returned no image")
+    _, png_bytes = _decode_image_data_url(data_url)
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as decoded_image:
+            if decoded_image.format != "PNG":
+                raise ValueError("visual payload is not a PNG")
+            decoded_image.verify()
+        with Image.open(io.BytesIO(png_bytes)) as decoded_image:
+            decoded_image.load()
+            decoded_size = decoded_image.size
+            decoded_mode = decoded_image.mode
+    except (OSError, ValueError) as exc:
+        raise ValueError("visual payload must decode to a valid PNG") from exc
+    if decoded_mode not in {"RGB", "RGBA"}:
+        raise ValueError("visual PNG must use RGB or RGBA mode")
+    if image.size != decoded_size or image.mode != decoded_mode:
+        raise ValueError("visual PNG and supplied PIL metadata do not match")
+    independent_image = image.copy()
+    width, height = independent_image.size
+    return CapsuleVisual(
+        camera=camera,
+        data_url=data_url,
+        image=independent_image,
+        width=width,
+        height=height,
+        sha256=hashlib.sha256(png_bytes).hexdigest(),
+    )
+
+
+def _try_capsule_visual(
+    camera: str,
+    data_url: Any,
+    image: Any,
+) -> CapsuleVisual | None:
+    try:
+        return _capsule_visual_from_payload(camera, data_url, image)
+    except Exception:
+        return None
+
+
+def _capture_capsule_main(env: CodeExecutionEnvBase) -> CapsuleVisual | None:
+    try:
+        data_url, image = _get_visual_feedback(env, use_wrist_camera=False)
+    except Exception:
+        return None
+    return _try_capsule_visual("main", data_url, image)
+
+
+def _capture_capsule_visuals(
+    env: CodeExecutionEnvBase,
+    *,
+    use_wrist_camera: bool = False,
+) -> tuple[list[CapsuleVisual], list[dict[str, str]]]:
+    """Capture current main/wrist observations without retaining stale frames."""
+    if not use_wrist_camera:
+        main_record = _capture_capsule_main(env)
+        if main_record is not None:
+            return [main_record], []
+        return [], [_capsule_capture_error("main", "capture_failed")]
+
+    combined_data_urls: list[Any] = []
+    combined_images: list[Any] = []
+    try:
+        data_urls, images = _get_visual_feedback(env, use_wrist_camera=True)
+        combined_data_urls = _visual_payloads(data_urls)
+        combined_images = _visual_payloads(images)
+    except Exception:
+        combined_data_urls = combined_images = []
+
+    if len(combined_data_urls) >= 2 and len(combined_images) >= 2:
+        main_record = _try_capsule_visual(
+            "main", combined_data_urls[0], combined_images[0]
+        )
+        wrist_record = _try_capsule_visual(
+            "wrist", combined_data_urls[1], combined_images[1]
+        )
+        if main_record is None:
+            main_record = _capture_capsule_main(env)
+
+        records = [record for record in (main_record, wrist_record) if record is not None]
+        errors = []
+        if main_record is None:
+            errors.append(_capsule_capture_error("main", "capture_failed"))
+        if wrist_record is None:
+            errors.append(_capsule_capture_error("wrist", "capture_failed"))
+        return records, errors
+
+    main_record = _capture_capsule_main(env)
+    records = [main_record] if main_record is not None else []
+    errors = []
+    if main_record is None:
+        errors.append(_capsule_capture_error("main", "capture_failed"))
+    wrist_error = (
+        "camera_unavailable" if not hasattr(env, "render_wrist") else "capture_failed"
+    )
+    errors.append(_capsule_capture_error("wrist", wrist_error))
+    return records, errors
+
+
+def _attach_capsule_visuals(
+    prompt: list[dict[str, Any]],
+    records: list[CapsuleVisual],
+    errors: list[Mapping[str, str]],
+) -> list[dict[str, Any]]:
+    """Return a prompt copy with current camera observations appended."""
+    attached = copy.deepcopy(prompt)
+    if not attached:
+        attached.append({"role": "user", "content": []})
+
+    content = attached[-1].get("content", [])
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    elif not isinstance(content, list):
+        content = [{"type": "text", "text": str(content)}]
+    else:
+        content = list(content)
+    attached[-1]["content"] = content
+
+    for record in records:
+        content.extend([
+            {"type": "text", "text": f"Current {record.camera}-camera view"},
+            {"type": "image_url", "image_url": {"url": record.data_url}},
+        ])
+    for error in errors:
+        camera = error.get("camera", "unknown")
+        error_code = error.get("error", "capture_failed")
+        content.append({
+            "type": "text",
+            "text": f"Current {camera}-camera view unavailable ({error_code}).",
+        })
+    return attached
+
+
+_DATA_URL_TEXT = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])data:(?:[-A-Za-z0-9.+]+/[-A-Za-z0-9.+]+)?"
+    r"(?:;[-A-Za-z0-9.+]+(?:=[-A-Za-z0-9.+]*)?)*;base64,"
+)
+_STANDALONE_BASE64_PAYLOAD = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])base64,(?=\s*[A-Za-z0-9+/_=-]{8})"
+)
+
+
+def _sanitize_text_data_urls(value: str) -> str:
+    match = _DATA_URL_TEXT.search(value)
+    if match is None:
+        match = _STANDALONE_BASE64_PAYLOAD.search(value)
+    if match is None:
+        return value
+    return f"{value[:match.start()]}[binary_payload_redacted]"
+
+
+def _safe_relative_artifact_path(value: Any) -> str | None:
+    if not isinstance(value, (str, os.PathLike)):
+        return None
+    raw_path = os.fspath(value)
+    if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+        return None
+    normalized = raw_path.replace("\\", "/")
+    if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+        return None
+    artifact_path = PurePosixPath(normalized)
+    if ".." in artifact_path.parts:
+        return None
+    canonical = artifact_path.as_posix()
+    if canonical in {"", "."} or canonical != normalized:
+        return None
+    return canonical
+
+
+def _image_reference_metadata(
+    value: Any,
+    *,
+    camera: str,
+    artifact_by_sha256: Mapping[str, Any],
+) -> dict[str, Any]:
+    image_url = value
+    if isinstance(value, Mapping):
+        image_url = value.get("url", "")
+    image_url = image_url if isinstance(image_url, str) else str(image_url)
+
+    width = height = None
+    media_type = "unknown"
+    try:
+        media_type, image_bytes = _decode_image_data_url(image_url)
+        digest = hashlib.sha256(image_bytes).hexdigest()
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            width, height = image.size
+    except Exception:
+        digest = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
+
+    artifact = artifact_by_sha256.get(digest)
+    if (
+        isinstance(artifact, Mapping)
+        and "path" not in artifact
+        and camera in artifact
+    ):
+        artifact = artifact[camera]
+    artifact_metadata = artifact if isinstance(artifact, Mapping) else {}
+    path = artifact_metadata.get("path") if artifact_metadata else artifact
+    artifact_camera = artifact_metadata.get("camera", camera)
+    if artifact_camera not in {"main", "wrist"}:
+        artifact_camera = camera if camera in {"main", "wrist"} else "unknown"
+    return {
+        "camera": artifact_camera,
+        "path": _safe_relative_artifact_path(path),
+        "width": artifact_metadata.get("width", width),
+        "height": artifact_metadata.get("height", height),
+        "sha256": digest,
+        "media_type": artifact_metadata.get("media_type", media_type),
+    }
+
+
+def _sanitize_multimodal_prompt(
+    prompt: Any,
+    artifact_by_sha256: Mapping[str, Any] | None = None,
+) -> Any:
+    """Deep-copy a prompt while replacing image payloads with artifact metadata."""
+    artifacts = artifact_by_sha256 or {}
+
+    def sanitize(value: Any, *, camera: str = "unknown") -> Any:
+        if isinstance(value, (list, tuple)):
+            sanitized_items = []
+            next_camera = camera
+            image_count = 0
+            for item in value:
+                if isinstance(item, Mapping) and item.get("type") == "text":
+                    text = str(item.get("text", "")).lower()
+                    if "wrist-camera" in text or "wrist camera" in text:
+                        next_camera = "wrist"
+                    elif (
+                        "main-camera" in text
+                        or "main camera" in text
+                        or "image of the initial state" in text
+                    ):
+                        next_camera = "main"
+                if isinstance(item, Mapping) and item.get("type") == "image_url":
+                    item_camera = next_camera
+                    if item_camera == "unknown" and image_count == 0:
+                        item_camera = "main"
+                    sanitized_items.append(sanitize(item, camera=item_camera))
+                    image_count += 1
+                    next_camera = "unknown"
+                else:
+                    sanitized_items.append(sanitize(item, camera=next_camera))
+            return sanitized_items
+        if isinstance(value, Mapping):
+            if value.get("type") == "image_url" or "image_url" in value:
+                image_value = value.get("image_url", value)
+                return {
+                    "type": "image_reference",
+                    "image_reference": _image_reference_metadata(
+                        image_value,
+                        camera=camera,
+                        artifact_by_sha256=artifacts,
+                    ),
+                }
+            return {key: sanitize(item, camera=camera) for key, item in value.items()}
+        if isinstance(value, str):
+            return _sanitize_text_data_urls(value)
+        return copy.deepcopy(value)
+
+    return sanitize(copy.deepcopy(prompt))
+
+
+def _save_capsule_visuals(
+    records: list[CapsuleVisual],
+    output_dir: str | os.PathLike[str] | None,
+    *,
+    trial_id: int,
+    step_id: int,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Persist captured PNG payloads and return hashes mapped to relative paths."""
+    if output_dir is None:
+        return {}, []
+
+    output_root = Path(output_dir)
+    visual_dir = output_root / f"capsule_visuals_trial_{trial_id:02d}"
+    artifact_by_sha256: dict[str, Any] = {}
+    camera_by_sha256: dict[str, str] = {}
+    errors: list[dict[str, str]] = []
+    try:
+        visual_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return {}, [_capsule_capture_error("all", "save_failed")]
+
+    for record in records:
+        if record.camera not in {"main", "wrist"}:
+            errors.append(_capsule_capture_error("unknown", "invalid_camera"))
+            continue
+        relative_path = Path(visual_dir.name) / f"step_{step_id:02d}_{record.camera}.png"
+        try:
+            validated_record = _capsule_visual_from_payload(
+                record.camera, record.data_url, record.image
+            )
+            if validated_record.metadata() != record.metadata():
+                raise ValueError("visual record metadata mismatch")
+            _, png_bytes = _decode_image_data_url(record.data_url)
+            (output_root / relative_path).write_bytes(png_bytes)
+            artifact_path = relative_path.as_posix()
+            existing_artifact = artifact_by_sha256.get(record.sha256)
+            if existing_artifact is None:
+                artifact_by_sha256[record.sha256] = artifact_path
+                camera_by_sha256[record.sha256] = record.camera
+            else:
+                if isinstance(existing_artifact, Mapping):
+                    camera_artifacts = dict(existing_artifact)
+                else:
+                    camera_artifacts = {
+                        camera_by_sha256[record.sha256]: existing_artifact
+                    }
+                camera_artifacts[record.camera] = artifact_path
+                artifact_by_sha256[record.sha256] = camera_artifacts
+        except (OSError, ValueError, TypeError):
+            errors.append(_capsule_capture_error(record.camera, "save_failed"))
+    return artifact_by_sha256, errors
+
+
+def _capture_and_save_capsule_visuals(
+    env: CodeExecutionEnvBase,
+    output_dir: str | os.PathLike[str] | None,
+    *,
+    trial_id: int,
+    step_id: int,
+    use_wrist_camera: bool,
+) -> tuple[
+    list[CapsuleVisual],
+    list[dict[str, str]],
+    list[dict[str, str]],
+    dict[str, Any],
+]:
+    records, capture_errors = _capture_capsule_visuals(
+        env, use_wrist_camera=use_wrist_camera
+    )
+    artifacts, save_errors = _save_capsule_visuals(
+        records,
+        output_dir,
+        trial_id=trial_id,
+        step_id=step_id,
+    )
+    return (
+        records,
+        _normalize_capsule_visual_errors(capture_errors),
+        _normalize_capsule_visual_errors(save_errors),
+        artifacts,
+    )
+
 
 def _capture_initial_visual_feedback(
     env: CodeExecutionEnvBase,
@@ -487,10 +961,14 @@ def _get_video_differencing_feedback(
 # Initial code generation
 # ---------------------------------------------------------------------------
 
+
 def _query_initial_code(
     args: LaunchArgs,
     config: dict[str, Any],
     obs: dict[str, Any],
+    *,
+    trial: int,
+    artifact_by_sha256: Mapping[str, Any] | None = None,
 ) -> tuple[str, str | None, dict | None]:
     """Query the model for the initial code generation.
 
@@ -498,8 +976,15 @@ def _query_initial_code(
         (raw_code, reasoning, ensemble_data)
     """
     # Save the initial prompt
-    with open(os.path.join(config["output_dir"], "initial_prompt.txt"), "w") as f:
-        f.write(str(obs["full_prompt"]))
+    artifact_name = f"initial_prompt_trial_{trial:02d}.txt"
+    with open(os.path.join(config["output_dir"], artifact_name), "w") as f:
+        f.write(
+            str(
+                _sanitize_multimodal_prompt(
+                    obs["full_prompt"], artifact_by_sha256=artifact_by_sha256
+                )
+            )
+        )
 
     ensemble_data = None
     if config["use_parallel_ensemble"]:
@@ -689,6 +1174,571 @@ def _whole_source_fallback_units(
     return [region], [group]
 
 
+@dataclass
+class _CapsuleSourceAnalysis:
+    regions: list[CodeRegion]
+    groups: list[CodeRegionGroup]
+    syntax_error: SyntaxError | None
+    contract_violations: list[ProgramContractViolation]
+    strict_subset_violations: list[ProgramContractViolation]
+    contract_effectful_region_ids: set[str]
+    contract_effectful_group_ids: set[str]
+
+
+@dataclass
+class _PreparedSourceEdit:
+    source: str
+    analysis: _CapsuleSourceAnalysis
+    revision: SourceRevision
+    lineage: UnitLineage
+    group_boundary_after_lines: set[int]
+    region_by_id: dict[str, CodeRegion]
+    group_by_id: dict[str, CodeRegionGroup]
+    recovery_generations: list[RecoveryGeneration]
+
+
+@dataclass(frozen=True)
+class _GroupDependencyState:
+    runnable_group_ids: tuple[str, ...]
+    missing_by_group_id: dict[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True)
+class _RecoveryActionState:
+    append_recovery_available: bool
+    append_recovery_block_reason: str | None
+    pending_recovery_group_ids: tuple[str, ...]
+    runnable_recovery_group_ids: tuple[str, ...]
+
+
+def _group_dependency_state(
+    groups: list[CodeRegionGroup],
+    runtime_globals: Mapping[str, Any],
+) -> _GroupDependencyState:
+    source_defined_names = {
+        name for group in groups for name in group.defined_names
+    }
+    missing_by_group_id = {
+        group.group_id: tuple(
+            name
+            for name in group.used_names
+            if (
+                name in source_defined_names
+                and name not in group.defined_names
+                and name not in runtime_globals
+            )
+        )
+        for group in groups
+    }
+    return _GroupDependencyState(
+        runnable_group_ids=tuple(
+            group.group_id
+            for group in groups
+            if not missing_by_group_id[group.group_id]
+        ),
+        missing_by_group_id={
+            group_id: missing
+            for group_id, missing in missing_by_group_id.items()
+            if missing
+        },
+    )
+
+
+def _recovery_generation_complete(generation: RecoveryGeneration) -> bool:
+    return (
+        generation.observation_satisfied
+        and not generation.authorized_group_keys
+        and not generation.authorized_region_keys
+    )
+
+
+def _recovery_action_state(
+    groups: list[CodeRegionGroup],
+    *,
+    lineage: UnitLineage,
+    recovery_generations: list[RecoveryGeneration],
+    group_dependency_state: _GroupDependencyState,
+) -> _RecoveryActionState:
+    if not recovery_generations:
+        return _RecoveryActionState(
+            append_recovery_available=True,
+            append_recovery_block_reason=None,
+            pending_recovery_group_ids=(),
+            runnable_recovery_group_ids=(),
+        )
+
+    generation = recovery_generations[-1]
+    if _recovery_generation_complete(generation):
+        return _RecoveryActionState(
+            append_recovery_available=True,
+            append_recovery_block_reason=None,
+            pending_recovery_group_ids=(),
+            runnable_recovery_group_ids=(),
+        )
+
+    pending_keys = set(generation.authorized_group_keys)
+    if not generation.observation_satisfied:
+        pending_keys.update(generation.observation_group_keys)
+    runnable_keys = set(generation.observation_group_keys)
+    if generation.observation_satisfied:
+        runnable_keys.update(generation.authorized_group_keys)
+    else:
+        runnable_keys.update(
+            generation.authorized_group_keys
+            & generation.inline_observation_group_keys
+        )
+    dependency_runnable = set(group_dependency_state.runnable_group_ids)
+    pending_group_ids = []
+    runnable_group_ids = []
+    for group in groups:
+        group_key = lineage.group_key_by_id.get(group.group_id)
+        if (
+            group_key in pending_keys
+            and group_key not in lineage.executed_group_keys
+        ):
+            pending_group_ids.append(group.group_id)
+        if (
+            group.group_id in dependency_runnable
+            and group_key in runnable_keys
+            and group_key not in lineage.executed_group_keys
+        ):
+            runnable_group_ids.append(group.group_id)
+    return _RecoveryActionState(
+        append_recovery_available=False,
+        append_recovery_block_reason="recovery_generation_pending",
+        pending_recovery_group_ids=tuple(pending_group_ids),
+        runnable_recovery_group_ids=tuple(runnable_group_ids),
+    )
+
+
+class _SourceEditRejection(ValueError):
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        *,
+        evidence: dict[str, Any] | None = None,
+        lineage_reconciliation_status: str = "not_attempted",
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+        self.evidence = evidence or {}
+        self.lineage_reconciliation_status = lineage_reconciliation_status
+
+
+def _prepare_capsule_source_edit(
+    action: RuntimeAction,
+    candidate_source: str,
+    *,
+    source: str,
+    regions: list[CodeRegion],
+    groups: list[CodeRegionGroup],
+    lineage: UnitLineage,
+    recovery_generations: list[RecoveryGeneration],
+    source_revision: SourceRevision,
+    trace_revision: int,
+    group_boundary_after_lines: set[int],
+    use_semantic_groups: bool,
+    max_regions_per_group: int,
+    public_api_calls: set[str],
+    side_effect_calls: set[str],
+    require_strict_subset: bool,
+    validate_program_contract: bool,
+    recovery_observation_functions: set[str],
+    current_analysis: _CapsuleSourceAnalysis | None = None,
+) -> _PreparedSourceEdit:
+    old_line_count = len(source.splitlines())
+    if (
+        current_analysis is not None
+        and _capsule_source_requires_repair(current_analysis)
+        and action.action == "append_recovery"
+    ):
+        raise _SourceEditRejection(
+            "repair_pending_append",
+            "append_recovery is unavailable while source repair is pending.",
+            evidence=_capsule_repair_state_evidence(current_analysis),
+        )
+    edit_span = _runtime_source_edit_span(
+        action,
+        source,
+        candidate_source,
+        regions,
+        groups,
+    )
+    if edit_span is None:
+        raise _SourceEditRejection(
+            "invalid_source_edit_action",
+            f"Could not determine source edit span for {action.action}.",
+        )
+    edit_start_line, edit_end_line, line_delta = edit_span
+    if (
+        action.action == "append_recovery"
+        and recovery_generations
+        and not _recovery_generation_complete(recovery_generations[-1])
+    ):
+        raise _SourceEditRejection(
+            "recovery_generation_pending",
+            (
+                "append_recovery is unavailable while the latest recovery generation "
+                "still has pending observation or side-effect groups."
+            ),
+        )
+    candidate_boundaries = _updated_group_boundaries_after_edit(
+        set(group_boundary_after_lines),
+        action=action,
+        edit_start_line=edit_start_line,
+        edit_end_line=edit_end_line,
+        line_delta=line_delta,
+        old_line_count=old_line_count,
+    )
+    if action.action == "append_recovery":
+        for group in groups:
+            group_key = lineage.group_key_by_id.get(group.group_id)
+            if group_key not in lineage.executed_group_keys:
+                continue
+            if group.start_line > 1:
+                candidate_boundaries.add(group.start_line - 1)
+            candidate_boundaries.add(group.end_line)
+    candidate_analysis = _analyze_capsule_source(
+        candidate_source,
+        use_semantic_groups=use_semantic_groups,
+        max_regions_per_group=max_regions_per_group,
+        public_api_calls=set(public_api_calls),
+        side_effect_calls=set(side_effect_calls),
+        require_strict_subset=require_strict_subset,
+        validate_program_contract=validate_program_contract,
+        group_boundary_after_lines=set(candidate_boundaries),
+    )
+
+    if candidate_analysis.syntax_error is not None:
+        exc = candidate_analysis.syntax_error
+        raise _SourceEditRejection(
+            "candidate_syntax_error",
+            f"Candidate source is invalid Python: {exc}",
+            evidence={
+                "exception_type": type(exc).__name__,
+                "lineno": exc.lineno,
+                "offset": exc.offset,
+                "text": exc.text,
+            },
+        )
+    candidate_violations = candidate_analysis.contract_violations
+    if candidate_violations:
+        current_violations = (
+            current_analysis.contract_violations
+            if current_analysis is not None
+            and current_analysis.syntax_error is None
+            else []
+        )
+        if current_violations:
+            if action.action not in {"patch_group", "patch_region"}:
+                raise _SourceEditRejection(
+                    "repair_patch_required",
+                    "Source repair is pending and requires a patch action.",
+                    evidence=_capsule_repair_state_evidence(current_analysis),
+                )
+            if lineage.executed_group_keys or lineage.executed_region_keys:
+                raise _SourceEditRejection(
+                    "repair_after_side_effects",
+                    "Partial source repair is unavailable after robot side effects.",
+                    evidence=_capsule_repair_state_evidence(current_analysis),
+                )
+            if not _is_improving_capsule_repair(
+                current_violations,
+                candidate_violations,
+            ):
+                raise _SourceEditRejection(
+                    "repair_not_improving",
+                    "Candidate patch does not strictly reduce the current violations.",
+                    evidence={
+                        **_capsule_repair_state_evidence(current_analysis),
+                        "candidate_violation_count": len(candidate_violations),
+                    },
+                )
+        elif candidate_analysis.strict_subset_violations:
+            serialized = [
+                item.to_dict()
+                for item in candidate_analysis.strict_subset_violations
+            ]
+            raise _SourceEditRejection(
+                "strict_subset_violation",
+                "Candidate source violates the strict Capsule Python subset.",
+                evidence={
+                    "strict_subset_violations": serialized,
+                    "program_contract_violations": serialized,
+                },
+            )
+        elif validate_program_contract or require_strict_subset:
+            raise _SourceEditRejection(
+                "program_contract_violation",
+                "Candidate source violates the Capsule-ready program contract.",
+                evidence={
+                    "program_contract_violations": [
+                        item.to_dict() for item in candidate_violations
+                    ]
+                },
+            )
+    if action.action == "append_recovery" and any(
+        group.start_line <= old_line_count < group.end_line
+        for group in candidate_analysis.groups
+    ):
+        raise _SourceEditRejection(
+            "append_boundary_crossed",
+            "Candidate group crosses the boundary between old and appended source.",
+        )
+
+    try:
+        candidate_lineage = reconcile_lineage(
+            edit_kind=action.action,
+            previous_source=source,
+            current_source=candidate_source,
+            previous_regions=copy.deepcopy(regions),
+            current_regions=candidate_analysis.regions,
+            previous_groups=copy.deepcopy(groups),
+            current_groups=candidate_analysis.groups,
+            previous_lineage=copy.deepcopy(lineage),
+            edit_start_line=edit_start_line,
+            edit_end_line=edit_end_line,
+            line_delta=line_delta,
+        )
+    except LineageAmbiguityError as exc:
+        raise _SourceEditRejection(
+            "lineage_ambiguous",
+            f"Candidate source lineage is ambiguous: {exc}",
+            evidence={"exception_type": type(exc).__name__},
+            lineage_reconciliation_status="ambiguous",
+        ) from exc
+
+    candidate_revision = _next_source_revision(
+        source_revision,
+        candidate_source,
+        edit_kind=action.action,
+        old_line_count=old_line_count,
+    )
+    region_by_id = {
+        region.region_id: region for region in candidate_analysis.regions
+    }
+    group_by_id = {group.group_id: group for group in candidate_analysis.groups}
+    candidate_recovery_generations = _prepare_recovery_generations(
+        action=action,
+        candidate_source=candidate_source,
+        candidate_regions=candidate_analysis.regions,
+        candidate_groups=candidate_analysis.groups,
+        candidate_lineage=candidate_lineage,
+        candidate_revision=candidate_revision,
+        previous_generations=copy.deepcopy(recovery_generations),
+        edit_start_line=edit_start_line,
+        edit_end_line=edit_end_line,
+        line_delta=line_delta,
+        old_line_count=old_line_count,
+        trace_revision=trace_revision,
+        recovery_observation_functions=recovery_observation_functions,
+        side_effect_calls=side_effect_calls,
+    )
+
+    return _PreparedSourceEdit(
+        source=candidate_source,
+        analysis=candidate_analysis,
+        revision=candidate_revision,
+        lineage=candidate_lineage,
+        group_boundary_after_lines=candidate_boundaries,
+        region_by_id=region_by_id,
+        group_by_id=group_by_id,
+        recovery_generations=candidate_recovery_generations,
+    )
+
+
+def _capsule_requires_strict_subset(env: CodeExecutionEnvBase) -> bool:
+    env_config = getattr(env, "cfg", None)
+    privileged = (
+        env_config.get("privileged")
+        if isinstance(env_config, Mapping)
+        else getattr(env_config, "privileged", None)
+    )
+    return privileged is False
+
+
+def _collect_public_api_calls(apis: Any) -> set[str]:
+    names: set[str] = set()
+    for api in apis:
+        functions = api.functions()
+        if isinstance(functions, Mapping):
+            names.update(str(name) for name in functions)
+    return names
+
+
+def _sort_contract_violations(
+    violations: list[ProgramContractViolation],
+) -> list[ProgramContractViolation]:
+    return sorted(
+        set(violations),
+        key=lambda violation: (
+            violation.start_line,
+            violation.end_line,
+            violation.code,
+            violation.message,
+            violation.helper_name or "",
+            violation.region_ids,
+            violation.group_ids,
+            violation.side_effect_calls,
+        ),
+    )
+
+
+def _capsule_violation_fingerprint(
+    violation: ProgramContractViolation,
+) -> tuple[str, str, str, tuple[str, ...]]:
+    return (
+        violation.code,
+        " ".join(violation.message.split()),
+        violation.helper_name or "",
+        tuple(sorted(violation.side_effect_calls)),
+    )
+
+
+def _is_improving_capsule_repair(
+    current_violations: list[ProgramContractViolation],
+    candidate_violations: list[ProgramContractViolation],
+) -> bool:
+    current = Counter(
+        _capsule_violation_fingerprint(violation)
+        for violation in current_violations
+    )
+    candidate = Counter(
+        _capsule_violation_fingerprint(violation)
+        for violation in candidate_violations
+    )
+    return bool(current) and candidate != current and all(
+        count <= current[fingerprint]
+        for fingerprint, count in candidate.items()
+    )
+
+
+def _capsule_source_requires_repair(analysis: _CapsuleSourceAnalysis) -> bool:
+    return analysis.syntax_error is not None or bool(analysis.contract_violations)
+
+
+def _capsule_remaining_violation_count(analysis: _CapsuleSourceAnalysis) -> int:
+    return len(analysis.contract_violations) + int(analysis.syntax_error is not None)
+
+
+def _capsule_repair_state_evidence(
+    analysis: _CapsuleSourceAnalysis,
+) -> dict[str, Any]:
+    remaining_count = _capsule_remaining_violation_count(analysis)
+    return {
+        "repair_pending": remaining_count > 0,
+        "remaining_violation_count": remaining_count,
+    }
+
+
+def _analyze_capsule_source(
+    source: str,
+    *,
+    use_semantic_groups: bool,
+    max_regions_per_group: int,
+    public_api_calls: set[str],
+    side_effect_calls: set[str],
+    require_strict_subset: bool,
+    validate_program_contract: bool,
+    group_boundary_after_lines: set[int] | None = None,
+) -> _CapsuleSourceAnalysis:
+    syntax_error: SyntaxError | None = None
+    strict_preflight_violations: list[ProgramContractViolation] = []
+    if require_strict_subset:
+        try:
+            strict_preflight_violations = preflight_capsule_strict_source(source)
+        except SyntaxError as exc:
+            syntax_error = exc
+
+    if syntax_error is not None or strict_preflight_violations:
+        regions, fallback_groups = _whole_source_fallback_units(source)
+        groups = fallback_groups if use_semantic_groups else []
+    else:
+        try:
+            regions = segment_python_code(source)
+            groups = (
+                segment_python_code_groups(
+                    source,
+                    regions,
+                    max_regions_per_group=max_regions_per_group,
+                    side_effect_calls=side_effect_calls,
+                    hard_boundary_after_lines=group_boundary_after_lines,
+                )
+                if use_semantic_groups
+                else []
+            )
+        except SyntaxError as exc:
+            syntax_error = exc
+            regions, fallback_groups = _whole_source_fallback_units(source)
+            groups = fallback_groups if use_semantic_groups else []
+
+    strict_subset_violations: list[ProgramContractViolation] = []
+    if require_strict_subset and syntax_error is None:
+        strict_subset_violations = analyze_capsule_strict_subset(
+            source,
+            regions,
+            groups,
+            public_api_calls=public_api_calls,
+            side_effect_calls=side_effect_calls,
+        )
+
+    contract_effectful_region_ids: set[str] = set()
+    contract_effectful_group_ids: set[str] = set()
+    legacy_violations: list[ProgramContractViolation] = []
+    if (
+        (validate_program_contract or require_strict_subset)
+        and syntax_error is None
+        and not strict_preflight_violations
+    ):
+        contract_analysis = analyze_capsule_program_contract_details(
+            source,
+            regions,
+            groups,
+            side_effect_calls=side_effect_calls,
+        )
+        legacy_violations = list(contract_analysis.violations)
+        contract_effectful_region_ids = set(
+            contract_analysis.effectful_region_ids
+        )
+        contract_effectful_group_ids = set(
+            contract_analysis.effectful_group_ids
+        )
+
+    return _CapsuleSourceAnalysis(
+        regions=regions,
+        groups=groups,
+        syntax_error=syntax_error,
+        contract_violations=_sort_contract_violations(
+            [*strict_subset_violations, *legacy_violations]
+        ),
+        strict_subset_violations=_sort_contract_violations(
+            strict_subset_violations
+        ),
+        contract_effectful_region_ids=contract_effectful_region_ids,
+        contract_effectful_group_ids=contract_effectful_group_ids,
+    )
+
+
+def _add_capsule_contract_metrics(
+    metric: dict[str, Any],
+    *,
+    contract_violations: list[ProgramContractViolation],
+    strict_subset_violations: list[ProgramContractViolation],
+) -> None:
+    metric["program_contract_valid"] = not contract_violations
+    metric["program_contract_violation_count"] = len(contract_violations)
+    metric["program_contract_violation_codes"] = sorted(
+        {item.code for item in contract_violations}
+    )
+    metric["strict_subset_valid"] = not strict_subset_violations
+    metric["strict_subset_violation_count"] = len(strict_subset_violations)
+    metric["strict_subset_violation_codes"] = sorted(
+        {item.code for item in strict_subset_violations}
+    )
+
+
 def _initial_syntax_error_history_entry(exc: SyntaxError) -> dict[str, Any]:
     return {
         "step_id": 0,
@@ -728,10 +1778,7 @@ def _run_capsule_trial(
     initial_code: str | None = None,
     scripted_actions: list[dict[str, Any]] | None = None,
 ) -> TrialSummary:
-    mode = str(config.get("capsule_control_mode", "llm_step"))
-    if mode != "llm_step":
-        raise ValueError(f"Unsupported capsule_control_mode: {mode}")
-    return _run_capsule_llm_step_loop(
+    return _run_capsule_loop(
         env=env,
         trial=trial,
         args=args,
@@ -740,7 +1787,28 @@ def _run_capsule_trial(
         scripted_actions=scripted_actions,
     )
 
-def _run_capsule_llm_step_loop(
+
+def _build_capsule_execution_globals(
+    env: CodeExecutionEnvBase,
+    trace: RuntimeTrace,
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a public namespace when Capsule safety boundaries are enabled."""
+    public_only = _capsule_requires_strict_subset(env) or _coerce_config_bool(
+        config.get("capsule_validate_program_contract", False)
+    )
+    if public_only:
+        # Call the base implementation directly so a legacy subclass override cannot
+        # reintroduce raw environment/API handles into a guarded Capsule executor.
+        return CodeExecutionEnvBase._build_capsule_globals(
+            env,
+            trace=trace,
+            include_internal_handles=False,
+        )
+    return env._build_capsule_globals(trace=trace)
+
+
+def _run_capsule_loop(
     env: CodeExecutionEnvBase,
     trial: int,
     args: LaunchArgs,
@@ -749,9 +1817,22 @@ def _run_capsule_llm_step_loop(
     initial_code: str | None = None,
     scripted_actions: list[dict[str, Any]] | None = None,
     stop_after_failed_event: bool = False,
-    stop_after_task_success: bool = False,
 ) -> TrialSummary:
+    progress_mode = validate_progress_mode(
+        str(config.get("capsule_progress_mode", "dense"))
+    )
+    prompt_state_level = _validate_capsule_state_level(
+        str(config.get("capsule_prompt_state_level", "full")),
+        config_name="capsule_prompt_state_level",
+    )
+    diagnostic_state_level = _validate_capsule_state_level(
+        str(config.get("capsule_diagnostic_state_level", "none")),
+        config_name="capsule_diagnostic_state_level",
+        allow_none=True,
+    )
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
+    obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
+    _patch_libero_goal(env, obs)
     output_dir = config.get("output_dir")
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -762,6 +1843,53 @@ def _run_capsule_llm_step_loop(
             wrist_camera=config.get("use_wrist_camera", False),
         )
 
+    use_initial_visual_feedback = _coerce_config_bool(
+        config.get("use_visual_feedback", False)
+    )
+    use_action_visual_feedback = _coerce_config_bool(
+        config.get("capsule_action_visual_feedback", False)
+    )
+    capture_visual_feedback = (
+        use_initial_visual_feedback or use_action_visual_feedback
+    )
+    use_wrist_camera = _coerce_config_bool(
+        config.get("use_wrist_camera", False)
+    )
+    current_visuals: list[CapsuleVisual] = []
+    current_visual_capture_errors: list[dict[str, str]] = []
+    current_visual_artifact_errors: list[dict[str, str]] = []
+    visual_artifact_by_sha256: dict[str, Any] = {}
+    visual_capture_audit: list[dict[str, Any]] = []
+    visual_artifact_audit: list[dict[str, Any]] = []
+    if capture_visual_feedback:
+        (
+            current_visuals,
+            current_visual_capture_errors,
+            current_visual_artifact_errors,
+            saved_artifacts,
+        ) = _capture_and_save_capsule_visuals(
+            env,
+            output_dir,
+            trial_id=trial,
+            step_id=0,
+            use_wrist_camera=use_wrist_camera,
+        )
+        visual_artifact_by_sha256.update(saved_artifacts)
+        visual_capture_audit.extend(
+            _capsule_visual_audit_entries(
+                current_visual_capture_errors,
+                step_id=0,
+                phase="initial",
+            )
+        )
+        visual_artifact_audit.extend(
+            _capsule_visual_audit_entries(
+                current_visual_artifact_errors,
+                step_id=0,
+                phase="initial",
+            )
+        )
+
     raw_code: str
     if initial_code is not None:
         raw_code = initial_code
@@ -770,46 +1898,70 @@ def _run_capsule_llm_step_loop(
         raw_code = env.oracle_code
         source = env.oracle_code
     else:
-        raw_code, _, _ = _query_initial_code(args, config, obs)
+        initial_query_obs = dict(obs)
+        initial_query_obs["full_prompt"] = (
+            _attach_capsule_visuals(
+                obs["full_prompt"],
+                current_visuals,
+                current_visual_capture_errors,
+            )
+            if use_initial_visual_feedback
+            else copy.deepcopy(obs["full_prompt"])
+        )
+        raw_code, _, _ = _query_initial_code(
+            args,
+            config,
+            initial_query_obs,
+            trial=trial,
+            artifact_by_sha256=visual_artifact_by_sha256,
+        )
         source = "\n\n".join(_extract_code(raw_code))
 
     max_regions_per_group = int(config.get("capsule_max_regions_per_group", 20))
     use_semantic_groups = (
         config.get("capsule_execution_granularity", "semantic_group") == "semantic_group"
     )
-    side_effect_calls = collect_side_effect_calls(getattr(env, "_apis", {}).values())
+    apis = getattr(env, "_apis", {}).values()
+    public_api_calls = _collect_public_api_calls(apis)
+    side_effect_calls = collect_side_effect_calls(apis)
     if not side_effect_calls:
         side_effect_calls = ROBOT_SIDE_EFFECT_CALLS
     recovery_observation_functions = _collect_recovery_observation_functions(
         getattr(env, "_apis", {}).values()
     )
-    initial_syntax_error: SyntaxError | None = None
-    try:
-        regions = segment_python_code(source)
-        groups = (
-            segment_python_code_groups(
-                source,
-                regions,
-                max_regions_per_group=max_regions_per_group,
-                side_effect_calls=side_effect_calls,
-            )
-            if use_semantic_groups
-            else []
-        )
-    except SyntaxError as exc:
-        initial_syntax_error = exc
-        regions, fallback_groups = _whole_source_fallback_units(source)
-        groups = fallback_groups if use_semantic_groups else []
+    validate_program_contract = _coerce_config_bool(
+        config.get("capsule_validate_program_contract", False)
+    )
+    require_strict_subset = _capsule_requires_strict_subset(env)
+    source_analysis = _analyze_capsule_source(
+        source,
+        use_semantic_groups=use_semantic_groups,
+        max_regions_per_group=max_regions_per_group,
+        public_api_calls=public_api_calls,
+        side_effect_calls=side_effect_calls,
+        require_strict_subset=require_strict_subset,
+        validate_program_contract=validate_program_contract,
+    )
+    regions = source_analysis.regions
+    groups = source_analysis.groups
+    initial_syntax_error = source_analysis.syntax_error
     region_by_id = {region.region_id: region for region in regions}
     group_by_id = {group.group_id: group for group in groups}
+    program_contract_violations = source_analysis.contract_violations
+    strict_subset_violations = source_analysis.strict_subset_violations
+    contract_effectful_region_ids = source_analysis.contract_effectful_region_ids
+    contract_effectful_group_ids = source_analysis.contract_effectful_group_ids
+    lineage = UnitLineage.create(regions, groups)
+    source_revision = _initial_source_revision(source)
+    group_boundary_after_lines: set[int] = set()
     trace = RuntimeTrace()
     executor = CapsuleExecutor(
-        base_globals=env._build_capsule_globals(trace=trace),
+        base_globals=_build_capsule_execution_globals(env, trace, config),
         trace=trace,
     )
     max_steps = int(config.get("max_capsule_steps", 12))
     action_query_args = copy.copy(args)
-    default_action_max_tokens = getattr(args, "max_tokens", 2048 * 10)
+    default_action_max_tokens = getattr(args, "max_tokens", 4096)
     action_query_args.max_tokens = int(
         config.get("capsule_action_max_tokens", default_action_max_tokens)
     )
@@ -819,15 +1971,15 @@ def _run_capsule_llm_step_loop(
     if initial_syntax_error is not None:
         history.append(_initial_syntax_error_history_entry(initial_syntax_error))
     step_metrics: list[dict[str, Any]] = []
+    diagnostic_states: list[dict[str, Any]] = []
     prompts: list[list[dict[str, Any]]] = []
-    failed = False
+    recoverable_failed = False
+    safety_failed = False
     finished = False
+    loop_exit_reason: str | None = None
     executed_regions = 0
     best_reward_so_far: float | None = None
-    executed_side_effect_regions: set[str] = set()
-    executed_side_effect_groups: set[str] = set()
-    recovery_side_effect_budget = 0
-    pending_recovery_actions: list[RuntimeAction] = []
+    recovery_generations: list[RecoveryGeneration] = []
     reward_drop_guard_min_best_reward = float(
         config.get("capsule_reward_drop_guard_min_best_reward", 0.6)
     )
@@ -848,33 +2000,84 @@ def _run_capsule_llm_step_loop(
     require_task_success_for_finish = _coerce_config_bool(
         config.get("capsule_require_task_success_for_finish", False)
     )
+    latest_post_action_observation: PostActionObservation | None = None
+    namespace_revision = 0
+    inspected_variable_states: set[tuple[int, int, int, tuple[str, ...]]] = set()
+    logical_decision_count = 0
+    llm_decision_count = 0
+    scripted_decision_count = 0
+    attempted_group_count = 0
+    post_action_observation_count = 0
+    source_edit_attempt_count = 0
+    committed_source_edit_count = 0
+    append_attempt_count = 0
+    committed_append_count = 0
+    blocked_replay_count = 0
+    duplicate_variable_inspection_count = 0
+    provider_attempt_count_baseline = _capsule_provider_attempt_count()
 
     for step_id in range(1, max_steps + 1):
+        logical_decision_count += 1
+        provider_attempt_count_before = _capsule_provider_attempt_count()
+        trace_revision_before = executor.trace.mark()
         action: RuntimeAction | None = None
-        before_state = _capsule_state_snapshot(env)
+        action_unit_key: str | None = None
+        action_source_revision = source_revision.revision
+        before_state = _capsule_state_snapshot(env, state_level=prompt_state_level)
+        diagnostic_before_state = (
+            _capsule_state_snapshot(env, state_level=diagnostic_state_level)
+            if diagnostic_state_level != "none"
+            else None
+        )
         source_unit_for_feedback = None
-        consumes_recovery_side_effect = False
-        forced_recovery_action = False
+        recovery_execution_attempt = False
+        recovery_authorization_consumed = False
+        consumed_recovery_generation_id: str | None = None
+        consumed_recovery_unit_key: str | None = None
+        consumed_recovery_unit_kind: str | None = None
+        action_origin = "llm"
         action_prompt_chars = 0
         action_prompt_char_budget_metric = None
         action_prompt_over_budget = False
+        action_prompt_images: list[dict[str, Any]] = []
+        action_prompt_visual_capture_errors: list[dict[str, str]] = []
+        action_prompt_visual_artifact_errors: list[dict[str, str]] = []
+        post_action_visual_capture_errors: list[dict[str, str]] = []
+        post_action_visual_artifact_errors: list[dict[str, str]] = []
+        post_action_observation: PostActionObservation | None = None
+        group_execution_trace_mark: int | None = None
+        group_observation_before_state: dict[str, Any] | None = None
+        group_new_trace_events: list[dict[str, Any]] = []
+        inspection_key: tuple[int, int, int, tuple[str, ...]] | None = None
+        group_dependency_state = _group_dependency_state(groups, executor.globals)
+        recovery_action_state = _recovery_action_state(
+            groups,
+            lineage=lineage,
+            recovery_generations=recovery_generations,
+            group_dependency_state=group_dependency_state,
+        )
 
         try:
-            if pending_recovery_actions:
-                forced_recovery_action = True
-                action = pending_recovery_actions.pop(0)
+            if script is not None and script_idx < len(script):
+                action_origin = "scripted"
+                scripted_decision_count += 1
+                action = RuntimeAction.from_mapping(script[script_idx])
+                script_idx += 1
             else:
+                llm_decision_count += 1
                 prompt = build_capsule_prompt(
                     task=_task_text_from_obs(obs),
                     regions=regions,
                     groups=groups if use_semantic_groups else None,
-                    history=history,
+                    history=_model_facing_capsule_history(history),
                     trace_summary=executor.trace.summary() if executor.trace is not None else {},
-                    side_effect_ledger={
-                        "executed_side_effect_groups": sorted(executed_side_effect_groups),
-                        "executed_side_effect_regions": sorted(executed_side_effect_regions),
-                    },
+                    contract_violations=[
+                        item.to_dict() for item in program_contract_violations
+                    ],
+                    side_effect_ledger=_display_side_effect_ledger(lineage),
                     recovery_observation_functions=recovery_observation_functions,
+                    strict_subset=require_strict_subset,
+                    repair_pending=_capsule_source_requires_repair(source_analysis),
                     compact_context=llm_step_compact_context,
                     history_max_entries=action_history_max_entries,
                     trace_max_events=action_trace_max_events,
@@ -882,6 +2085,30 @@ def _run_capsule_llm_step_loop(
                     focused_source_max_units=1 if llm_step_compact_context else 0,
                     prompt_char_budget=(
                         action_prompt_char_budget if llm_step_compact_context else None
+                    ),
+                    latest_observation=latest_post_action_observation,
+                    source_revision=source_revision.revision,
+                    runnable_group_ids=list(
+                        recovery_action_state.runnable_recovery_group_ids
+                        if not recovery_action_state.append_recovery_available
+                        and use_semantic_groups
+                        else group_dependency_state.runnable_group_ids
+                    ),
+                    blocked_group_dependencies={
+                        group_id: list(missing)
+                        for group_id, missing in group_dependency_state.missing_by_group_id.items()
+                    },
+                    append_recovery_available=(
+                        recovery_action_state.append_recovery_available
+                    ),
+                    append_recovery_block_reason=(
+                        recovery_action_state.append_recovery_block_reason
+                    ),
+                    pending_recovery_group_ids=list(
+                        recovery_action_state.pending_recovery_group_ids
+                    ),
+                    runnable_recovery_group_ids=list(
+                        recovery_action_state.runnable_recovery_group_ids
                     ),
                 )
                 action_prompt_chars = len(json.dumps(prompt, default=str))
@@ -893,19 +2120,44 @@ def _run_capsule_llm_step_loop(
                     and action_prompt_char_budget_metric > 0
                     and action_prompt_chars > action_prompt_char_budget_metric
                 )
-                prompts.append(prompt)
-
-            if action is None and script is not None:
-                if script_idx >= len(script):
-                    action = RuntimeAction(action="finish", args={})
-                else:
-                    action = RuntimeAction.from_mapping(script[script_idx])
-                    script_idx += 1
-            elif action is None:
+                live_prompt = prompt
+                if use_action_visual_feedback:
+                    action_prompt_images = [
+                        _image_reference_metadata(
+                            {"url": record.data_url},
+                            camera=record.camera,
+                            artifact_by_sha256=visual_artifact_by_sha256,
+                        )
+                        for record in current_visuals
+                    ]
+                    action_prompt_visual_capture_errors = copy.deepcopy(
+                        current_visual_capture_errors
+                    )
+                    action_prompt_visual_artifact_errors = copy.deepcopy(
+                        current_visual_artifact_errors
+                    )
+                    live_prompt = _attach_capsule_visuals(
+                        prompt,
+                        current_visuals,
+                        action_prompt_visual_capture_errors,
+                    )
+                prompts.append(
+                    _sanitize_multimodal_prompt(
+                        live_prompt,
+                        artifact_by_sha256=visual_artifact_by_sha256,
+                    )
+                )
                 with llm_call_stage("capsule_action"):
-                    response = _query_model(action_query_args, prompt)
+                    response = _query_model(action_query_args, live_prompt)
                 action = parse_runtime_action_response(response["content"])
             action.step_id = step_id
+            action_unit_key = _runtime_action_unit_key(action, lineage)
+            if action.action == "run_group":
+                attempted_group_count += 1
+            if action.action in {"patch_region", "patch_group", "append_recovery"}:
+                source_edit_attempt_count += 1
+            if action.action == "append_recovery":
+                append_attempt_count += 1
         except ValueError as exc:
             event = RuntimeEvent(
                 action="invalid",
@@ -913,21 +2165,65 @@ def _run_capsule_llm_step_loop(
                 message=str(exc),
                 evidence={"exception_type": type(exc).__name__},
             )
-            failed = True
         else:
             region_id = str(action.args.get("region_id", ""))
             group_id = str(action.args.get("group_id", ""))
             source_unit_for_feedback = region_by_id.get(region_id) or group_by_id.get(group_id)
-            event = _finish_requires_task_success_guard_event(
+            if action.action == "run_group":
+                group_execution_trace_mark = executor.trace.mark()
+                group_observation_before_state = _capsule_state_snapshot(
+                    env,
+                    state_level=prompt_state_level,
+                )
+                before_state = group_observation_before_state
+            event = _finish_success_guard_event(
                 action,
                 before_state,
-                require_task_success_for_finish,
+                require_task_success=require_task_success_for_finish,
             )
+            if event is None:
+                event = _execution_granularity_guard_event(
+                    action,
+                    use_semantic_groups=use_semantic_groups,
+                )
+            if event is None:
+                event = _strict_subset_guard_event(
+                    action, strict_subset_violations
+                )
+            if event is None:
+                event = _repair_pending_guard_event(action, source_analysis)
+            if event is None:
+                event = (
+                    _program_contract_guard_event(
+                        action,
+                        program_contract_violations,
+                        contract_effectful_region_ids,
+                        contract_effectful_group_ids,
+                    )
+                    if validate_program_contract or require_strict_subset
+                    else None
+                )
+            if event is None:
+                event = _group_dependency_guard_event(
+                    action,
+                    group_dependency_state,
+                )
+            if event is None:
+                event = _append_recovery_guard_event(
+                    action,
+                    recovery_action_state,
+                )
+            if event is None:
+                event = _pending_recovery_group_guard_event(
+                    action,
+                    recovery_action_state,
+                )
             if event is None:
                 event = _no_rollback_guard_event(
                     action,
-                    executed_side_effect_regions,
-                    executed_side_effect_groups,
+                    lineage,
+                    region_by_id,
+                    group_by_id,
                     recovery_observation_functions=recovery_observation_functions,
                 )
             if event is None:
@@ -938,85 +2234,274 @@ def _run_capsule_llm_step_loop(
                     region_by_id,
                     group_by_id,
                     side_effect_calls,
-                    recovery_side_effect_budget=recovery_side_effect_budget,
+                    lineage=lineage,
+                    recovery_generations=recovery_generations,
                     min_best_reward=reward_drop_guard_min_best_reward,
                     drop_threshold=reward_drop_guard_threshold,
                     recovery_observation_functions=recovery_observation_functions,
                 )
             if event is None:
-                consumes_recovery_side_effect = (
-                    recovery_side_effect_budget > 0
-                    and _runtime_action_targets_side_effect_unit(
+                inspection_key = _variable_inspection_key(
+                    action,
+                    source_revision=source_revision.revision,
+                    trace_revision=executor.trace.mark(),
+                    namespace_revision=namespace_revision,
+                )
+                if (
+                    inspection_key is not None
+                    and inspection_key in inspected_variable_states
+                ):
+                    event = RuntimeEvent(
+                        action="inspect_variables",
+                        status="invalid",
+                        message=(
+                            "no_new_variable_state: the same variables were already "
+                            "inspected without a source, trace, or namespace revision"
+                        ),
+                        evidence={
+                            "diagnostic_failure": "no_new_variable_state",
+                        },
+                    )
+            if event is None:
+                recovery_authorization = _recovery_authorization_for_action(
+                    action,
+                    lineage=lineage,
+                    recovery_generations=recovery_generations,
+                )
+                recovery_execution_attempt = recovery_authorization is not None
+                if action.action == "run_group":
+                    event = _execute_runtime_action_with_infrastructure_retries(
                         action,
+                        executor,
+                        source,
                         region_by_id,
                         group_by_id,
-                        side_effect_calls,
+                        recovery_observation_functions=(
+                            recovery_observation_functions
+                        ),
+                        side_effect_calls=side_effect_calls,
                     )
-                )
-                event = _execute_runtime_action(
-                    action,
-                    executor,
-                    source,
-                    region_by_id,
-                    group_by_id,
-                    recovery_observation_functions=recovery_observation_functions,
-                )
-                if consumes_recovery_side_effect:
-                    recovery_side_effect_budget -= 1
-            if event.status in {"failed", "invalid"}:
-                if not _is_recoverable_finish_guard_event(event):
-                    failed = True
-                if forced_recovery_action:
-                    pending_recovery_actions.clear()
-            if action.action == "run_region" and event.status != "invalid":
-                executed_regions += 1
-                region = region_by_id.get(region_id)
+                else:
+                    event = _execute_runtime_action(
+                        action,
+                        executor,
+                        source,
+                        region_by_id,
+                        group_by_id,
+                        recovery_observation_functions=(
+                            recovery_observation_functions
+                        ),
+                    )
                 if (
-                    event.status == "success"
-                    and region is not None
-                    and _region_has_side_effect_call(region, side_effect_calls)
+                    action.action == "inspect_variables"
+                    and event.status == "success"
+                    and inspection_key is not None
                 ):
-                    executed_side_effect_regions.add(region_id)
-                elif event.status == "failed" and region is not None:
-                    _mark_executed_side_effect_region_from_trace(
+                    inspected_variable_states.add(inspection_key)
+                prepared_trace_commit = _prepare_runtime_trace_commit(
+                    action,
+                    event,
+                    region_by_id=region_by_id,
+                    group_by_id=group_by_id,
+                    lineage=lineage,
+                    recovery_generations=recovery_generations,
+                    side_effect_calls=side_effect_calls,
+                    trace_revision=executor.trace.mark(),
+                )
+                event = prepared_trace_commit.event
+                lineage = prepared_trace_commit.lineage
+                recovery_generations = (
+                    prepared_trace_commit.recovery_generations
+                )
+                recovery_authorization_consumed = (
+                    prepared_trace_commit.authorization_consumed
+                )
+                consumed_recovery_generation_id = (
+                    prepared_trace_commit.recovery_generation_id
+                )
+                consumed_recovery_unit_key = (
+                    prepared_trace_commit.recovery_unit_key
+                )
+                consumed_recovery_unit_kind = (
+                    prepared_trace_commit.recovery_unit_kind
+                )
+            if group_execution_trace_mark is not None:
+                group_new_trace_events = executor.trace.events_since(
+                    group_execution_trace_mark
+                )
+            if action.action in {"patch_region", "patch_group", "append_recovery"}:
+                prepared_source_edit: _PreparedSourceEdit | None = None
+                rejection: _SourceEditRejection | None = None
+                if event.status == "success":
+                    try:
+                        prepared_source_edit = _prepare_capsule_source_edit(
+                            action,
+                            str(event.evidence["source"]),
+                            source=source,
+                            regions=regions,
+                            groups=groups,
+                            lineage=lineage,
+                            recovery_generations=recovery_generations,
+                            source_revision=source_revision,
+                            trace_revision=executor.trace.mark(),
+                            group_boundary_after_lines=group_boundary_after_lines,
+                            use_semantic_groups=use_semantic_groups,
+                            max_regions_per_group=max_regions_per_group,
+                            public_api_calls=public_api_calls,
+                            side_effect_calls=side_effect_calls,
+                            require_strict_subset=require_strict_subset,
+                            validate_program_contract=validate_program_contract,
+                            recovery_observation_functions=recovery_observation_functions,
+                            current_analysis=source_analysis,
+                        )
+                    except _SourceEditRejection as exc:
+                        rejection = exc
+
+                if rejection is not None:
+                    event = _source_edit_rejection_event(action, rejection)
+                    _annotate_source_edit_event(
                         event,
-                        region,
-                        executed_side_effect_regions,
-                        side_effect_calls,
+                        source_revision_before=action_source_revision,
+                        source_revision_after=action_source_revision,
+                        source_edit_committed=False,
+                        lineage_reconciliation_status=(
+                            rejection.lineage_reconciliation_status
+                        ),
+                        edit_rejection_reason=rejection.reason,
                     )
+                elif prepared_source_edit is not None:
+                    source = prepared_source_edit.source
+                    source_analysis = prepared_source_edit.analysis
+                    source_revision = prepared_source_edit.revision
+                    lineage = prepared_source_edit.lineage
+                    recovery_generations = (
+                        prepared_source_edit.recovery_generations
+                    )
+                    group_boundary_after_lines = (
+                        prepared_source_edit.group_boundary_after_lines
+                    )
+                    regions = source_analysis.regions
+                    groups = source_analysis.groups
+                    region_by_id = prepared_source_edit.region_by_id
+                    group_by_id = prepared_source_edit.group_by_id
+                    program_contract_violations = source_analysis.contract_violations
+                    strict_subset_violations = source_analysis.strict_subset_violations
+                    contract_effectful_region_ids = (
+                        source_analysis.contract_effectful_region_ids
+                    )
+                    contract_effectful_group_ids = (
+                        source_analysis.contract_effectful_group_ids
+                    )
+                    if not program_contract_violations:
+                        recoverable_failed = False
+                    if action.action == "append_recovery":
+                        generation = recovery_generations[-1]
+                        event.evidence["recovery_generation_id"] = (
+                            generation.generation_id
+                        )
+                        committed_append_count += 1
+                    committed_source_edit_count += 1
+                    namespace_revision += 1
+                    _annotate_source_edit_event(
+                        event,
+                        source_revision_before=action_source_revision,
+                        source_revision_after=source_revision.revision,
+                        source_edit_committed=True,
+                        lineage_reconciliation_status="success",
+                    )
+                    event.evidence.update(
+                        _capsule_repair_state_evidence(source_analysis)
+                    )
+                else:
+                    rejection_reason, lineage_status = (
+                        _source_edit_rejection_metadata(action, event)
+                    )
+                    _annotate_source_edit_event(
+                        event,
+                        source_revision_before=action_source_revision,
+                        source_revision_after=action_source_revision,
+                        source_edit_committed=False,
+                        lineage_reconciliation_status=lineage_status,
+                        edit_rejection_reason=rejection_reason,
+                    )
+            if (
+                action.action in {"run_group", "run_region", "resume_from_region"}
+                and event.status != "invalid"
+            ):
+                namespace_revision += 1
+            if event.evidence.get("safety_failure") == "side_effect_replay":
+                blocked_replay_count += 1
+            if event.evidence.get("diagnostic_failure") == "no_new_variable_state":
+                duplicate_variable_inspection_count += 1
+            safety_failed = safety_failed or _capsule_event_has_safety_failure(
+                event
+            )
+            if event.status == "failed":
+                recoverable_failed = True
+            if (
+                action.action in {"run_region", "resume_from_region"}
+                and event.status != "invalid"
+            ):
+                executed_regions += 1
             elif action.action == "run_group":
                 group = group_by_id.get(group_id)
                 if event.status != "invalid":
                     executed_regions += len(group.region_ids) if group is not None else 0
-                if event.status == "success" and group is not None and group.has_robot_side_effect:
-                    executed_side_effect_groups.add(group_id)
-                    for member_region_id in group.region_ids:
-                        member_region = region_by_id.get(member_region_id)
-                        if member_region is not None and _region_has_side_effect_call(
-                            member_region,
-                            side_effect_calls,
-                        ):
-                            executed_side_effect_regions.add(member_region_id)
-                elif event.status == "failed" and group is not None:
-                    _mark_executed_side_effects_from_trace(
-                        event,
-                        group,
-                        region_by_id,
-                        executed_side_effect_regions,
-                        executed_side_effect_groups,
-                        side_effect_calls,
-                    )
-            elif action.action == "append_recovery" and event.status == "success":
-                recovery_side_effect_budget = 1
-
-        after_state = _capsule_state_snapshot(env)
-        trace_events = event.evidence.get("trace_events", [])
+        after_state = _capsule_state_snapshot(env, state_level=prompt_state_level)
+        if use_action_visual_feedback:
+            (
+                current_visuals,
+                current_visual_capture_errors,
+                current_visual_artifact_errors,
+                saved_artifacts,
+            ) = _capture_and_save_capsule_visuals(
+                env,
+                output_dir,
+                trial_id=trial,
+                step_id=step_id,
+                use_wrist_camera=use_wrist_camera,
+            )
+            visual_artifact_by_sha256.update(saved_artifacts)
+            post_action_visual_capture_errors = copy.deepcopy(
+                current_visual_capture_errors
+            )
+            post_action_visual_artifact_errors = copy.deepcopy(
+                current_visual_artifact_errors
+            )
+            visual_capture_audit.extend(
+                _capsule_visual_audit_entries(
+                    post_action_visual_capture_errors,
+                    step_id=step_id,
+                    phase="post_action",
+                )
+            )
+            visual_artifact_audit.extend(
+                _capsule_visual_audit_entries(
+                    post_action_visual_artifact_errors,
+                    step_id=step_id,
+                    phase="post_action",
+                )
+            )
+        if diagnostic_before_state is not None:
+            diagnostic_states.append(
+                {
+                    "step_id": step_id,
+                    "state_before": diagnostic_before_state,
+                    "state_after": _capsule_state_snapshot(
+                        env, state_level=diagnostic_state_level
+                    ),
+                }
+            )
+        trace_events = (
+            group_new_trace_events
+            if group_execution_trace_mark is not None
+            else event.evidence.get("trace_events", [])
+        )
         feedback_action = (
             action
             if action is not None
             else RuntimeAction(action="invalid", args={}, step_id=step_id)
         )
-        capsule_action = feedback_action.to_dict()
         feedback = build_runtime_feedback(
             step_id=step_id,
             action=feedback_action,
@@ -1025,20 +2510,51 @@ def _run_capsule_llm_step_loop(
             trace_events=trace_events,
             before_state=before_state,
             after_state=after_state,
+            progress_mode=progress_mode,
+            side_effect_calls=side_effect_calls,
         )
+        trace_revision_after = executor.trace.mark()
+        step_trace_events = executor.trace.events_since(trace_revision_before)
 
-        history.append(
-            {
-                "step_id": step_id,
-                "capsule_action": capsule_action,
-                "action": action.to_dict() if action is not None else {"action": "invalid"},
-                "event": event.to_dict(),
-                "feedback": feedback.to_dict(),
-                "trace_events": trace_events,
-                "state_before": before_state,
-                "state_after": after_state,
-            }
-        )
+        if group_execution_trace_mark is not None and action is not None:
+            observation_before_state = group_observation_before_state or before_state
+            post_action_observation = PostActionObservation(
+                step_id=step_id,
+                action=action.action,
+                unit_id=_runtime_action_unit_id(action) or event.region_id,
+                unit_key=action_unit_key,
+                event_status=event.status,
+                state_before=copy.deepcopy(observation_before_state),
+                state_after=copy.deepcopy(after_state),
+                reward_before=_state_reward(observation_before_state),
+                reward_after=_state_reward(after_state),
+                task_completed=bool(after_state.get("task_completed")),
+                new_trace_events=copy.deepcopy(group_new_trace_events),
+                trace_revision=trace_revision_after,
+                source_revision=action_source_revision,
+                terminal_progress_unverified=bool(
+                    feedback.evidence.get("terminal_progress_unverified")
+                ),
+                safety_failure=_post_action_safety_failure(event),
+            )
+            post_action_observation_count += 1
+            latest_post_action_observation = post_action_observation
+
+        history_entry = {
+            "step_id": step_id,
+            "capsule_action": feedback_action.to_dict(),
+            "action": action.to_dict() if action is not None else {"action": "invalid"},
+            "event": event.to_dict(),
+            "feedback": feedback.to_dict(),
+            "trace_events": trace_events,
+            "state_before": before_state,
+            "state_after": after_state,
+            "unit_key": action_unit_key,
+            "source_revision": action_source_revision,
+        }
+        if post_action_observation is not None:
+            history_entry["post_action_observation"] = post_action_observation.to_dict()
+        history.append(history_entry)
         metric, best_reward_so_far = _capsule_step_metric(
             step_id=step_id,
             action=action,
@@ -1047,73 +2563,141 @@ def _run_capsule_llm_step_loop(
             after_state=after_state,
             executed_regions=executed_regions,
             best_reward_so_far=best_reward_so_far,
-            recovery_execution_attempt=consumes_recovery_side_effect,
+            recovery_execution_attempt=recovery_execution_attempt,
         )
+        metric["unit_key"] = action_unit_key
+        metric["source_revision"] = action_source_revision
+        metric["action_origin"] = action_origin
+        metric["logical_decision_id"] = logical_decision_count
+        metric["llm_decision_id"] = (
+            llm_decision_count if action_origin == "llm" else None
+        )
+        metric["provider_attempt_count"] = (
+            _capsule_provider_attempt_count() - provider_attempt_count_before
+        )
+        metric["group_execution_attempted"] = bool(
+            action is not None and action.action == "run_group"
+        )
+        metric["robot_side_effect_executed"] = _event_has_side_effect_trace(
+            event, side_effect_calls
+        )
+        for field in (
+            "source_revision_before",
+            "source_revision_after",
+            "source_edit_committed",
+            "lineage_reconciliation_status",
+            "edit_rejection_reason",
+        ):
+            metric[field] = event.evidence.get(field)
         metric["action_prompt_chars"] = action_prompt_chars
         metric["action_prompt_compact_context"] = llm_step_compact_context
         metric["action_prompt_char_budget"] = action_prompt_char_budget_metric
         metric["action_prompt_over_budget"] = action_prompt_over_budget
+        metric["action_prompt_image_count"] = len(action_prompt_images)
+        metric["action_prompt_images"] = action_prompt_images
+        metric["visual_capture_errors"] = action_prompt_visual_capture_errors
+        metric["visual_artifact_errors"] = action_prompt_visual_artifact_errors
+        metric["post_action_visual_capture_errors"] = (
+            post_action_visual_capture_errors
+        )
+        metric["post_action_visual_artifact_errors"] = (
+            post_action_visual_artifact_errors
+        )
+        metric["post_action_observation_recorded"] = post_action_observation is not None
+        metric["new_trace_event_count"] = len(step_trace_events)
+        metric["trace_revision_before"] = trace_revision_before
+        metric["trace_revision_after"] = trace_revision_after
+        metric["recovery_authorization_consumed"] = (
+            recovery_authorization_consumed
+        )
+        metric["recovery_generation_id"] = consumed_recovery_generation_id
+        metric["recovery_unit_key"] = consumed_recovery_unit_key
+        metric["recovery_unit_kind"] = consumed_recovery_unit_kind
+        metric["recovery_group_key"] = (
+            consumed_recovery_unit_key
+            if consumed_recovery_unit_kind == "group"
+            else None
+        )
+        metric["recovery_region_key"] = (
+            consumed_recovery_unit_key
+            if consumed_recovery_unit_kind == "region"
+            else None
+        )
+        metric["recovery_generations"] = _recovery_generation_metrics(
+            recovery_generations
+        )
+        metric["executed_side_effect_group_keys"] = sorted(
+            lineage.executed_group_keys
+        )
+        metric["executed_side_effect_region_keys"] = sorted(
+            lineage.executed_region_keys
+        )
+        _add_capsule_contract_metrics(
+            metric,
+            contract_violations=program_contract_violations,
+            strict_subset_violations=strict_subset_violations,
+        )
+        metric.update(_capsule_repair_state_evidence(source_analysis))
+        metric["budget_exhausted"] = False
         step_metrics.append(metric)
 
+        reward_after = _state_reward(after_state)
         if (
             action is not None
-            and action.action in {"patch_region", "patch_group", "append_recovery"}
+            and action.action == "finish"
             and event.status == "success"
         ):
-            previous_source_line_count = len(source.splitlines())
-            source = str(event.evidence["source"])
-            regions = segment_python_code(source)
-            groups = (
-                segment_python_code_groups(
-                    source,
-                    regions,
-                    max_regions_per_group=max_regions_per_group,
-                    side_effect_calls=side_effect_calls,
-                )
-                if use_semantic_groups
-                else []
-            )
-            region_by_id = {region.region_id: region for region in regions}
-            group_by_id = {group.group_id: group for group in groups}
-            if action.action == "append_recovery":
-                pending_recovery_actions = _runtime_actions_for_appended_recovery(
-                    regions,
-                    groups,
-                    use_semantic_groups=use_semantic_groups,
-                    insert_after_line=previous_source_line_count,
-                )
-                recovery_side_effect_budget = max(
-                    recovery_side_effect_budget,
-                    _count_side_effect_runtime_actions(
-                        pending_recovery_actions,
-                        region_by_id,
-                        group_by_id,
-                        side_effect_calls,
-                    ),
-                )
-
-        if stop_after_failed_event and event.status in {"failed", "invalid"}:
-            break
-        reward_after = _state_reward(after_state)
-        if stop_after_task_success and (
-            bool(after_state.get("task_completed"))
-            or (reward_after is not None and reward_after >= 1.0)
-        ):
-            break
-        if (
-            event.status == "success"
-            and (
-                event.action == "finish"
-                or (action.action == "finish" if action is not None else False)
-            )
-        ):
             finished = True
+            loop_exit_reason = "accepted_finish"
+            break
+        if bool(after_state.get("task_completed")) or (
+            reward_after is not None and reward_after >= 1.0
+        ):
+            loop_exit_reason = "task_success"
+            break
+        if stop_after_failed_event and event.status in {"failed", "invalid"}:
+            loop_exit_reason = "failed_event"
             break
 
     reward = _safe_compute_reward(env)
     task_completed = _safe_task_completed(env)
     task_succeeded = bool(task_completed) or reward >= 1.0
-    sandbox_rc = 0 if task_succeeded and not failed else 1
+    budget_exhausted = (
+        loop_exit_reason is None and not finished and not task_succeeded
+    )
+    if loop_exit_reason is None:
+        loop_exit_reason = "task_success" if task_succeeded else "budget_exhausted"
+    if budget_exhausted and step_metrics:
+        step_metrics[-1]["budget_exhausted"] = True
+    if post_action_observation_count != attempted_group_count:
+        raise AssertionError(
+            "Capsule post-action observation count must equal attempted run_group count: "
+            f"{post_action_observation_count} != {attempted_group_count}"
+        )
+    trial_metrics = {
+        "logical_decision_count": logical_decision_count,
+        "llm_decision_count": llm_decision_count,
+        "scripted_decision_count": scripted_decision_count,
+        "provider_attempt_count": (
+            _capsule_provider_attempt_count() - provider_attempt_count_baseline
+        ),
+        "attempted_group_count": attempted_group_count,
+        "post_action_observation_count": post_action_observation_count,
+        "source_edit_attempt_count": source_edit_attempt_count,
+        "committed_source_edit_count": committed_source_edit_count,
+        "append_attempt_count": append_attempt_count,
+        "committed_append_count": committed_append_count,
+        "blocked_replay_count": blocked_replay_count,
+        "duplicate_variable_inspection_count": duplicate_variable_inspection_count,
+        "budget_exhausted": budget_exhausted,
+        "loop_exit_reason": loop_exit_reason,
+    }
+    run_outcome = _capsule_run_outcome(loop_exit_reason)
+    sandbox_rc = (
+        0
+        if task_succeeded and not recoverable_failed and not safety_failed
+        else 1
+    )
     code_path = None
     if output_dir:
         code_path = os.path.join(output_dir, f"capsule_code_trial_{trial:02d}.py")
@@ -1127,6 +2711,18 @@ def _run_capsule_llm_step_loop(
         with open(metrics_path, "w") as f:
             for metric in step_metrics:
                 f.write(json.dumps(metric, default=str) + "\n")
+        trial_metrics_path = os.path.join(
+            output_dir, f"capsule_trial_metrics_trial_{trial:02d}.json"
+        )
+        with open(trial_metrics_path, "w") as f:
+            json.dump(trial_metrics, f, indent=2)
+        if diagnostic_state_level != "none":
+            diagnostics_path = os.path.join(
+                output_dir, f"capsule_diagnostics_trial_{trial:02d}.jsonl"
+            )
+            with open(diagnostics_path, "w") as f:
+                for diagnostic_state in diagnostic_states:
+                    f.write(json.dumps(diagnostic_state, default=str) + "\n")
 
     if config.get("record_video"):
         info_step = {
@@ -1143,18 +2739,29 @@ def _run_capsule_llm_step_loop(
             suffix_extra="capsule",
         )
 
+    visual_audit = {
+        "visual_capture_errors": visual_capture_audit,
+        "visual_artifact_errors": visual_artifact_audit,
+        "visual_artifacts_complete": (
+            not visual_capture_audit and not visual_artifact_audit
+        ),
+    }
     log = (
         f"Capsule actions: {len(history)}\n"
         f"Executed regions: {executed_regions}\n"
         f"Reward: {reward}\n"
-        f"Task Completed: {task_completed}"
+        f"Task Completed: {task_completed}\n"
+        f"Budget Exhausted: {budget_exhausted}\n"
+        f"Loop Exit Reason: {loop_exit_reason}\n"
+        f"Capsule Metrics: {json.dumps(trial_metrics)}\n"
+        f"Visual Audit: {json.dumps(visual_audit)}"
     )
     return TrialSummary(
         trial=trial,
         success=sandbox_rc == 0,
         reward=reward,
-        terminated=bool(task_completed) or reward == 1.0,
-        truncated=False,
+        terminated=task_succeeded,
+        truncated=budget_exhausted,
         sandbox_rc=sandbox_rc,
         log=log,
         task_completed=task_completed,
@@ -1162,6 +2769,31 @@ def _run_capsule_llm_step_loop(
         num_regenerations=0,
         num_finishes=1 if finished else 0,
         num_code_blocks=executed_regions,
+        run_outcome=run_outcome.value,
+    )
+
+
+def _finish_success_guard_event(
+    action: RuntimeAction,
+    state: dict[str, Any],
+    *,
+    require_task_success: bool,
+) -> RuntimeEvent | None:
+    if action.action != "finish" or not require_task_success:
+        return None
+    reward = _state_reward(state)
+    if state.get("task_completed") is True or (reward is not None and reward >= 1.0):
+        return None
+    return RuntimeEvent(
+        action="finish",
+        status="warning",
+        message=(
+            "Finish rejected because the environment success predicate is not satisfied."
+        ),
+        evidence={
+            "task_completed": state.get("task_completed"),
+            "reward": reward,
+        },
     )
 
 
@@ -1186,6 +2818,104 @@ def _validate_patched_source(
     return None
 
 
+def _source_edit_rejection_event(
+    action: RuntimeAction,
+    rejection: _SourceEditRejection,
+) -> RuntimeEvent:
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=_runtime_action_unit_id(action),
+        message=rejection.message,
+        evidence=dict(rejection.evidence),
+    )
+
+
+def _source_edit_rejection_metadata(
+    action: RuntimeAction,
+    event: RuntimeEvent,
+) -> tuple[str, str]:
+    explicit_reason = event.evidence.get("edit_rejection_reason")
+    if isinstance(explicit_reason, str) and explicit_reason:
+        lineage_status = event.evidence.get(
+            "lineage_reconciliation_status",
+            "not_attempted",
+        )
+        return explicit_reason, str(lineage_status)
+    if event.evidence.get("safety_failure") == "side_effect_replay":
+        return "executed_unit_edit_attempt", "not_attempted"
+    if event.evidence.get("safety_failure") == "side_effect_lineage_unavailable":
+        return "lineage_ambiguous", "ambiguous"
+    if event.evidence.get("exception_type") == "SyntaxError":
+        return "candidate_syntax_error", "not_attempted"
+    if action.action == "append_recovery":
+        return "invalid_recovery_source", "not_attempted"
+    return "invalid_source_edit_action", "not_attempted"
+
+
+def _annotate_source_edit_event(
+    event: RuntimeEvent,
+    *,
+    source_revision_before: int,
+    source_revision_after: int,
+    source_edit_committed: bool,
+    lineage_reconciliation_status: str,
+    edit_rejection_reason: str | None = None,
+) -> None:
+    if not source_edit_committed:
+        event.evidence.pop("source", None)
+    event.evidence.update(
+        {
+            "source_revision_before": source_revision_before,
+            "source_revision_after": source_revision_after,
+            "source_edit_committed": source_edit_committed,
+            "lineage_reconciliation_status": lineage_reconciliation_status,
+        }
+    )
+    if edit_rejection_reason is not None:
+        event.evidence["edit_rejection_reason"] = edit_rejection_reason
+
+
+def _capsule_provider_attempt_count() -> int:
+    context = get_trial_llm_context()
+    if context is None:
+        return 0
+    return int(context.summary().get("attempt_count", 0))
+
+
+def _capsule_run_outcome(loop_exit_reason: str) -> RunOutcome:
+    return {
+        "accepted_finish": RunOutcome.FINISHED,
+        "task_success": RunOutcome.FINISHED,
+        "failed_event": RunOutcome.EXECUTION_FAILED,
+        "budget_exhausted": RunOutcome.TRIAL_BUDGET_EXHAUSTED,
+    }[loop_exit_reason]
+
+
+def _variable_inspection_key(
+    action: RuntimeAction,
+    *,
+    source_revision: int,
+    trace_revision: int,
+    namespace_revision: int,
+) -> tuple[int, int, int, tuple[str, ...]] | None:
+    if action.action != "inspect_variables":
+        return None
+    names = action.args.get("names", [])
+    if (
+        not isinstance(names, list)
+        or not names
+        or not all(isinstance(name, str) for name in names)
+    ):
+        return None
+    return (
+        source_revision,
+        trace_revision,
+        namespace_revision,
+        tuple(sorted(set(names))),
+    )
+
+
 def _execute_runtime_action(
     action: RuntimeAction,
     executor: CapsuleExecutor,
@@ -1193,7 +2923,6 @@ def _execute_runtime_action(
     region_by_id: dict[str, Any],
     group_by_id: dict[str, Any] | None = None,
     recovery_observation_functions: set[str] | None = None,
-    append_recovery_insert_after_line: int | None = None,
 ) -> RuntimeEvent:
     group_by_id = group_by_id or {}
     if action.action == "finish":
@@ -1224,25 +2953,6 @@ def _execute_runtime_action(
         event = executor.run_region(group)
         event.action = "run_group"
         return event
-
-    if action.action == "inspect_trace":
-        last_n = _runtime_trace_last_n(action.args.get("last_n", 8))
-        failed_only = bool(action.args.get("failed_only", False))
-        return RuntimeEvent(
-            action=action.action,
-            status="success",
-            evidence=(
-                executor.trace.summary(max_events=last_n, failed_only=failed_only)
-                if executor.trace is not None
-                else {
-                    "event_count": 0,
-                    "primitive_call_counts": {},
-                    "failed_event_count": 0,
-                    "recent_events": [],
-                    "failed_events": [],
-                }
-            ),
-        )
 
     if action.action == "inspect_variables":
         names = action.args.get("names", [])
@@ -1335,7 +3045,12 @@ def _execute_runtime_action(
                 action=action.action,
                 status="invalid",
                 message=f"append_recovery source must parse as Python: {exc.msg}",
-                evidence={"exception_type": type(exc).__name__},
+                evidence={
+                    "exception_type": type(exc).__name__,
+                    "lineno": exc.lineno,
+                    "offset": exc.offset,
+                    "text": exc.text,
+                },
             )
         fresh_state_functions = (
             {"get_observation"}
@@ -1358,11 +3073,7 @@ def _execute_runtime_action(
                 status="invalid",
                 message=f"append_recovery source must call at least one of: {allowed_calls}.",
             )
-        patched = _append_recovery_source(
-            source,
-            recovery_source,
-            insert_after_line=append_recovery_insert_after_line,
-        )
+        patched = _append_recovery_source(source, recovery_source)
         return RuntimeEvent(
             action=action.action,
             status="success",
@@ -1377,6 +3088,7 @@ def _execute_runtime_action(
                 "Rollback is disabled. Continue from the current physical state with "
                 "fresh observation and recovery code."
             ),
+            evidence={"safety_failure": "rollback_disabled"},
         )
 
     if action.action == "resume_from_region":
@@ -1394,23 +3106,124 @@ def _execute_runtime_action(
     return RuntimeEvent(action=action.action, status="invalid", message="Unsupported runtime action")
 
 
+def _execute_runtime_action_with_infrastructure_retries(
+    action: RuntimeAction,
+    executor: CapsuleExecutor,
+    source: str,
+    region_by_id: dict[str, Any],
+    group_by_id: dict[str, Any] | None = None,
+    *,
+    recovery_observation_functions: set[str] | None = None,
+    side_effect_calls: set[str],
+) -> RuntimeEvent:
+    attempts: list[dict[str, Any]] = []
+    for attempt in range(1, CAPSULE_INFRASTRUCTURE_MAX_ATTEMPTS + 1):
+        event = _execute_runtime_action(
+            action,
+            executor,
+            source,
+            region_by_id,
+            group_by_id,
+            recovery_observation_functions=recovery_observation_functions,
+        )
+        failure = classify_runtime_infrastructure_failure(event)
+        if failure is None:
+            if attempts:
+                event.evidence.update(
+                    {
+                        "infrastructure_attempt_count": attempt,
+                        "infrastructure_retry_count": len(attempts),
+                        "infrastructure_failed_attempts": attempts,
+                    }
+                )
+            return event
+
+        side_effect_trace_present = _event_has_side_effect_trace(
+            event,
+            side_effect_calls,
+        )
+        attempts.append(
+            {
+                "attempt": attempt,
+                "failure_kind": failure.kind,
+                "side_effect_trace_present": side_effect_trace_present,
+                "runtime_event": event.to_dict(),
+            }
+        )
+        if side_effect_trace_present or attempt == CAPSULE_INFRASTRUCTURE_MAX_ATTEMPTS:
+            failure.evidence.update(
+                {
+                    "infrastructure_attempt_count": attempt,
+                    "infrastructure_retry_count": attempt - 1,
+                    "infrastructure_failed_attempts": attempts,
+                }
+            )
+            if side_effect_trace_present:
+                failure.evidence["retry_suppressed_reason"] = (
+                    "robot_side_effect_trace_present"
+                )
+            raise failure
+
+        backoff_index = min(
+            attempt - 1,
+            len(CAPSULE_INFRASTRUCTURE_RETRY_BACKOFF_SECONDS) - 1,
+        )
+        time.sleep(CAPSULE_INFRASTRUCTURE_RETRY_BACKOFF_SECONDS[backoff_index])
+
+    raise InfrastructureFailure(
+        "service_retry_exhausted",
+        "Runtime service retry loop exhausted unexpectedly.",
+    )
+
+
 def _no_rollback_guard_event(
     action: RuntimeAction,
-    executed_side_effect_regions: set[str],
-    executed_side_effect_groups: set[str],
+    lineage: UnitLineage,
+    region_by_id: dict[str, CodeRegion] | None = None,
+    group_by_id: dict[str, CodeRegionGroup] | None = None,
     *,
     recovery_observation_functions: set[str] | None = None,
 ) -> RuntimeEvent | None:
+    region_by_id = region_by_id or {}
+    group_by_id = group_by_id or {}
     recovery_hint = _recovery_instruction(recovery_observation_functions)
     if action.action in {"run_group", "patch_group"}:
         group_id = str(action.args.get("group_id", ""))
-        if group_id in executed_side_effect_groups:
+        group = group_by_id.get(group_id)
+        if group is None:
+            return None
+        group_key = lineage.group_key_by_id.get(group_id)
+        region_keys = [
+            lineage.region_key_by_id.get(region_id) for region_id in group.region_ids
+        ]
+        if group_key is None or any(region_key is None for region_key in region_keys):
+            return _missing_side_effect_lineage_event(action.action, group_id)
+        contains_executed_region = bool(
+            lineage.executed_region_keys.intersection(region_keys)
+        )
+        if group_key in lineage.executed_group_keys or contains_executed_region:
             return _already_executed_side_effect_event(action.action, group_id, recovery_hint)
         return None
 
     if action.action in {"run_region", "patch_region", "resume_from_region"}:
         region_id = str(action.args.get("region_id", ""))
-        if region_id in executed_side_effect_regions:
+        if region_id not in region_by_id:
+            return None
+        region_key = lineage.region_key_by_id.get(region_id)
+        containing_groups = [
+            group for group in group_by_id.values() if region_id in group.region_ids
+        ]
+        containing_group_keys = [
+            lineage.group_key_by_id.get(group.group_id) for group in containing_groups
+        ]
+        if region_key is None or any(
+            group_key is None for group_key in containing_group_keys
+        ):
+            return _missing_side_effect_lineage_event(action.action, region_id)
+        if (
+            region_key in lineage.executed_region_keys
+            or bool(lineage.executed_group_keys.intersection(containing_group_keys))
+        ):
             return _already_executed_side_effect_event(action.action, region_id, recovery_hint)
         return None
 
@@ -1425,13 +3238,12 @@ def _reward_drop_guard_event(
     group_by_id: dict[str, Any],
     side_effect_calls: set[str] | None = None,
     *,
-    recovery_side_effect_budget: int,
+    lineage: UnitLineage,
+    recovery_generations: list[RecoveryGeneration],
     min_best_reward: float,
     drop_threshold: float,
     recovery_observation_functions: set[str] | None = None,
 ) -> RuntimeEvent | None:
-    if recovery_side_effect_budget > 0:
-        return None
     if side_effect_calls is None:
         side_effect_calls = ROBOT_SIDE_EFFECT_CALLS
     if not _runtime_action_targets_side_effect_unit(
@@ -1440,6 +3252,19 @@ def _reward_drop_guard_event(
         group_by_id,
         side_effect_calls,
     ):
+        return None
+    recovery_authorization = _recovery_authorization_for_action(
+        action,
+        lineage=lineage,
+        recovery_generations=recovery_generations,
+    )
+    observation_guard = _recovery_observation_guard_event(
+        action,
+        recovery_authorization,
+    )
+    if observation_guard is not None:
+        return observation_guard
+    if recovery_authorization is not None:
         return None
 
     current_reward = _state_reward(before_state)
@@ -1462,6 +3287,7 @@ def _reward_drop_guard_event(
             "Finish instead if the task is complete."
         ),
         evidence={
+            "safety_failure": "reward_drop_guard",
             "best_reward_so_far": best_reward_so_far,
             "current_reward": current_reward,
             "reward_drop_from_best": reward_drop,
@@ -1469,6 +3295,235 @@ def _reward_drop_guard_event(
             "min_best_reward": min_best_reward,
         },
     )
+
+
+def _repair_pending_guard_event(
+    action: RuntimeAction,
+    analysis: _CapsuleSourceAnalysis,
+) -> RuntimeEvent | None:
+    if not _capsule_source_requires_repair(analysis) or action.action not in {
+        "run_group",
+        "run_region",
+        "resume_from_region",
+    }:
+        return None
+    safety_failure = (
+        "program_contract_violation"
+        if analysis.contract_violations
+        else "repair_pending"
+    )
+    evidence: dict[str, Any] = {
+        "safety_failure": safety_failure,
+        **_capsule_repair_state_evidence(analysis),
+    }
+    if analysis.contract_violations:
+        evidence["program_contract_violations"] = [
+            violation.to_dict() for violation in analysis.contract_violations
+        ]
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=_runtime_action_unit_id(action),
+        message=(
+            "Source execution is quarantined until all pending source violations "
+            "are repaired. Patch the source before running or resuming it."
+        ),
+        evidence=evidence,
+    )
+
+
+def _program_contract_guard_event(
+    action: RuntimeAction,
+    violations: list[ProgramContractViolation],
+    effectful_region_ids: set[str],
+    effectful_group_ids: set[str],
+) -> RuntimeEvent | None:
+    if not violations:
+        return None
+    if action.action == "run_group":
+        target_is_effectful = str(action.args.get("group_id", "")) in effectful_group_ids
+    elif action.action in {"run_region", "resume_from_region"}:
+        target_is_effectful = (
+            str(action.args.get("region_id", "")) in effectful_region_ids
+        )
+    else:
+        target_is_effectful = False
+    if not target_is_effectful:
+        return None
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=str(
+            action.args.get("group_id") or action.args.get("region_id") or ""
+        )
+        or None,
+        message=(
+            "Robot side-effect execution is blocked until the Capsule-ready "
+            "program contract is repaired."
+        ),
+        evidence={
+            "program_contract_violations": [item.to_dict() for item in violations]
+        },
+    )
+
+
+def _group_dependency_guard_event(
+    action: RuntimeAction,
+    state: _GroupDependencyState,
+) -> RuntimeEvent | None:
+    if action.action != "run_group":
+        return None
+    group_id = str(action.args.get("group_id", ""))
+    missing = state.missing_by_group_id.get(group_id)
+    if not missing:
+        return None
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=group_id,
+        message=(
+            f"{group_id} cannot run until its source dependencies are defined: "
+            f"{', '.join(missing)}."
+        ),
+        evidence={
+            "safety_failure": "missing_group_dependencies",
+            "missing_dependencies": list(missing),
+            "runnable_group_ids": list(state.runnable_group_ids),
+        },
+    )
+
+
+def _pending_recovery_evidence(
+    state: _RecoveryActionState,
+) -> dict[str, Any]:
+    return {
+        "safety_failure": "recovery_generation_pending",
+        "edit_rejection_reason": state.append_recovery_block_reason,
+        "pending_recovery_group_ids": list(state.pending_recovery_group_ids),
+        "runnable_recovery_group_ids": list(
+            state.runnable_recovery_group_ids
+        ),
+    }
+
+
+def _append_recovery_guard_event(
+    action: RuntimeAction,
+    state: _RecoveryActionState,
+) -> RuntimeEvent | None:
+    if action.action != "append_recovery" or state.append_recovery_available:
+        return None
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=_runtime_action_unit_id(action),
+        message=(
+            "append_recovery is unavailable until the latest recovery transaction "
+            "completes. Run a runnable recovery group or patch a pending recovery "
+            "group."
+        ),
+        evidence=_pending_recovery_evidence(state),
+    )
+
+
+def _pending_recovery_group_guard_event(
+    action: RuntimeAction,
+    state: _RecoveryActionState,
+) -> RuntimeEvent | None:
+    if state.append_recovery_available or action.action not in {
+        "run_group",
+        "patch_group",
+    }:
+        return None
+
+    group_id = str(action.args.get("group_id", ""))
+    if group_id in state.pending_recovery_group_ids:
+        return None
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=group_id or None,
+        message=(
+            f"{action.action} must target the latest pending recovery transaction."
+        ),
+        evidence=_pending_recovery_evidence(state),
+    )
+
+
+def _execution_granularity_guard_event(
+    action: RuntimeAction,
+    *,
+    use_semantic_groups: bool,
+) -> RuntimeEvent | None:
+    allowed_actions = (
+        {"run_group", "patch_group"}
+        if use_semantic_groups
+        else {"run_region", "resume_from_region", "patch_region"}
+    )
+    granularity_actions = {
+        "run_group",
+        "patch_group",
+        "run_region",
+        "resume_from_region",
+        "patch_region",
+    }
+    if action.action not in granularity_actions or action.action in allowed_actions:
+        return None
+    granularity = "semantic_group" if use_semantic_groups else "region"
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=_runtime_action_unit_id(action),
+        message=(
+            f"execution_granularity_mismatch: {action.action} is unavailable "
+            f"when capsule_execution_granularity={granularity}."
+        ),
+        evidence={
+            "safety_failure": "execution_granularity_mismatch",
+            "execution_granularity": granularity,
+            "allowed_granularity_actions": sorted(allowed_actions),
+        },
+    )
+
+
+def _strict_subset_guard_event(
+    action: RuntimeAction,
+    violations: list[ProgramContractViolation],
+) -> RuntimeEvent | None:
+    if not violations or action.action not in {
+        "run_group",
+        "run_region",
+        "resume_from_region",
+    }:
+        return None
+    serialized_violations = [item.to_dict() for item in violations]
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=_runtime_action_unit_id(action),
+        message=(
+            "Source execution is blocked until all strict Capsule Python subset "
+            "violations are repaired. Patch the source before running or resuming it."
+        ),
+        evidence={
+            "strict_subset_violations": serialized_violations,
+            "program_contract_violations": serialized_violations,
+        },
+    )
+
+
+def _capsule_event_has_safety_failure(event: RuntimeEvent) -> bool:
+    return _post_action_safety_failure(event) is not None
+
+
+def _post_action_safety_failure(event: RuntimeEvent) -> str | None:
+    explicit_failure = event.evidence.get("safety_failure")
+    if explicit_failure is not None:
+        return str(explicit_failure)
+    if event.evidence.get("strict_subset_violations"):
+        return "strict_subset_violation"
+    if event.evidence.get("program_contract_violations"):
+        return "program_contract_violation"
+    return None
 
 
 def _runtime_action_targets_side_effect_unit(
@@ -1498,102 +3553,401 @@ def _runtime_action_unit_id(action: RuntimeAction) -> str | None:
     return str(unit_id) if unit_id else None
 
 
-RECOVERY_ACTIONS: set[str] = {
-    "inspect_trace",
-    "inspect_variables",
-    "patch_group",
-    "patch_region",
-    "append_recovery",
-    "resume_from_region",
-    "finish",
-}
-
-
-def _validate_recovery_action(
+def _runtime_action_unit_key(
     action: RuntimeAction,
-    *,
-    failed_unit: CodeRegion | CodeRegionGroup,
-    region_by_id: dict[str, Any],
-    group_by_id: dict[str, Any],
-) -> RuntimeEvent | None:
-    if action.action not in RECOVERY_ACTIONS:
-        return RuntimeEvent(
-            action=action.action,
-            status="invalid",
-            region_id=_runtime_action_unit_id(action),
-            message=f"{action.action} is not allowed during recovery.",
-        )
-
-    if action.action in {"patch_group"}:
-        group_id = str(action.args.get("group_id", ""))
-        if not isinstance(failed_unit, CodeRegionGroup) or group_id != failed_unit.group_id:
-            return RuntimeEvent(
-                action=action.action,
-                status="invalid",
-                region_id=group_id,
-                message="Recovery patch_group must target the failed group.",
-            )
-        if group_id not in group_by_id:
-            return None
-
-    if action.action in {"patch_region", "resume_from_region"}:
-        region_id = str(action.args.get("region_id", ""))
-        if not _recovery_region_is_local(failed_unit, region_id):
-            return RuntimeEvent(
-                action=action.action,
-                status="invalid",
-                region_id=region_id,
-                message=(
-                    "Recovery patch_region/resume_from_region must target the failed "
-                    "region or a member region of the failed group."
-                ),
-            )
-        if region_id not in region_by_id:
-            return None
-
+    lineage: UnitLineage,
+) -> str | None:
+    if action.action in {"run_group", "patch_group"}:
+        return lineage.group_key_by_id.get(str(action.args.get("group_id", "")))
+    if action.action in {"run_region", "patch_region", "resume_from_region"}:
+        return lineage.region_key_by_id.get(str(action.args.get("region_id", "")))
     return None
 
 
-def _recovery_region_is_local(
-    failed_unit: CodeRegion | CodeRegionGroup,
-    region_id: str,
-) -> bool:
-    if isinstance(failed_unit, CodeRegionGroup):
-        return region_id in failed_unit.region_ids
-    return region_id == failed_unit.region_id
+def _display_side_effect_ledger(lineage: UnitLineage) -> dict[str, list[str]]:
+    return {
+        "executed_side_effect_groups": sorted(
+            group_id
+            for group_id, group_key in lineage.group_key_by_id.items()
+            if group_key in lineage.executed_group_keys
+        ),
+        "executed_side_effect_regions": sorted(
+            region_id
+            for region_id, region_key in lineage.region_key_by_id.items()
+            if region_key in lineage.executed_region_keys
+        ),
+    }
 
 
-def _mark_executed_side_effects_from_trace(
+def _recovery_generation_metrics(
+    generations: list[RecoveryGeneration],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "generation_id": generation.generation_id,
+            "source_revision": generation.source_revision,
+            "start_line": generation.start_line,
+            "end_line": generation.end_line,
+            "observation_functions": list(generation.observation_functions),
+            "observation_group_keys": sorted(
+                generation.observation_group_keys
+            ),
+            "inline_observation_group_keys": sorted(
+                generation.inline_observation_group_keys
+            ),
+            "observation_region_keys": sorted(
+                generation.observation_region_keys
+            ),
+            "inline_observation_region_keys": sorted(
+                generation.inline_observation_region_keys
+            ),
+            "observation_satisfied": generation.observation_satisfied,
+            "observation_trace_revision": generation.observation_trace_revision,
+            "authorized_group_keys": sorted(generation.authorized_group_keys),
+            "executed_group_keys": sorted(generation.executed_group_keys),
+            "authorized_region_keys": sorted(generation.authorized_region_keys),
+            "executed_region_keys": sorted(generation.executed_region_keys),
+            "append_trace_revision": generation.append_trace_revision,
+        }
+        for generation in generations
+    ]
+
+
+_MODEL_HISTORY_INTERNAL_AUDIT_FIELDS = {
+    "missing_executed_group_keys",
+    "missing_executed_region_keys",
+}
+
+
+def _model_facing_capsule_history(
+    history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    allowed_fields = (
+        "step_id",
+        "action",
+        "event",
+        "feedback",
+        "trace_events",
+        "state_before",
+        "state_after",
+    )
+    model_history = []
+    for entry in history:
+        sanitized_entry = {
+            field: _sanitize_model_facing_capsule_value(entry[field])
+            for field in allowed_fields
+            if field in entry
+        }
+        action = entry.get("action")
+        if isinstance(action, dict) and action.get("action") == "inspect_variables":
+            for field in ("event", "feedback"):
+                original_value = entry.get(field)
+                sanitized_value = sanitized_entry.get(field)
+                if not isinstance(original_value, dict) or not isinstance(
+                    sanitized_value, dict
+                ):
+                    continue
+                if "evidence" in original_value:
+                    sanitized_value["evidence"] = copy.deepcopy(
+                        original_value["evidence"]
+                    )
+        model_history.append(sanitized_entry)
+    return model_history
+
+
+def _sanitize_model_facing_capsule_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_model_facing_capsule_value(item)
+            for key, item in value.items()
+            if key not in _MODEL_HISTORY_INTERNAL_AUDIT_FIELDS
+        }
+    if isinstance(value, list):
+        return [_sanitize_model_facing_capsule_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_model_facing_capsule_value(item) for item in value)
+    return copy.deepcopy(value)
+
+
+@dataclass(frozen=True)
+class _RecoveryAuthorization:
+    generation: RecoveryGeneration
+    unit_key: str
+    unit_kind: str
+
+
+@dataclass(frozen=True)
+class _PreparedRuntimeTraceCommit:
+    event: RuntimeEvent
+    lineage: UnitLineage
+    recovery_generations: list[RecoveryGeneration]
+    authorization_consumed: bool
+    recovery_generation_id: str | None
+    recovery_unit_key: str | None
+    recovery_unit_kind: str | None
+
+
+def _recovery_authorization_for_action(
+    action: RuntimeAction,
+    *,
+    lineage: UnitLineage,
+    recovery_generations: list[RecoveryGeneration],
+) -> _RecoveryAuthorization | None:
+    if action.action == "run_group":
+        unit_key = lineage.group_key_by_id.get(
+            str(action.args.get("group_id", ""))
+        )
+        unit_kind = "group"
+        authorization_field = "authorized_group_keys"
+    elif action.action in {"run_region", "resume_from_region"}:
+        unit_key = lineage.region_key_by_id.get(
+            str(action.args.get("region_id", ""))
+        )
+        unit_kind = "region"
+        authorization_field = "authorized_region_keys"
+    else:
+        return None
+    if unit_key is None:
+        return None
+    matches = [
+        generation
+        for generation in recovery_generations
+        if unit_key in getattr(generation, authorization_field)
+    ]
+    if len(matches) > 1:
+        raise LineageAmbiguityError(
+            f"Recovery {unit_kind} key is authorized by multiple generations: {unit_key}"
+        )
+    if not matches:
+        return None
+    return _RecoveryAuthorization(matches[0], unit_key, unit_kind)
+
+
+def _recovery_observation_guard_event(
+    action: RuntimeAction,
+    authorization: _RecoveryAuthorization | None,
+) -> RuntimeEvent | None:
+    if authorization is None:
+        return None
+    generation = authorization.generation
+    inline_observation_keys = (
+        generation.inline_observation_group_keys
+        if authorization.unit_kind == "group"
+        else generation.inline_observation_region_keys
+    )
+    if (
+        generation.observation_satisfied
+        or authorization.unit_key in inline_observation_keys
+    ):
+        return None
+    return RuntimeEvent(
+        action=action.action,
+        status="invalid",
+        region_id=_runtime_action_unit_id(action),
+        message=(
+            "Recovery side effects require fresh observation trace evidence "
+            "from their recovery generation."
+        ),
+        evidence={
+            "safety_failure": "recovery_observation_required",
+            "recovery_generation_id": generation.generation_id,
+        },
+    )
+
+
+def _record_recovery_observation_trace(
+    action: RuntimeAction,
     event: RuntimeEvent,
-    group: CodeRegionGroup,
-    region_by_id: dict[str, Any],
-    executed_side_effect_regions: set[str],
-    executed_side_effect_groups: set[str],
+    *,
+    lineage: UnitLineage,
+    recovery_generations: list[RecoveryGeneration],
     side_effect_calls: set[str],
+    trace_revision: int,
 ) -> None:
-    if not _event_has_side_effect_trace(event, side_effect_calls):
+    if action.action == "run_group":
+        unit_key = lineage.group_key_by_id.get(
+            str(action.args.get("group_id", ""))
+        )
+        observation_field = "observation_group_keys"
+    elif action.action in {"run_region", "resume_from_region"}:
+        unit_key = lineage.region_key_by_id.get(
+            str(action.args.get("region_id", ""))
+        )
+        observation_field = "observation_region_keys"
+    else:
         return
-
-    executed_side_effect_groups.add(group.group_id)
-    for member_region_id in group.region_ids:
-        member_region = region_by_id.get(member_region_id)
-        if member_region is not None and _region_has_side_effect_call(
-            member_region,
-            side_effect_calls,
+    if unit_key is None:
+        return
+    trace_events = event.evidence.get("trace_events", [])
+    if not isinstance(trace_events, list):
+        return
+    for generation in recovery_generations:
+        if unit_key not in getattr(generation, observation_field):
+            continue
+        observation_indices = [
+            index
+            for index, trace_event in enumerate(trace_events)
+            if trace_event.get("name") in generation.observation_functions
+            and trace_event.get("status") == "success"
+        ]
+        side_effect_indices = [
+            index
+            for index, trace_event in enumerate(trace_events)
+            if trace_event.get("name") in side_effect_calls
+        ]
+        if (
+            side_effect_indices
+            and not generation.observation_satisfied
+            and (
+                not observation_indices
+                or min(observation_indices) > min(side_effect_indices)
+            )
         ):
-            executed_side_effect_regions.add(member_region_id)
+            event.evidence["safety_failure"] = (
+                "recovery_observation_trace_order"
+            )
+            event.evidence["recovery_generation_id"] = generation.generation_id
+            continue
+        if observation_indices:
+            generation.observation_satisfied = True
+            generation.observation_trace_revision = trace_revision
 
 
-def _mark_executed_side_effect_region_from_trace(
+def _prepare_runtime_trace_commit(
+    action: RuntimeAction,
     event: RuntimeEvent,
-    region: CodeRegion,
-    executed_side_effect_regions: set[str],
+    *,
+    region_by_id: dict[str, CodeRegion],
+    group_by_id: dict[str, CodeRegionGroup],
+    lineage: UnitLineage,
+    recovery_generations: list[RecoveryGeneration],
+    side_effect_calls: set[str],
+    trace_revision: int,
+) -> _PreparedRuntimeTraceCommit:
+    candidate_event = copy.deepcopy(event)
+    candidate_lineage = copy.deepcopy(lineage)
+    candidate_generations = copy.deepcopy(recovery_generations)
+    authorization = _recovery_authorization_for_action(
+        action,
+        lineage=candidate_lineage,
+        recovery_generations=candidate_generations,
+    )
+    generation_id = (
+        authorization.generation.generation_id
+        if authorization is not None
+        else None
+    )
+    unit_key = authorization.unit_key if authorization is not None else None
+    unit_kind = authorization.unit_kind if authorization is not None else None
+
+    _record_recovery_observation_trace(
+        action,
+        candidate_event,
+        lineage=candidate_lineage,
+        recovery_generations=candidate_generations,
+        side_effect_calls=side_effect_calls,
+        trace_revision=trace_revision,
+    )
+    has_side_effect_trace = _event_has_side_effect_trace(
+        candidate_event, side_effect_calls
+    )
+    authorization_consumed = False
+    if authorization is not None and has_side_effect_trace:
+        generation = authorization.generation
+        if authorization.unit_kind == "group":
+            generation.authorized_group_keys.remove(authorization.unit_key)
+            generation.executed_group_keys.add(authorization.unit_key)
+        else:
+            generation.authorized_region_keys.remove(authorization.unit_key)
+            generation.executed_region_keys.add(authorization.unit_key)
+        authorization_consumed = generation.observation_satisfied
+
+    _record_runtime_side_effect_execution(
+        action,
+        candidate_event,
+        region_by_id,
+        group_by_id,
+        candidate_lineage,
+        side_effect_calls,
+    )
+    return _PreparedRuntimeTraceCommit(
+        event=candidate_event,
+        lineage=candidate_lineage,
+        recovery_generations=candidate_generations,
+        authorization_consumed=authorization_consumed,
+        recovery_generation_id=generation_id,
+        recovery_unit_key=unit_key,
+        recovery_unit_kind=unit_kind,
+    )
+
+
+def _record_runtime_side_effect_execution(
+    action: RuntimeAction,
+    event: RuntimeEvent,
+    region_by_id: dict[str, CodeRegion],
+    group_by_id: dict[str, CodeRegionGroup],
+    lineage: UnitLineage,
     side_effect_calls: set[str],
 ) -> None:
-    if not _event_has_side_effect_trace(event, side_effect_calls):
+    if event.status == "invalid" or not _event_has_side_effect_trace(
+        event, side_effect_calls
+    ):
         return
-    if _region_has_side_effect_call(region, side_effect_calls):
-        executed_side_effect_regions.add(region.region_id)
+
+    if action.action in {"run_region", "resume_from_region"}:
+        region_id = str(action.args.get("region_id", ""))
+        if region_id not in region_by_id:
+            raise LineageAmbiguityError(
+                f"executed region is missing from current region table: {region_id}"
+            )
+        region_key = lineage.region_key_by_id.get(region_id)
+        if region_key is None:
+            raise LineageAmbiguityError(
+                f"executed region is missing a stable region key: {region_id}"
+            )
+        containing_group_keys: set[str] = set()
+        for group in group_by_id.values():
+            if region_id not in group.region_ids:
+                continue
+            group_key = lineage.group_key_by_id.get(group.group_id)
+            if group_key is None:
+                raise LineageAmbiguityError(
+                    "containing group is missing a stable group key: "
+                    f"{group.group_id}"
+                )
+            containing_group_keys.add(group_key)
+
+        lineage.executed_region_keys.update({region_key})
+        lineage.executed_group_keys.update(containing_group_keys)
+        return
+
+    if action.action == "run_group":
+        group_id = str(action.args.get("group_id", ""))
+        group = group_by_id.get(group_id)
+        if group is None:
+            raise LineageAmbiguityError(
+                f"executed group is missing from current group table: {group_id}"
+            )
+        group_key = lineage.group_key_by_id.get(group_id)
+        if group_key is None:
+            raise LineageAmbiguityError(
+                f"executed group is missing a stable group key: {group_id}"
+            )
+        constituent_region_keys: set[str] = set()
+        for region_id in group.region_ids:
+            if region_id not in region_by_id:
+                raise LineageAmbiguityError(
+                    f"constituent region is missing from current region table: {region_id}"
+                )
+            region_key = lineage.region_key_by_id.get(region_id)
+            if region_key is None:
+                raise LineageAmbiguityError(
+                    f"constituent region is missing a stable region key: {region_id}"
+                )
+            constituent_region_keys.add(region_key)
+
+        lineage.executed_group_keys.update({group_key})
+        lineage.executed_region_keys.update(constituent_region_keys)
 
 
 def _event_has_side_effect_trace(event: RuntimeEvent, side_effect_calls: set[str]) -> bool:
@@ -1611,84 +3965,6 @@ def _region_has_side_effect_call(region: CodeRegion, side_effect_calls: set[str]
     return any(_ast_calls_function(tree, name) for name in side_effect_calls)
 
 
-def _group_index_by_id(
-    groups: list[CodeRegionGroup],
-    group_id: str,
-    *,
-    default: int,
-) -> int:
-    for idx, group in enumerate(groups):
-        if group.group_id == group_id:
-            return idx
-    return default
-
-
-def _next_group_index_after_group(groups: list[CodeRegionGroup], group_id: str) -> int:
-    return _group_index_by_id(groups, group_id, default=len(groups) - 1) + 1
-
-
-def _first_group_index_starting_after_line(
-    groups: list[CodeRegionGroup],
-    line_number: int,
-    *,
-    default: int,
-) -> int:
-    for idx, group in enumerate(groups):
-        if group.start_line > line_number:
-            return idx
-    return default
-
-
-def _runtime_actions_for_appended_recovery(
-    regions: list[CodeRegion],
-    groups: list[CodeRegionGroup],
-    *,
-    use_semantic_groups: bool,
-    insert_after_line: int,
-) -> list[RuntimeAction]:
-    if use_semantic_groups:
-        return [
-            RuntimeAction("run_group", {"group_id": group.group_id})
-            for group in groups
-            if group.start_line > insert_after_line
-        ]
-    return [
-        RuntimeAction("run_region", {"region_id": region.region_id})
-        for region in regions
-        if region.start_line > insert_after_line
-    ]
-
-
-def _count_side_effect_runtime_actions(
-    actions: list[RuntimeAction],
-    region_by_id: dict[str, Any],
-    group_by_id: dict[str, Any],
-    side_effect_calls: set[str],
-) -> int:
-    return sum(
-        1
-        for action in actions
-        if _runtime_action_targets_side_effect_unit(
-            action,
-            region_by_id,
-            group_by_id,
-            side_effect_calls,
-        )
-    )
-
-
-def _group_index_for_region(
-    groups: list[CodeRegionGroup],
-    region_id: str,
-    *,
-    default: int,
-) -> int:
-    for idx, group in enumerate(groups):
-        if region_id in group.region_ids:
-            return idx
-    return default
-
-
 def _already_executed_side_effect_event(
     action_name: str, unit_id: str, recovery_hint: str
 ) -> RuntimeEvent:
@@ -1700,7 +3976,492 @@ def _already_executed_side_effect_event(
             f"{unit_id} already executed robot-side-effect code and rollback is disabled. "
             f"{recovery_hint}"
         ),
+        evidence={"safety_failure": "side_effect_replay"},
     )
+
+
+def _missing_side_effect_lineage_event(action_name: str, unit_id: str) -> RuntimeEvent:
+    return RuntimeEvent(
+        action=action_name,
+        status="invalid",
+        region_id=unit_id,
+        message=f"Stable lineage is unavailable for known runtime unit {unit_id}.",
+        evidence={"safety_failure": "side_effect_lineage_unavailable"},
+    )
+
+
+def _runtime_source_edit_span(
+    action: RuntimeAction,
+    previous_source: str,
+    current_source: str,
+    previous_regions: list[CodeRegion],
+    previous_groups: list[CodeRegionGroup],
+) -> tuple[int, int, int] | None:
+    line_delta = len(current_source.splitlines()) - len(previous_source.splitlines())
+    if action.action == "patch_region":
+        target_id = str(action.args.get("region_id", ""))
+        target = next(
+            (region for region in previous_regions if region.region_id == target_id),
+            None,
+        )
+        if target is None:
+            return None
+        return target.start_line, target.end_line, line_delta
+    if action.action == "patch_group":
+        target_id = str(action.args.get("group_id", ""))
+        target = next(
+            (group for group in previous_groups if group.group_id == target_id),
+            None,
+        )
+        if target is None:
+            return None
+        return target.start_line, target.end_line, line_delta
+    if action.action == "append_recovery":
+        insertion_line = len(previous_source.splitlines()) + 1
+        return insertion_line, insertion_line - 1, line_delta
+    return None
+
+
+def _updated_group_boundaries_after_edit(
+    previous_boundaries: set[int],
+    *,
+    action: RuntimeAction,
+    edit_start_line: int,
+    edit_end_line: int,
+    line_delta: int,
+    old_line_count: int,
+) -> set[int]:
+    boundaries: set[int] = set()
+    for boundary in previous_boundaries:
+        if edit_end_line <= boundary:
+            boundaries.add(boundary + line_delta)
+        elif edit_start_line > boundary:
+            boundaries.add(boundary)
+    if action.action == "append_recovery":
+        boundaries.add(old_line_count)
+    return boundaries
+
+
+def _initial_source_revision(source: str) -> SourceRevision:
+    return SourceRevision(
+        revision=0,
+        source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        edit_kind="initial",
+        parent_revision=None,
+        old_line_count=0,
+    )
+
+
+def _next_source_revision(
+    previous_revision: SourceRevision,
+    source: str,
+    *,
+    edit_kind: str,
+    old_line_count: int,
+) -> SourceRevision:
+    if edit_kind not in {"patch_region", "patch_group", "append_recovery"}:
+        raise ValueError(f"Unsupported source revision edit kind: {edit_kind}")
+    return SourceRevision(
+        revision=previous_revision.revision + 1,
+        source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        edit_kind=edit_kind,
+        parent_revision=previous_revision.revision,
+        old_line_count=old_line_count,
+    )
+
+
+@dataclass(frozen=True)
+class _RecoveryObservationPlan:
+    functions: tuple[str, ...]
+    positions: tuple[tuple[int, int], ...]
+    side_effect_positions: tuple[tuple[int, int], ...]
+
+
+def _direct_statement_call(statement: ast.stmt) -> ast.Call | None:
+    value: ast.expr | None = None
+    if isinstance(statement, ast.Expr):
+        value = statement.value
+    elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+        value = statement.value
+    return value if isinstance(value, ast.Call) else None
+
+
+def _call_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _call_arguments_have_side_effect(
+    call: ast.Call,
+    side_effect_calls: set[str],
+) -> bool:
+    argument_roots: list[ast.AST] = [*call.args]
+    argument_roots.extend(keyword.value for keyword in call.keywords)
+    return any(
+        isinstance(node, ast.Call) and _call_name(node) in side_effect_calls
+        for root in argument_roots
+        for node in ast.walk(root)
+    )
+
+
+def _recovery_generation_observation_plan(
+    source: str,
+    recovery_observation_functions: set[str],
+    side_effect_calls: set[str],
+) -> _RecoveryObservationPlan:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise _SourceEditRejection(
+            "candidate_syntax_error",
+            f"Recovery generation is invalid Python: {exc}",
+            evidence={
+                "exception_type": type(exc).__name__,
+                "lineno": exc.lineno,
+                "offset": exc.offset,
+                "text": exc.text,
+            },
+        ) from exc
+    direct_observations: list[tuple[str, tuple[int, int]]] = []
+    for statement in tree.body:
+        call = _direct_statement_call(statement)
+        if call is None or not isinstance(call.func, ast.Name):
+            continue
+        name = call.func.id
+        if (
+            name in recovery_observation_functions
+            and not _call_arguments_have_side_effect(call, side_effect_calls)
+        ):
+            direct_observations.append(
+                (name, (call.lineno, call.col_offset))
+            )
+    side_effect_positions = sorted(
+        (node.lineno, node.col_offset)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _call_name(node) in side_effect_calls
+    )
+    return _RecoveryObservationPlan(
+        functions=tuple(sorted({name for name, _ in direct_observations})),
+        positions=tuple(position for _, position in direct_observations),
+        side_effect_positions=tuple(side_effect_positions),
+    )
+
+
+def _recovery_side_effect_group_keys(
+    *,
+    groups: list[CodeRegionGroup],
+    lineage: UnitLineage,
+    start_line: int,
+    end_line: int,
+) -> set[str]:
+    keys: set[str] = set()
+    for group in groups:
+        if (
+            not group.has_robot_side_effect
+            or group.start_line < start_line
+            or group.end_line > end_line
+        ):
+            continue
+        group_key = lineage.group_key_by_id.get(group.group_id)
+        if group_key is None:
+            raise _SourceEditRejection(
+                "lineage_ambiguous",
+                (
+                    "Recovery side-effect group is missing stable lineage: "
+                    f"{group.group_id}."
+                ),
+                lineage_reconciliation_status="ambiguous",
+            )
+        keys.add(group_key)
+    return keys
+
+
+def _recovery_side_effect_region_keys(
+    *,
+    regions: list[CodeRegion],
+    lineage: UnitLineage,
+    side_effect_calls: set[str],
+    start_line: int,
+    end_line: int,
+) -> set[str]:
+    keys: set[str] = set()
+    for region in regions:
+        if (
+            region.start_line < start_line
+            or region.end_line > end_line
+            or not _region_has_side_effect_call(region, side_effect_calls)
+        ):
+            continue
+        region_key = lineage.region_key_by_id.get(region.region_id)
+        if region_key is None:
+            raise _SourceEditRejection(
+                "lineage_ambiguous",
+                f"Recovery side-effect region lacks stable lineage: {region.region_id}.",
+                lineage_reconciliation_status="ambiguous",
+            )
+        keys.add(region_key)
+    return keys
+
+
+def _recovery_observation_group_keys(
+    *,
+    plan: _RecoveryObservationPlan,
+    groups: list[CodeRegionGroup],
+    lineage: UnitLineage,
+    start_line: int,
+) -> tuple[set[str], set[str]]:
+    observation_keys: set[str] = set()
+    inline_keys: set[str] = set()
+    global_observations = [
+        (line + start_line - 1, column) for line, column in plan.positions
+    ]
+    global_side_effects = [
+        (line + start_line - 1, column)
+        for line, column in plan.side_effect_positions
+    ]
+    for group in groups:
+        observations = [
+            position
+            for position in global_observations
+            if group.start_line <= position[0] <= group.end_line
+        ]
+        if not observations:
+            continue
+        group_key = lineage.group_key_by_id.get(group.group_id)
+        if group_key is None:
+            raise _SourceEditRejection(
+                "lineage_ambiguous",
+                f"Recovery observation group lacks stable lineage: {group.group_id}.",
+                lineage_reconciliation_status="ambiguous",
+            )
+        observation_keys.add(group_key)
+        side_effects = [
+            position
+            for position in global_side_effects
+            if group.start_line <= position[0] <= group.end_line
+        ]
+        if side_effects and min(observations) < min(side_effects):
+            inline_keys.add(group_key)
+    return observation_keys, inline_keys
+
+
+def _recovery_observation_region_keys(
+    *,
+    plan: _RecoveryObservationPlan,
+    regions: list[CodeRegion],
+    lineage: UnitLineage,
+    start_line: int,
+) -> tuple[set[str], set[str]]:
+    observation_keys: set[str] = set()
+    inline_keys: set[str] = set()
+    global_observations = [
+        (line + start_line - 1, column) for line, column in plan.positions
+    ]
+    global_side_effects = [
+        (line + start_line - 1, column)
+        for line, column in plan.side_effect_positions
+    ]
+    for region in regions:
+        observations = [
+            position
+            for position in global_observations
+            if region.start_line <= position[0] <= region.end_line
+        ]
+        if not observations:
+            continue
+        region_key = lineage.region_key_by_id.get(region.region_id)
+        if region_key is None:
+            raise _SourceEditRejection(
+                "lineage_ambiguous",
+                f"Recovery observation region lacks stable lineage: {region.region_id}.",
+                lineage_reconciliation_status="ambiguous",
+            )
+        observation_keys.add(region_key)
+        side_effects = [
+            position
+            for position in global_side_effects
+            if region.start_line <= position[0] <= region.end_line
+        ]
+        if side_effects and min(observations) < min(side_effects):
+            inline_keys.add(region_key)
+    return observation_keys, inline_keys
+
+
+def _generation_source(source: str, start_line: int, end_line: int) -> str:
+    lines = source.splitlines()
+    return "\n".join(lines[start_line - 1 : end_line])
+
+
+def _next_recovery_generation_id(
+    generations: list[RecoveryGeneration],
+) -> str:
+    return f"recovery_generation_{len(generations) + 1:06d}"
+
+
+def _prepare_recovery_generations(
+    *,
+    action: RuntimeAction,
+    candidate_source: str,
+    candidate_regions: list[CodeRegion],
+    candidate_groups: list[CodeRegionGroup],
+    candidate_lineage: UnitLineage,
+    candidate_revision: SourceRevision,
+    previous_generations: list[RecoveryGeneration],
+    edit_start_line: int,
+    edit_end_line: int,
+    line_delta: int,
+    old_line_count: int,
+    trace_revision: int,
+    recovery_observation_functions: set[str],
+    side_effect_calls: set[str],
+) -> list[RecoveryGeneration]:
+    generations = copy.deepcopy(previous_generations)
+    if action.action == "append_recovery":
+        start_line = old_line_count + 1
+        end_line = len(candidate_source.splitlines())
+        generations.append(
+            RecoveryGeneration(
+                generation_id=_next_recovery_generation_id(generations),
+                source_revision=candidate_revision.revision,
+                start_line=start_line,
+                end_line=end_line,
+                observation_functions=(),
+                append_trace_revision=trace_revision,
+            )
+        )
+    elif action.action in {"patch_region", "patch_group"}:
+        for generation in generations:
+            overlaps_generation = not (
+                edit_end_line < generation.start_line
+                or edit_start_line > generation.end_line
+            )
+            if edit_end_line < generation.start_line:
+                generation.start_line += line_delta
+                generation.end_line += line_delta
+            elif overlaps_generation:
+                if (
+                    edit_start_line < generation.start_line
+                    or edit_end_line > generation.end_line
+                ):
+                    raise _SourceEditRejection(
+                        "recovery_generation_boundary_crossed",
+                        (
+                            "Patch crosses a recovery-generation boundary and cannot "
+                            "be reconciled safely."
+                        ),
+                    )
+                generation.end_line += line_delta
+
+    for generation in generations:
+        observation_plan = _recovery_generation_observation_plan(
+            _generation_source(
+                candidate_source,
+                generation.start_line,
+                generation.end_line,
+            ),
+            recovery_observation_functions,
+            side_effect_calls,
+        )
+        if (
+            not observation_plan.functions
+            or (
+                observation_plan.side_effect_positions
+                and min(observation_plan.positions)
+                >= min(observation_plan.side_effect_positions)
+            )
+        ):
+            raise _SourceEditRejection(
+                "recovery_generation_observation_not_unconditional",
+                (
+                    f"{generation.generation_id} must directly call a declared "
+                    "fresh-state observation function before recovery side effects."
+                ),
+                evidence={"generation_id": generation.generation_id},
+            )
+        observation_group_keys, inline_observation_group_keys = (
+            _recovery_observation_group_keys(
+                plan=observation_plan,
+                groups=candidate_groups,
+                lineage=candidate_lineage,
+                start_line=generation.start_line,
+            )
+        )
+        observation_region_keys: set[str] = set()
+        inline_observation_region_keys: set[str] = set()
+        if not candidate_groups:
+            observation_region_keys, inline_observation_region_keys = (
+                _recovery_observation_region_keys(
+                    plan=observation_plan,
+                    regions=candidate_regions,
+                    lineage=candidate_lineage,
+                    start_line=generation.start_line,
+                )
+            )
+        side_effect_keys = _recovery_side_effect_group_keys(
+            groups=candidate_groups,
+            lineage=candidate_lineage,
+            start_line=generation.start_line,
+            end_line=generation.end_line,
+        )
+        missing_executed_keys = generation.executed_group_keys - side_effect_keys
+        if missing_executed_keys:
+            raise _SourceEditRejection(
+                "lineage_ambiguous",
+                (
+                    f"{generation.generation_id} executed group lineage is outside "
+                    "its current source span."
+                ),
+                evidence={
+                    "generation_id": generation.generation_id,
+                    "missing_executed_group_keys": sorted(missing_executed_keys),
+                },
+                lineage_reconciliation_status="ambiguous",
+            )
+        side_effect_region_keys: set[str] = set()
+        if not candidate_groups:
+            side_effect_region_keys = _recovery_side_effect_region_keys(
+                regions=candidate_regions,
+                lineage=candidate_lineage,
+                side_effect_calls=side_effect_calls,
+                start_line=generation.start_line,
+                end_line=generation.end_line,
+            )
+        missing_executed_region_keys = (
+            generation.executed_region_keys - side_effect_region_keys
+        )
+        if missing_executed_region_keys:
+            raise _SourceEditRejection(
+                "lineage_ambiguous",
+                (
+                    f"{generation.generation_id} executed region lineage is outside "
+                    "its current source span."
+                ),
+                evidence={
+                    "generation_id": generation.generation_id,
+                    "missing_executed_region_keys": sorted(
+                        missing_executed_region_keys
+                    ),
+                },
+                lineage_reconciliation_status="ambiguous",
+            )
+        generation.source_revision = candidate_revision.revision
+        generation.observation_functions = observation_plan.functions
+        generation.observation_group_keys = observation_group_keys
+        generation.inline_observation_group_keys = inline_observation_group_keys
+        generation.observation_region_keys = observation_region_keys
+        generation.inline_observation_region_keys = (
+            inline_observation_region_keys
+        )
+        generation.authorized_group_keys = (
+            side_effect_keys - generation.executed_group_keys
+        )
+        generation.authorized_region_keys = (
+            side_effect_region_keys - generation.executed_region_keys
+        )
+    return generations
 
 
 def _runtime_patch_replacement(args: dict[str, Any]) -> Any:
@@ -1709,14 +4470,6 @@ def _runtime_patch_replacement(args: dict[str, Any]) -> Any:
         if isinstance(replacement, str):
             return replacement
     return None
-
-
-def _runtime_trace_last_n(value: Any) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return 8
-    return max(0, min(parsed, 50))
 
 
 def _coerce_config_bool(value: Any) -> bool:
@@ -1734,34 +4487,12 @@ def _coerce_config_bool(value: Any) -> bool:
 def _append_recovery_source(
     source: str,
     recovery_source: str,
-    *,
-    insert_after_line: int | None = None,
 ) -> str:
-    base = source.rstrip("\n")
     recovery = recovery_source.strip("\n")
-    if insert_after_line is not None:
-        return _insert_recovery_source_after_line(source, recovery, insert_after_line)
-    if not base:
+    if not source:
         return f"{recovery}\n"
-    return f"{base}\n\n{recovery}\n"
-
-
-def _insert_recovery_source_after_line(
-    source: str,
-    recovery_source: str,
-    insert_after_line: int,
-) -> str:
-    lines = source.splitlines()
-    insert_at = max(0, min(insert_after_line, len(lines)))
-    barrier_name = "__capsule_recovery_barrier"
-    # The duplicate definition prevents bounded grouping from merging recovery with future effects.
-    recovery_block = [
-        f"{barrier_name} = None",
-        *recovery_source.splitlines(),
-        f"{barrier_name} = {barrier_name}",
-    ]
-    patched_lines = [*lines[:insert_at], *recovery_block, *lines[insert_at:]]
-    return "\n".join(patched_lines) + "\n"
+    separator = "" if source.endswith(("\n", "\r")) else "\n"
+    return f"{source}{separator}{recovery}\n"
 
 
 def _ast_calls_function(tree: ast.AST, function_name: str) -> bool:
@@ -1816,7 +4547,29 @@ def _safe_compute_reward(env: CodeExecutionEnvBase) -> float:
         return 0.0
 
 
-def _capsule_state_snapshot(env: CodeExecutionEnvBase) -> dict[str, Any]:
+def _validate_capsule_state_level(
+    state_level: str,
+    *,
+    config_name: str = "state_level",
+    allow_none: bool = False,
+) -> str:
+    allowed = ("none", "full", "proprioceptive") if allow_none else (
+        "full",
+        "proprioceptive",
+    )
+    if state_level not in allowed:
+        raise ValueError(
+            f"{config_name} must use one of the allowed values: {', '.join(allowed)}"
+        )
+    return state_level
+
+
+def _capsule_state_snapshot(
+    env: CodeExecutionEnvBase,
+    *,
+    state_level: str = "full",
+) -> dict[str, Any]:
+    _validate_capsule_state_level(state_level)
     snapshot: dict[str, Any] = {
         "reward": _safe_compute_reward(env),
         "task_completed": _safe_task_completed(env),
@@ -1837,9 +4590,10 @@ def _capsule_state_snapshot(env: CodeExecutionEnvBase) -> dict[str, Any]:
     if current_joints is not None:
         snapshot["robot_joint_pos"] = _jsonable_metric_value(current_joints)
 
-    object_poses = _capsule_object_pose_snapshot(low_level_env)
-    if object_poses:
-        snapshot["object_poses"] = object_poses
+    if state_level == "full":
+        object_poses = _capsule_object_pose_snapshot(low_level_env)
+        if object_poses:
+            snapshot["object_poses"] = object_poses
 
     return snapshot
 
@@ -1922,47 +4676,6 @@ def _capsule_step_metric(
     return metric, updated_best
 
 
-def _finish_requires_task_success_guard_event(
-    action: RuntimeAction,
-    state: dict[str, Any],
-    require_task_success_for_finish: bool,
-) -> RuntimeEvent | None:
-    if action.action != "finish" or not require_task_success_for_finish:
-        return None
-    if _state_task_succeeded(state):
-        return None
-
-    return RuntimeEvent(
-        action="finish",
-        status="invalid",
-        message=(
-            "finish rejected because capsule_require_task_success_for_finish is true "
-            "and the current state has not completed the task; continue execution or "
-            "use append_recovery from a fresh observation."
-        ),
-        evidence={
-            "guard": "capsule_require_task_success_for_finish",
-            "task_completed": state.get("task_completed"),
-            "reward": _state_reward(state),
-            "recoverable": True,
-        },
-    )
-
-
-def _is_recoverable_finish_guard_event(event: RuntimeEvent) -> bool:
-    return (
-        event.action == "finish"
-        and event.status == "invalid"
-        and event.evidence.get("guard") == "capsule_require_task_success_for_finish"
-        and bool(event.evidence.get("recoverable"))
-    )
-
-
-def _state_task_succeeded(state: dict[str, Any]) -> bool:
-    reward = _state_reward(state)
-    return bool(state.get("task_completed")) or (reward is not None and reward >= 1.0)
-
-
 def _state_reward(state: dict[str, Any]) -> float | None:
     value = state.get("reward")
     try:
@@ -1986,6 +4699,16 @@ def _jsonable_metric_value(value: Any) -> Any:
 
 
 def _capsule_object_pose_snapshot(low_level_env: Any) -> dict[str, Any]:
+    get_all_object_poses = getattr(low_level_env, "_get_all_object_poses", None)
+    if callable(get_all_object_poses):
+        try:
+            raw_object_poses = get_all_object_poses()
+        except Exception:
+            raw_object_poses = None
+        normalized_poses = _normalize_named_object_poses(raw_object_poses)
+        if normalized_poses:
+            return normalized_poses
+
     robosuite_env = getattr(low_level_env, "robosuite_env", None)
     sim = getattr(robosuite_env, "sim", None)
     if robosuite_env is None or sim is None:
@@ -2006,9 +4729,32 @@ def _capsule_object_pose_snapshot(low_level_env: Any) -> dict[str, Any]:
         except Exception as exc:
             object_poses[attr_name] = {
                 "body": root_body,
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": type(exc).__name__,
             }
     return object_poses
+
+
+def _normalize_named_object_poses(raw_object_poses: Any) -> dict[str, Any]:
+    if not isinstance(raw_object_poses, Mapping):
+        return {}
+
+    normalized: dict[str, Any] = {}
+    for object_name, raw_pose in raw_object_poses.items():
+        if isinstance(raw_pose, Mapping):
+            pose = {
+                str(key): _jsonable_metric_value(value)
+                for key, value in raw_pose.items()
+            }
+        elif isinstance(raw_pose, (list, tuple)) and len(raw_pose) == 2:
+            position, quaternion_wxyz = raw_pose
+            pose = {
+                "pos": _jsonable_metric_value(position),
+                "quat_wxyz": _jsonable_metric_value(quaternion_wxyz),
+            }
+        else:
+            continue
+        normalized[str(object_name)] = pose
+    return normalized
 
 
 def _safe_task_completed(env: CodeExecutionEnvBase) -> bool | None:
@@ -2127,7 +4873,7 @@ def _run_single_trial(
         reasoning = None
         ensemble_data = None
     else:
-        raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs)
+        raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs, trial=trial)
 
     # Initialize partial artifacts for timeout recovery
     if partial_artifacts is not None:
@@ -2335,7 +5081,7 @@ def _run_single_trial(
         try:
             from capx.skills import SkillLibrary
 
-            skill_lib_path = config.get("skill_library_path", None)
+            skill_lib_path = config.get("skill_library_path")
             skill_lib = SkillLibrary(path=skill_lib_path)
             task_name = config.get("task_name", f"trial_{trial}")
             new_skills = skill_lib.extract_from_code(final_code, task_name=task_name)
@@ -2374,7 +5120,7 @@ def _patch_libero_goal(env: CodeExecutionEnvBase, obs: dict[str, Any]) -> None:
         hasattr(handle, "task_language")
         and "libero_environment_goal" in obs["full_prompt"][-1]["content"][0]["text"]
     ):
-        goal = getattr(handle, "task_language")
+        goal = handle.task_language
         obs["full_prompt"][-1]["content"][0]["text"] = (
             obs["full_prompt"][-1]["content"][0]["text"].format(
                 libero_environment_goal=goal

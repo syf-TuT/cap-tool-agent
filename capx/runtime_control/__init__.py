@@ -1,16 +1,34 @@
 from capx.runtime_control.checkpoints import NamespaceCheckpointStore
+from capx.runtime_control.contract import (
+    STRICT_CAPSULE_MAX_STATIC_ITERATIONS,
+    STRICT_CAPSULE_SAFE_BUILTINS,
+    ProgramContractAnalysis,
+    ProgramContractViolation,
+    analyze_capsule_program_contract,
+    analyze_capsule_program_contract_details,
+    analyze_capsule_strict_subset,
+    preflight_capsule_strict_source,
+)
 from capx.runtime_control.executor import CapsuleExecutor
-from capx.runtime_control.feedback import build_runtime_feedback
+from capx.runtime_control.feedback import build_runtime_feedback, validate_progress_mode
+from capx.runtime_control.lineage import (
+    LineageAmbiguityError,
+    RecoveryGeneration,
+    SourceRevision,
+    UnitLineage,
+    reconcile_lineage,
+)
+from capx.runtime_control.normalizer import segment_python_code_groups
 from capx.runtime_control.patching import replace_region_source
 from capx.runtime_control.prompts import build_capsule_prompt, parse_runtime_action_response
 from capx.runtime_control.schema import (
     CodeRegion,
     CodeRegionGroup,
+    PostActionObservation,
     RuntimeAction,
     RuntimeEvent,
     RuntimeFeedback,
 )
-from capx.runtime_control.normalizer import segment_python_code_groups
 from capx.runtime_control.segmenter import segment_python_code
 from capx.runtime_control.trace import RuntimeTrace, wrap_function_for_trace
 
@@ -18,10 +36,25 @@ __all__ = [
     "CapsuleExecutor",
     "CodeRegion",
     "CodeRegionGroup",
+    "LineageAmbiguityError",
     "NamespaceCheckpointStore",
+    "PostActionObservation",
+    "ProgramContractAnalysis",
+    "ProgramContractViolation",
+    "STRICT_CAPSULE_MAX_STATIC_ITERATIONS",
+    "STRICT_CAPSULE_SAFE_BUILTINS",
     "RuntimeTrace",
+    "RecoveryGeneration",
+    "SourceRevision",
+    "UnitLineage",
+    "reconcile_lineage",
     "build_capsule_prompt",
     "build_runtime_feedback",
+    "validate_progress_mode",
+    "analyze_capsule_program_contract",
+    "analyze_capsule_program_contract_details",
+    "analyze_capsule_strict_subset",
+    "preflight_capsule_strict_source",
     "parse_runtime_action_response",
     "RuntimeAction",
     "RuntimeEvent",

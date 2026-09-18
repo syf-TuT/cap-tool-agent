@@ -55,7 +55,7 @@ class LaunchArgs:
     temperature: float = 1.0
     """Sampling temperature for code generation (higher = more random)."""
 
-    max_tokens: int = 2048 * 10
+    max_tokens: int = 4096
     """Maximum number of tokens to generate in the model response."""
 
     reasoning_effort: str = "medium"
@@ -202,11 +202,20 @@ def _run_web_ui(args: LaunchArgs, config: dict[str, Any]) -> None:
 
 def main(args: LaunchArgs) -> None:
     """Load config and dispatch to web UI or headless trial execution."""
-    from capx.envs.runner import _run_headless_trials, _start_api_servers, _stop_api_servers
+    from capx.envs.runner import (
+        _required_service_endpoints,
+        _run_headless_trials,
+        _start_api_servers,
+        _stop_api_servers,
+    )
 
     start_time = time.time()
     env_factory, config, api_servers = _load_config(args)
-    server_procs = _start_api_servers(api_servers)
+    required_endpoints = _required_service_endpoints(api_servers, env_factory)
+    server_procs = _start_api_servers(
+        api_servers,
+        required_endpoints=required_endpoints,
+    )
 
     try:
         if config.get("web_ui", False):

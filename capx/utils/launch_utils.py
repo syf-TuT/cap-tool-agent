@@ -37,9 +37,17 @@ from capx.llm.client import (  # noqa: F401
     _completions_to_responses_convert_prompt,
     collapse_text_image_inputs,
     is_openrouter_model,
+)
+from capx.llm.client import (
     query_model as _query_model,
-    query_model_streaming as _query_model_streaming,
+)
+from capx.llm.client import (
     query_model_ensemble as _query_model_ensemble,
+)
+from capx.llm.client import (
+    query_model_streaming as _query_model_streaming,
+)
+from capx.llm.client import (
     query_single_model_ensemble as _query_single_model_ensemble,
 )
 
@@ -100,6 +108,11 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
     """
     config_path = os.path.expanduser(args.config_path)
     configs_dict = DictLoader.load([config_path])
+    if "capsule_control_mode" in configs_dict:
+        raise ValueError(
+            "capsule_control_mode has been removed. Capsule now always uses strict "
+            "per-action LLM control. Remove this configuration field."
+        )
 
     # Extract environment factory (don't instantiate yet - that happens per worker)
     if "env" not in configs_dict:
@@ -169,7 +182,6 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "agent_mode": configs_dict.get("agent_mode", "code"),
         "max_regenerations": configs_dict.get("max_regenerations", None),
         "max_capsule_steps": configs_dict.get("max_capsule_steps", 12),
-        "capsule_control_mode": configs_dict.get("capsule_control_mode", "llm_step"),
         "capsule_llm_step_compact_context": configs_dict.get(
             "capsule_llm_step_compact_context", True
         ),
@@ -185,8 +197,19 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "capsule_action_prompt_char_budget": configs_dict.get(
             "capsule_action_prompt_char_budget", 60000
         ),
+        "capsule_progress_mode": configs_dict.get("capsule_progress_mode", "dense"),
         "capsule_require_task_success_for_finish": configs_dict.get(
             "capsule_require_task_success_for_finish", False
+        ),
+        "capsule_validate_program_contract": configs_dict.get(
+            "capsule_validate_program_contract", False
+        ),
+        "capsule_action_visual_feedback": configs_dict.get(
+            "capsule_action_visual_feedback", False
+        ),
+        "capsule_prompt_state_level": configs_dict.get("capsule_prompt_state_level", "full"),
+        "capsule_diagnostic_state_level": configs_dict.get(
+            "capsule_diagnostic_state_level", "none"
         ),
         "capsule_execution_granularity": configs_dict.get(
             "capsule_execution_granularity", "semantic_group"
@@ -575,8 +598,6 @@ def _print_and_save_summary(
     except (subprocess.CalledProcessError, FileNotFoundError):
         git_commit = "unknown"
         is_dirty = False
-
-    import time
 
     elapsed_time = time.time() - start_time
     print("\nSummary Statistics:")

@@ -1,7 +1,8 @@
 import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from functools import lru_cache
+from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 
 import numpy as np
@@ -54,11 +55,7 @@ class ApiBase(ABC):
         self,
         tool_name: str,
         text: str,
-        images: list[np.ndarray | Image.Image | str]
-        | np.ndarray
-        | Image.Image
-        | str
-        | None = None,
+        images: list[np.ndarray | Image.Image | str] | np.ndarray | Image.Image | str | None = None,
         highlight: bool = False,
     ) -> None:
         """Log an execution step if web UI mode is enabled.
@@ -76,11 +73,7 @@ class ApiBase(ABC):
     def _log_step_update(
         self,
         text: str | None = None,
-        images: list[np.ndarray | Image.Image | str]
-        | np.ndarray
-        | Image.Image
-        | str
-        | None = None,
+        images: list[np.ndarray | Image.Image | str] | np.ndarray | Image.Image | str | None = None,
     ) -> None:
         """Update the last logged step if web UI mode is enabled."""
         if not self._webui_enabled:
@@ -140,19 +133,46 @@ class ApiBase(ABC):
         return "\n".join(lines).strip()
 
 
-_API_FACTORIES: dict[str, Callable[[], ApiBase]] = {}
+@dataclass(frozen=True)
+class _ApiRegistration:
+    factory: Callable[[BaseEnv], ApiBase]
+    config_factory: Callable[[BaseEnv, Any], ApiBase] | None = None
 
 
-def register_api(name: str, factory: Callable[[], ApiBase]) -> None:
-    _API_FACTORIES[name] = factory
+_API_REGISTRATIONS: dict[str, _ApiRegistration] = {}
+_API_REGISTRY_LOCK = RLock()
 
 
-@lru_cache(maxsize=256)
-def get_api(name: str) -> Callable[[BaseEnv], ApiBase]:
-    if name not in _API_FACTORIES:
+def register_api(
+    name: str,
+    factory: Callable[[BaseEnv], ApiBase],
+    *,
+    config_factory: Callable[[BaseEnv, Any], ApiBase] | None = None,
+) -> None:
+    registration = _ApiRegistration(factory=factory, config_factory=config_factory)
+    with _API_REGISTRY_LOCK:
+        _API_REGISTRATIONS[name] = registration
+
+
+def _get_api_registration(name: str) -> _ApiRegistration:
+    with _API_REGISTRY_LOCK:
+        registration = _API_REGISTRATIONS.get(name)
+    if registration is None:
         raise KeyError(f"API '{name}' not registered")
-    return _API_FACTORIES[name]
+    return registration
+
+
+def get_api(name: str) -> Callable[[BaseEnv], ApiBase]:
+    return _get_api_registration(name).factory
+
+
+def instantiate_api(name: str, env: BaseEnv, config: Any) -> ApiBase:
+    registration = _get_api_registration(name)
+    if registration.config_factory is not None:
+        return registration.config_factory(env, config)
+    return registration.factory(env)
 
 
 def list_apis() -> list[str]:
-    return list(_API_FACTORIES.keys())
+    with _API_REGISTRY_LOCK:
+        return list(_API_REGISTRATIONS)
