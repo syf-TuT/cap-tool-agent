@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 
-from .config_validation import GRPO_BC_LOSS_MODE, validate_capsule_training_config
+from .config_validation import TRAJECTORY_BC_LOSS_MODE, validate_capsule_training_config
 
 CAPSULE_CRITIQUE_LOSS_MODE = "capsule_critique"
 GUIDED_TOKEN_MASK_FIELD = "guided_token_mask"
@@ -350,7 +350,7 @@ def register_capsule_critique_policy_loss() -> bool:
     registry = core_algos.POLICY_LOSS_REGISTRY
     for mode, loss in (
         (CAPSULE_CRITIQUE_LOSS_MODE, verl_capsule_critique_policy_loss),
-        (GRPO_BC_LOSS_MODE, verl_grpo_bc_policy_loss),
+        (TRAJECTORY_BC_LOSS_MODE, verl_grpo_bc_policy_loss),
     ):
         existing = registry.get(mode)
         if existing is loss:

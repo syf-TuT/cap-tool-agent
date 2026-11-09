@@ -18,7 +18,8 @@ from capx.rl.capsule.policy_loss import (  # noqa: E402
 
 
 @pytest.mark.parametrize("has_repair", [True, False])
-def test_grpo_bc_micro_batches_match_independent_full_group_losses(has_repair):
+@pytest.mark.parametrize("accumulation", [3, 19])
+def test_grpo_bc_micro_batches_match_independent_full_group_losses(has_repair, accumulation):
     mask = torch.tensor([[True, True], [True, False], [True, True]])
     guided = torch.zeros_like(mask)
     if has_repair:
@@ -40,10 +41,10 @@ def test_grpo_bc_micro_batches_match_independent_full_group_losses(has_repair):
         return loss
 
     full_loss = compute(slice(None), payload)
-    micro_payload = torch.stack((weights * len(mask), ref), dim=-1)
+    micro_payload = torch.stack((weights * accumulation, ref), dim=-1)
     micro_loss = torch.stack(
         [compute(slice(i, i + 1), micro_payload[i : i + 1]) for i in range(len(mask))]
-    ).mean()
+    ).sum() / accumulation
     delta = ref[base] - current[base]
     expected = (
         -(advantages[base] * (current[base] - old[base]).exp()).mean()
@@ -63,7 +64,7 @@ def test_grpo_bc_requires_explicit_positive_finite_coefficient(coef):
         validate_capsule_training_config({
             "algorithm": {"rollout_is": False, "rollout_is_threshold": None},
             "actor_rollout_ref": {
-                "actor": {"policy_loss": {"loss_mode": "grpo_bc", "bc_coef": coef}},
+                "actor": {"policy_loss": {"loss_mode": "grpo_bc_trajectory", "bc_coef": coef}},
             },
         })
 

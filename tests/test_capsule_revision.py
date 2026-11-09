@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from capx.rl.capsule.repair import BaseUnitSpan, RepairDraft
@@ -58,6 +60,10 @@ def test_revision_prompt_contains_task_p0_and_full_edit_history_without_training
     assert "the direct move collided" in prompt.text
     assert prompt.response_token_limit == 2048
     assert prompt.input_token_limit == 8192
+    recorded = replace(trace, controller_turns=({"response": "raw reply"},))
+    assert build_revision_prompt(
+        make_task(), recorded, token_counter=lambda text: len(text.split())
+    ) == prompt
 
 
 def test_revision_prompt_overflow_is_rejected_without_truncation():

@@ -13,6 +13,7 @@ from capx.rl.capsule.controller import (
     python_base_unit_spans,
 )
 from capx.rl.capsule.group import CollectionInfrastructureError, ProgramCandidate
+from capx.rl.capsule.repair_manifest import supervised_turns
 from capx.rl.capsule.schema import ProgramReplayResultV1, ReplayOutcome, TaskInstanceV1
 
 
@@ -92,6 +93,26 @@ def test_python_base_units_are_stable_top_level_statement_spans() -> None:
         "x = 1",
         "def helper():\n    return x",
     ]
+
+
+def test_recorded_controller_turns_match_requests_and_select_accepted_actions() -> None:
+    p0 = ProgramCandidate("base", "print(missing)")
+    responses = [
+        "not JSON",
+        _action("inspect"),
+        _action("replace", target="base:group_0", source="print('ok')"),
+        _action("finish"),
+    ]
+    transport = _ScriptedTransport(responses)
+    trace = ControllerRepairCollector(transport=transport, record_turns=True)(
+        _task(), p0, _failure(p0), 0, 0, "repair"
+    )
+    turns = trace.to_dict()["controller_turns"]
+    assert [turn["messages"] for turn in turns] == [list(call) for call in transport.calls]
+    assert [turn["response"] for turn in turns] == responses
+    assert "parse_failure/rejected" in json.loads(turns[1]["messages"][1]["content"])["feedback"]
+    assert [turn["turn_index"] for turn in supervised_turns(trace)] == [3, 4]
+    assert type(trace).from_dict(trace.to_dict()) == trace
 
 
 def test_python_base_units_expose_fences_without_cleaning_actor_source() -> None:

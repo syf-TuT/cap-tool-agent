@@ -6,7 +6,7 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
-GRPO_BC_LOSS_MODE = "grpo_bc"
+TRAJECTORY_BC_LOSS_MODE = "grpo_bc_trajectory"
 _MISSING = object()
 _NO_DEFAULT = object()
 
@@ -18,7 +18,7 @@ def validate_bc_coef(value: Any) -> None:
         or not math.isfinite(value)
         or value <= 0
     ):
-        raise ValueError("grpo_bc requires a finite positive bc_coef")
+        raise ValueError("grpo_bc_trajectory requires a finite positive bc_coef")
 
 
 def _get(config: Any, key: str, default: Any = _NO_DEFAULT) -> Any:
@@ -56,10 +56,16 @@ def validate_capsule_training_config(config: Any) -> None:
     policy_loss = _get(actor, "policy_loss", {})
     mode = _get(policy_loss, "loss_mode", None)
     bc_coef = _get(policy_loss, "bc_coef", None)
-    if mode == GRPO_BC_LOSS_MODE:
+    if mode == TRAJECTORY_BC_LOSS_MODE:
         validate_bc_coef(bc_coef)
     elif bc_coef is not None:
-        raise ValueError("bc_coef requires grpo_bc loss mode")
+        raise ValueError("bc_coef requires grpo_bc_trajectory loss mode")
+    runtime = _get(config, "runtime", {})
+    manifest_path = _get(runtime, "repair_manifest_path", None)
+    if mode == TRAJECTORY_BC_LOSS_MODE and (
+        not isinstance(manifest_path, str) or not manifest_path.strip()
+    ):
+        raise ValueError("grpo_bc_trajectory requires runtime.repair_manifest_path")
 
 
 __all__ = ["validate_capsule_training_config"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+import yaml
 
 from capx.rl.capsule.group import (
     GroupAssemblyResult,
@@ -16,6 +18,7 @@ from capx.rl.capsule.group import (
     deterministic_group_uid,
 )
 from capx.rl.capsule.repair import BaseUnitSpan, RepairDraft
+from capx.rl.capsule.repair_manifest import export_manifest, match_manifest, read_manifest
 from capx.rl.capsule.schema import (
     LearningGroupV1,
     LearningMemberV1,
@@ -590,53 +593,152 @@ def test_trainer_rejects_missing_typed_base_replay_provenance() -> None:
         trainer.run_step(_task())
 
 
-@pytest.mark.parametrize(
-    ("rewards", "expected_advantages", "skips"),
-    [
-        ([0.0] * 7 + [1.0], (0.0,) * 8, False),
-        ([0.0] * 8, (0.0,) * 8, True),
-        ([1.0] * 4 + [0.0] * 4, (0.5,) * 4 + (-0.5,) * 4, False),
-    ],
-)
-def test_grpo_bc_trainer_uses_base_advantages_and_keeps_repair_update(
-    rewards, expected_advantages, skips
-) -> None:
-    events: list[str] = []
-    config = _config()
-    config["actor_rollout_ref"] = {
-        "actor": {"policy_loss": {"loss_mode": "grpo_bc", "bc_coef": 0.5}}
-    }
+@pytest.mark.parametrize("with_trace", [True, False])
+def test_trajectory_bc_uses_separate_action_rows_and_one_worker_update(with_trace) -> None:
+    assembly = _assembly([0.0] * 7 + [1.0] if with_trace else [0.0] * 8)
+    trace_data = None
+    action = '{"action":"replace","target":"base:program","source":"pt_program()"}'
+    if with_trace:
+        trace = assembly.repair_attempts[0].trace
+        trace_data = trace.to_dict()
+        trace_data["controller_turns"] = [{
+            "turn_index": 1,
+            "messages": [
+                {"role": "system", "content": "Controller system"},
+                {"role": "user", "content": "state before patch"},
+            ],
+            "response": action,
+            "result": trace_data["edits"][0],
+        }]
+        assembly = replace(assembly, group=replace(
+            assembly.group, members=assembly.group.members[:7], skip_actor_update=True
+        ))
+    events = []
     actor = _Actor(events)
-    encoder = _Encoder()
 
-    def update(batch):
-        actor.updated_batch = batch
-        return SimpleNamespace(meta_info={"metrics": {"actor/bc_loss": [0.0] * 7 + [8.0]}})
+    class PairedAssembler:
+        def assemble_base(self, task, count):
+            assert count == (7 if with_trace else 8)
+            return assembly
 
-    actor.update_actor = update
+    class PairedEncoder(_Encoder):
+        def encode(self, prompts, responses, **kwargs):
+            if with_trace:
+                assert prompts[-1] == "state before patch"
+                assert responses[-1] == action
+                assert kwargs["system_prompts"] == (None,) * 7 + ("Controller system",)
+            return super().encode(prompts, responses)
+
+    config = _config()
+    config["runtime"] = {"repair_manifest_path": "paired.json"}
+    config["actor_rollout_ref"] = {"actor": {
+        "policy_loss": {"loss_mode": "grpo_bc_trajectory", "bc_coef": 0.5}
+    }}
     trainer = CapsuleCritiqueRayTrainer(
-        assembler=_Assembler(events, _assembly(rewards)),
-        batch_encoder=encoder,
-        actor_rollout_wg=actor,
-        ref_policy_wg=_Reference(events),
-        artifact_sink=MemoryArtifactSink(),
-        config=config,
+        assembler=PairedAssembler(), batch_encoder=PairedEncoder(), actor_rollout_wg=actor,
+        ref_policy_wg=_Reference(events), artifact_sink=MemoryArtifactSink(), config=config,
+        paired_groups={5: {
+            "trajectory": trace_data, "group_uid": "source", "source_artifact_sha256": "a" * 64,
+            "trajectory_sha256": "b" * 64 if with_trace else None,
+        }},
     )
-
     result = trainer.run_step(_task())
+    assert events.count("update") == int(with_trace)
+    assert result.artifact.trajectory_bc["action_count"] == int(with_trace)
+    assert result.artifact.trajectory_bc["target_token_count"] == (3 if with_trace else 0)
+    if with_trace:
+        assert not result.batch["advantages"].any()
+        weights = result.batch["rollout_is_weights"][..., 0]
+        assert weights[:7].sum().item() == pytest.approx(19)
+        assert weights[7].sum().item() == pytest.approx(-19)
 
-    assert result.artifact.sequence_advantages == expected_advantages
-    assert result.skipped_actor_update is skips
-    assert trainer.actor_updates_completed == int(not skips)
-    assert encoder.prompts == (_task().prompt,) * 8
-    if not skips:
-        assert result.artifact.to_dict()["loss_metrics"] == {"actor/bc_loss": 1.0}
-        weights = actor.updated_batch["rollout_is_weights"][..., 0]
-        mask = actor.updated_batch["response_mask"]
-        guided = actor.updated_batch["guided_token_mask"]
-        assert weights[mask & ~guided].sum().item() == pytest.approx(8.0)
-        assert weights[guided].sum().item() == pytest.approx(-8.0 if guided.any() else 0.0)
-        assert not weights[~mask].any()
+
+@pytest.mark.parametrize("with_trace", [True, False])
+def test_export_pins_only_selected_trace_and_all_groups(
+    tmp_path, monkeypatch, with_trace
+) -> None:
+    from capx.rl.capsule import server_factory
+
+    task = _task()
+    assembly = _assembly([0.0] * 7 + [1.0] if with_trace else [0.0] * 8)
+    if with_trace:
+        selected = assembly.repair_attempts[0]
+        trace = replace(selected.trace, controller_turns=({
+            "turn_index": 1,
+            "messages": [
+                {"role": "system", "content": "repair system"},
+                {"role": "user", "content": "repair state"},
+            ],
+            "response": '{"action":"replace","target":"base:program","source":"pt_program()"}',
+            "result": selected.trace.edits[0].to_dict(),
+        },))
+        assembly = replace(assembly, repair_attempts=(
+            replace(selected, trace=trace), *assembly.repair_attempts[1:]
+        ))
+    monkeypatch.setattr(server_factory, "load_task_instances", lambda _: (task,))
+    monkeypatch.setattr(server_factory, "_schedule_training_tasks", lambda tasks, _: tasks)
+    model_hash = "f" * 64
+    files = {
+        "runtime.yaml": yaml.safe_dump({
+            "runtime": {"base_model_sha256": model_hash},
+            "task": {"environment": task.environment},
+            "program_service": {"system_prompt": "program system"},
+            "capsule": {"record_repair_turns": True},
+            "actor_rollout_ref": {"actor": {"policy_loss": {"loss_mode": "capsule_critique"}}},
+        }),
+        "verl.yaml": "trainer: {total_epochs: 1}",
+        "dataset.seed_resolved.jsonl": json.dumps(task.to_dict()) + "\n",
+    }
+    for name, value in files.items():
+        (tmp_path / name).write_text(value, encoding="utf-8")
+    (tmp_path / "protocol.json").write_text(json.dumps({
+        "method": "cc-grpo", "record_repair_turns": True, "group_count": 1,
+        "base_model_sha256": model_hash, "new_training_seeds": [task.environment_seed],
+        "input_sha256": {
+            name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest() for name in files
+        },
+    }))
+    group_path = tmp_path / "training/groups/00000000-group.json"
+    group_path.parent.mkdir(parents=True)
+    group_path.write_text(json.dumps({"assembly": assembly.to_dict()}))
+    (tmp_path / "training_result.json").write_text(json.dumps({
+        "status": "completed", "completed_group_count": 1,
+        "group_artifact_sha256": {
+            group_path.name: hashlib.sha256(group_path.read_bytes()).hexdigest()
+        },
+    }))
+    manifest = export_manifest(tmp_path)
+    entry, = manifest["groups"]
+    assert entry["group_uid"] == assembly.group.group_uid
+    if with_trace:
+        assert entry["trajectory"]["repair_trajectory_id"] == selected.repair_trajectory_id
+        assert entry["trajectory_sha256"]
+        tokenizer = SimpleNamespace(encode=lambda text, **_: list(map(ord, text)))
+        limits = server_factory._trajectory_training_limits(manifest, tokenizer, 8, 4, 1024)
+        assert limits[0] > 8 and limits[1] > 4
+        with pytest.raises(server_factory.ServerFactoryError, match="turn 1: training tensor"):
+            server_factory._trajectory_training_limits(manifest, tokenizer, 8, 4, 20)
+    else:
+        assert entry["trajectory"] is entry["trajectory_sha256"] is None
+    match_manifest(
+        manifest, [task.to_dict()], environment=task.environment,
+        model_sha256=model_hash, system_prompt="program system",
+    )
+    with pytest.raises(ValueError, match="task identity mismatch"):
+        match_manifest(
+            manifest, [replace(task, prompt="different").to_dict()],
+            environment=task.environment, model_sha256=model_hash, system_prompt="program system",
+        )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+    assert read_manifest(manifest_path) == manifest
+    entry["seed"] += 1
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="manifest hash"):
+        read_manifest(manifest_path)
+    group_path.write_text("{}")
+    with pytest.raises(ValueError, match="source group artifact changed"):
+        export_manifest(tmp_path)
 
 
 def test_trainer_rejects_guided_member_without_matching_selected_revision_replay() -> None:

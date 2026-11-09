@@ -859,6 +859,32 @@ class CapsuleGroupAssembler:
             revision if succeeded else None,
         )
 
+    def assemble_base(self, task: TaskInstanceV1, count: int) -> GroupAssemblyResult:
+        """Collect only ordinary samples for a paired trajectory baseline."""
+        seen: set[str] = set()
+        pairs = [self._sample_and_evaluate_base(task, index, seen) for index in range(count)]
+        members = tuple(
+            self._base_member(task, candidate, result, index)
+            for index, (candidate, result) in enumerate(pairs)
+        )
+        return GroupAssemblyResult(
+            group=LearningGroupV1(
+                task_id=task.task_id,
+                environment_seed=task.environment_seed,
+                group_uid=deterministic_group_uid(task),
+                initial_state_sha256=task.initial_state_sha256,
+                members=members,
+                skip_actor_update=len({member.reward for member in members}) == 1,
+                metadata={
+                    "repair_triggered": False,
+                    "guided_member_selected": False,
+                    "base_member_count": count,
+                },
+            ),
+            base_results=tuple(result for _, result in pairs),
+            repair_attempts=(),
+        )
+
     def assemble(self, task: TaskInstanceV1) -> GroupAssemblyResult:
         """Build one complete, auditable group for exactly one environment seed."""
 

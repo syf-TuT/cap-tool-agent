@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .config_validation import GRPO_BC_LOSS_MODE, validate_capsule_training_config
+from .config_validation import TRAJECTORY_BC_LOSS_MODE, validate_capsule_training_config
 from .program_protocol import ProgramProtocolError, program_sampling
 from .task_profiles import collect_task_profile_errors
 
@@ -468,17 +468,22 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
     for path, expected, reason in exact_values:
         _require_exact(config, path, expected, reason, errors)
     loss_mode = _get(config, "actor_rollout_ref.actor.policy_loss.loss_mode")
-    if loss_mode not in (CAPSULE_LOSS_MODE, GRPO_BC_LOSS_MODE):
+    if loss_mode not in (CAPSULE_LOSS_MODE, TRAJECTORY_BC_LOSS_MODE):
         errors.append(
-            "actor_rollout_ref.actor.policy_loss.loss_mode must be capsule_critique or grpo_bc"
+            "actor policy loss must be capsule_critique or grpo_bc_trajectory"
         )
     _require_exact(
         config,
         "actor_rollout_ref.actor.use_kl_loss",
-        loss_mode != GRPO_BC_LOSS_MODE,
+        loss_mode != TRAJECTORY_BC_LOSS_MODE,
         "GRPO + BC computes ordinary-only KL in its registered loss",
         errors,
     )
+    record_turns = _get(config, "capsule.record_repair_turns")
+    if record_turns is not _MISSING and (
+        not isinstance(record_turns, bool) or (record_turns and loss_mode != CAPSULE_LOSS_MODE)
+    ):
+        errors.append("capsule.record_repair_turns may only be enabled for capsule_critique")
     repair_trigger = _get(config, "capsule.repair_trigger")
     if repair_trigger is not _MISSING and repair_trigger not in ("never", "any_failed", "all_failed"):
         errors.append("capsule.repair_trigger must be never, any_failed, or all_failed")

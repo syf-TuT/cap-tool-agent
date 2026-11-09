@@ -90,7 +90,7 @@ def build_revision_prompt(
         ) from error
 
     repair_json = json.dumps(
-        trace.to_dict(),
+        trace.to_dict(include_controller_turns=False),
         ensure_ascii=False,
         sort_keys=True,
         indent=2,

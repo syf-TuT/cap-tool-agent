@@ -7,7 +7,7 @@ from numbers import Real
 
 from verl.workers.config import PolicyLossConfig
 
-from .config_validation import GRPO_BC_LOSS_MODE, validate_bc_coef
+from .config_validation import TRAJECTORY_BC_LOSS_MODE, validate_bc_coef
 
 
 @dataclass
@@ -22,7 +22,7 @@ class CapsulePolicyLossConfig(PolicyLossConfig):
         parent_post_init = getattr(super(), "__post_init__", None)
         if callable(parent_post_init):
             parent_post_init()
-        if self.loss_mode == GRPO_BC_LOSS_MODE:
+        if self.loss_mode == TRAJECTORY_BC_LOSS_MODE:
             validate_bc_coef(self.bc_coef)
         if self.guided_objective not in ("probability_shaping", "log_probability"):
             raise ValueError(f"unsupported guided_objective: {self.guided_objective!r}")

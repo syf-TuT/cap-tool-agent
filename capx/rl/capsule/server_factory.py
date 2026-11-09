@@ -34,8 +34,8 @@ from .compat import (
     validate_capsule_config,
     verify_imported_verl_path,
 )
-from .checkpoint import AtomicCheckpointClaim
-from .config_validation import GRPO_BC_LOSS_MODE
+from .checkpoint import AtomicCheckpointClaim, checkpoint_tree_sha256
+from .config_validation import TRAJECTORY_BC_LOSS_MODE
 from .controller import (
     ControllerRepairCollector,
     FrozenControllerConfig,
@@ -64,7 +64,13 @@ from .program_protocol import (
     program_sampling,
     validate_program_prompt,
 )
-from .schema import TaskInstanceV1
+from .repair_manifest import (
+    TRAJECTORY_BATCH_SIZE,
+    match_manifest,
+    read_manifest,
+    supervised_turns,
+)
+from .schema import RepairTraceV1, TaskInstanceV1
 from .trainer import (
     AtomicJsonArtifactSink,
     CapsuleCritiqueRayTrainer,
@@ -560,11 +566,14 @@ class VeRLGroupEncoder:
     def encode(
         self, prompts: tuple[str, ...], responses: tuple[str, ...],
         *, response_token_ids: tuple[tuple[int, ...] | None, ...] | None = None,
+        system_prompts: tuple[str | None, ...] | None = None,
     ) -> Any:
         if not prompts or len(prompts) != len(responses):
             raise ServerFactoryError("training prompts/responses must have equal non-zero size")
         if response_token_ids is not None and len(response_token_ids) != len(responses):
             raise ServerFactoryError("sampled token rows must match training responses")
+        if system_prompts is not None and len(system_prompts) != len(prompts):
+            raise ServerFactoryError("system prompt rows must match training prompts")
         prompt_rows: list[list[int]] = []
         response_rows: list[list[int]] = []
         prompt_lengths: list[int] = []
@@ -572,7 +581,10 @@ class VeRLGroupEncoder:
         for row_index, (prompt, response) in enumerate(
             zip(prompts, responses, strict=True)
         ):
-            prompt_ids = _apply_chat_template(self.tokenizer, prompt, self.system_prompt)
+            system_prompt = system_prompts[row_index] if system_prompts is not None else None
+            prompt_ids = _apply_chat_template(
+                self.tokenizer, prompt, self.system_prompt if system_prompt is None else system_prompt
+            )
             sampled = response_token_ids[row_index] if response_token_ids is not None else None
             if sampled is None:
                 response_ids = _encode_raw_response(self.tokenizer, response)
@@ -673,6 +685,7 @@ class VeRLWorkerSession:
     rollout_mode: str = "sync"
     ppo_epochs: int = 1
     ppo_mini_batch_size: int = 8
+    trajectory_token_limits: tuple[int, int] | None = None
     kl_loss_coef: float = 0.001
     data_parallel_world_size: int = 1
     sequence_parallel_size: int = 1
@@ -1375,18 +1388,20 @@ def _load_resolved_verl_config(config: Mapping[str, Any], project_root: Path) ->
         actor = verl_config.actor_rollout_ref.actor
         policy_loss = capsule_actor["policy_loss"]
         loss_mode = policy_loss["loss_mode"]
-        grpo_bc = loss_mode == GRPO_BC_LOSS_MODE
-        actor.use_kl_loss = not grpo_bc
+        trajectory_bc = loss_mode == TRAJECTORY_BC_LOSS_MODE
+        actor.use_kl_loss = not trajectory_bc
         actor.kl_loss_coef = float(capsule_actor["kl_loss_coef"])
         actor.ppo_epochs = 1
-        actor.ppo_mini_batch_size = BASE_GROUP_SIZE
+        actor.ppo_mini_batch_size = (
+            TRAJECTORY_BATCH_SIZE if trajectory_bc else BASE_GROUP_SIZE
+        )
         actor.ulysses_sequence_parallel_size = 1
         actor.policy_loss.loss_mode = loss_mode
         actor.policy_loss.capsule_gamma = 0.1
         actor.policy_loss.guided_objective = policy_loss.get(
             "guided_objective", "probability_shaping"
         )
-        if grpo_bc:
+        if trajectory_bc:
             if (
                 _capsule_data_parallel_world_size(verl_config) != 1
                 or actor.strategy != "fsdp"
@@ -1414,6 +1429,39 @@ def _load_resolved_verl_config(config: Mapping[str, Any], project_root: Path) ->
             / "checkpoints"
         )
     return verl_config
+
+
+def _trajectory_training_limits(
+    manifest: Mapping[str, Any], tokenizer: Any, prompt_limit: int,
+    response_limit: int, context_limit: int,
+) -> tuple[int, int]:
+    if prompt_limit + response_limit > context_limit:
+        raise ServerFactoryError("ordinary rollout training capacity exceeds model context")
+    for entry in manifest["groups"]:
+        if entry["trajectory"] is None:
+            continue
+        trace = RepairTraceV1.from_dict(entry["trajectory"])
+        for turn in supervised_turns(trace):
+            system, user = turn["messages"]
+            prompt_size = len(_apply_chat_template(tokenizer, user["content"], system["content"]))
+            response_size = len(_encode_raw_response(tokenizer, turn["response"])) + 1
+            prompt_limit = max(prompt_limit, prompt_size)
+            response_limit = max(response_limit, response_size)
+            if prompt_limit + response_limit > context_limit:
+                raise ServerFactoryError(
+                    f"{trace.repair_trajectory_id} turn {turn['turn_index']}: training tensor "
+                    f"capacity {prompt_limit}+{response_limit} exceeds model context {context_limit}"
+                )
+    return prompt_limit, response_limit
+
+
+def _load_paired_manifest(config: Mapping[str, Any], project_root: Path) -> dict[str, Any]:
+    runtime = config["runtime"]
+    digest = runtime.get("repair_manifest_file_sha256")
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise ServerFactoryError("trajectory BC requires a pinned repair manifest file hash")
+    path = _resolve_project_path(runtime["repair_manifest_path"], project_root, "repair manifest")
+    return read_manifest(path, digest)
 
 
 def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
@@ -1449,6 +1497,32 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
     from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
     _verify_imported_verl_path(verl_path)
+    tokenizer = None
+    trajectory_token_limits = None
+    if verl_config.actor_rollout_ref.actor.policy_loss.loss_mode == TRAJECTORY_BC_LOSS_MODE:
+        from transformers import AutoConfig
+
+        if total_epochs != 1:
+            raise ServerFactoryError("paired trajectory BC requires exactly one training round")
+        model_path = verl_config.actor_rollout_ref.model.path
+        trust_remote_code = bool(verl_config.data.get("trust_remote_code", False))
+        tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
+        model_config = AutoConfig.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code, local_files_only=True
+        )
+        context_limit = getattr(model_config, "max_position_embeddings", None)
+        if type(context_limit) is not int or context_limit <= 0:
+            raise ServerFactoryError("trajectory BC requires a model with a known context limit")
+        trajectory_token_limits = _trajectory_training_limits(
+            _load_paired_manifest(config, project_root), tokenizer,
+            int(config["capsule"]["revision_input_max_tokens"]),
+            program_response_token_limit(config), context_limit,
+        )
+        capacity = sum(trajectory_token_limits)
+        for section in (verl_config.actor_rollout_ref.rollout, verl_config.actor_rollout_ref.ref):
+            section.log_prob_max_token_len_per_gpu = max(
+                int(section.get("log_prob_max_token_len_per_gpu") or 0), capacity
+            )
     if ray.is_initialized():
         raise ServerFactoryError(
             "Capsule requires an isolated Ray runtime so actor/ref workers can be cleaned up"
@@ -1609,10 +1683,11 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
             sampling_evidence = actor_rollout_wg.configure_capsule_program_sampling(sampling)
             if not sampling_evidence or any(record != sampling for record in sampling_evidence):
                 raise ServerFactoryError("rollout workers did not retain the Program sampling protocol")
-        tokenizer = hf_tokenizer(
-            verl_config.actor_rollout_ref.model.path,
-            trust_remote_code=bool(verl_config.data.get("trust_remote_code", False)),
-        )
+        if tokenizer is None:
+            tokenizer = hf_tokenizer(
+                verl_config.actor_rollout_ref.model.path,
+                trust_remote_code=bool(verl_config.data.get("trust_remote_code", False)),
+            )
         session = VeRLWorkerSession(
             actor_rollout_wg=actor_rollout_wg,
             ref_policy_wg=ref_policy_wg,
@@ -1628,6 +1703,7 @@ def start_verl_workers(config: Mapping[str, Any]) -> VeRLWorkerSession:
             ppo_mini_batch_size=int(
                 verl_config.actor_rollout_ref.actor.ppo_mini_batch_size
             ),
+            trajectory_token_limits=trajectory_token_limits,
             kl_loss_coef=float(verl_config.actor_rollout_ref.actor.kl_loss_coef),
             data_parallel_world_size=data_parallel_world_size,
             sequence_parallel_size=int(
@@ -1709,6 +1785,28 @@ class CapsuleServerRuntime:
         )
         program_service = _mapping(self.config.get("program_service"), "program_service")
         tasks = self.task_loader(self.config)
+        paired_groups = None
+        loss_mode = self.config["actor_rollout_ref"]["actor"]["policy_loss"]["loss_mode"]
+        if loss_mode == TRAJECTORY_BC_LOSS_MODE or capsule.get("record_repair_turns"):
+            model = _resolve_project_path(runtime["program_model_path"], project_root, "model")
+            model_hash = checkpoint_tree_sha256(model)
+            if model_hash != runtime.get("base_model_sha256"):
+                raise ServerFactoryError("prepared base model content changed")
+            if loss_mode == TRAJECTORY_BC_LOSS_MODE:
+                manifest = _load_paired_manifest(self.config, project_root)
+                match_manifest(
+                    manifest, [task.to_dict() for task in tasks],
+                    environment=task_config["environment"], model_sha256=model_hash,
+                    system_prompt=program_service["system_prompt"],
+                )
+                if any(
+                    deterministic_group_uid(task) != entry["group_uid"]
+                    for task, entry in zip(
+                        _schedule_training_tasks(tasks, 1), manifest["groups"], strict=True
+                    )
+                ):
+                    raise ServerFactoryError("repair manifest source group identity mismatch")
+                paired_groups = {entry["seed"]: entry for entry in manifest["groups"]}
         configured_run_id = runtime.get("run_id", "formal")
         if not isinstance(configured_run_id, str) or not configured_run_id.strip():
             raise ServerFactoryError("runtime.run_id must be non-empty when configured")
@@ -1751,7 +1849,7 @@ class CapsuleServerRuntime:
             )
             repair_trigger = capsule.get("repair_trigger", "all_failed")
             controller_transport = None
-            if repair_trigger != "never":
+            if repair_trigger != "never" and paired_groups is None:
                 controller_config = FrozenControllerConfig(
                     endpoint=str(controller_service["endpoint"]),
                     model=str(controller_service["model"]),
@@ -1766,6 +1864,7 @@ class CapsuleServerRuntime:
                 repair_collector = ControllerRepairCollector(
                     transport=controller_transport,
                     max_turns=controller_config.max_turns,
+                    **({"record_turns": True} if capsule.get("record_repair_turns") else {}),
                 )
             assembler = CapsuleGroupAssembler(
                 base_sampler=ActorBaseSampler(generator),
@@ -1777,13 +1876,22 @@ class CapsuleServerRuntime:
                 revision_input_token_limit=int(capsule["revision_input_max_tokens"]),
                 revision_response_token_limit=int(capsule["revision_response_max_tokens"]),
                 allow_fenced_revisions=capsule.get("allow_fenced_revisions", False),
-                repair_trigger=repair_trigger,
+                repair_trigger=repair_trigger if paired_groups is None else "never",
+            )
+            token_limits = (
+                workers.trajectory_token_limits if paired_groups is not None else None
+            )
+            if paired_groups is not None and token_limits is None:
+                raise ServerFactoryError("trajectory BC requires preflighted training token limits")
+            prompt_limit, response_limit = token_limits or (
+                int(capsule["revision_input_max_tokens"]),
+                program_response_token_limit(self.config),
             )
             batch_encoder = VeRLGroupEncoder(
                 tokenizer=workers.tokenizer,
                 data_proto_factory=workers.data_proto_factory,
-                prompt_token_limit=int(capsule["revision_input_max_tokens"]),
-                response_token_limit=program_response_token_limit(self.config),
+                prompt_token_limit=prompt_limit,
+                response_token_limit=response_limit,
                 system_prompt=system_prompt,
             )
             trainer = CapsuleCritiqueRayTrainer(
@@ -1797,6 +1905,7 @@ class CapsuleServerRuntime:
                 artifact_sink=AtomicJsonArtifactSink(output_dir / "groups"),
                 config=self.config,
                 max_group_attempts=capsule["max_group_attempts"],
+                **({"paired_groups": paired_groups} if paired_groups is not None else {}),
             )
             checkpoint_root = output_dir / "checkpoints"
             if runtime.get("checkpoint_root"):

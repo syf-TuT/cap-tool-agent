@@ -611,9 +611,14 @@ class RepairTraceV1:
     final_source_sha256: str = ""
     event_sequence_sha256: str = ""
     schema_version: int = SCHEMA_VERSION
+    controller_turns: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         _require_schema_version(self.schema_version)
+        object.__setattr__(
+            self, "controller_turns",
+            tuple(_freeze_json(turn, "controller turn") for turn in self.controller_turns),
+        )
         if not self.task_id or not self.program_sample_id or not self.repair_trajectory_id:
             raise ValueError("task, program sample, and repair trajectory IDs must not be empty")
         if isinstance(self.environment_seed, bool) or not isinstance(self.environment_seed, int):
@@ -677,8 +682,8 @@ class RepairTraceV1:
             raise ValueError("event_sequence_sha256 does not match repair turn chronology")
         object.__setattr__(self, "event_sequence_sha256", computed_event_hash)
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, include_controller_turns: bool = True) -> dict[str, Any]:
+        payload = {
             "schema_version": self.schema_version,
             "task_id": self.task_id,
             "environment_seed": self.environment_seed,
@@ -693,6 +698,9 @@ class RepairTraceV1:
             "final_source_sha256": self.final_source_sha256,
             "event_sequence_sha256": self.event_sequence_sha256,
         }
+        if include_controller_turns and self.controller_turns:
+            payload["controller_turns"] = [_thaw_json(turn) for turn in self.controller_turns]
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> RepairTraceV1:
@@ -721,6 +729,10 @@ class RepairTraceV1:
             final_source_sha256=data["final_source_sha256"],
             event_sequence_sha256=data["event_sequence_sha256"],
             schema_version=data["schema_version"],
+            controller_turns=tuple(
+                _mapping(item, "controller turn")
+                for item in _sequence(data.get("controller_turns", []), "controller_turns")
+            ),
         )
 
     def to_json(self) -> str:

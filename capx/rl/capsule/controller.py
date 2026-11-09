@@ -8,7 +8,7 @@ import math
 import os
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
@@ -316,13 +316,17 @@ def _state_message(
 class ControllerRepairCollector:
     """Collect one complete edit trajectory; never imports or invokes a simulator."""
 
-    def __init__(self, *, transport: ControllerTransport, max_turns: int = 12) -> None:
+    def __init__(
+        self, *, transport: ControllerTransport, max_turns: int = 12,
+        record_turns: bool = False,
+    ) -> None:
         if isinstance(max_turns, bool) or not isinstance(max_turns, int):
             raise TypeError("max_turns must be an integer")
         if max_turns < 1 or max_turns > 12:
             raise ValueError("max_turns must be between 1 and 12")
         self.transport = transport
         self.max_turns = max_turns
+        self.record_turns = record_turns
 
     def __call__(
         self,
@@ -373,9 +377,11 @@ class ControllerRepairCollector:
             "role": "user",
             "content": _state_message(task, p0_result, draft, "start repair"),
         }
-        for _ in range(self.max_turns):
+        turns = []
+        for turn_index in range(1, self.max_turns + 1):
+            messages = (system_message, state_message)
             try:
-                response = self.transport.complete((system_message, state_message))
+                response = self.transport.complete(messages)
             except ControllerProtocolError:
                 raise
             except Exception as error:
@@ -385,6 +391,16 @@ class ControllerRepairCollector:
             if not isinstance(response, str):
                 raise ControllerProtocolError("Controller transport response must be text")
             submission = draft.submit_json(response)
+            if self.record_turns:
+                result = submission.edit if submission.committed else submission.audit
+                if result is None:
+                    raise ControllerProtocolError("repair draft returned no edit or audit")
+                turns.append({
+                    "turn_index": turn_index,
+                    "messages": [dict(message) for message in messages],
+                    "response": response,
+                    "result": result.to_dict(),
+                })
             if draft.finished:
                 break
             if submission.committed and submission.edit is not None:
@@ -403,7 +419,8 @@ class ControllerRepairCollector:
                 "role": "user",
                 "content": _state_message(task, p0_result, draft, feedback),
             }
-        return draft.to_trace()
+        trace = draft.to_trace()
+        return replace(trace, controller_turns=tuple(turns)) if self.record_turns else trace
 
     def close(self) -> None:
         close = getattr(self.transport, "close", None)

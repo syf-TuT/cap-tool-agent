@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .config_validation import GRPO_BC_LOSS_MODE
+from .config_validation import TRAJECTORY_BC_LOSS_MODE
 from .group import (
     BASE_GROUP_SIZE,
     GroupAssemblyResult,
@@ -26,7 +26,8 @@ from .group import (
     should_trigger_repair,
     token_levenshtein_distance,
 )
-from .schema import ProgramReplayResultV1, ReplayOutcome, TaskInstanceV1
+from .repair_manifest import TRAJECTORY_BATCH_SIZE, supervised_turns
+from .schema import ProgramReplayResultV1, RepairTraceV1, ReplayOutcome, TaskInstanceV1
 from .telemetry import summarize_replay_results
 
 _CONFIG_MISSING = object()
@@ -63,6 +64,7 @@ class TrainingStepArtifact:
     sequence_advantages: tuple[float, ...]
     skipped_actor_update: bool
     loss_metrics: dict[str, float] | None = None
+    trajectory_bc: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -75,6 +77,8 @@ class TrainingStepArtifact:
         }
         if self.loss_metrics is not None:
             payload["loss_metrics"] = self.loss_metrics
+        if self.trajectory_bc is not None:
+            payload["trajectory_bc"] = self.trajectory_bc
         return payload
 
 
@@ -395,19 +399,24 @@ class CapsuleCritiqueRayTrainer:
         reference_policy_mode: str = "standalone",
         event_log: list[str] | None = None,
         max_group_attempts: int = 3,
+        paired_groups: Mapping[int, Mapping[str, Any]] | None = None,
     ) -> None:
         from .policy_loss import validate_capsule_training_config
 
         validate_capsule_training_config(config)
-        self.grpo_bc = _nested_config_value(
+        loss_mode = _nested_config_value(
             config, ("actor_rollout_ref", "actor", "policy_loss", "loss_mode")
-        ) == GRPO_BC_LOSS_MODE
+        )
+        self.trajectory_bc = loss_mode == TRAJECTORY_BC_LOSS_MODE
+        if self.trajectory_bc and paired_groups is None:
+            raise ValueError("trajectory BC requires verified paired groups")
+        self.paired_groups = paired_groups
         reference_kl_enabled = _nested_config_value(
             config,
             ("actor_rollout_ref", "actor", "use_kl_loss"),
             False,
         )
-        if (reference_kl_enabled is True or self.grpo_bc) and ref_policy_wg is None:
+        if (reference_kl_enabled is True or self.trajectory_bc) and ref_policy_wg is None:
             raise ValueError("ref_policy_wg is required when actor reference KL is enabled")
         if reference_policy_mode not in REFERENCE_POLICY_MODES:
             raise ValueError(
@@ -761,7 +770,7 @@ class CapsuleCritiqueRayTrainer:
             raise ValueError("base-only group cannot retain a successful guided repair")
 
     @staticmethod
-    def _validate_encoded_tensors(tensors: Any) -> None:
+    def _validate_encoded_tensors(tensors: Any, row_count: int = BASE_GROUP_SIZE) -> None:
         import torch
 
         required = (
@@ -782,14 +791,14 @@ class CapsuleCritiqueRayTrainer:
         position_ids = tensors["position_ids"]
         responses = tensors["responses"]
         response_mask = tensors["response_mask"]
-        if input_ids.ndim != 2 or input_ids.shape[0] != BASE_GROUP_SIZE:
-            raise ValueError("input_ids must have shape (8, sequence_length)")
+        if input_ids.ndim != 2 or input_ids.shape[0] != row_count:
+            raise ValueError(f"input_ids must have shape ({row_count}, sequence_length)")
         if attention_mask.shape != input_ids.shape:
             raise ValueError("attention_mask shape must match input_ids")
         if position_ids.shape != input_ids.shape:
             raise ValueError("position_ids shape must match input_ids")
-        if responses.ndim != 2 or responses.shape[0] != BASE_GROUP_SIZE:
-            raise ValueError("responses must have shape (8, response_length)")
+        if responses.ndim != 2 or responses.shape[0] != row_count:
+            raise ValueError(f"responses must have shape ({row_count}, response_length)")
         if response_mask.shape != responses.shape:
             raise ValueError("responses and response_mask must have identical shapes")
         if responses.shape[1] > input_ids.shape[1]:
@@ -797,25 +806,35 @@ class CapsuleCritiqueRayTrainer:
         if response_mask.dtype != torch.bool:
             raise TypeError("batch encoder must provide a boolean response_mask tensor")
 
-    def _inject_group(self, task: TaskInstanceV1, assembly: GroupAssemblyResult) -> Any:
+    def _inject_group(
+        self, task: TaskInstanceV1, assembly: GroupAssemblyResult,
+        turns: tuple[Mapping[str, Any], ...] = (),
+    ) -> Any:
         import numpy as np
         import torch
 
         from .policy_loss import map_guided_token_mask_to_verl_slot
 
         group = assembly.group
-        prompts = (task.prompt,) * BASE_GROUP_SIZE
+        prompts = (task.prompt,) * len(group.members)
         responses = tuple(member.response for member in group.members)
         sampled_ids = tuple(member.metadata.get("response_token_ids") for member in group.members)
-        if any(ids is not None for ids in sampled_ids):
+        if turns:
+            batch = self.batch_encoder.encode(
+                prompts + tuple(turn["messages"][1]["content"] for turn in turns),
+                responses + tuple(turn["response"] for turn in turns),
+                response_token_ids=sampled_ids + (None,) * len(turns),
+                system_prompts=(None,) * len(group.members)
+                + tuple(turn["messages"][0]["content"] for turn in turns),
+            )
+        elif any(ids is not None for ids in sampled_ids):
             batch = self.batch_encoder.encode(prompts, responses, response_token_ids=sampled_ids)
         else:
             batch = self.batch_encoder.encode(prompts, responses)
         tensors = _tensor_batch(batch)
-        self._validate_encoded_tensors(tensors)
+        row_count = len(group.members) + len(turns)
+        self._validate_encoded_tensors(tensors, row_count)
         response_mask = tensors["response_mask"]
-        if response_mask.ndim != 2 or response_mask.shape[0] != BASE_GROUP_SIZE:
-            raise ValueError("response_mask must have shape (8, response_length)")
         if torch.any(response_mask.sum(dim=-1) == 0).item():
             raise ValueError("every final program must contain at least one response token")
 
@@ -834,7 +853,8 @@ class CapsuleCritiqueRayTrainer:
             token_scores[row, final_token] = reward
 
         guided_rows = torch.tensor(
-            [member.member_type == "critique_guided_revision" for member in group.members],
+            [member.member_type == "critique_guided_revision" for member in group.members]
+            + [True] * len(turns),
             dtype=torch.bool,
             device=response_mask.device,
         )
@@ -854,12 +874,12 @@ class CapsuleCritiqueRayTrainer:
             }
         )
         tensors[VERL_MASK_SLOT] = mapped[VERL_MASK_SLOT]
-        uid = (group.group_uid,) * BASE_GROUP_SIZE
+        uid = (group.group_uid,) * row_count
         if hasattr(batch, "non_tensor_batch"):
             if not isinstance(batch.non_tensor_batch, dict):
                 raise TypeError("DataProto-like non_tensor_batch must be a mutable dictionary")
             batch.non_tensor_batch["uid"] = np.full(
-                (BASE_GROUP_SIZE,), group.group_uid, dtype=object
+                (row_count,), group.group_uid, dtype=object
             )
             if not isinstance(batch.meta_info, dict):
                 raise TypeError("DataProto-like meta_info must be a mutable dictionary")
@@ -881,27 +901,25 @@ class CapsuleCritiqueRayTrainer:
             dtype=torch.float32,
             device=response_mask.device,
         )
-        if self.grpo_bc:
-            guided_rows = tensors[GUIDED_TOKEN_MASK_FIELD].any(dim=-1)
-            base_mean = rewards[~guided_rows].mean()
-            sequence_advantages = (rewards - base_mean).masked_fill(guided_rows, 0)
-        else:
-            sequence_advantages = rewards - rewards.mean()
-        advantages = sequence_advantages.unsqueeze(-1) * response_mask.to(torch.float32)
+        sequence_advantages = rewards - rewards.mean()
+        advantage_rows = torch.nn.functional.pad(
+            sequence_advantages, (0, response_mask.shape[0] - len(rewards))
+        )
+        advantages = advantage_rows.unsqueeze(-1) * response_mask.to(torch.float32)
         tensors["advantages"] = advantages
         tensors["returns"] = advantages.clone()
         self.events.append("advantage")
         return tuple(float(value) for value in sequence_advantages.detach().cpu().tolist())
 
-    def _pack_grpo_bc_loss_inputs(self, batch: Any) -> None:
+    def _pack_trajectory_bc_loss_inputs(self, batch: Any) -> None:
         import torch
 
         tensors = _tensor_batch(batch)
         guided = tensors[GUIDED_TOKEN_MASK_FIELD]
         base = tensors["response_mask"] & ~guided
-        # The pinned actor divides each of the eight one-row micro-batch losses by eight.
-        base_weights = base.float() * (BASE_GROUP_SIZE / base.sum().clamp_min(1))
-        bc_weights = guided.float() * (BASE_GROUP_SIZE / guided.sum().clamp_min(1))
+        # VeRL divides by the configured accumulation factor, even for a short mini-batch.
+        base_weights = base.float() * (TRAJECTORY_BATCH_SIZE / base.sum().clamp_min(1))
+        bc_weights = guided.float() * (TRAJECTORY_BATCH_SIZE / guided.sum().clamp_min(1))
         reference = tensors["ref_log_prob"].float().masked_fill(~base, 0)
         tensors[VERL_MASK_SLOT] = torch.stack((base_weights - bc_weights, reference), dim=-1)
 
@@ -936,17 +954,33 @@ class CapsuleCritiqueRayTrainer:
 
     def run_step(self, task: TaskInstanceV1) -> TrainingStepResult:
         execution_trace: list[str] = []
-        assembly = self.assembler.assemble(task)
-        validate_group_provenance(
-            task, assembly,
-            _nested_config_value(self.config, ("capsule", "repair_trigger"), "all_failed"),
-        )
-        batch = self._inject_group(task, assembly)
-        skip_actor_update = assembly.group.skip_actor_update
-        if self.grpo_bc and any(
-            member.member_type == "critique_guided_revision" for member in assembly.group.members
-        ):
-            skip_actor_update = False
+        turns = ()
+        trajectory_evidence = None
+        if self.trajectory_bc:
+            entry = self.paired_groups[task.environment_seed]
+            trace = RepairTraceV1.from_dict(entry["trajectory"]) if entry["trajectory"] else None
+            if trace is not None:
+                turns = supervised_turns(trace)
+            assembly = self.assembler.assemble_base(task, BASE_GROUP_SIZE - bool(turns))
+            trajectory_evidence = {
+                "source_group_uid": entry["group_uid"],
+                "source_artifact_sha256": entry["source_artifact_sha256"],
+                "repair_trajectory_id": trace.repair_trajectory_id if trace is not None else None,
+                "trajectory_sha256": entry["trajectory_sha256"],
+                "action_count": len(turns),
+            }
+        else:
+            assembly = self.assembler.assemble(task)
+            validate_group_provenance(
+                task, assembly,
+                _nested_config_value(self.config, ("capsule", "repair_trigger"), "all_failed"),
+            )
+        batch = self._inject_group(task, assembly, turns)
+        if trajectory_evidence is not None:
+            trajectory_evidence["target_token_count"] = int(
+                _tensor_batch(batch)[GUIDED_TOKEN_MASK_FIELD].sum().item()
+            )
+        skip_actor_update = assembly.group.skip_actor_update and not turns
 
         if not skip_actor_update:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -962,8 +996,8 @@ class CapsuleCritiqueRayTrainer:
                     ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                 batch = _merge_batch(batch, ref_log_prob)
                 execution_trace.append("reference_logprob")
-            if self.grpo_bc:
-                self._pack_grpo_bc_loss_inputs(batch)
+            if self.trajectory_bc:
+                self._pack_trajectory_bc_loss_inputs(batch)
 
         sequence_advantages = self._add_advantages(batch, assembly)
         actor_output = None
@@ -972,13 +1006,13 @@ class CapsuleCritiqueRayTrainer:
             actor_output = self.actor_rollout_wg.update_actor(batch)
             self._actor_updates_completed += 1
             execution_trace.append("update")
-            if self.grpo_bc:
+            if self.trajectory_bc:
                 import numpy as np
 
                 metadata = getattr(actor_output, "meta_info", actor_output)
                 metrics = metadata.get("metrics", {}) if isinstance(metadata, Mapping) else {}
                 loss_metrics = {
-                    name: float(np.mean(metrics[name]))
+                    name: float(np.sum(metrics[name])) / TRAJECTORY_BATCH_SIZE
                     for name in ("actor/grpo_loss", "actor/bc_loss", "actor/base_ref_kl")
                     if name in metrics
                 }
@@ -990,6 +1024,7 @@ class CapsuleCritiqueRayTrainer:
             sequence_advantages=sequence_advantages,
             skipped_actor_update=skip_actor_update,
             loss_metrics=loss_metrics,
+            trajectory_bc=trajectory_evidence,
         )
         self.artifact_sink.write(artifact)
         return TrainingStepResult(

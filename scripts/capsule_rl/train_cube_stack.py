@@ -16,7 +16,14 @@ from pathlib import Path
 
 import yaml
 
-from capx.rl.capsule.config_validation import GRPO_BC_LOSS_MODE, validate_bc_coef
+from capx.rl.capsule.checkpoint import checkpoint_tree_sha256
+from capx.rl.capsule.config_validation import TRAJECTORY_BC_LOSS_MODE, validate_bc_coef
+from capx.rl.capsule.repair_manifest import (
+    MANIFEST_NAME,
+    export_manifest,
+    match_manifest,
+    read_manifest,
+)
 from scripts.capsule_rl.common import atomic_write_json, load_and_validate_server_config
 
 
@@ -29,17 +36,27 @@ def prepare(
     controller_endpoint: str | None = None,
     method: str = "cc-grpo",
     bc_coef: float | None = None,
+    record_repair_turns: bool = False,
+    repair_manifest: Path | None = None,
 ) -> None:
     from capx.rl.capsule.server_factory import YamlEnvironmentFactory, load_task_instances
 
     if task not in ("cube_stack", "cube_restack", "cube_lift", "spill_wipe"):
         raise ValueError(f"unsupported training task: {task}")
-    if method == "grpo-bc":
+    trajectory_bc = method == "grpo-bc-trajectory"
+    if trajectory_bc:
         if task not in ("cube_stack", "spill_wipe"):
             raise ValueError("GRPO + BC supports cube_stack and spill_wipe")
         validate_bc_coef(bc_coef)
     elif method != "cc-grpo" or bc_coef is not None:
-        raise ValueError("bc_coef is available only with method grpo-bc")
+        raise ValueError("bc_coef is available only with grpo-bc-trajectory")
+    if trajectory_bc != (repair_manifest is not None):
+        raise ValueError("--repair-manifest is required only for grpo-bc-trajectory")
+    if record_repair_turns and method != "cc-grpo":
+        raise ValueError("--record-repair-turns applies only to source CC-GRPO")
+    if (trajectory_bc or record_repair_turns) and resume_from is not None:
+        raise ValueError("paired trajectory experiments must start from the base model")
+    manifest = read_manifest(repair_manifest) if repair_manifest is not None else None
     if not seeds or min(seeds) < 0 or len(set(seeds)) != len(seeds):
         raise ValueError("training seeds must be distinct non-negative integers")
     parent = None
@@ -96,7 +113,6 @@ def prepare(
             / ("env_configs/cube_lifting/capsule_rl/franka_robosuite_cube_lift_capsule_smoke.yaml")
         ).read_text()
     )
-    root.mkdir(parents=True, exist_ok=False)
     config["runtime"].update(
         {
             "run_id": root.name,
@@ -166,6 +182,26 @@ def prepare(
     config["program_service"]["prompt_sha256"] = hashlib.sha256(prompt.encode()).hexdigest()
     if parent is not None and config["program_service"] != parent_protocol["program_service"]:
         raise ValueError("continuation must retain the parent's Program prompt and sampling recipe")
+    model_hash = None
+    if manifest is not None or record_repair_turns:
+        model_hash = checkpoint_tree_sha256(model.resolve())
+        config["runtime"]["base_model_sha256"] = model_hash
+    if manifest is not None:
+        match_manifest(
+            manifest, rows, environment=config["task"]["environment"],
+            model_sha256=model_hash, system_prompt=config["program_service"]["system_prompt"],
+        )
+    root.mkdir(parents=True, exist_ok=False)
+    input_files = ["runtime.yaml", "verl.yaml", "dataset.seed_resolved.jsonl"]
+    if manifest is not None:
+        snapshot = atomic_write_json(root / MANIFEST_NAME, manifest)
+        config["runtime"]["repair_manifest_path"] = str(snapshot.resolve())
+        config["runtime"]["repair_manifest_file_sha256"] = hashlib.sha256(
+            snapshot.read_bytes()
+        ).hexdigest()
+        input_files.append(MANIFEST_NAME)
+    if record_repair_turns:
+        config["capsule"]["record_repair_turns"] = True
     (root / "dataset.seed_resolved.jsonl").write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8"
     )
@@ -180,10 +216,10 @@ def prepare(
             training_config["actor_rollout_ref"]["actor"]["policy_loss"][
                 "guided_objective"
             ] = "log_probability"
-    if method == "grpo-bc":
+    if trajectory_bc:
         for training_config in (config, worker_config):
             actor = training_config["actor_rollout_ref"]["actor"]
-            actor["policy_loss"].update(loss_mode=GRPO_BC_LOSS_MODE, bc_coef=bc_coef)
+            actor["policy_loss"].update(loss_mode=TRAJECTORY_BC_LOSS_MODE, bc_coef=bc_coef)
             actor["use_kl_loss"] = False
     (root / "verl.yaml").write_text(yaml.safe_dump(worker_config, sort_keys=False))
     config_path = root / "runtime.yaml"
@@ -196,6 +232,9 @@ def prepare(
             "mode": f"privileged_highlevel_{task}_capsule_rl",
             "method": method,
             "bc_coef": bc_coef,
+            "record_repair_turns": record_repair_turns,
+            "base_model_sha256": model_hash,
+            "repair_manifest_sha256": manifest["manifest_sha256"] if manifest else None,
             "project_commit": subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=project, text=True
             ).strip(),
@@ -212,7 +251,7 @@ def prepare(
             "task": config["task"],
             "input_sha256": {
                 name: hashlib.sha256((root / name).read_bytes()).hexdigest()
-                for name in ("runtime.yaml", "verl.yaml", "dataset.seed_resolved.jsonl")
+                for name in input_files
             },
         },
     )
@@ -247,6 +286,9 @@ def summarize(root: Path, result: dict) -> dict:
                     if r.get("rejection_reason")
                 ],
                 "skipped_actor_update": artifact["skipped_actor_update"],
+                **({"trajectory_bc": artifact["trajectory_bc"], "loss_metrics": artifact.get(
+                    "loss_metrics"
+                )} if "trajectory_bc" in artifact else {}),
             }
         )
     if len(groups) != result["completed_group_count"]:
@@ -267,7 +309,12 @@ def train(root: Path) -> None:
     from capx.rl.capsule.server_factory import create_trainer
 
     config = load_and_validate_server_config(root / "runtime.yaml", check_runtime_paths=True)
-    if config["capsule"].get("repair_trigger", "all_failed") != "never" and not os.environ.get(config["controller_service"]["api_key_env"]):
+    if (
+        config["actor_rollout_ref"]["actor"]["policy_loss"]["loss_mode"]
+        != TRAJECTORY_BC_LOSS_MODE
+        and config["capsule"].get("repair_trigger", "all_failed") != "never"
+        and not os.environ.get(config["controller_service"]["api_key_env"])
+    ):
         raise RuntimeError("set the Controller API key before starting Capsule training")
     protocol = json.loads((root / "protocol.json").read_text())
     for name, expected in protocol["input_sha256"].items():
@@ -307,6 +354,11 @@ def train(root: Path) -> None:
         runtime.worker_starter = restored_starter
     started = time.monotonic()
     result = runtime.fit()
+    if config["capsule"].get("record_repair_turns"):
+        result["group_artifact_sha256"] = {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted((root / "training/groups").glob("*.json"))
+        }
     result["training_wall_seconds"] = time.monotonic() - started
     result["cumulative_group_count"] = protocol.get("cumulative_group_count", protocol["group_count"])
     atomic_write_json(root / "training_result.json", result)
@@ -318,7 +370,7 @@ def train(root: Path) -> None:
 def main(task: str = "cube_stack") -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", choices=("cube_stack", "cube_restack", "cube_lift", "spill_wipe"), default=task)
-    parser.add_argument("phase", choices=("prepare", "train", "summarize"))
+    parser.add_argument("phase", choices=("prepare", "train", "summarize", "export-repair-trajectories"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--verl", type=Path)
@@ -327,15 +379,20 @@ def main(task: str = "cube_stack") -> None:
     parser.add_argument("--controller-model")
     parser.add_argument("--controller-endpoint")
     parser.add_argument(
-        "--method", choices=("cc-grpo", "grpo-bc"),
+        "--method", choices=("cc-grpo", "grpo-bc-trajectory"),
         help="policy objective for prepare (default: cc-grpo)",
     )
-    parser.add_argument("--bc-coef", type=float, help="required with --method grpo-bc")
+    parser.add_argument("--bc-coef", type=float, help="required with grpo-bc-trajectory")
+    parser.add_argument("--record-repair-turns", action="store_true")
+    parser.add_argument("--repair-manifest", type=Path)
     parser.add_argument("--repair-trigger", choices=("never", "any_failed", "all_failed"), default="all_failed")
     parser.add_argument("--seeds", default=",".join(map(str, range(5, 21))))
     args = parser.parse_args()
-    if args.phase != "prepare" and (args.method is not None or args.bc_coef is not None):
-        parser.error("--method and --bc-coef apply only to prepare")
+    if args.phase != "prepare" and (
+        args.method is not None or args.bc_coef is not None
+        or args.record_repair_turns or args.repair_manifest is not None
+    ):
+        parser.error("method, BC, and trajectory options apply only to prepare")
     root = args.root.resolve()
     if args.phase == "prepare":
         if args.model is None or args.verl is None:
@@ -344,9 +401,13 @@ def main(task: str = "cube_stack") -> None:
                 args.resume_from, task=args.task, repair_trigger=args.repair_trigger,
                 checkpoint_root=args.checkpoint_root, controller_model=args.controller_model,
                 controller_endpoint=args.controller_endpoint, method=args.method or "cc-grpo",
-                bc_coef=args.bc_coef)
+                bc_coef=args.bc_coef, record_repair_turns=args.record_repair_turns,
+                repair_manifest=args.repair_manifest)
     elif args.phase == "train":
         train(root)
+    elif args.phase == "export-repair-trajectories":
+        path = atomic_write_json(root / MANIFEST_NAME, export_manifest(root))
+        print(path)
     else:
         result = json.loads((root / "training_result.json").read_text())
         atomic_write_json(root / "summary.json", summarize(root, result))
