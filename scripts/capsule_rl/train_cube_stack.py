@@ -16,6 +16,7 @@ from pathlib import Path
 
 import yaml
 
+from capx.rl.capsule.config_validation import GRPO_BC_LOSS_MODE, validate_bc_coef
 from scripts.capsule_rl.common import atomic_write_json, load_and_validate_server_config
 
 
@@ -26,11 +27,19 @@ def prepare(
     checkpoint_root: Path | None = None,
     controller_model: str | None = None,
     controller_endpoint: str | None = None,
+    method: str = "cc-grpo",
+    bc_coef: float | None = None,
 ) -> None:
     from capx.rl.capsule.server_factory import YamlEnvironmentFactory, load_task_instances
 
     if task not in ("cube_stack", "cube_restack", "cube_lift", "spill_wipe"):
         raise ValueError(f"unsupported training task: {task}")
+    if method == "grpo-bc":
+        if task not in ("cube_stack", "spill_wipe"):
+            raise ValueError("GRPO + BC supports cube_stack and spill_wipe")
+        validate_bc_coef(bc_coef)
+    elif method != "cc-grpo" or bc_coef is not None:
+        raise ValueError("bc_coef is available only with method grpo-bc")
     if not seeds or min(seeds) < 0 or len(set(seeds)) != len(seeds):
         raise ValueError("training seeds must be distinct non-negative integers")
     parent = None
@@ -42,6 +51,11 @@ def prepare(
         parent_result_path = resume_from / "training_result.json"
         parent_protocol = json.loads(parent_protocol_path.read_text())
         parent_result = json.loads(parent_result_path.read_text())
+        if (
+            parent_protocol.get("method", "cc-grpo") != method
+            or parent_protocol.get("bc_coef") != bc_coef
+        ):
+            raise ValueError("continuation must retain the parent's method and BC coefficient")
         if (
             parent_result["status"] not in (
                 ("completed", "completed_no_updates_all_constant")
@@ -166,6 +180,11 @@ def prepare(
             training_config["actor_rollout_ref"]["actor"]["policy_loss"][
                 "guided_objective"
             ] = "log_probability"
+    if method == "grpo-bc":
+        for training_config in (config, worker_config):
+            actor = training_config["actor_rollout_ref"]["actor"]
+            actor["policy_loss"].update(loss_mode=GRPO_BC_LOSS_MODE, bc_coef=bc_coef)
+            actor["use_kl_loss"] = False
     (root / "verl.yaml").write_text(yaml.safe_dump(worker_config, sort_keys=False))
     config_path = root / "runtime.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
@@ -175,6 +194,8 @@ def prepare(
         root / "protocol.json",
         {
             "mode": f"privileged_highlevel_{task}_capsule_rl",
+            "method": method,
+            "bc_coef": bc_coef,
             "project_commit": subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=project, text=True
             ).strip(),
@@ -305,9 +326,16 @@ def main(task: str = "cube_stack") -> None:
     parser.add_argument("--checkpoint-root", type=Path)
     parser.add_argument("--controller-model")
     parser.add_argument("--controller-endpoint")
+    parser.add_argument(
+        "--method", choices=("cc-grpo", "grpo-bc"),
+        help="policy objective for prepare (default: cc-grpo)",
+    )
+    parser.add_argument("--bc-coef", type=float, help="required with --method grpo-bc")
     parser.add_argument("--repair-trigger", choices=("never", "any_failed", "all_failed"), default="all_failed")
     parser.add_argument("--seeds", default=",".join(map(str, range(5, 21))))
     args = parser.parse_args()
+    if args.phase != "prepare" and (args.method is not None or args.bc_coef is not None):
+        parser.error("--method and --bc-coef apply only to prepare")
     root = args.root.resolve()
     if args.phase == "prepare":
         if args.model is None or args.verl is None:
@@ -315,7 +343,8 @@ def main(task: str = "cube_stack") -> None:
         prepare(root, args.model, args.verl, tuple(int(s) for s in args.seeds.split(",")),
                 args.resume_from, task=args.task, repair_trigger=args.repair_trigger,
                 checkpoint_root=args.checkpoint_root, controller_model=args.controller_model,
-                controller_endpoint=args.controller_endpoint)
+                controller_endpoint=args.controller_endpoint, method=args.method or "cc-grpo",
+                bc_coef=args.bc_coef)
     elif args.phase == "train":
         train(root)
     else:

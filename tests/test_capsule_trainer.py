@@ -590,6 +590,55 @@ def test_trainer_rejects_missing_typed_base_replay_provenance() -> None:
         trainer.run_step(_task())
 
 
+@pytest.mark.parametrize(
+    ("rewards", "expected_advantages", "skips"),
+    [
+        ([0.0] * 7 + [1.0], (0.0,) * 8, False),
+        ([0.0] * 8, (0.0,) * 8, True),
+        ([1.0] * 4 + [0.0] * 4, (0.5,) * 4 + (-0.5,) * 4, False),
+    ],
+)
+def test_grpo_bc_trainer_uses_base_advantages_and_keeps_repair_update(
+    rewards, expected_advantages, skips
+) -> None:
+    events: list[str] = []
+    config = _config()
+    config["actor_rollout_ref"] = {
+        "actor": {"policy_loss": {"loss_mode": "grpo_bc", "bc_coef": 0.5}}
+    }
+    actor = _Actor(events)
+    encoder = _Encoder()
+
+    def update(batch):
+        actor.updated_batch = batch
+        return SimpleNamespace(meta_info={"metrics": {"actor/bc_loss": [0.0] * 7 + [8.0]}})
+
+    actor.update_actor = update
+    trainer = CapsuleCritiqueRayTrainer(
+        assembler=_Assembler(events, _assembly(rewards)),
+        batch_encoder=encoder,
+        actor_rollout_wg=actor,
+        ref_policy_wg=_Reference(events),
+        artifact_sink=MemoryArtifactSink(),
+        config=config,
+    )
+
+    result = trainer.run_step(_task())
+
+    assert result.artifact.sequence_advantages == expected_advantages
+    assert result.skipped_actor_update is skips
+    assert trainer.actor_updates_completed == int(not skips)
+    assert encoder.prompts == (_task().prompt,) * 8
+    if not skips:
+        assert result.artifact.to_dict()["loss_metrics"] == {"actor/bc_loss": 1.0}
+        weights = actor.updated_batch["rollout_is_weights"][..., 0]
+        mask = actor.updated_batch["response_mask"]
+        guided = actor.updated_batch["guided_token_mask"]
+        assert weights[mask & ~guided].sum().item() == pytest.approx(8.0)
+        assert weights[guided].sum().item() == pytest.approx(-8.0 if guided.any() else 0.0)
+        assert not weights[~mask].any()
+
+
 def test_trainer_rejects_guided_member_without_matching_selected_revision_replay() -> None:
     events: list[str] = []
     assembly = _assembly([0.0] * 7 + [1.0])

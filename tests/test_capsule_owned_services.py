@@ -20,6 +20,7 @@ from scripts.capsule_rl import (
     analyze_artifacts,
     server_adapter,
     server_preflight,
+    train_cube_stack,
 )
 from scripts.capsule_rl import launch_owned_services as owned_launcher
 
@@ -424,7 +425,10 @@ def test_profile_loader_fails_fast_on_missing_worker_surface(
         load_single_a800_resolved_profile(broken)
 
 
-def test_profile_round_trips_through_capsule_factory_before_ray(tmp_path: Path) -> None:
+@pytest.mark.parametrize("grpo_bc", [False, True])
+def test_profile_round_trips_through_capsule_factory_before_ray(
+    tmp_path: Path, grpo_bc: bool
+) -> None:
     config = yaml.safe_load(CAPSULE_PATH.read_text(encoding="utf-8"))
     config["runtime"].update(
         {
@@ -433,6 +437,11 @@ def test_profile_round_trips_through_capsule_factory_before_ray(tmp_path: Path) 
             "output_dir": str(tmp_path / "outputs"),
         }
     )
+    if grpo_bc:
+        actor = config["actor_rollout_ref"]["actor"]
+        actor["use_kl_loss"] = False
+        actor["policy_loss"].update(loss_mode="grpo_bc", bc_coef=0.5)
+        server_factory.validate_capsule_config(config)
 
     resolved = server_factory._load_resolved_verl_config(
         config, Path(__file__).parents[1]
@@ -444,6 +453,78 @@ def test_profile_round_trips_through_capsule_factory_before_ray(tmp_path: Path) 
     assert resolved.actor_rollout_ref.actor.ppo_micro_batch_size is None
     assert resolved.actor_rollout_ref.rollout.log_prob_micro_batch_size is None
     assert resolved.actor_rollout_ref.ref.log_prob_micro_batch_size is None
+    actor = resolved.actor_rollout_ref.actor
+    assert actor.use_kl_loss is not grpo_bc
+    if grpo_bc:
+        assert actor.policy_loss.loss_mode == "grpo_bc"
+        assert actor.policy_loss.bc_coef == 0.5
+
+
+@pytest.mark.parametrize(
+    "parent_protocol", [{}, {"method": "grpo-bc", "bc_coef": 0.25}]
+)
+def test_grpo_bc_continuation_requires_same_method_and_coefficient(
+    tmp_path: Path, parent_protocol: dict
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    (parent / "protocol.json").write_text(json.dumps(parent_protocol))
+    (parent / "training_result.json").write_text("{}")
+    root = tmp_path / "child"
+    with pytest.raises(ValueError, match="retain the parent's method and BC coefficient"):
+        train_cube_stack.prepare(
+            root, tmp_path / "model", tmp_path / "verl", (5,), parent,
+            method="grpo-bc", bc_coef=0.5,
+        )
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("task", ["cube_stack", "spill_wipe"])
+def test_prepare_grpo_bc_writes_task_config_and_protocol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, task: str
+) -> None:
+    project = Path(__file__).parents[1]
+    lift = yaml.safe_load(
+        (
+            project / "env_configs/cube_lifting/capsule_rl/"
+            "franka_robosuite_cube_lift_capsule_smoke.yaml"
+        ).read_text()
+    )
+    messages = [
+        {"content": lift["program_service"]["system_prompt"]},
+        {"content": [{"text": "original task prompt"}]},
+    ]
+    environment = types.SimpleNamespace(
+        reset=lambda **_: ({"full_prompt": messages}, {"initial_state_sha256": "a" * 64}),
+        close=lambda: None,
+    )
+    monkeypatch.setattr(server_factory, "YamlEnvironmentFactory", lambda _: lambda _: environment)
+    monkeypatch.setattr(server_factory, "load_task_instances", lambda _: [object()])
+    monkeypatch.setattr(train_cube_stack.subprocess, "check_output", lambda *_, **__: "test-commit")
+
+    def validate_generated_config(path, **_):
+        config = yaml.safe_load(path.read_text())
+        server_factory.validate_capsule_config(config)
+        return config
+
+    monkeypatch.setattr(
+        train_cube_stack, "load_and_validate_server_config", validate_generated_config
+    )
+    root = tmp_path / "baseline"
+    train_cube_stack.prepare(
+        root, tmp_path / "model", tmp_path / "verl", (5,),
+        task=task, method="grpo-bc", bc_coef=0.5,
+    )
+
+    protocol = json.loads((root / "protocol.json").read_text())
+    assert protocol["method"] == "grpo-bc"
+    assert protocol["bc_coef"] == 0.5
+    assert protocol["task"]["environment"] == f"robosuite_{task}"
+    for name in ("runtime.yaml", "verl.yaml"):
+        actor = yaml.safe_load((root / name).read_text())["actor_rollout_ref"]["actor"]
+        assert actor["policy_loss"]["loss_mode"] == "grpo_bc"
+        assert actor["policy_loss"]["bc_coef"] == 0.5
+        assert actor["use_kl_loss"] is False
 
 
 def test_capsule_policy_loss_target_accepts_and_preserves_gamma(

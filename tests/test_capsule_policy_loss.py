@@ -13,7 +13,59 @@ from capx.rl.capsule.policy_loss import (  # noqa: E402
     map_guided_token_mask_to_verl_slot,
     validate_capsule_training_config,
     verl_capsule_critique_policy_loss,
+    verl_grpo_bc_policy_loss,
 )
+
+
+@pytest.mark.parametrize("has_repair", [True, False])
+def test_grpo_bc_micro_batches_match_independent_full_group_losses(has_repair):
+    mask = torch.tensor([[True, True], [True, False], [True, True]])
+    guided = torch.zeros_like(mask)
+    if has_repair:
+        guided[-1] = mask[-1]
+    base = mask & ~guided
+    current = torch.full(mask.shape, -0.7, requires_grad=True)
+    old = torch.where(guided, float("nan"), -0.7)
+    ref = torch.where(guided, float("nan"), -0.9)
+    advantages = torch.where(guided, float("nan"), 0.5)
+    weights = base / base.sum() - guided / guided.sum().clamp_min(1)
+    payload = torch.stack((weights, ref), dim=-1)
+    config = {"kl_loss_coef": 0.1, "policy_loss": {"bc_coef": 0.3}}
+
+    def compute(selection, packed):
+        loss, _ = verl_grpo_bc_policy_loss(
+            old[selection], current[selection], advantages[selection], mask[selection],
+            config=config, rollout_is_weights=packed,
+        )
+        return loss
+
+    full_loss = compute(slice(None), payload)
+    micro_payload = torch.stack((weights * len(mask), ref), dim=-1)
+    micro_loss = torch.stack(
+        [compute(slice(i, i + 1), micro_payload[i : i + 1]) for i in range(len(mask))]
+    ).mean()
+    delta = ref[base] - current[base]
+    expected = (
+        -(advantages[base] * (current[base] - old[base]).exp()).mean()
+        + 0.1 * (delta.exp() - delta - 1).mean()
+        - 0.3 * current[guided].sum() / guided.sum().clamp_min(1)
+    )
+    assert full_loss.item() == pytest.approx(expected.item())
+    assert micro_loss.item() == pytest.approx(expected.item())
+    expected_gradient = torch.autograd.grad(expected, current)[0]
+    torch.testing.assert_close(torch.autograd.grad(full_loss, current)[0], expected_gradient)
+    torch.testing.assert_close(torch.autograd.grad(micro_loss, current)[0], expected_gradient)
+
+
+@pytest.mark.parametrize("coef", [None, True, 0, -1, math.nan, math.inf])
+def test_grpo_bc_requires_explicit_positive_finite_coefficient(coef):
+    with pytest.raises(ValueError, match="finite positive bc_coef"):
+        validate_capsule_training_config({
+            "algorithm": {"rollout_is": False, "rollout_is_threshold": None},
+            "actor_rollout_ref": {
+                "actor": {"policy_loss": {"loss_mode": "grpo_bc", "bc_coef": coef}},
+            },
+        })
 
 
 def vanilla_reference(

@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import Any
 
+GRPO_BC_LOSS_MODE = "grpo_bc"
 _MISSING = object()
 _NO_DEFAULT = object()
+
+
+def validate_bc_coef(value: Any) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError("grpo_bc requires a finite positive bc_coef")
 
 
 def _get(config: Any, key: str, default: Any = _NO_DEFAULT) -> Any:
@@ -39,6 +51,15 @@ def validate_capsule_training_config(config: Any) -> None:
             "standard rollout importance sampling must be disabled: set "
             "algorithm.rollout_is=false and algorithm.rollout_is_threshold=null"
         )
+    rollout_ref = _get(config, "actor_rollout_ref", {})
+    actor = _get(rollout_ref, "actor", {})
+    policy_loss = _get(actor, "policy_loss", {})
+    mode = _get(policy_loss, "loss_mode", None)
+    bc_coef = _get(policy_loss, "bc_coef", None)
+    if mode == GRPO_BC_LOSS_MODE:
+        validate_bc_coef(bc_coef)
+    elif bc_coef is not None:
+        raise ValueError("bc_coef requires grpo_bc loss mode")
 
 
 __all__ = ["validate_capsule_training_config"]

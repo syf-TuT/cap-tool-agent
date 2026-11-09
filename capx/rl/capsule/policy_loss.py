@@ -1,8 +1,8 @@
-"""Pure Torch Capsule-Critique policy loss and a lazy VeRL adapter.
+"""Capsule policy losses and their lazy VeRL adapters.
 
-`rollout_is_weights` is an existing optional tensor slot in the pinned VeRL actor API.  In the
-Capsule loss mode that slot is *only* a transport for the boolean ``guided_token_mask`` artifact;
-standard rollout importance sampling must be disabled by configuration.
+`rollout_is_weights` is an optional transport slot in the pinned VeRL actor API.
+CC-GRPO passes a boolean guided mask. GRPO + BC passes signed loss weights and
+reference log-probs. Both modes require standard rollout importance sampling to be disabled.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 
-from .config_validation import validate_capsule_training_config
+from .config_validation import GRPO_BC_LOSS_MODE, validate_capsule_training_config
 
 CAPSULE_CRITIQUE_LOSS_MODE = "capsule_critique"
 GUIDED_TOKEN_MASK_FIELD = "guided_token_mask"
@@ -202,6 +202,61 @@ def _policy_loss_config_get(config: Any, key: str, default: Any) -> Any:
     return default
 
 
+def verl_grpo_bc_policy_loss(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Any | None = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Combine independently normalized GRPO, reference KL, and BC."""
+    if config is None or loss_agg_mode != "token-mean":
+        raise ValueError("GRPO + BC requires an actor config and token-mean aggregation")
+    if (
+        rollout_is_weights is None
+        or rollout_is_weights.shape != (*log_prob.shape, 2)
+        or not rollout_is_weights.is_floating_point()
+    ):
+        raise ValueError("GRPO + BC requires packed loss weights and reference log-probs")
+    weights, reference = rollout_is_weights.unbind(dim=-1)
+    base_mask = response_mask.bool() & (weights > 0)
+    bc_mask = response_mask.bool() & (weights < 0)
+    base_log_prob = log_prob.masked_fill(~base_mask, 0)
+    base_weights = weights.masked_fill(~base_mask, 0)
+    grpo, clipfrac, ppo_kl, lower_clipfrac = capsule_critique_policy_loss(
+        old_log_prob.masked_fill(~base_mask, 0),
+        base_log_prob,
+        advantages.masked_fill(~base_mask, 0),
+        base_mask,
+        torch.zeros_like(base_mask),
+        clip_ratio=_config_get(config, "clip_ratio", 0.2),
+        clip_ratio_low=_config_get(config, "clip_ratio_low", None),
+        clip_ratio_high=_config_get(config, "clip_ratio_high", None),
+        clip_ratio_c=_config_get(config, "clip_ratio_c", 3.0),
+    )
+    grpo = grpo * base_weights.sum()
+    # Pinned VeRL low_var_kl estimator. The worker factory locks this KL type.
+    delta = (reference.masked_fill(~base_mask, 0) - base_log_prob).clamp(-20, 20)
+    reference_kl = ((delta.exp() - delta - 1).clamp(-10, 10) * base_weights).sum()
+    bc = (log_prob.masked_fill(~bc_mask, 0) * weights.masked_fill(~bc_mask, 0)).sum()
+    loss = (
+        grpo
+        + _config_get(config, "kl_loss_coef") * reference_kl
+        + _policy_loss_config_get(config, "bc_coef", None) * bc
+    )
+    # VeRL averages these metrics over the same micro-batches used for the update.
+    return loss, {
+        "actor/grpo_loss": grpo.detach().item(),
+        "actor/bc_loss": bc.detach().item(),
+        "actor/base_ref_kl": reference_kl.detach().item(),
+        "actor/pg_clipfrac": clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": lower_clipfrac.detach().item(),
+    }
+
+
 def verl_capsule_critique_policy_loss(
     old_log_prob: torch.Tensor,
     log_prob: torch.Tensor,
@@ -284,7 +339,7 @@ def map_guided_token_mask_to_verl_slot(batch: Mapping[str, Any]) -> dict[str, An
 
 
 def register_capsule_critique_policy_loss() -> bool:
-    """Lazily register the loss with VeRL; return ``False`` when VeRL is unavailable."""
+    """Lazily register Capsule losses; return ``False`` when VeRL is unavailable."""
 
     try:
         from verl.trainer.ppo import core_algos
@@ -293,16 +348,16 @@ def register_capsule_critique_policy_loss() -> bool:
             return False
         raise
     registry = core_algos.POLICY_LOSS_REGISTRY
-    existing = registry.get(CAPSULE_CRITIQUE_LOSS_MODE)
-    if existing is verl_capsule_critique_policy_loss:
-        return True
-    if existing is not None:
-        raise RuntimeError(
-            f"VeRL loss mode {CAPSULE_CRITIQUE_LOSS_MODE!r} is already registered"
-        )
-    core_algos.register_policy_loss(CAPSULE_CRITIQUE_LOSS_MODE)(
-        verl_capsule_critique_policy_loss
-    )
+    for mode, loss in (
+        (CAPSULE_CRITIQUE_LOSS_MODE, verl_capsule_critique_policy_loss),
+        (GRPO_BC_LOSS_MODE, verl_grpo_bc_policy_loss),
+    ):
+        existing = registry.get(mode)
+        if existing is loss:
+            continue
+        if existing is not None:
+            raise RuntimeError(f"VeRL loss mode {mode!r} is already registered")
+        core_algos.register_policy_loss(mode)(loss)
     return True
 
 
@@ -315,4 +370,5 @@ __all__ = [
     "register_capsule_critique_policy_loss",
     "validate_capsule_training_config",
     "verl_capsule_critique_policy_loss",
+    "verl_grpo_bc_policy_loss",
 ]

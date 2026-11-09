@@ -35,6 +35,7 @@ from .compat import (
     verify_imported_verl_path,
 )
 from .checkpoint import AtomicCheckpointClaim
+from .config_validation import GRPO_BC_LOSS_MODE
 from .controller import (
     ControllerRepairCollector,
     FrozenControllerConfig,
@@ -1371,16 +1372,37 @@ def _load_resolved_verl_config(config: Mapping[str, Any], project_root: Path) ->
                 section[field] = max(int(section.get(field) or 0), capacity)
             verl_config.data.max_prompt_length = rollout.prompt_length
             verl_config.data.max_response_length = rollout.response_length
-        verl_config.actor_rollout_ref.actor.use_kl_loss = True
-        verl_config.actor_rollout_ref.actor.kl_loss_coef = float(capsule_actor["kl_loss_coef"])
-        verl_config.actor_rollout_ref.actor.ppo_epochs = 1
-        verl_config.actor_rollout_ref.actor.ppo_mini_batch_size = 8
-        verl_config.actor_rollout_ref.actor.ulysses_sequence_parallel_size = 1
-        verl_config.actor_rollout_ref.actor.policy_loss.loss_mode = "capsule_critique"
-        verl_config.actor_rollout_ref.actor.policy_loss.capsule_gamma = 0.1
-        verl_config.actor_rollout_ref.actor.policy_loss.guided_objective = (
-            capsule_actor["policy_loss"].get("guided_objective", "probability_shaping")
+        actor = verl_config.actor_rollout_ref.actor
+        policy_loss = capsule_actor["policy_loss"]
+        loss_mode = policy_loss["loss_mode"]
+        grpo_bc = loss_mode == GRPO_BC_LOSS_MODE
+        actor.use_kl_loss = not grpo_bc
+        actor.kl_loss_coef = float(capsule_actor["kl_loss_coef"])
+        actor.ppo_epochs = 1
+        actor.ppo_mini_batch_size = BASE_GROUP_SIZE
+        actor.ulysses_sequence_parallel_size = 1
+        actor.policy_loss.loss_mode = loss_mode
+        actor.policy_loss.capsule_gamma = 0.1
+        actor.policy_loss.guided_objective = policy_loss.get(
+            "guided_objective", "probability_shaping"
         )
+        if grpo_bc:
+            if (
+                _capsule_data_parallel_world_size(verl_config) != 1
+                or actor.strategy != "fsdp"
+                or actor.use_dynamic_bsz is not False
+                or actor.ppo_micro_batch_size_per_gpu != 1
+                or actor.get("ppo_micro_batch_size") is not None
+                or actor.loss_agg_mode != "token-mean"
+                or actor.entropy_coeff != 0
+                or actor.kl_loss_type != "low_var_kl"
+            ):
+                raise ServerFactoryError(
+                    "GRPO + BC requires single-GPU FSDP, fixed one-row micro-batches, "
+                    "token-mean aggregation, zero entropy coefficient, and low_var_kl"
+                )
+            actor.policy_loss._target_ = "capx.rl.capsule.verl_config.CapsulePolicyLossConfig"
+            actor.policy_loss.bc_coef = float(policy_loss["bc_coef"])
         verl_config.algorithm.norm_adv_by_std_in_grpo = False
         verl_config.algorithm.rollout_is = False
         verl_config.algorithm.rollout_is_threshold = None

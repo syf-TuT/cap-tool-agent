@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from .config_validation import GRPO_BC_LOSS_MODE
 from .group import (
     BASE_GROUP_SIZE,
     GroupAssemblyResult,
@@ -61,9 +62,10 @@ class TrainingStepArtifact:
     sequence_rewards: tuple[float, ...]
     sequence_advantages: tuple[float, ...]
     skipped_actor_update: bool
+    loss_metrics: dict[str, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": 1,
             "assembly": self.assembly.to_dict(),
             GUIDED_TOKEN_MASK_FIELD: [list(row) for row in self.guided_token_mask],
@@ -71,6 +73,9 @@ class TrainingStepArtifact:
             "sequence_advantages": list(self.sequence_advantages),
             "skipped_actor_update": self.skipped_actor_update,
         }
+        if self.loss_metrics is not None:
+            payload["loss_metrics"] = self.loss_metrics
+        return payload
 
 
 @dataclass(frozen=True)
@@ -394,12 +399,15 @@ class CapsuleCritiqueRayTrainer:
         from .policy_loss import validate_capsule_training_config
 
         validate_capsule_training_config(config)
+        self.grpo_bc = _nested_config_value(
+            config, ("actor_rollout_ref", "actor", "policy_loss", "loss_mode")
+        ) == GRPO_BC_LOSS_MODE
         reference_kl_enabled = _nested_config_value(
             config,
             ("actor_rollout_ref", "actor", "use_kl_loss"),
             False,
         )
-        if reference_kl_enabled is True and ref_policy_wg is None:
+        if (reference_kl_enabled is True or self.grpo_bc) and ref_policy_wg is None:
             raise ValueError("ref_policy_wg is required when actor reference KL is enabled")
         if reference_policy_mode not in REFERENCE_POLICY_MODES:
             raise ValueError(
@@ -873,12 +881,29 @@ class CapsuleCritiqueRayTrainer:
             dtype=torch.float32,
             device=response_mask.device,
         )
-        sequence_advantages = rewards - rewards.mean()
+        if self.grpo_bc:
+            guided_rows = tensors[GUIDED_TOKEN_MASK_FIELD].any(dim=-1)
+            base_mean = rewards[~guided_rows].mean()
+            sequence_advantages = (rewards - base_mean).masked_fill(guided_rows, 0)
+        else:
+            sequence_advantages = rewards - rewards.mean()
         advantages = sequence_advantages.unsqueeze(-1) * response_mask.to(torch.float32)
         tensors["advantages"] = advantages
         tensors["returns"] = advantages.clone()
         self.events.append("advantage")
         return tuple(float(value) for value in sequence_advantages.detach().cpu().tolist())
+
+    def _pack_grpo_bc_loss_inputs(self, batch: Any) -> None:
+        import torch
+
+        tensors = _tensor_batch(batch)
+        guided = tensors[GUIDED_TOKEN_MASK_FIELD]
+        base = tensors["response_mask"] & ~guided
+        # The pinned actor divides each of the eight one-row micro-batch losses by eight.
+        base_weights = base.float() * (BASE_GROUP_SIZE / base.sum().clamp_min(1))
+        bc_weights = guided.float() * (BASE_GROUP_SIZE / guided.sum().clamp_min(1))
+        reference = tensors["ref_log_prob"].float().masked_fill(~base, 0)
+        tensors[VERL_MASK_SLOT] = torch.stack((base_weights - bc_weights, reference), dim=-1)
 
     def _compute_actor_base_reference_log_prob(self, batch: Any) -> Any:
         """Ask the LoRA actor for frozen-base log-probs via VeRL's adapter-disable flag."""
@@ -917,8 +942,13 @@ class CapsuleCritiqueRayTrainer:
             _nested_config_value(self.config, ("capsule", "repair_trigger"), "all_failed"),
         )
         batch = self._inject_group(task, assembly)
+        skip_actor_update = assembly.group.skip_actor_update
+        if self.grpo_bc and any(
+            member.member_type == "critique_guided_revision" for member in assembly.group.members
+        ):
+            skip_actor_update = False
 
-        if not assembly.group.skip_actor_update:
+        if not skip_actor_update:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_tensors = _tensor_batch(old_log_prob)
             if "entropys" in old_log_prob_tensors:
@@ -932,22 +962,35 @@ class CapsuleCritiqueRayTrainer:
                     ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                 batch = _merge_batch(batch, ref_log_prob)
                 execution_trace.append("reference_logprob")
+            if self.grpo_bc:
+                self._pack_grpo_bc_loss_inputs(batch)
 
         sequence_advantages = self._add_advantages(batch, assembly)
+        actor_output = None
+        loss_metrics = None
+        if not skip_actor_update:
+            actor_output = self.actor_rollout_wg.update_actor(batch)
+            self._actor_updates_completed += 1
+            execution_trace.append("update")
+            if self.grpo_bc:
+                import numpy as np
+
+                metadata = getattr(actor_output, "meta_info", actor_output)
+                metrics = metadata.get("metrics", {}) if isinstance(metadata, Mapping) else {}
+                loss_metrics = {
+                    name: float(np.mean(metrics[name]))
+                    for name in ("actor/grpo_loss", "actor/bc_loss", "actor/base_ref_kl")
+                    if name in metrics
+                }
         tensors = _tensor_batch(batch)
         artifact = TrainingStepArtifact(
             assembly=assembly,
             guided_token_mask=_mask_tuple(tensors[GUIDED_TOKEN_MASK_FIELD]),
             sequence_rewards=tuple(member.reward for member in assembly.group.members),
             sequence_advantages=sequence_advantages,
-            skipped_actor_update=assembly.group.skip_actor_update,
+            skipped_actor_update=skip_actor_update,
+            loss_metrics=loss_metrics,
         )
-
-        actor_output = None
-        if not assembly.group.skip_actor_update:
-            actor_output = self.actor_rollout_wg.update_actor(batch)
-            self._actor_updates_completed += 1
-            execution_trace.append("update")
         self.artifact_sink.write(artifact)
         return TrainingStepResult(
             artifact=artifact,
@@ -955,7 +998,7 @@ class CapsuleCritiqueRayTrainer:
             actor_output=actor_output,
             events=tuple(self.events),
             execution_trace=tuple(execution_trace),
-            skipped_actor_update=assembly.group.skip_actor_update,
+            skipped_actor_update=skip_actor_update,
         )
 
     def fit(self, tasks: Iterable[TaskInstanceV1]) -> tuple[TrainingStepResult, ...]:

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .config_validation import validate_capsule_training_config
+from .config_validation import GRPO_BC_LOSS_MODE, validate_capsule_training_config
 from .program_protocol import ProgramProtocolError, program_sampling
 from .task_profiles import collect_task_profile_errors
 
@@ -428,13 +428,7 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
             CAPSULE_EXTERNAL_LIB,
             "the project-owned loss must be registered",
         ),
-        (
-            "actor_rollout_ref.actor.policy_loss.loss_mode",
-            CAPSULE_LOSS_MODE,
-            "guided tokens require Capsule-Critique loss",
-        ),
         ("actor_rollout_ref.actor.policy_loss.capsule_gamma", 0.1, "guided gamma is fixed"),
-        ("actor_rollout_ref.actor.use_kl_loss", True, "reference KL stays in the actor loss"),
         ("actor_rollout_ref.actor.ppo_epochs", 1, "one update_actor call is one PPO epoch"),
         (
             "actor_rollout_ref.actor.ulysses_sequence_parallel_size",
@@ -473,6 +467,18 @@ def validate_capsule_config(config: Mapping[str, Any]) -> None:
     )
     for path, expected, reason in exact_values:
         _require_exact(config, path, expected, reason, errors)
+    loss_mode = _get(config, "actor_rollout_ref.actor.policy_loss.loss_mode")
+    if loss_mode not in (CAPSULE_LOSS_MODE, GRPO_BC_LOSS_MODE):
+        errors.append(
+            "actor_rollout_ref.actor.policy_loss.loss_mode must be capsule_critique or grpo_bc"
+        )
+    _require_exact(
+        config,
+        "actor_rollout_ref.actor.use_kl_loss",
+        loss_mode != GRPO_BC_LOSS_MODE,
+        "GRPO + BC computes ordinary-only KL in its registered loss",
+        errors,
+    )
     repair_trigger = _get(config, "capsule.repair_trigger")
     if repair_trigger is not _MISSING and repair_trigger not in ("never", "any_failed", "all_failed"):
         errors.append("capsule.repair_trigger must be never, any_failed, or all_failed")
