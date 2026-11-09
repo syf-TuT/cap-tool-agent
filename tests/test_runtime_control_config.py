@@ -1,8 +1,10 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
+from capx.envs.launch import LaunchArgs
 from capx.envs.tasks.franka.franka_pick_place import PROMPT
 from capx.utils.launch_utils import _load_config
 
@@ -137,6 +139,81 @@ def test_cube_stack_action_ablation_configs_form_controlled_a1_a4_matrix():
         for config in configs
     ]
     assert all(config == normalized_configs[0] for config in normalized_configs[1:])
+
+
+@pytest.mark.parametrize(
+    "task_config",
+    [
+        "cube_lifting/franka_robosuite_cube_lifting",
+        "cube_restack/franka_robosuite_cube_restack",
+        "spill_wipe/franka_robosuite_spill_wipe",
+        "two_arm_lift/franka_robosuite_two_arm_lift",
+        "two_arm_handover/two_arm_handover",
+    ],
+)
+def test_task_action_ablation_configs_form_controlled_a1_a4_matrix(task_config):
+    base_path = Path(f"env_configs/{task_config}.yaml")
+    base = yaml.safe_load(base_path.read_text())
+    expected_env = base["env"]
+    expected_env["cfg"].setdefault("privileged", False)
+    groups = (
+        ("a1_one_shot", "code", False, False),
+        ("capsule_llm_step_a2_no_patch", "capsule", False, True),
+        ("capsule_llm_step_a3_no_append_recovery", "capsule", True, False),
+        ("capsule_llm_step_a4_full", "capsule", True, True),
+    )
+    shared_config = None
+    for suffix, mode, patch, append_recovery in groups:
+        path = base_path.with_name(f"{base_path.stem}_{suffix}.yaml")
+        data = yaml.safe_load(path.read_text())
+        env, config, servers = _load_config(LaunchArgs(config_path=str(path)))
+
+        assert env == data["env"]
+        assert env["_target_"] == expected_env["_target_"]
+        cfg = dict(env["cfg"])
+        prompt = cfg.pop("prompt")
+        assert prompt.startswith("Goal: ")
+        assert "non-privileged robot APIs" in prompt
+        assert "executable Python" in prompt
+        assert cfg == expected_env["cfg"]
+        assert servers == base["api_servers"]
+
+        assert config["agent_mode"] == mode
+        assert config["capsule_llm_step_allow_patch"] is patch
+        assert config["capsule_llm_step_allow_append_recovery"] is append_recovery
+        assert config["output_dir"] == f"./outputs/{path.stem}"
+        assert config["total_trials"] == base["trials"]
+        assert config["num_workers"] == base["num_workers"]
+        assert config["record_video"] == base["record_video"]
+        assert config["capsule_control_mode"] == "llm_step"
+        assert config["max_capsule_steps"] == 12
+        assert config["capsule_llm_step_compact_context"] is True
+        assert config["capsule_execution_granularity"] == "semantic_group"
+        assert config["capsule_max_regions_per_group"] == 20
+        assert config["checkpoint_policy"] == "region"
+        assert config["rollback_policy"] == "none"
+        assert config["capsule_feedback_level"] == "source_region_repair_hint"
+        assert config["use_oracle_code"] is False
+        assert config["use_visual_feedback"] is False
+        assert config["use_img_differencing"] is False
+        assert config["use_video_differencing"] is False
+        for key in (
+            "capsule_reward_drop_guard_min_best_reward",
+            "capsule_reward_drop_guard_threshold",
+        ):
+            assert config.get(key) == base.get(key)
+
+        for key in (
+            "agent_mode",
+            "capsule_llm_step_allow_patch",
+            "capsule_llm_step_allow_append_recovery",
+            "output_dir",
+        ):
+            del data[key]
+        if shared_config is None:
+            shared_config = data
+        else:
+            assert data == shared_config
 
 
 def test_load_config_reads_capsule_fields():

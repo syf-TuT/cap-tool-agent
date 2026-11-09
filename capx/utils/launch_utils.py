@@ -205,6 +205,13 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "scripted_actions": configs_dict.get("scripted_actions", None),
     }
 
+    for field in (
+        "capsule_reward_drop_guard_min_best_reward",
+        "capsule_reward_drop_guard_threshold",
+    ):
+        if field in configs_dict:
+            merged_config[field] = configs_dict[field]
+
     return env_factory, merged_config, api_servers
 
 
