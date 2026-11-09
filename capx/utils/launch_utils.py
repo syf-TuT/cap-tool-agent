@@ -186,6 +186,12 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "capsule_llm_step_compact_context": configs_dict.get(
             "capsule_llm_step_compact_context", True
         ),
+        "capsule_llm_step_allow_patch": configs_dict.get(
+            "capsule_llm_step_allow_patch", True
+        ),
+        "capsule_llm_step_allow_append_recovery": configs_dict.get(
+            "capsule_llm_step_allow_append_recovery", True
+        ),
         "capsule_action_history_max_entries": configs_dict.get(
             "capsule_action_history_max_entries", 4
         ),
@@ -225,6 +231,13 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         ),
         "scripted_actions": configs_dict.get("scripted_actions", None),
     }
+
+    for field in (
+        "capsule_reward_drop_guard_min_best_reward",
+        "capsule_reward_drop_guard_threshold",
+    ):
+        if field in configs_dict:
+            merged_config[field] = configs_dict[field]
 
     return env_factory, merged_config, api_servers
 

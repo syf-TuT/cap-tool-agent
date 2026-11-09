@@ -1,0 +1,49 @@
+# A3 ablation: llm_step without append_recovery; patch remains available.
+# Usage: uv run capx/envs/launch.py --config-path env_configs/two_arm_handover/two_arm_handover_capsule_llm_step_a3_no_append_recovery.yaml
+
+env:
+  _target_: capx.envs.tasks.franka.two_arm_handover.TwoArmHandoverCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level: two_arm_handover_robosuite
+    privileged: false
+    apis:
+      - FrankaHandoverApi
+    prompt: |-
+      Goal: Transfer the hammer from Arm 0 to Arm 1. At completion, Arm 1 alone grasps the hammer handle.
+      Cartesian poses use the robot0 base frame.
+      Use the provided non-privileged robot APIs.
+      Write only executable Python code without code fences.
+      Import external libraries explicitly if needed.
+
+agent_mode: capsule
+max_capsule_steps: 12
+capsule_llm_step_compact_context: true
+capsule_llm_step_allow_patch: true
+capsule_llm_step_allow_append_recovery: false
+capsule_execution_granularity: semantic_group
+capsule_max_regions_per_group: 20
+checkpoint_policy: region
+rollback_policy: none
+capsule_feedback_level: source_region_repair_hint
+
+api_servers:
+  - _target_: capx.serving.launch_sam3_server.main
+    device: cuda
+    port: 8114
+    host: 127.0.0.1
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+record_video: true
+use_oracle_code: false
+use_visual_feedback: false
+use_img_differencing: false
+use_video_differencing: false
+output_dir: ./outputs/two_arm_handover_capsule_llm_step_a3_no_append_recovery
+
+trials: 100
+num_workers: 5

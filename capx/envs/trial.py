@@ -1989,6 +1989,12 @@ def _run_capsule_loop(
     llm_step_compact_context = _coerce_config_bool(
         config.get("capsule_llm_step_compact_context", True)
     )
+    llm_step_allow_patch = _coerce_config_bool(
+        config.get("capsule_llm_step_allow_patch", True)
+    )
+    llm_step_allow_append_recovery = _coerce_config_bool(
+        config.get("capsule_llm_step_allow_append_recovery", True)
+    )
     action_history_max_entries = int(config.get("capsule_action_history_max_entries", 4))
     action_trace_max_events = int(config.get("capsule_action_trace_max_events", 5))
     action_source_preview_chars = int(
@@ -2110,6 +2116,8 @@ def _run_capsule_loop(
                     runnable_recovery_group_ids=list(
                         recovery_action_state.runnable_recovery_group_ids
                     ),
+                    allow_patch=llm_step_allow_patch,
+                    allow_append_recovery=llm_step_allow_append_recovery,
                 )
                 action_prompt_chars = len(json.dumps(prompt, default=str))
                 action_prompt_char_budget_metric = (
@@ -2176,11 +2184,17 @@ def _run_capsule_loop(
                     state_level=prompt_state_level,
                 )
                 before_state = group_observation_before_state
-            event = _finish_success_guard_event(
+            event = _llm_step_action_policy_event(
                 action,
-                before_state,
-                require_task_success=require_task_success_for_finish,
+                allow_patch=llm_step_allow_patch,
+                allow_append_recovery=llm_step_allow_append_recovery,
             )
+            if event is None:
+                event = _finish_success_guard_event(
+                    action,
+                    before_state,
+                    require_task_success=require_task_success_for_finish,
+                )
             if event is None:
                 event = _execution_granularity_guard_event(
                     action,
@@ -2639,6 +2653,8 @@ def _run_capsule_loop(
         )
         metric.update(_capsule_repair_state_evidence(source_analysis))
         metric["budget_exhausted"] = False
+        metric["llm_step_allow_patch"] = llm_step_allow_patch
+        metric["llm_step_allow_append_recovery"] = llm_step_allow_append_recovery
         step_metrics.append(metric)
 
         reward_after = _state_reward(after_state)
@@ -3227,6 +3243,34 @@ def _no_rollback_guard_event(
             return _already_executed_side_effect_event(action.action, region_id, recovery_hint)
         return None
 
+    return None
+
+
+def _llm_step_action_policy_event(
+    action: RuntimeAction,
+    *,
+    allow_patch: bool,
+    allow_append_recovery: bool,
+) -> RuntimeEvent | None:
+    if not allow_patch and action.action in {"patch_group", "patch_region"}:
+        return RuntimeEvent(
+            action=action.action,
+            status="invalid",
+            region_id=_runtime_action_unit_id(action),
+            message=(
+                f"{action.action} is disabled by "
+                "capsule_llm_step_allow_patch=false for this experiment."
+            ),
+        )
+    if not allow_append_recovery and action.action == "append_recovery":
+        return RuntimeEvent(
+            action=action.action,
+            status="invalid",
+            message=(
+                "append_recovery is disabled by "
+                "capsule_llm_step_allow_append_recovery=false for this experiment."
+            ),
+        )
     return None
 
 

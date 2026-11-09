@@ -1,0 +1,63 @@
+# A3 ablation: llm_step without append_recovery; patch remains available.
+# Usage: uv run capx/envs/launch.py --config-path env_configs/two_arm_lift/franka_robosuite_two_arm_lift_capsule_llm_step_a3_no_append_recovery.yaml
+
+env:
+  _target_: capx.envs.tasks.franka.two_arm_lift.TwoArmLiftCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level: two_arm_lift_robosuite
+    privileged: false
+    apis:
+      - FrankaTwoArmLiftApi
+    prompt: |-
+      Goal: Lift the pot with both arms while keeping it level. Arm 0 grasps handle 0 and Arm 1 grasps handle 1.
+      Cartesian poses use the robot0 base frame.
+      Use the provided non-privileged robot APIs.
+      Write only executable Python code without code fences.
+      Import external libraries explicitly if needed.
+
+agent_mode: capsule
+max_capsule_steps: 12
+capsule_llm_step_compact_context: true
+capsule_llm_step_allow_patch: true
+capsule_llm_step_allow_append_recovery: false
+capsule_execution_granularity: semantic_group
+capsule_max_regions_per_group: 20
+checkpoint_policy: region
+rollback_policy: none
+capsule_feedback_level: source_region_repair_hint
+
+api_servers:
+  - _target_: capx.serving.launch_owlvit_server.main
+    device: cuda
+    port: 8117
+    host: 127.0.0.1
+    model_name: google/owlv2-large-patch14-ensemble
+  - _target_: capx.serving.launch_sam2_server.main
+    device: cuda
+    port: 8113
+    host: 127.0.0.1
+    model_name: facebook/sam2.1-hiera-large
+  - _target_: capx.serving.launch_contact_graspnet_server.main
+    port: 8115
+    host: 127.0.0.1
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+record_video: true
+use_oracle_code: false
+use_visual_feedback: false
+use_img_differencing: false
+use_video_differencing: false
+output_dir: ./outputs/franka_robosuite_two_arm_lift_capsule_llm_step_a3_no_append_recovery
+
+trials: 100
+num_workers: 12
+
+# Two Arm Lift uses a low-range dense reward before task success. Keep this
+# override task-local so other Capsule experiments retain their existing guard.
+capsule_reward_drop_guard_min_best_reward: 0.05
+capsule_reward_drop_guard_threshold: 0.03

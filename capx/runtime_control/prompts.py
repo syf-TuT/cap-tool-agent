@@ -109,24 +109,34 @@ def build_capsule_prompt(
     append_recovery_block_reason: str | None = None,
     pending_recovery_group_ids: list[str] | None = None,
     runnable_recovery_group_ids: list[str] | None = None,
+    allow_patch: bool = True,
+    allow_append_recovery: bool = True,
 ) -> list[dict[str, Any]]:
     recovery_functions = sorted(
         {"get_observation"}
         if recovery_observation_functions is None
         else recovery_observation_functions
     )
-    if repair_pending:
+    if not allow_append_recovery:
+        recovery_guidance = ""
+        recovery_example_line = ""
+        recovery_rule = ""
+    elif repair_pending:
         recovery_guidance = (
             "append_recovery is unavailable while source repair is pending."
         )
         recovery_example_line = ""
         recovery_rule = recovery_guidance
     elif not append_recovery_available:
+        pending_repair_guidance = (
+            ", or patch one of its pending groups when repair is required"
+            if allow_patch
+            else ""
+        )
         recovery_guidance = (
             "append_recovery is unavailable while the latest recovery transaction "
             "is pending; finish the existing recovery transaction by running one of "
-            "the runnable recovery groups shown below, or patch one of its pending "
-            "groups when repair is required."
+            f"the runnable recovery groups shown below{pending_repair_guidance}."
         )
         recovery_example_line = ""
         recovery_rule = recovery_guidance
@@ -157,11 +167,17 @@ def build_capsule_prompt(
             "- Repair the current source before attempting additional robot-side-effect "
             "motion.\n"
         )
+    elif not allow_append_recovery:
+        recovery_continuation_rule = ""
     elif not append_recovery_available:
+        pending_repair_rule = (
+            ", or patch a listed pending recovery group when repair is required"
+            if allow_patch
+            else ""
+        )
         recovery_continuation_rule = (
             "- Finish the existing recovery transaction before appending another: "
-            "run a listed runnable recovery group, or patch a listed pending recovery "
-            "group when repair is required.\n"
+            f"run a listed runnable recovery group{pending_repair_rule}.\n"
         )
     elif recovery_functions:
         recovery_continuation_rule = (
@@ -177,12 +193,14 @@ def build_capsule_prompt(
         runnable_group_ids,
         blocked_group_dependencies,
     )
-    recovery_availability = _normalize_recovery_availability(
-        append_recovery_available=append_recovery_available,
-        append_recovery_block_reason=append_recovery_block_reason,
-        pending_recovery_group_ids=pending_recovery_group_ids,
-        runnable_recovery_group_ids=runnable_recovery_group_ids,
-    )
+    recovery_availability = None
+    if allow_append_recovery:
+        recovery_availability = _normalize_recovery_availability(
+            append_recovery_available=append_recovery_available,
+            append_recovery_block_reason=append_recovery_block_reason,
+            pending_recovery_group_ids=pending_recovery_group_ids,
+            runnable_recovery_group_ids=runnable_recovery_group_ids,
+        )
     run_group_example_id = _example_group_id(
         groups or [],
         normalized_side_effect_ledger,
@@ -276,7 +294,29 @@ def build_capsule_prompt(
             if repair_pending
             else "run_region, resume_from_region, or patch_region"
         )
-    if recovery_functions and not repair_pending and append_recovery_available:
+    if not allow_patch:
+        allowed_actions = [action for action in allowed_actions if not action.startswith("patch_")]
+        execution_examples = "".join(
+            line for line in execution_examples.splitlines(keepends=True)
+            if '"action": "patch_' not in line
+        )
+        patch_rule = ""
+        ledger_actions_text = (
+            "run_group" if uses_semantic_groups else "run_region or resume_from_region"
+        )
+        if repair_pending:
+            execution_guidance = "Source repair is quarantined and source edits are disabled."
+            recovery_continuation_rule = ""
+        elif uses_semantic_groups:
+            execution_guidance = "Use run_group for effect-bounded execution units."
+        else:
+            execution_guidance = "Use run_region or resume_from_region for atomic region execution."
+    if (
+        allow_append_recovery
+        and recovery_functions
+        and not repair_pending
+        and append_recovery_available
+    ):
         allowed_actions.append("append_recovery")
     allowed_actions.append("finish")
     allowed_actions_text = ", ".join(allowed_actions)
@@ -313,6 +353,8 @@ def build_capsule_prompt(
         group_availability=group_availability,
         recovery_availability=recovery_availability,
         recovery_continuation_rule=recovery_continuation_rule,
+        allow_patch=allow_patch,
+        allow_append_recovery=allow_append_recovery,
     )
     if compact_context and _prompt_text_over_budget(prompt_text, prompt_char_budget):
         prompt_text = _build_capsule_prompt_text(
@@ -353,6 +395,8 @@ def build_capsule_prompt(
             group_availability=group_availability,
             recovery_availability=recovery_availability,
             recovery_continuation_rule=recovery_continuation_rule,
+            allow_patch=allow_patch,
+            allow_append_recovery=allow_append_recovery,
         )
     if (
         compact_context
@@ -398,6 +442,8 @@ def build_capsule_prompt(
             group_availability=group_availability,
             recovery_availability=recovery_availability,
             recovery_continuation_rule=recovery_continuation_rule,
+            allow_patch=allow_patch,
+            allow_append_recovery=allow_append_recovery,
         )
     if (
         compact_context
@@ -439,6 +485,8 @@ def build_capsule_prompt(
             group_availability=group_availability,
             recovery_availability=recovery_availability,
             recovery_continuation_rule=recovery_continuation_rule,
+            allow_patch=allow_patch,
+            allow_append_recovery=allow_append_recovery,
         )
     return _capsule_prompt_messages(prompt_text)
 
@@ -482,6 +530,8 @@ def _build_capsule_prompt_text(
     group_availability: dict[str, Any] | None,
     recovery_availability: dict[str, Any] | None,
     recovery_continuation_rule: str,
+    allow_patch: bool,
+    allow_append_recovery: bool,
 ) -> str:
     if compact_context:
         region_units = [
@@ -534,6 +584,11 @@ def _build_capsule_prompt_text(
             else None
         ),
     )
+    for unit in [*region_units, *group_units]:
+        if not allow_patch:
+            unit.pop("patch_allowed", None)
+        if not allow_append_recovery:
+            unit.pop("recovery_required", None)
     ledger_data = side_effect_ledger
     if compact_context:
         phase_index = min(compact_phase, len(_COMPACT_UNIT_MAX_ITEMS_BY_PHASE) - 1)
@@ -611,6 +666,14 @@ def _build_capsule_prompt_text(
             "Latest post-action observation:\n"
             f"{json.dumps(compact_observation, indent=2, default=str)}\n\n"
         )
+    action_scope = (
+        "execution, inspection, and local source patches"
+        if allow_patch
+        else "execution and inspection"
+    )
+    current_state_action = (
+        "an allowed patch or execution action" if allow_patch else "an allowed action"
+    )
     prompt_text = (
         "Task:\n"
         f"{task}\n\n"
@@ -629,11 +692,11 @@ def _build_capsule_prompt_text(
         f"{contract_violation_text}"
         f"{focused_source_text}"
         "Choose exactly one runtime-control action. These actions control source-code "
-        "execution, inspection, and local source patches. They do "
+        f"{action_scope}. They do "
         "not directly perform robot manipulation.\n\n"
         "Rollback is unavailable. Previously executed robot-side-effect code may have "
         "changed the current physical state, so repairs must continue from that state. "
-        "Use a fresh observation and continue with an allowed patch or execution action; do "
+        f"Use a fresh observation and continue with {current_state_action}; do "
         "not assume earlier robot actions can be undone or replayed from their original "
         "preconditions. "
         f"{recovery_guidance}\n\n"
