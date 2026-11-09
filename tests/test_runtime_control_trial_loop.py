@@ -6,11 +6,13 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import capx.envs.trial as trial_module
 import numpy as np
 import pytest
 from PIL import Image
+
+import capx.envs.trial as trial_module
 from capx.envs.infrastructure import InfrastructureFailure
+from capx.envs.launch import LaunchArgs
 from capx.envs.trial import (
     _analyze_capsule_source,
     _attach_capsule_visuals,
@@ -129,6 +131,36 @@ def test_capsule_partial_repair_progress_accepts_fully_valid_candidate():
         [_repair_violation()],
         [],
     )
+@pytest.mark.parametrize("mode", ["code", "capsule"])
+def test_libero_goal_is_expanded_before_initial_code_query(monkeypatch, tmp_path, mode):
+    template = "Goal: {libero_environment_goal}\nAPI example: {'key': 1}"
+    cached_prompt = [{"content": [{"text": template}]}]
+    env = SimpleNamespace(
+        low_level_env=SimpleNamespace(handle=SimpleNamespace(task_language="open the drawer")),
+        reset=lambda **kwargs: ({"full_prompt": cached_prompt}, {}),
+    )
+    config = {
+        "agent_mode": mode,
+        "output_dir": str(tmp_path),
+        "record_video": False,
+        "use_img_differencing": False,
+        "use_visual_feedback": False,
+        "use_oracle_code": False,
+    }
+
+    class ReachedInitialQuery(Exception):
+        pass
+
+    def check_prompt(args, config, obs, **kwargs):
+        assert obs["full_prompt"][-1]["content"][0]["text"] == (
+            "Goal: open the drawer\nAPI example: {'key': 1}"
+        )
+        raise ReachedInitialQuery
+
+    monkeypatch.setattr(trial_module, "_query_initial_code", check_prompt)
+    with pytest.raises(ReachedInitialQuery):
+        _run_single_trial(env, 1, LaunchArgs(config_path="unused.yaml"), config, None)
+    assert cached_prompt[-1]["content"][0]["text"] == template
 
 
 class FakeApi:

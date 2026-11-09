@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import copy
 import os
-import sys
 import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import tyro
@@ -14,17 +14,58 @@ import yaml
 from capx.envs.launch import LaunchArgs
 from capx.envs.launch import main as launch_main
 
-# Force weights_only=False for PyTorch loading of legacy files.
-os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+STANDARD_SUITES = ("libero_object", "libero_spatial", "libero_goal")
+PRO_SUITES = (
+    "libero_object_swap",
+    "libero_object_task",
+    "libero_goal_swap",
+    "libero_goal_task",
+    "libero_spatial_swap",
+    "libero_spatial_task",
+)
+ABLATION_CONFIGS = {
+    "a1": "franka_libero_a1_one_shot.yaml",
+    "a2": "franka_libero_capsule_llm_step_a2_no_patch.yaml",
+    "a3": "franka_libero_capsule_llm_step_a3_no_append_recovery.yaml",
+    "a4": "franka_libero_capsule_llm_step_a4_full.yaml",
+}
+
+
+@dataclass
+class LiberoBatchLaunchArgs:
+    """Command-line arguments for automated Libero batch execution."""
+
+    base_config_path: str = "env_configs/libero/franka_libero_cap_agent0.yaml"
+    ablation: bool = False
+    # Defaults to the three standard suites in ablation mode, or six PRO suites otherwise.
+    suites: list[str] | None = None
+    # Select these zero-based task indices in each selected suite.
+    task_ids: list[int] | None = None
+    models: list[str] = field(default_factory=lambda: ["google/gemini-3.1-pro-preview"])
+    server_url: str = "http://127.0.0.1:8110/chat/completions"
+    output_dir: str = "./outputs/libero_batch_run"
+    temperature: float = 1.0
+    max_tokens: int = 4096
+    reasoning_effort: str = "medium"
+    api_key: str | None = None
+    use_visual_feedback: bool | None = None
+    use_img_differencing: bool | None = None
+    use_wrist_camera: bool | None = None
+    use_legacy_multi_turn_decision_prompt: bool | None = None
+    total_trials: int | None = None
+    num_workers: int | None = None
+    record_video: bool | None = None
+    debug: bool = False
+    use_oracle_code: bool | None = None
 
 
 def _load_benchmark_dict() -> Mapping[str, Callable[[], Any]]:
+    # LIBERO checkpoints may use the legacy PyTorch serialization format.
+    os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
     try:
         from libero import benchmark
     except ImportError as exc:
-        raise RuntimeError(
-            "LIBERO is not installed; run this command in the dedicated LIBERO environment."
-        ) from exc
+        raise RuntimeError("LIBERO is unavailable. Install the libero extra.") from exc
     return benchmark.get_benchmark_dict()
 
 
@@ -53,226 +94,145 @@ def _select_task_ids(n_tasks: int, task_ids: list[int] | None) -> list[int]:
 
 
 def _collect_tasks(
-    benchmark_dict: Mapping[str, Callable[[], Any]],
-    suite_names: list[str],
+    benchmarks: Mapping[str, Callable[[], Any]],
+    suites: list[str],
     task_ids: list[int] | None,
+    *,
+    ablation: bool = False,
+    total_trials: int | None = None,
 ) -> list[tuple[str, int, str, int]]:
-    selected_suites: list[tuple[str, Any, list[int]]] = []
-    for suite_name in suite_names:
-        if suite_name not in benchmark_dict:
-            print(f"Warning: Suite '{suite_name}' not found in Libero benchmarks.")
+    tasks = []
+    for suite_name in suites:
+        if suite_name not in benchmarks:
+            if ablation:
+                raise ValueError(f"LIBERO suite {suite_name!r} is unavailable")
+            print(f"Warning: Suite {suite_name!r} not found in LIBERO benchmarks.")
             continue
 
-        task_suite = benchmark_dict[suite_name]()
-        num_tasks = task_suite.n_tasks
-        print(f"Suite {suite_name} has {num_tasks} tasks.")
-        selected_suites.append(
-            (suite_name, task_suite, _select_task_ids(num_tasks, task_ids))
-        )
-
-    tasks_to_run: list[tuple[str, int, str, int]] = []
-    for suite_name, task_suite, selected_task_ids in selected_suites:
-        for task_id in selected_task_ids:
-            task = task_suite.get_task(task_id)
-            task_name = task.name
-
+        suite = benchmarks[suite_name]()
+        for task_id in _select_task_ids(suite.n_tasks, task_ids):
+            task_name = suite.get_task(task_id).name
             try:
-                init_states = task_suite.get_task_init_states(task_id)
-                assert init_states is not None, f"No initial states found for task {task_name}"
-                num_trials = len(init_states)
+                num_trials = len(suite.get_task_init_states(task_id))
             except Exception as exc:
-                print(
-                    f"Warning: Could not determine init states for {task_name}, "
-                    f"defaulting to 50. Error: {exc}"
-                )
+                if ablation:
+                    raise ValueError(
+                        f"Cannot load initial states for {suite_name}/{task_name}"
+                    ) from exc
+                print(f"Warning: Could not count initial states for {task_name}; using 50. {exc}")
                 num_trials = 50
 
-            tasks_to_run.append((suite_name, task_id, task_name, num_trials))
+            if ablation:
+                if num_trials == 0:
+                    raise ValueError(f"No initial states for {suite_name}/{task_name}")
+                if total_trials is not None and not 1 <= total_trials <= num_trials:
+                    raise ValueError(
+                        f"--total-trials must be between 1 and {num_trials} "
+                        f"for {suite_name}/{task_name}"
+                    )
+                num_trials = total_trials if total_trials is not None else num_trials
+            tasks.append((suite_name, task_id, task_name, num_trials))
+    return tasks
 
-    return tasks_to_run
+
+def _load_templates(args):
+    paths = {None: Path(args.base_config_path)}
+    if args.ablation:
+        config_dir = Path(__file__).resolve().parents[3] / "env_configs" / "libero"
+        paths = {group: config_dir / filename for group, filename in ABLATION_CONFIGS.items()}
+    return {group: yaml.safe_load(path.read_text(encoding="utf-8")) for group, path in paths.items()}
 
 
-@dataclass
-class LiberoBatchLaunchArgs:
-    """Command-line arguments for automated Libero batch execution."""
-
-    # Base configuration file
-    base_config_path: str = "env_configs/libero/franka_libero_cap_agent0.yaml"
-
-    # Suites to run
-    suites: list[str] = field(
-        default_factory=lambda: [
-            "libero_object_swap",
-            "libero_object_task",
-            "libero_goal_swap",
-            "libero_goal_task",
-            "libero_spatial_swap",
-            "libero_spatial_task",
-        ]
+def main(args: LiberoBatchLaunchArgs) -> None:
+    suites = args.suites if args.suites is not None else (
+        STANDARD_SUITES if args.ablation else PRO_SUITES
     )
+    if args.ablation:
+        if not suites or any(suite not in STANDARD_SUITES for suite in suites):
+            raise ValueError(f"--ablation requires suites from {', '.join(STANDARD_SUITES)}")
+        if args.task_ids == []:
+            raise ValueError("--task-ids requires at least one task ID")
+        if args.use_visual_feedback or args.use_img_differencing or args.use_oracle_code:
+            raise ValueError(
+                "--ablation requires model-generated code with visual feedback and differencing off"
+            )
+        model_dirs = {model.replace("/", "_") for model in args.models}
+        if not model_dirs or len(model_dirs) != len(args.models):
+            raise ValueError("--ablation requires models with distinct output directory names")
 
-    # Optional task IDs to run from each selected suite (all tasks by default)
-    task_ids: list[int] | None = None
-
-    # Models to run (copied from run_batch.py default)
-    models: list[str] = field(
-        default_factory=lambda: [
-            # "openai/gpt-5.4",
-            "google/gemini-3.1-pro-preview"
-        ]
+    templates = _load_templates(args)
+    tasks = _collect_tasks(
+        _load_benchmark_dict(), list(dict.fromkeys(suites)), args.task_ids,
+        ablation=args.ablation, total_trials=args.total_trials,
     )
+    if args.ablation and not tasks:
+        raise ValueError("No LIBERO tasks selected for ablation")
 
-    server_url: str = "http://127.0.0.1:8110/chat/completions"  # local server
+    total_runs = len(args.models) * len(tasks) * len(templates)
+    print(f"Total experimental runs: {total_runs}")
+    failed_runs = []
+    for model in args.models:
+        for suite_name, task_id, task_name, num_trials in tasks:
+            for group, template in templates.items():
+                config = copy.deepcopy(template)
+                env_config = config["env"]["cfg"]
+                task_dir = Path(args.output_dir).resolve() / suite_name / task_name
+                if group is None:
+                    env_config["low_level"] = {
+                        "_target_": "capx.envs.simulators.libero.FrankaLiberoEnv",
+                        "privileged": env_config.get("privileged", False),
+                        "max_steps": 8000,
+                        "seed": None,
+                        "enable_render": True,
+                        "viser_debug": False,
+                    }
+                    run_dir = task_dir
+                    config_dir = task_dir
+                else:
+                    run_dir = task_dir / group
+                    config_dir = run_dir / model.replace("/", "_")
 
-    # Output directory base
-    output_dir: str = "./outputs/libero_batch_run"
+                env_config["low_level"].update(suite_name=suite_name, task_id=task_id)
+                config["trials"] = num_trials
+                # The launcher inserts the model name before the final path component.
+                config["output_dir"] = (run_dir / "run").as_posix()
+                config_dir.mkdir(parents=True, exist_ok=True)
+                config_path = config_dir / "config.yaml"
+                config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
 
-    # Other LaunchArgs overrides
-    temperature: float = 1.0
-    max_tokens: int = 4096
-    reasoning_effort: str = "medium"
-    api_key: str | None = None
-    use_visual_feedback: bool | None = None
-    use_img_differencing: bool | None = None
-    use_wrist_camera: bool | None = None
-    use_legacy_multi_turn_decision_prompt: bool | None = None
-    total_trials: int | None = None
-    num_workers: int | None = None
-    record_video: bool | None = None
-    debug: bool = False
-    use_oracle_code: bool | None = None
+                label = f"{suite_name}/{task_name}/{group}" if group else f"{suite_name}/{task_name}"
+                print(f"Running {label} with {model} ({num_trials} configured trials)")
+                launch_args = LaunchArgs(
+                    config_path=str(config_path),
+                    server_url=args.server_url,
+                    model=model,
+                    temperature=args.temperature,
+                    max_tokens=args.max_tokens,
+                    reasoning_effort=args.reasoning_effort,
+                    api_key=args.api_key,
+                    use_visual_feedback=args.use_visual_feedback,
+                    use_img_differencing=args.use_img_differencing,
+                    use_wrist_camera=args.use_wrist_camera,
+                    use_legacy_multi_turn_decision_prompt=args.use_legacy_multi_turn_decision_prompt,
+                    total_trials=args.total_trials,
+                    num_workers=args.num_workers,
+                    record_video=args.record_video,
+                    debug=args.debug,
+                    use_oracle_code=args.use_oracle_code,
+                )
+                try:
+                    launch_main(launch_args)
+                except Exception:
+                    traceback.print_exc()
+                    failed_runs.append(f"{label} with {model}")
+
+    if failed_runs:
+        raise SystemExit("LIBERO batch failed for:\n" + "\n".join(failed_runs))
+    print("Batch execution completed successfully.")
 
 
 def _parse_args(cli_args: list[str] | None = None) -> LiberoBatchLaunchArgs:
     return tyro.cli(LiberoBatchLaunchArgs, args=cli_args)
-
-
-def main(args: LiberoBatchLaunchArgs) -> None:
-    # Load base configuration
-    if not os.path.exists(args.base_config_path):
-        print(f"Error: Base config file not found: {args.base_config_path}")
-        sys.exit(1)
-        
-    with open(args.base_config_path) as f:
-        base_config = yaml.safe_load(f)
-
-    benchmark_dict = _load_benchmark_dict()
-    
-    print(f"Collecting tasks for suites: {args.suites}")
-    tasks_to_run = _collect_tasks(benchmark_dict, args.suites, args.task_ids)
-
-    print(f"Total tasks to run: {len(tasks_to_run)}")
-    
-    total_runs = len(args.models) * len(tasks_to_run)
-    print(f"Total experimental runs (models x tasks): {total_runs}")
-    
-    experiment_idx = 1
-    failed_runs = []
-    
-    for model in args.models:
-        print(f"\n{'=' * 80}")
-        print(f"Running model: {model}")
-        print(f"{'=' * 80}")
-        
-        for suite_name, task_id, task_name, num_trials in tasks_to_run:
-            print(f"\n{'-' * 80}")
-            print(f"Running Experiment {experiment_idx}/{total_runs}")
-            print(f"Model: {model}")
-            print(f"Suite: {suite_name}, Task ID: {task_id}, Task Name: {task_name}")
-            print(f"Trials: {num_trials}")
-            print(f"{'-' * 80}\n")
-            
-            # Construct config from base template
-            # Deep copy to ensure we don't modify the shared base_config for subsequent runs
-            config = copy.deepcopy(base_config)
-
-            # Inject task details
-            # We overwrite the 'low_level' entry to be a dictionary definition for FrankaLiberoEnv
-            # instead of the string reference (e.g. 'franka_libero_pick_place_low_level')
-            
-            # Check if env/cfg/privileged exists, use it if so
-            is_privileged = config.get("env", {}).get("cfg", {}).get("privileged", False)
-            
-            config["env"]["cfg"]["low_level"] = {
-                "_target_": "capx.envs.simulators.libero.FrankaLiberoEnv",
-                "suite_name": suite_name,
-                "task_id": task_id,
-                "privileged": is_privileged,
-                "max_steps": 8000,
-                "seed": None,
-                "enable_render": True,
-                "viser_debug": False
-            }
-            
-            # Set trials count dynamically
-            config["trials"] = num_trials
-            
-            # Customize output directory
-            # Structure: output_dir/suite_name/task_name/run
-            # launch.py will append model_name automatically to the last component if we rely on its default behavior
-            # But we want: output_dir/suite/task/model/run (or similar)
-            
-            # To get output_dir/suite/task/model/run:
-            # We set config["output_dir"] = .../suite/task/run
-            # launch.py splits: [..., suite, task, run]
-            # Inserts model at -1: [..., suite, task, model, run]
-            # Result: .../suite/task/model/run
-            
-            config_dir_base = os.path.join(os.path.abspath(args.output_dir), suite_name, task_name)
-            config["output_dir"] = os.path.join(config_dir_base, "run")
-            
-            # Create the base directory if it doesn't exist to save the config
-            os.makedirs(config_dir_base, exist_ok=True)
-            
-            # Save config permanently to the run directory (parent of "run" subfolder effectively)
-            config_filename = "config.yaml"
-            config_path = os.path.join(config_dir_base, config_filename)
-            
-            with open(config_path, "w") as f:
-                yaml.dump(config, f)
-            
-            # Create LaunchArgs
-            launch_args = LaunchArgs(
-                config_path=config_path,
-                server_url=args.server_url,
-                model=model,
-                temperature=args.temperature,
-                max_tokens=args.max_tokens,
-                reasoning_effort=args.reasoning_effort,
-                api_key=args.api_key,
-                use_visual_feedback=args.use_visual_feedback,
-                use_img_differencing=args.use_img_differencing,
-                use_wrist_camera=args.use_wrist_camera,
-                use_legacy_multi_turn_decision_prompt=args.use_legacy_multi_turn_decision_prompt,
-                total_trials=args.total_trials,
-                num_workers=args.num_workers,
-                record_video=args.record_video,
-                # We do NOT pass output_dir here to avoid the logic that uses config_stem
-                output_dir=None, 
-                debug=args.debug,
-                use_oracle_code=args.use_oracle_code,
-            )
-            
-            try:
-                launch_main(launch_args)
-            except Exception as e:
-                print(f"\nERROR running {suite_name}/{task_name} with model {model}: {e}")
-                traceback.print_exc()
-                failed_runs.append((model, suite_name, task_name))
-            
-            experiment_idx += 1
-
-    if failed_runs:
-        print(f"\n{'=' * 80}")
-        print(f"Batch execution completed with {len(failed_runs)} failures:")
-        for model, suite, task in failed_runs:
-            print(f"  - model={model}, suite={suite}, task={task}")
-        print(f"{'=' * 80}")
-        sys.exit(1)
-    else:
-        print(f"\n{'=' * 80}")
-        print("Batch execution completed successfully.")
-        print(f"{'=' * 80}")
 
 
 if __name__ == "__main__":

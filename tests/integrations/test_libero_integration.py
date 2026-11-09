@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import types
+from unittest.mock import Mock, call
 
 from capx.integrations import libero as lib_mod
 
@@ -18,7 +19,7 @@ class FakeEnv:
         pass
 
     def set_init_state(self, state):  # noqa: D401, ARG002
-        pass
+        return {"image": None}
 
     def step(self, action):  # noqa: D401, ARG002
         self._t += 1
@@ -64,3 +65,16 @@ def test_load_libero_task(monkeypatch: object) -> None:
     assert isinstance(obs, dict)
     obs, rew, done, info = handle.step([0.0] * 7)
     assert done in (True, False)
+
+
+def test_libero_handle_resets_before_applying_the_selected_initial_state():
+    env = Mock()
+    env.reset.return_value = {"from": "reset"}
+    env.set_init_state.return_value = {"from": "initial state"}
+    handle = lib_mod.LiberoHandle(env, "libero_goal", 0, "open the drawer", ["first", "second"])
+
+    obs, info = handle.reset(seed=2, init_state_index=1)
+
+    assert obs == {"from": "initial state"}
+    assert info == {}
+    assert env.mock_calls == [call.seed(2), call.reset(), call.set_init_state("second")]

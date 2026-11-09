@@ -5157,16 +5157,12 @@ def _run_single_trial(
 
 def _patch_libero_goal(env: CodeExecutionEnvBase, obs: dict[str, Any]) -> None:
     """Inject the LIBERO task language into the prompt template if applicable."""
-    if not hasattr(env.low_level_env, "handle"):
+    handle = getattr(getattr(env, "low_level_env", None), "handle", None)
+    goal = getattr(handle, "task_language", None)
+    if goal is None:
         return
-    handle = env.low_level_env.handle
-    if (
-        hasattr(handle, "task_language")
-        and "libero_environment_goal" in obs["full_prompt"][-1]["content"][0]["text"]
-    ):
-        goal = handle.task_language
-        obs["full_prompt"][-1]["content"][0]["text"] = (
-            obs["full_prompt"][-1]["content"][0]["text"].format(
-                libero_environment_goal=goal
-            )
-        )
+    text = obs["full_prompt"][-1]["content"][0]["text"]
+    placeholder = "{libero_environment_goal}"
+    if placeholder in text:
+        obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
+        obs["full_prompt"][-1]["content"][0]["text"] = text.replace(placeholder, goal)

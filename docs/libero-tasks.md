@@ -196,6 +196,44 @@ uv run --no-sync --active capx/envs/launch.py \
 
 ## Choosing a Task
 
+### A1–A4 ablation on a GPU server
+
+Use the dedicated LIBERO environment and LLM proxy from the setup above. The
+ablation configs start SAM3, Contact-GraspNet, and PyRoKi. For a single task, run
+one of these configs with the same model and trial count for each group:
+
+```bash
+export MUJOCO_GL=egl
+python capx/envs/launch.py \
+    --config-path env_configs/libero/franka_libero_a1_one_shot.yaml \
+    --model google/gemini-3.1-pro-preview --total-trials 10 --num-workers 1
+```
+
+| Group | Configuration | Runtime |
+|-------|---------------|---------|
+| A1 | `franka_libero_a1_one_shot.yaml` | One code generation |
+| A2 | `franka_libero_capsule_llm_step_a2_no_patch.yaml` | Capsule with append recovery |
+| A3 | `franka_libero_capsule_llm_step_a3_no_append_recovery.yaml` | Capsule with patch |
+| A4 | `franka_libero_capsule_llm_step_a4_full.yaml` | Capsule with patch and append recovery |
+
+These configs default to `libero_spatial` task 0. To run all four groups over
+every task in the standard Object, Spatial, and Goal suites, use:
+
+```bash
+python -m capx.envs.scripts.run_libero_batch --ablation \
+    --models google/gemini-3.1-pro-preview --num-workers 1 \
+    --output-dir ./outputs/libero_ablation
+```
+
+Add `--suites libero_goal --task-ids 0 1 --total-trials 10` to run only the
+first two Goal tasks with the same first ten initial states in every group.
+Without `--total-trials`, the batch runs every available initial state once per
+group. Configs are saved under `<output-dir>/<suite>/<task>/<group>/<model>/config.yaml`
+and trial results go in the sibling `run/` directory. Slashes in model names
+become underscores in output paths.
+
+### Suite and task selection
+
 Each LIBERO task is specified by a **suite name** and **task index**. The YAML config's `low_level` field follows the pattern:
 
 ```
