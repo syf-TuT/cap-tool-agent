@@ -5,8 +5,55 @@ import pytest
 import yaml
 
 from capx.envs.launch import LaunchArgs
+from capx.envs.scripts.run_libero_batch import ABLATION_CONFIGS
 from capx.envs.tasks.franka.franka_pick_place import PROMPT
 from capx.utils.launch_utils import _load_config
+
+
+def test_libero_ablation_configs_control_only_agent_mode_and_recovery():
+    expected = {
+        "a1": ("code", False, False),
+        "a2": ("capsule", False, True),
+        "a3": ("capsule", True, False),
+        "a4": ("capsule", True, True),
+    }
+    common = []
+    outputs = set()
+    assert ABLATION_CONFIGS.keys() == expected.keys()
+    for group, filename in ABLATION_CONFIGS.items():
+        path = Path("env_configs/libero") / filename
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        env, runtime, _ = _load_config(LaunchArgs(config_path=str(path)))
+        assert (
+            runtime["agent_mode"],
+            runtime["capsule_llm_step_allow_patch"],
+            runtime["capsule_llm_step_allow_append_recovery"],
+        ) == expected[group]
+        assert not env["cfg"].get("multi_turn_prompt")
+        assert env["cfg"]["apis"] == ["FrankaLiberoApi"]
+        assert env["cfg"]["privileged"] is False
+        assert env["cfg"]["low_level"]["suite_name"] == "libero_spatial"
+        assert env["cfg"]["low_level"]["task_id"] == 0
+        assert runtime["capsule_control_mode"] == "llm_step"
+        assert runtime["max_capsule_steps"] == 12
+        assert runtime["capsule_execution_granularity"] == "semantic_group"
+        assert runtime["checkpoint_policy"] == "region"
+        assert runtime["rollback_policy"] == "none"
+        for flag in (
+            "use_visual_feedback", "use_img_differencing", "use_video_differencing",
+            "use_parallel_ensemble", "use_multimodel",
+        ):
+            assert runtime[flag] is False
+
+        outputs.add(data.pop("output_dir"))
+        for key in (
+            "agent_mode", "capsule_llm_step_allow_patch", "capsule_llm_step_allow_append_recovery",
+        ):
+            del data[key]
+        common.append(data)
+
+    assert len(outputs) == 4
+    assert all(config == common[0] for config in common)
 
 
 def test_capsule_yaml_uses_code_primitives_not_robot_tools():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import types
+from unittest.mock import Mock, call
 
 from capx.integrations import libero as lib_mod
 
@@ -18,7 +19,7 @@ class FakeEnv:
         pass
 
     def set_init_state(self, state):  # noqa: D401, ARG002
-        pass
+        return {"image": None}
 
     def step(self, action):  # noqa: D401, ARG002
         self._t += 1
@@ -36,7 +37,7 @@ def test_load_libero_task(monkeypatch: object) -> None:
         def get_task_init_states(self, task_id: int):  # noqa: D401
             return [None]
 
-    def get_benchmark_dict():  # noqa: D401
+    def get_benchmark_dict(help=False):  # noqa: D401, ARG001
         return {"libero_10": lambda: FakeSuite()}
 
     # Define FakeOffEnv before injection
@@ -46,18 +47,16 @@ def test_load_libero_task(monkeypatch: object) -> None:
 
     # Create fake package/module hierarchy for libero
     libero_pkg = types.ModuleType("libero")
-    libero_libero = types.ModuleType("libero.libero")
-    envs_mod = types.ModuleType("libero.libero.envs")
-    utils_mod = types.ModuleType("libero.libero.utils")
+    envs_mod = types.ModuleType("libero.envs")
+    utils_mod = types.ModuleType("libero.utils")
     # Attach attributes
-    libero_libero.benchmark = types.SimpleNamespace(get_benchmark_dict=get_benchmark_dict)  # type: ignore[attr-defined]
+    libero_pkg.benchmark = types.SimpleNamespace(get_benchmark_dict=get_benchmark_dict)  # type: ignore[attr-defined]
     envs_mod.OffScreenRenderEnv = FakeOffEnv  # type: ignore[attr-defined]
     utils_mod.get_libero_path = lambda name: "/x"  # type: ignore[attr-defined]
     # Register in sys.modules
     monkeypatch.setitem(sys.modules, "libero", libero_pkg)
-    monkeypatch.setitem(sys.modules, "libero.libero", libero_libero)
-    monkeypatch.setitem(sys.modules, "libero.libero.envs", envs_mod)
-    monkeypatch.setitem(sys.modules, "libero.libero.utils", utils_mod)
+    monkeypatch.setitem(sys.modules, "libero.envs", envs_mod)
+    monkeypatch.setitem(sys.modules, "libero.utils", utils_mod)
 
     # No need to patch attributes on lib_mod; load_libero_task imports from the injected modules above
 
@@ -66,3 +65,16 @@ def test_load_libero_task(monkeypatch: object) -> None:
     assert isinstance(obs, dict)
     obs, rew, done, info = handle.step([0.0] * 7)
     assert done in (True, False)
+
+
+def test_libero_handle_resets_before_applying_the_selected_initial_state():
+    env = Mock()
+    env.reset.return_value = {"from": "reset"}
+    env.set_init_state.return_value = {"from": "initial state"}
+    handle = lib_mod.LiberoHandle(env, "libero_goal", 0, "open the drawer", ["first", "second"])
+
+    obs, info = handle.reset(seed=2, init_state_index=1)
+
+    assert obs == {"from": "initial state"}
+    assert info == {}
+    assert env.mock_calls == [call.seed(2), call.reset(), call.set_init_state("second")]

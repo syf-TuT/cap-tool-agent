@@ -16,11 +16,14 @@ class LiberoHandle:
     task_language: str
     init_states: Any
 
-    def reset(self, seed: int | None = None) -> tuple[Any, dict[str, Any]]:
+    def reset(
+        self, seed: int | None = None, *, init_state_index: int = 0
+    ) -> tuple[Any, dict[str, Any]]:
         self.env.seed(seed)
         obs = self.env.reset()
-        if self.init_states is not None:
-            self.env.set_init_state(self.init_states[0])
+        if self.init_states is not None and len(self.init_states) > 0:
+            state = self.init_states[init_state_index % len(self.init_states)]
+            obs = self.env.set_init_state(state)
         return obs, {}
 
     def step(self, action: list[float]) -> tuple[Any, float, bool, dict[str, Any]]:

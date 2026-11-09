@@ -772,6 +772,7 @@ def _run_capsule_auto_forward_loop(
         )
 
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
+    _patch_libero_goal(env, obs)
     if config.get("record_video") and hasattr(env, "enable_video_capture"):
         env.enable_video_capture(
             True,
@@ -1342,6 +1343,7 @@ def _run_capsule_llm_step_loop(
     stop_after_task_success: bool = False,
 ) -> TrialSummary:
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
+    _patch_libero_goal(env, obs)
     output_dir = config.get("output_dir")
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -2978,16 +2980,12 @@ def _run_single_trial(
 
 def _patch_libero_goal(env: CodeExecutionEnvBase, obs: dict[str, Any]) -> None:
     """Inject the LIBERO task language into the prompt template if applicable."""
-    if not hasattr(env.low_level_env, "handle"):
+    handle = getattr(getattr(env, "low_level_env", None), "handle", None)
+    goal = getattr(handle, "task_language", None)
+    if goal is None:
         return
-    handle = env.low_level_env.handle
-    if (
-        hasattr(handle, "task_language")
-        and "libero_environment_goal" in obs["full_prompt"][-1]["content"][0]["text"]
-    ):
-        goal = getattr(handle, "task_language")
-        obs["full_prompt"][-1]["content"][0]["text"] = (
-            obs["full_prompt"][-1]["content"][0]["text"].format(
-                libero_environment_goal=goal
-            )
-        )
+    text = obs["full_prompt"][-1]["content"][0]["text"]
+    placeholder = "{libero_environment_goal}"
+    if placeholder in text:
+        obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
+        obs["full_prompt"][-1]["content"][0]["text"] = text.replace(placeholder, goal)

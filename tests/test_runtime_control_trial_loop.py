@@ -2,7 +2,10 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import capx.envs.trial as trial_module
+from capx.envs.launch import LaunchArgs
 from capx.envs.trial import (
     _describe_initial_scene,
     _execute_runtime_action,
@@ -21,6 +24,39 @@ from capx.llm.context import get_trial_llm_context, trial_llm_context
 from capx.runtime_control.executor import CapsuleExecutor
 from capx.runtime_control.schema import CodeRegion, CodeRegionGroup, RuntimeAction
 from capx.runtime_control.trace import wrap_function_for_trace
+
+
+@pytest.mark.parametrize("mode", ["code", "auto_forward", "llm_step"])
+def test_libero_goal_is_expanded_before_initial_code_query(monkeypatch, tmp_path, mode):
+    template = "Goal: {libero_environment_goal}\nAPI example: {'key': 1}"
+    cached_prompt = [{"content": [{"text": template}]}]
+    env = SimpleNamespace(
+        low_level_env=SimpleNamespace(handle=SimpleNamespace(task_language="open the drawer")),
+        reset=lambda **kwargs: ({"full_prompt": cached_prompt}, {}),
+    )
+    config = {
+        "agent_mode": "code" if mode == "code" else "capsule",
+        "capsule_control_mode": mode,
+        "output_dir": str(tmp_path),
+        "record_video": False,
+        "use_img_differencing": False,
+        "use_visual_feedback": False,
+        "use_oracle_code": False,
+    }
+
+    class ReachedInitialQuery(Exception):
+        pass
+
+    def check_prompt(args, config, obs):
+        assert obs["full_prompt"][-1]["content"][0]["text"] == (
+            "Goal: open the drawer\nAPI example: {'key': 1}"
+        )
+        raise ReachedInitialQuery
+
+    monkeypatch.setattr(trial_module, "_query_initial_code", check_prompt)
+    with pytest.raises(ReachedInitialQuery):
+        _run_single_trial(env, 1, LaunchArgs(config_path="unused.yaml"), config, None)
+    assert cached_prompt[-1]["content"][0]["text"] == template
 
 
 class FakeApi:

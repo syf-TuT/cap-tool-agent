@@ -153,18 +153,9 @@ class FrankaLiberoEnv(BaseEnv):
             # NOTE: currently not used
             self._rng = np.random.default_rng(seed)
 
-        # We call handle.reset, but then we might want to override the init state
-        libero_obs, libero_info = self.handle.reset(seed=seed)
-        
-        # Override the init state based on the seed (which corresponds to trial ID)
-        if self.handle.init_states is not None and len(self.handle.init_states) > 0:
-            if seed is not None:
-                # Assuming seed is the trial number (1-based)
-                state_idx = (seed - 1) % len(self.handle.init_states)
-                self.handle.env.set_init_state(self.handle.init_states[state_idx])
-                # Reset simulation again to apply the new init state
-                libero_obs = self.handle.env.reset()
-                libero_info = {}
+        # The trial runner supplies the one-based trial number as the seed.
+        state_index = seed - 1 if seed is not None else 0
+        libero_obs, libero_info = self.handle.reset(seed=seed, init_state_index=state_index)
 
         self._current_obs = libero_obs
         self._current_info = libero_info
