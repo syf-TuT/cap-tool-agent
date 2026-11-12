@@ -1,68 +1,44 @@
+# Capsule
 
+面向机器人代码策略的效应边界前向恢复运行时，以及在该运行时上训练程序策略的 Capsule Critique RL。
 
+语言模型仍生成调用原有机器人函数的 Python 程序。Capsule 加在程序和环境之间：按效应边界把程序分成执行单元，在同一次试次的持久命名空间里逐单元执行，并把失败定位到具体源码。已经产生机器人副作用的单元写入账本，不能再次运行，也不能改完后当作历史片段重放。恢复代码只能追加到程序末尾，并且必须先调用环境声明的新观测函数，再从当前物理状态继续。
 
-# CaP-X
+![Capsule 运行时](docs/figures/capsule-runtime-control-architecture.svg)
 
-### A Framework for Benchmarking and Improving Coding Agents for Robot Manipulation
+默认决策循环向模型暴露这些运行时动作：`run_group`、`patch_group`、`inspect_variables`、`append_recovery`、`finish`。这些动作本身不直接移动机器人。主机每轮至多执行一个动作，保存有界反馈，再交给下一轮决策。
 
-[Project Page](https://capgym.github.io/) &ensp;|&ensp; [Paper](https://arxiv.org/abs/2603.22435) 
+仓库分成两部分：
 
-**Max Fu<sup>&#42;,1,2</sup>, Justin Yu<sup>&#42;,2</sup>, Karim El-Refai<sup>&#42;,2</sup>, Ethan Kou<sup>&#42;,2</sup>, Haoru Xue<sup>&#42;,1,2</sup>,
-Huang Huang<sup>3</sup>, Wenli Xiao<sup>4</sup>, Guanzhi Wang<sup>1</sup>, Fei-Fei Li<sup>3</sup>, Guanya Shi<sup>4</sup>, Jiajun Wu<sup>3</sup>,
-Shankar Sastry<sup>2</sup>, Yuke Zhu<sup>1</sup>, Ken Goldberg<sup>&dagger;,2</sup>, Jim Fan<sup>&dagger;,1</sup>**
+| 部分 | 做什么 | 代码 |
+| --- | --- | --- |
+| Capsule 运行时 | 执行、定位失败、禁止重放、追加恢复 | `capx/runtime_control/`，入口 `capx/envs/launch.py` |
+| Capsule Critique RL | 用环境奖励和修复轨迹训练生成程序的模型 | `capx/rl/capsule/`，脚本 `scripts/capsule_rl/` |
 
-<sup>1</sup>NVIDIA &ensp; <sup>2</sup>UC Berkeley &ensp; <sup>3</sup>Stanford University &ensp; <sup>4</sup>Carnegie Mellon University
+Python 包的 import 路径是 `capx`。
 
-<sup>&#42;</sup>Equal contribution &ensp; <sup>&dagger;</sup>Equal advising
+## 安装
 
-
-
----
-**CaP-X** is an open-access framework for systematically studying Code-as-Policy agents in robot manipulation. It consists of four components:
-
-
-| Component      | What it does                                                                                                                                                                                   |
-| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **CaP-Gym**    | Interactive Gymnasium environments where agents control robots by generating Python code that composes perception and control primitives. 39 tasks across Robosuite, LIBERO-PRO, and BEHAVIOR. |
-| **CaP-Bench**  | Systematic benchmark evaluating coding agents across abstraction levels, interaction modes, and visual grounding modalities. 8 tiers (S1-S4 single-turn, M1-M4 multi-turn).                    |
-| **CaP-Agent0** | Training-free agentic framework with multi-turn visual differencing, auto-synthesized skill libraries, and parallel ensembled reasoning.                                                       |
-| **CaP-RL**     | Reinforcement learning on the coding agent via GRPO, using environment rewards to post-train language models. Transfers from sim to real with minimal gap.                                     |
-
-
----
-
-## Installation
-
-CaP-X uses [uv](https://docs.astral.sh/uv/) for dependency management. Requires **Python 3.10** and a **CUDA-capable GPU**.
+需要 Python 3.10–3.12、一块支持 CUDA 的 GPU，以及 [uv](https://docs.astral.sh/uv/)。
 
 ```bash
-git clone --recurse-submodules https://github.com/capgym/cap-x && cd cap-x
-
-# Or if already cloned without --recurse-submodules:
+git clone --recurse-submodules <repo-url> && cd <repo>
 git submodule update --init --recursive
 
-# Install uv (if not present)
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
 uv python install 3.10 && uv venv -p 3.10
-
-# Base install
 uv sync
 ```
 
-### Simulator-specific setup
+Robosuite 和 LIBERO 依赖的 Robosuite 版本不同，各自使用一个虚拟环境。
 
-Pick **one** simulator family to install, as Robosuite (1.5.0) and LIBERO (`robosuite==1.4.0`) would be in conflict.
-
-#### Robosuite
+### Robosuite
 
 ```bash
 uv sync --extra robosuite
 ```
 
-#### LIBERO-PRO
-
-LIBERO requires a **separate virtual environment**.
+### LIBERO
 
 ```bash
 uv venv .venv-libero --python 3.12
@@ -70,182 +46,91 @@ source .venv-libero/bin/activate
 uv sync --active --extra libero --extra contactgraspnet
 ```
 
-See [docs/libero-tasks.md](docs/libero-tasks.md) for running any of 130+ LIBERO tasks.
+任务选择、Molmo 外置服务和非特权程序约束见 [docs/libero-tasks.md](docs/libero-tasks.md)。
 
-#### BEHAVIOR (Isaac Sim)
-
-BEHAVIOR tasks run on NVIDIA Isaac Sim via OmniGibson. Requires Python 3.10 and CUDA 12.x.
+可选组件：
 
 ```bash
-cd capx/third_party/b1k
-./uv_install.sh --dataset          # installs OmniGibson, Isaac Sim, BDDL, cuRobo, and downloads assets
-cd ../../..                        # back to repo root
-
-# Post-install fix — copy cuRobo JIT headers (run with b1k venv active)
-source capx/third_party/b1k/.venv/bin/activate
-cp capx/third_party/curobo/src/curobo/curobolib/cpp/*.h \
-   $(python -c "import sysconfig; print(sysconfig.get_path('purelib'))")/curobo/curobolib/cpp/
+uv sync --extra verl              # Capsule Critique RL，依赖 VeRL
+uv sync --extra contactgraspnet   # Contact-GraspNet 抓取规划
+uv sync --extra curobo            # cuRobo 运动规划，需要本机 CUDA
 ```
 
-> The `--dataset` flag downloads robot assets, BEHAVIOR-1K scene/object assets, and 2025 challenge task instances. You will be prompted to accept the NVIDIA Isaac Sim EULA and BEHAVIOR dataset license. To auto-accept, add `--accept-dataset-tos`.
+## Capsule 运行时
 
-For headless servers:
-```bash
-sudo apt-get update && sudo apt-get install -y libegl1 libgl1
-# Remove duplicate Vulkan ICD if present (causes segfault on multi-GPU systems)
-sudo rm -f /usr/share/vulkan/icd.d/nvidia_icd.json
-```
+实现在 `capx/runtime_control/`：分段、效应边界、原语追踪、副作用账本和 `append_recovery`。`capx/envs/launch.py` 读取 `env_configs/` 里 `agent_mode: capsule` 的 YAML，在试次循环中调用这套运行时。
 
-See [docs/behavior-tasks.md](docs/behavior-tasks.md) for task details and expected baselines.
-
-### Optional extras
+感知服务由任务 YAML 在评测开始时拉起。模型请求走本机的 OpenAI 兼容接口，默认地址是 `http://127.0.0.1:8110/chat/completions`。把密钥放在被 git 忽略的 `.openrouterkey` 里：
 
 ```bash
-uv sync --extra verl             # RL training with VeRL/GRPO
-uv sync --extra contactgraspnet  # Contact-GraspNet grasp planning
-uv sync --extra curobo           # cuRobo GPU-accelerated IK & motion planning (requires CUDA)
-```
-
-## Quick Start
-
-### 1. Perception servers (auto-launched)
-
-Perception servers (SAM3, ContactGraspNet, PyRoKi) are **auto-launched** by the YAML config when you run an evaluation. No manual setup required for most configs.
-
-> **SAM3 authentication:** SAM3 weights require HuggingFace access. Request access at the [SAM3 repo](https://github.com/facebookresearch/sam3), then authenticate locally with `huggingface-cli login`. Weights are cached after first download.
-
-To pre-launch servers (e.g. for sharing across multiple eval runs):
-
-```bash
-# Start SAM3 + GraspNet + PyRoKi with automatic GPU allocation
-uv run --no-sync --active capx/serving/launch_servers.py --profile default
-```
-
-Use `--dry-run` to preview the allocation. Other profiles:
-
-```bash
---profile full      # All perception servers (SAM3, GraspNet, PyRoKi, OWL-ViT, SAM2)
---profile minimal   # PyRoKi only (for oracle/privileged evals)
-```
-
-### 2. Set up an LLM proxy
-
-The evaluation harness queries an LLM through a local proxy that exposes an OpenAI-compatible API.
-
-```bash
-# OpenRouter (get a key at openrouter.ai/keys)
 echo "sk-or-v1-your-key-here" > .openrouterkey
 uv run --no-sync --active capx/serving/openrouter_server.py --key-file .openrouterkey --port 8110
 ```
 
-> **Note:** `.openrouterkey` are git-ignored. The default server URL in configs is `http://127.0.0.1:8110/chat/completions`. 
+提供商、CLI 和 YAML 字段见 [docs/configuration.md](docs/configuration.md)。
 
-See [docs/configuration.md](docs/configuration.md) for all provider options (OpenRouter, vLLM, custom).
-
-### LLM failure accounting and time limits
-
-Each logical LLM call makes at most **two** HTTP attempts. The defaults are a 60-second
-request timeout, a one-second retry backoff (with small jitter), and a `Retry-After` cap of
-10 seconds. Configure them with the canonical environment variables below; existing streaming
-and non-streaming retry/timeout variables are still accepted for compatibility.
+Robosuite Cube Stack，完整动作集（修补和追加恢复都打开）：
 
 ```bash
-export CAPX_LLM_MAX_ATTEMPTS=2
-export CAPX_LLM_REQUEST_TIMEOUT_SECONDS=60
-export CAPX_LLM_RETRY_BACKOFF_SECONDS=1
-export CAPX_LLM_RETRY_AFTER_CAP_SECONDS=10
-export CAPX_TRIAL_TIMEOUT_SECONDS=450
-export CAPX_PARENT_TIMEOUT_GRACE_SECONDS=30
+export MUJOCO_GL=egl
+uv run --no-sync --active capx/envs/launch.py \
+    --config-path env_configs/cube_stack/franka_robosuite_cube_stack_capsule_llm_step_a4_full.yaml \
+    --total-trials 1 \
+    --num-workers 1
 ```
 
-Never put a provider key in these variables, logs, result files, or committed configuration.
-Keep it in an ignored key file such as `.openrouterkey`. CaP-X records no prompts, responses,
-images, authorization headers, or keys in its resilience artifacts.
-
-For each trial, the seed output directory contains append-only attempt telemetry at
-`llm_calls_trial_<trial>.jsonl` and a canonical structured result at
-`trial_<trial>_result.json`. Each telemetry row has the logical call index, HTTP status,
-attempt, time-to-first-byte (TTFB), total duration, and remaining trial budget, along with
-the failure classification. Trial outcomes are `finished`, `llm_failed`,
-`trial_budget_exhausted`, `execution_failed`, `cancelled`, or `parent_guard_killed`; only
-`finished` trials contribute to reward and task-completion averages.
-
-The 450-second trial budget covers **all** work in the trial: environment setup, LLM waiting,
-simulation, and execution. If invoking a child process from a batch runner, set its external
-parent guard to 480 seconds (`450 + 30`): the final 30 seconds are reserved for saving the
-structured result and final telemetry. When that guard returns exit code 124, call
-`finalize_parent_guard_exit()` so a residual `running` result becomes `parent_guard_killed`.
-
-### 3. Run evaluation
+LIBERO Object 任务 0：
 
 ```bash
-# Robosuite: single-turn benchmark (100 trials, 12 parallel workers)
-uv run --no-sync --active capx/envs/launch.py \
-    --config-path env_configs/cube_stack/franka_robosuite_cube_stack.yaml \
-    --model "google/gemini-3.1-pro-preview"
-
-# Robosuite: multi-turn with visual differencing
-uv run --no-sync --active capx/envs/launch.py \
-    --config-path env_configs/cube_stack/franka_robosuite_cube_stack_multiturn_vdm.yaml \
-    --model "google/gemini-3.1-pro-preview"
-
-# LIBERO-PRO: spatial task (requires .venv-libero)
 source .venv-libero/bin/activate
+export MUJOCO_GL=egl
 uv run --no-sync --active capx/envs/launch.py \
-    --config-path env_configs/libero/franka_libero_spatial_0.yaml \
-    --model "google/gemini-3.1-pro-preview"
-
-# BEHAVIOR: R1Pro radio pickup (20 trials) — requires b1k venv
-source capx/third_party/b1k/.venv/bin/activate
-OMNI_KIT_ACCEPT_EULA=YES OMNIGIBSON_HEADLESS=1 \
-uv run --no-sync --active capx/envs/launch.py \
-    --config-path env_configs/r1pro/r1pro_pick_up_radio.yaml \
-    --model "google/gemini-3.1-pro-preview"
-
-# Interactive Web UI
-uv run --no-sync --active capx/envs/launch.py \
-    --config-path env_configs/cube_stack/franka_robosuite_cube_stack.yaml \
-    --web-ui True
-# Open http://localhost:8200
-
-# Regression tests
-./scripts/regression_test.sh quick    # 10-trial smoke test (~30s)
-./scripts/regression_test.sh test1    # Full single-turn (~3 min)
+    --config-path env_configs/libero/franka_libero_object_0_capsule_llm_step.yaml \
+    --total-trials 1 \
+    --num-workers 1
 ```
 
-> **Tip (BEHAVIOR):** Isaac Sim uses `OMNIGIBSON_GPU_ID` (not `CUDA_VISIBLE_DEVICES`) to select the GPU. For best performance on multi-GPU systems, run perception servers on a separate GPU (e.g. `OMNIGIBSON_GPU_ID=0` for the eval, and pre-launch SAM3/GraspNet with `CUDA_VISIBLE_DEVICES=1`). Set `OMNI_KIT_ACCEPT_EULA=YES` and `OMNIGIBSON_HEADLESS=1` for headless evaluation.
+同一任务族的消融配置：
 
----
+| 配置 | 行为 |
+| --- | --- |
+| `a1` | 一次生成 |
+| `a2` | Capsule，关闭修补 |
+| `a3` | Capsule，关闭追加恢复 |
+| `a4` | Capsule，修补和追加恢复都打开 |
 
-## Documentation
+## Capsule Critique RL
 
-| Guide | Contents |
-| ----- | -------- |
-| [Adding Environments](docs/adding-environments.md) | Creating simulators, task environments, YAML configs |
-| [Adding APIs](docs/adding-apis.md) | Implementing and registering new robot control APIs |
-| [User Manual (中文)](docs/user-manual-zh.md) | Chinese user guide for installation, running evaluations, Web UI, tests, and troubleshooting |
-| [Configuration](docs/configuration.md) | YAML format, CLI flags, LLM provider setup |
-| [LIBERO-PRO Tasks](docs/libero-tasks.md) | Setup, running any of 130+ LIBERO tasks, suite reference |
-| [BEHAVIOR Tasks](docs/behavior-tasks.md) | Setup, R1Pro tasks, expected baselines, environment variables |
-| [Development](docs/development.md) | Testing, linting, LIBERO/GraspNet setup, checkpoints, known issues |
-| [Real-World Franka Panda Bringup](docs/real-franka.md) | Bringup with robots_realtime, real-robot QuickStart |
-| [RL Training](docs/rl-training.md) | CaP-RL with GRPO/VeRL, sim-to-real transfer |
-| [Skill Library Compilation](scripts/skill_library_compilation/README.md) | Analyze eval outputs, compile reusable skill libraries |
+在 Capsule 运行时收集的程序和修复轨迹上训练。默认目标是 Capsule-Critique-GRPO（命令行里的 `cc-grpo`）。
 
----
+代码位置：
 
-## Citation
+- `capx/rl/capsule/`：训练器、策略损失、VeRL 配置。静态检查入口是 `python -m capx.rl.capsule.main_ppo`。
+- `scripts/capsule_rl/`：准备数据、训练和评测。Cube Stack 用 `train_cube_stack.py`，训练后评测用 `evaluate_cube_stack.py`。
+- `env_configs/cube_stack/capsule_rl/`：Cube Stack 的训练 YAML。
 
-```bibtex
-@article{fu2025capx,
-  title     = {{CaP-X}: A Framework for Benchmarking and Improving Coding Agents for Robot Manipulation},
-  author    = {Fu, Max and Yu, Justin and El-Refai, Karim and Kou, Ethan and Xue, Haoru and Huang, Huang and Xiao, Wenli and Wang, Guanzhi and Li, Fei-Fei and Shi, Guanya and Wu, Jiajun and Sastry, Shankar and Zhu, Yuke and Goldberg, Ken and Fan, Jim},
-  journal   = {arXiv preprint arXiv:2603.22435},
-  year      = {2025},
-  url       = {https://arxiv.org/abs/2603.22435}
-}
+先做不启动仿真器、Ray 或优化器的静态检查。模板里的 `/path/to` 在正式训练前要换成本机路径；`--validate-only` 只检查配置是否能解析。
+
+```bash
+uv run --extra verl --no-sync python -m capx.rl.capsule.main_ppo \
+    --config env_configs/cube_stack/capsule_rl/franka_robosuite_cube_stack_capsule_critique_grpo.yaml \
+    --validate-only
 ```
 
-## License
+`prepare` 需要程序模型路径，以及一份单独检出的 VeRL。`train` 只读取 `prepare` 写出的 `--root`。
 
-This project is released under the [MIT License](LICENSE).
+```bash
+uv run --extra verl --no-sync python scripts/capsule_rl/train_cube_stack.py prepare \
+    --root outputs/cube_stack_capsule_rl \
+    --model /path/to/program-model \
+    --verl /path/to/verl
+
+uv run --extra verl --no-sync python scripts/capsule_rl/train_cube_stack.py train \
+    --root outputs/cube_stack_capsule_rl
+```
+
+评测脚本是 `scripts/capsule_rl/evaluate_cube_stack.py`，阶段为 `prepare`、`generate`、`evaluate`、`summarize`。`prepare` 需要 `--training-root` 指向一次训练目录。
+
+## 许可证
+
+本仓库以 [MIT License](LICENSE) 发布。
