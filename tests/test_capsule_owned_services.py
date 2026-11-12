@@ -226,8 +226,8 @@ def _write_external_controller_workflow(tmp_path: Path) -> Path:
     workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
     workflow["services"]["controller"] = {
         "mode": "external",
-        "endpoint": "https://coding.dashscope.aliyuncs.com/v1",
-        "model": "qwen3.7-plus",
+        "endpoint": "https://openrouter.ai/api/v1",
+        "model": "qwen/qwen3.7-plus",
         "api_key_env": "CAPX_CONTROLLER_API_KEY",
         "request_timeout_s": 300.0,
         "max_output_tokens": 4096,
@@ -257,7 +257,7 @@ def test_external_controller_workflow_renders_only_owned_services(tmp_path: Path
     services = _render_services(workflow, capsule_config_path=CAPSULE_PATH)
 
     assert set(services) == {"program", "pyroki"}
-    assert workflow["services"]["controller"]["model"] == "qwen3.7-plus"
+    assert workflow["services"]["controller"]["model"] == "qwen/qwen3.7-plus"
     assert workflow["services"]["controller"]["max_output_tokens"] == 4096
     assert "controller-secret" not in yaml.safe_dump(workflow)
 
@@ -625,8 +625,8 @@ def test_repository_owned_workflow_matches_exact_service_and_audit_contract() ->
     ]
     assert workflow["services"]["controller"] == {
         "mode": "external",
-        "endpoint": "https://coding.dashscope.aliyuncs.com/v1",
-        "model": "qwen3.7-plus",
+        "endpoint": "https://openrouter.ai/api/v1",
+        "model": "qwen/qwen3.7-plus",
         "api_key_env": "CAPX_CONTROLLER_API_KEY",
         "request_timeout_s": 300.0,
         "max_output_tokens": 4096,

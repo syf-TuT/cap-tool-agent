@@ -1,4 +1,4 @@
-"""Collect successful glm-4.7 Restack programs and fit an assistant-only LoRA SFT."""
+"""Collect successful z-ai/glm-4.7 Restack programs and fit an assistant-only LoRA SFT."""
 
 from __future__ import annotations
 
@@ -19,10 +19,10 @@ def collect(root: Path, target: int, budget: int, seed_count: int = 32) -> None:
     from capx.utils.program_source import normalize_program_source
 
     client = OpenAI(api_key=os.environ["CAPX_CONTROLLER_API_KEY"],
-                    base_url="https://coding.dashscope.aliyuncs.com/v1", timeout=300)
+                    base_url="https://openrouter.ai/api/v1", timeout=300)
     config = Path("env_configs/cube_restack/capsule_rl/"
                   "franka_robosuite_cube_restack_privileged_clean_replay.yaml")
-    protocol = {"teacher": "glm-4.7", "target": target, "budget": budget,
+    protocol = {"teacher": "z-ai/glm-4.7", "target": target, "budget": budget,
                 "teacher_scene_context": "green initially stacked on red; unstack before restacking",
                 "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
                 "training_seeds": list(range(5, 5 + seed_count)), "temperature": 0.9}
@@ -53,7 +53,7 @@ def collect(root: Path, target: int, budget: int, seed_count: int = 32) -> None:
                     "only, including all required imports."
                 )}]
                 response = client.chat.completions.create(
-                    model="glm-4.7", messages=teacher_messages, temperature=0.9,
+                    model="z-ai/glm-4.7", messages=teacher_messages, temperature=0.9,
                     max_tokens=4096, extra_body={"enable_thinking": False})
                 raw = response.choices[0].message.content or ""
                 source = normalize_program_source(raw)

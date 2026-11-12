@@ -452,8 +452,8 @@ def test_openai_transport_is_lazy_and_uses_dedicated_credentials(monkeypatch) ->
 
     monkeypatch.setenv("CAPX_CONTROLLER_API_KEY", "controller-secret")
     config = FrozenControllerConfig(
-        endpoint="https://coding.dashscope.aliyuncs.com/v1",
-        model="qwen3.7-plus",
+        endpoint="https://openrouter.ai/api/v1",
+        model="qwen/qwen3.7-plus",
         api_key_env="CAPX_CONTROLLER_API_KEY",
     )
     transport = OpenAICompatibleControllerTransport(config, client_factory=factory)
@@ -465,13 +465,13 @@ def test_openai_transport_is_lazy_and_uses_dedicated_credentials(monkeypatch) ->
     assert client_construction == [
         {
             "api_key": "controller-secret",
-            "base_url": "https://coding.dashscope.aliyuncs.com/v1",
+            "base_url": "https://openrouter.ai/api/v1",
             "timeout": 300.0,
         }
     ]
     assert calls == [
         {
-            "model": "qwen3.7-plus",
+            "model": "qwen/qwen3.7-plus",
             "messages": [{"role": "user", "content": "repair"}],
             "temperature": 0.7,
             "max_tokens": 4096,

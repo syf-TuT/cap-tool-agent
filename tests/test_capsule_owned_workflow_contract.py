@@ -26,8 +26,8 @@ def test_controller_is_fixed_external_non_thinking_non_streaming_contract() -> N
     workflow = load_owned_services_workflow(WORKFLOW_PATH)
     assert workflow["services"]["controller"] == {
         "mode": "external",
-        "endpoint": "https://coding.dashscope.aliyuncs.com/v1",
-        "model": "qwen3.7-plus",
+        "endpoint": "https://openrouter.ai/api/v1",
+        "model": "qwen/qwen3.7-plus",
         "api_key_env": "CAPX_CONTROLLER_API_KEY",
         "request_timeout_s": 300.0,
         "max_output_tokens": 4096,

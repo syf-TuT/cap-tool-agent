@@ -35,7 +35,7 @@ def main() -> None:
         protocol = read(path / "protocol.json")
         assert protocol["training_seeds"] == list(range(5, 21))
         assert protocol["task"]["environment"] == "robosuite_spill_wipe"
-        assert protocol["controller_service"]["model"] == "glm-5"
+        assert protocol["controller_service"]["model"] in {"glm-5", "z-ai/glm-5"}
         evaluations[arm] = root / f"eval_{arm}"
         evaluation = read(evaluations[arm] / "protocol.json")
         assert evaluation["seeds"] == list(range(201, 221))

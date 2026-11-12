@@ -67,8 +67,8 @@ def valid_config() -> dict:
             "api_key_env": "CAPX_PROGRAM_API_KEY",
         },
         "controller_service": {
-            "endpoint": "https://coding.dashscope.aliyuncs.com/v1",
-            "model": "qwen3.7-plus",
+            "endpoint": "https://openrouter.ai/api/v1",
+            "model": "qwen/qwen3.7-plus",
             "api_key_env": "CAPX_CONTROLLER_API_KEY",
             "frozen": True,
             "request_timeout_s": 300.0,
@@ -318,9 +318,9 @@ def test_repository_template_contains_all_local_and_server_contract_fields() -> 
     assert config["controller_service"]["api_key_env"] == "CAPX_CONTROLLER_API_KEY"
     assert config["program_service"]["mode"] == "actor_identity"
     assert config["controller_service"]["endpoint"] == (
-        "https://coding.dashscope.aliyuncs.com/v1"
+        "https://openrouter.ai/api/v1"
     )
-    assert config["controller_service"]["model"] == "qwen3.7-plus"
+    assert config["controller_service"]["model"] == "qwen/qwen3.7-plus"
     assert config["controller_service"]["request_timeout_s"] == 300.0
     assert config["controller_service"]["max_output_tokens"] == 4096
     assert config["controller_service"]["stream"] is False

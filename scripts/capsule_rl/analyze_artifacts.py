@@ -74,8 +74,8 @@ _CONTROLLER_GGUF_SHA256 = (
     "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c"
 )
 _EXTERNAL_CONTROLLER_ATTESTATION_TYPE = "external_controller_runtime_attestation"
-_EXTERNAL_CONTROLLER_ENDPOINT = "https://coding.dashscope.aliyuncs.com/v1"
-_EXTERNAL_CONTROLLER_MODEL = "qwen3.7-plus"
+_EXTERNAL_CONTROLLER_ENDPOINT = "https://openrouter.ai/api/v1"
+_EXTERNAL_CONTROLLER_MODEL = "qwen/qwen3.7-plus"
 GATE_VERIFIERS = {
     "preflight": verify_preflight_gate_artifact,
     "seed": verify_seed_gate_artifact,

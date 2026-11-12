@@ -9,8 +9,8 @@ if ! curl -fsS --max-time 3 http://127.0.0.1:8116/docs >/dev/null; then
 fi
 exec .venv/bin/python -m scripts.capsule_rl.run_cube_stack_ac \
   --task spill_wipe --groups 16 \
-  --controller-model glm-5 \
-  --controller-endpoint https://coding.dashscope.aliyuncs.com/v1 \
+  --controller-model z-ai/glm-5 \
+  --controller-endpoint https://openrouter.ai/api/v1 \
   --model "${CAPX_PROGRAM_MODEL:-.codex-downloads/models/Qwen2.5-Coder-7B-Instruct}" \
   --verl "${CAPX_VERL_SOURCE:-.codex-downloads/verl-v0.6.1}" \
   --run-id "${CAPX_RUN_ID:-spill_wipe_ac_glm5_qwen7b_g16_20260912}" "$@"

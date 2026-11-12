@@ -158,8 +158,8 @@ _FINAL_RUNTIME_AUDIT_SHA256_FIELDS = frozenset(
         "resolved_profile_sha256",
     }
 )
-_EXTERNAL_CONTROLLER_ENDPOINT = "https://coding.dashscope.aliyuncs.com/v1"
-_EXTERNAL_CONTROLLER_MODEL = "qwen3.7-plus"
+_EXTERNAL_CONTROLLER_ENDPOINT = "https://openrouter.ai/api/v1"
+_EXTERNAL_CONTROLLER_MODEL = "qwen/qwen3.7-plus"
 SINGLE_A800_OOM_PROFILE = "fsdp_base_bf16_vllm_util_045"
 
 

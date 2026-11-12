@@ -4842,8 +4842,8 @@ def test_external_controller_attestation_and_cleanup_are_verified_without_a_pid(
 ) -> None:
     controller = {
         "mode": "external",
-        "endpoint": "https://coding.dashscope.aliyuncs.com/v1",
-        "model": "qwen3.7-plus",
+        "endpoint": "https://openrouter.ai/api/v1",
+        "model": "qwen/qwen3.7-plus",
         "api_key_env": "CAPX_CONTROLLER_API_KEY",
         "request_timeout_s": 300.0,
         "max_output_tokens": 4096,
