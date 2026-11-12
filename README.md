@@ -4,8 +4,6 @@
 
 语言模型仍生成调用原有机器人函数的 Python 程序。Capsule 加在程序和环境之间：按效应边界把程序分成执行单元，在同一次试次的持久命名空间里逐单元执行，并把失败定位到具体源码。已经产生机器人副作用的单元写入账本，不能再次运行，也不能改完后当作历史片段重放。恢复代码只能追加到程序末尾，并且必须先调用环境声明的新观测函数，再从当前物理状态继续。
 
-![Capsule 运行时](docs/figures/capsule-runtime-control-architecture.svg)
-
 默认决策循环向模型暴露这些运行时动作：`run_group`、`patch_group`、`inspect_variables`、`append_recovery`、`finish`。这些动作本身不直接移动机器人。主机每轮至多执行一个动作，保存有界反馈，再交给下一轮决策。
 
 仓库分成两部分：
